@@ -1,0 +1,27 @@
+#!/bin/sh
+# Switch the Wi-Fi function on (titan-wmt.service is serving the WMT core):
+# load the char device + gen3 driver, hand the driver this phone's factory
+# NVRAM record (MAC address, TX power calibration, 5 GHz enable), write "1"
+# to /dev/wmtWifi (chip power on, ROM patch + RAM code download), wait for
+# wlan0.
+set -e
+NV=/var/lib/titan-wifi/nvram.bin	# first 1024 bytes of nvdata APCFG/APRDEB/WIFI
+
+modprobe wmt_chrdev_wifi
+modprobe wlan_drv_gen3
+for i in $(seq 50); do [ -e /dev/wmtWifi ] && break; sleep 0.2; done
+
+titan-nvram-copy APCFG/APRDEB/WIFI "$NV" 1024 || rm -f "$NV"
+if [ -s "$NV" ]; then
+	# must reach the driver as a single write: "WR-BUF:NVRAM" + record
+	{ printf 'WR-BUF:NVRAM'; cat "$NV"; } |
+		dd of=/dev/wmtWifi bs=1036 count=1 iflag=fullblock 2>/dev/null ||
+		echo "titan-wifi-on: NVRAM not accepted, using driver defaults" >&2
+else
+	echo "titan-wifi-on: no NVRAM record, using driver defaults (2.4 GHz only)" >&2
+fi
+
+echo 1 > /dev/wmtWifi
+for i in $(seq 75); do [ -e /sys/class/net/wlan0 ] && exit 0; sleep 0.2; done
+echo "titan-wifi-on: wlan0 did not appear" >&2
+exit 1

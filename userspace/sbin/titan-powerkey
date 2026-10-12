@@ -1,0 +1,218 @@
+#!/usr/bin/python3
+"""
+titan-powerkey: power button → screen off + suspend to RAM, volume keys →
+speaker volume (Titan Pocket).
+
+Volume keys (screen on only) step the FS1860 amp ("Speaker Amp Volume",
+0-255) by VOL_STEP, capped at VOL_MAX so it never goes full blast; the
+level is kept in /var/lib/titan-audio/volume and applied at start
+(default 160).
+
+  awake      short press → blank the panel, suspend ("mem", deep)
+             if the kernel refuses (e.g. USB cable connected): stay
+             "screen off" and retry every RETRY_S seconds
+  screen off short press → panel on
+  asleep     the power key wakes the SoC; its press is swallowed and the
+             panel comes back. Any other wake source (RTC alarm, cable
+             plugged in, ...) → straight back to sleep, panel stays off.
+
+TITAN_SLEEP_WIFI=off takes Wi-Fi down while asleep (experimental): while
+associated, the CONNSYS chip wakes the SoC within ~0.5 s even with the
+driver's suspend mode (measured, docs/power.md). wpa_supplicant and
+systemd-networkd reconnect when the link comes back up.
+
+The panel is blanked through mtkfb (fb0 blank = FB_BLANK_POWERDOWN), which
+runs MediaTek's display suspend (panel + backlight off, display wakelock
+released). Long presses are left alone: the PMIC resets the phone after
+holding the key for ~10 s.
+"""
+import errno
+import os
+import select
+import struct
+import sys
+import syslog
+import time
+
+EVENT = struct.Struct("llHHi")      # struct input_event (64-bit)
+EV_KEY = 1
+KEY_VOLUMEDOWN = 114
+KEY_VOLUMEUP = 115
+KEY_POWER = 116
+VOL_CONTROL = "Speaker Amp Volume"
+VOL_FILE = "/var/lib/titan-audio/volume"
+VOL_DEFAULT = 160
+VOL_STEP = 8
+VOL_MAX = 224
+# while this file exists an app owns the volume keys (titan-remote sends the
+# TV's volume instead)
+VOL_KEYS_GRABBED = "/run/titan-volume-keys.grab"
+SHORT_PRESS_S = 1.5
+RETRY_S = 30
+WAKE_WINDOW_S = 1.5                  # wait for the waking key press after resume
+FB_BLANK = "/sys/class/graphics/fb0/blank"
+WIFI_IF = "wlan0"
+# off by default: taking wlan0 down before suspend (with Bluetooth on) hung
+# the phone once (hardware watchdog reset, 2026-10-12) - under investigation
+WIFI_OFF_IN_SLEEP = os.environ.get("TITAN_SLEEP_WIFI", "on") == "off"
+
+
+def log(msg):
+    syslog.syslog(syslog.LOG_INFO, msg)
+
+
+def find_power_key():
+    for name in sorted(os.listdir("/dev/input")):
+        if not name.startswith("event"):
+            continue
+        base = "/sys/class/input/%s/device" % name
+        try:
+            caps = open(base + "/capabilities/key").read().split()
+        except OSError:
+            continue
+        # bitmap, most significant word first, 64-bit words
+        words = [int(w, 16) for w in reversed(caps)]
+        idx, bit = divmod(KEY_POWER, 64)
+        if idx < len(words) and words[idx] >> bit & 1:
+            dev = open(base + "/name").read().strip()
+            if dev in ("mtk-kpd", "mtk-pmic-keys") or "kpd" in dev:
+                return "/dev/input/" + name, dev
+    return None, None
+
+
+def write(path, value):
+    with open(path, "w") as f:
+        f.write(value)
+
+
+def panel(on):
+    try:
+        write(FB_BLANK, "0" if on else "4")
+    except OSError as e:
+        log("panel %s: %s" % ("on" if on else "off", e))
+
+
+def wifi(up):
+    if not WIFI_OFF_IN_SLEEP or not os.path.exists("/sys/class/net/" + WIFI_IF):
+        return
+    os.system("ip link set %s %s" % (WIFI_IF, "up" if up else "down"))
+
+
+class Volume:
+    def __init__(self):
+        try:
+            self.level = int(open(VOL_FILE).read())
+        except (OSError, ValueError):
+            self.level = VOL_DEFAULT
+        self.level = max(0, min(VOL_MAX, self.level))
+        self.apply()
+
+    def apply(self):
+        os.system("tinymix -D 0 set '%s' %d >/dev/null 2>&1" % (VOL_CONTROL, self.level))
+
+    def step(self, up):
+        new = max(0, min(VOL_MAX, self.level + (VOL_STEP if up else -VOL_STEP)))
+        if new == self.level:
+            return
+        self.level = new
+        self.apply()
+        try:
+            os.makedirs(os.path.dirname(VOL_FILE), exist_ok=True)
+            with open(VOL_FILE, "w") as f:
+                f.write("%d\n" % new)
+        except OSError:
+            pass
+
+
+def suspend():
+    """True after a real suspend/resume cycle, False if the kernel refused."""
+    os.sync()
+    try:
+        write("/sys/power/state", "mem")
+        return True
+    except OSError as e:
+        if e.errno not in (errno.EBUSY, errno.EAGAIN):
+            log("suspend: %s" % e)
+        return False
+
+
+class PowerKey:
+    def __init__(self, path, volume=None):
+        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        self.pressed_at = None
+        self.volume = volume        # stepped on volume keys while set
+
+    def drain(self):
+        try:
+            while os.read(self.fd, EVENT.size * 64):
+                pass
+        except BlockingIOError:
+            pass
+        self.pressed_at = None
+
+    def wait_press(self, timeout=None):
+        """Wait for a short press (on release); False on timeout."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            left = None if deadline is None else max(0.0, deadline - time.monotonic())
+            r, _, _ = select.select([self.fd], [], [], left)
+            if not r:
+                return False
+            try:
+                data = os.read(self.fd, EVENT.size * 64)
+            except BlockingIOError:
+                continue
+            for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, typ, code, value = EVENT.unpack_from(data, i)
+                if typ == EV_KEY and code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
+                    if self.volume and value in (1, 2) and \
+                            not os.path.exists(VOL_KEYS_GRABBED):   # press, autorepeat
+                        self.volume.step(code == KEY_VOLUMEUP)
+                    continue
+                if typ != EV_KEY or code != KEY_POWER:
+                    continue
+                if value == 1:
+                    self.pressed_at = time.monotonic()
+                elif value == 0 and self.pressed_at is not None:
+                    held = time.monotonic() - self.pressed_at
+                    self.pressed_at = None
+                    if held < SHORT_PRESS_S:
+                        return True
+
+
+def main():
+    path, name = find_power_key()
+    if not path:
+        print("titan-powerkey: no input device with KEY_POWER", file=sys.stderr)
+        return 1
+    syslog.openlog("titan-powerkey")
+    log("power key: %s (%s)" % (path, name))
+    volume = Volume()
+    key = PowerKey(path, volume)
+    while True:
+        key.volume = volume         # screen on: volume keys work
+        key.wait_press()
+        key.volume = None
+        log("screen off, suspending")
+        panel(False)
+        wifi(False)
+        while True:
+            t0 = time.time()
+            if suspend():
+                log("slept %.1f s" % (time.time() - t0))
+                # woke up: was it the power key?
+                if key.wait_press(WAKE_WINDOW_S) or key.pressed_at is not None:
+                    key.drain()
+                    break
+                log("woken by something else, back to sleep")
+                continue
+            # suspend refused (USB connected, ...): screen stays off
+            if key.wait_press(RETRY_S):
+                break
+        wifi(True)
+        panel(True)
+        log("screen on")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

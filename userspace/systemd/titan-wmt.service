@@ -1,0 +1,10 @@
+[Unit]
+Description=MT6771 CONNSYS core (WMT driver + titan-wmt launcher)
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe wmt_drv
+ExecStart=/usr/local/bin/titan-wmt
+# ready once the launcher has configured WMT (it then serves patch requests)
+ExecStartPost=/bin/sh -c 'for i in $(seq 50); do [ -e /run/titan-wmt.ready ] && exit 0; sleep 0.2; done; exit 1'
+Restart=on-failure

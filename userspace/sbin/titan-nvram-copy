@@ -1,0 +1,21 @@
+#!/bin/sh
+# titan-nvram-copy RECORD DEST [BYTES]
+# One-time copy of a factory NVRAM record (e.g. APCFG/APRDEB/WIFI) from the
+# Android nvdata partition. nvdata is mounted read-only without journal
+# replay, so it is never modified. The copy is per-phone data: mode 600.
+set -e
+rec=$1 dest=$2 bytes=${3:-}
+[ -s "$dest" ] && exit 0
+part=$(grep -l '^PARTNAME=nvdata$' /sys/class/block/*/uevent | head -1 | xargs dirname | xargs basename)
+[ -n "$part" ] || { echo "titan-nvram-copy: no nvdata partition" >&2; exit 1; }
+mnt=$(mktemp -d)
+trap 'umount "$mnt" 2>/dev/null; rmdir "$mnt"' EXIT
+mount -o ro,noload "/dev/$part" "$mnt"
+mkdir -p "$(dirname "$dest")"
+umask 077
+if [ -n "$bytes" ]; then
+	head -c "$bytes" "$mnt/$rec" > "$dest.tmp"
+else
+	cat "$mnt/$rec" > "$dest.tmp"
+fi
+mv "$dest.tmp" "$dest"

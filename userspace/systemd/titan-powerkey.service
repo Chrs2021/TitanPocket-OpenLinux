@@ -1,0 +1,11 @@
+[Unit]
+Description=Power button: screen off and suspend to RAM
+After=systemd-logind.service
+
+[Service]
+ExecStart=/usr/local/sbin/titan-powerkey
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

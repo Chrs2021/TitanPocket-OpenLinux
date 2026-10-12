@@ -1,0 +1,14 @@
+[Unit]
+Description=MT6771 Wi-Fi (gen3 driver, wlan0)
+Requires=titan-wmt.service
+After=titan-wmt.service
+Before=network.target wpa_supplicant@wlan0.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/titan-wifi-on
+
+[Install]
+WantedBy=multi-user.target

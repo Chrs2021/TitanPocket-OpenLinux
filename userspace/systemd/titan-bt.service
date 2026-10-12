@@ -1,0 +1,14 @@
+[Unit]
+Description=MT6771 Bluetooth (stpbt to vhci bridge, hci0)
+Requires=titan-wmt.service
+After=titan-wmt.service
+Before=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/titan-bt-start
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target bluetooth.target

@@ -1,0 +1,34 @@
+#!/bin/sh
+# titan-radio [MHZ] [GAIN]: FM radio on the loudspeaker.
+#
+# Routes the MT6631's I2S output through the AFE to the speaker amp, then
+# runs titan-fm interactively (type a frequency, u/d, su/sd, q). Everything
+# is switched off again on exit.
+#
+#   GAIN: AFE FM gain, 0..524288 (0x80000 = 0 dB); default 32768 (-24 dB).
+#   The speaker amp stays at 160, the comfortable level from docs/audio.md.
+FREQ=${1:-99.5}
+GAIN=${2:-32768}
+
+modprobe fmradio_drv || exit 1
+for i in $(seq 25); do [ -e /dev/fm ] && break; sleep 0.2; done
+
+tinymix -D 0 set "Audio FM I2S Volume" "$GAIN" >/dev/null
+tinymix -D 0 set "Speaker Amp Volume" 160 >/dev/null
+tinymix -D 0 set Audio_i2s0_SideGen_Switch On48000 >/dev/null
+
+pids=
+cleanup() {
+	[ -n "$pids" ] && kill $pids 2>/dev/null
+	wait 2>/dev/null
+	tinymix -D 0 set Audio_i2s0_SideGen_Switch Off >/dev/null
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+# hostless links, held prepared: device 30 powers the speaker amp,
+# device 21 (FM_I2S_Playback) connects CONNSYS I2S -> HW gain -> I2S3
+spk-hold 0 30 48000 & pids="$pids $!"
+spk-hold 0 21 48000 & pids="$pids $!"
+
+titan-fm "$FREQ"
