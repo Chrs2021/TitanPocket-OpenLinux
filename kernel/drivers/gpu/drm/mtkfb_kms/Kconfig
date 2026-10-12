@@ -1,0 +1,10 @@
+config DRM_MTKFB_KMS
+	tristate "KMS on the MediaTek legacy framebuffer (mtkfb)"
+	depends on DRM
+	select DRM_KMS_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	help
+	  A minimal DRM/KMS device (driver name "mediatek") that shows its
+	  framebuffers by copying them into mtkfb's buffers. Lets Mesa (kmsro
+	  + Panfrost) and Wayland compositors use the built-in display of
+	  MT6771 phones running the MediaTek BSP display stack.

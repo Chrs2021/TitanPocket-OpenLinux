@@ -1,0 +1,29 @@
+# macOS volume metadata (this repository lives on its own disk image)
+.fseventsd/
+.Spotlight-V100/
+.Trashes
+.DS_Store
+._*
+
+# Dead `sed -i` temp files: when the kernel is built from a Linux VM on a
+# folder shared from macOS, each in-place sed leaves a 0-byte, mode-000
+# placeholder (sedXXXXXX) on the Mac side
+sed??????
+
+# out-of-tree kernel build directory (see README)
+/build/
+
+# kernel build output, if built in-tree (kernel/.gitignore covers the rest)
+/kernel/.config
+/kernel/.config.old
+
+# connectivity module build output
+/modules/connectivity/out/
+/modules/connectivity/**/*.o
+/modules/connectivity/**/*.ko
+/modules/connectivity/**/*.mod
+/modules/connectivity/**/*.mod.c
+/modules/connectivity/**/.*.cmd
+/modules/connectivity/**/Module.symvers
+/modules/connectivity/**/modules.order
+/modules/connectivity/**/.tmp_versions/

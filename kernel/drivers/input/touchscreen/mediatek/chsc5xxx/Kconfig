@@ -1,0 +1,32 @@
+#
+# ChipSemi CHSC5XXX Touchscreen driver
+#
+
+config SEMI_TOUCH_AUTO_UPDATE_EN
+	bool "ChipSemi CHSC5XXX touchpanel auto update support"
+	depends on TOUCHSCREEN_MTK_CHSC5432
+	default n
+	help
+	  This enables support for firmware update for ChipSemi CHSC5XXX
+	  touchscreens.
+
+	  Say Y here if you have a ChipSemi CHSC5XXX touchscreen connected
+	  to your system.
+
+	  If unsure, say N.
+
+config SEMI_TOUCH_APK_NODE_EN
+	bool "ChipSemi CHSC5XXX Node for debuging"
+	depends on TOUCHSCREEN_MTK_CHSC5432
+	default n
+	help
+	  This is application debug interface support for ChipSemi CHSC5XXX
+	  touchscreens.
+
+	  Say Y here if you want to have a Android app debug interface
+	  to your system.
+
+	  If unsure, say N.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called semi_touch_apk.
