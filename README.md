@@ -21,6 +21,7 @@ Wayland desktop.
 |---|---|
 | `kernel/` | the kernel tree: MediaTek 4.14.186 BSP for the Titan Pocket with our changes |
 | `modules/connectivity/` | out-of-tree MediaTek CONNSYS drivers: WMT core, Wi-Fi, Bluetooth, FM radio |
+| `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up) and the power/volume keys, with their systemd units |
 | `docs/` | hardware reference, per-driver notes, and how the vendor drivers were reverse-engineered |
 
 ## Hardware support
@@ -219,17 +220,58 @@ These files are not redistributable, and the NVRAM records are specific
 to each phone. Copy them from your own device, and don't publish images
 that contain them.
 
-The drivers also need some userspace:
+The drivers also need userspace:
 - **Wi-Fi/Bluetooth/FM:** the WMT core needs a launcher that powers the
-  chip on and serves the patch download. This is Android's
-  `wmt_loader`/`wmt_launcher`, or a replacement implementing the same
-  protocol. Bluetooth needs a relay from `/dev/stpbt` to `/dev/vhci` to
-  appear as a BlueZ `hci0`. See
-  [docs/drivers/connectivity.md](docs/drivers/connectivity.md).
+  chip on and serves the patch download. Bluetooth needs a relay from
+  `/dev/stpbt` to `/dev/vhci` so it appears as BlueZ `hci0`. Both are in
+  [`userspace/`](#userspace-programs).
 - **GPU:** Mesa 22.3 or later (Panfrost + `kmsro`). The KMS driver
   registers as `mediatek`, so Mesa pairs it with Panfrost.
 - **NFC:** an NCI stack talking to `/dev/st21nfc`
   ([docs/nfc.md](docs/nfc.md)).
+
+## Userspace programs
+
+`userspace/` holds what Android's vendor daemons used to do for this
+hardware, rewritten for a plain Linux system (systemd, BlueZ, ALSA).
+
+| Program | What it does |
+|---|---|
+| `titan-wmt` (C) | WMT launcher, replacing Android's `wmt_loader` + `wmt_launcher`. Configures the WMT core, then serves the chip's ROM patch download requests. Everything else on CONNSYS depends on it |
+| `titan-wifi-on` (sh) | loads the Wi-Fi drivers, hands the driver the phone's factory NVRAM record (MAC address, TX power, 5 GHz enable), powers Wi-Fi on and waits for `wlan0` |
+| `titan-btbridge` (C) | relays raw H4 HCI between `/dev/stpbt` and `/dev/vhci`, which creates BlueZ `hci0`. Sets the factory Bluetooth address with vendor command `0xFC1A` |
+| `titan-bt-start` (sh) | loads `bt_drv`, reads the phone's Bluetooth address from NVRAM, starts `titan-btbridge` |
+| `titan-nvram-copy` (sh) | one-time, read-only copy of a factory NVRAM record from Android's `nvdata` partition (kept mode 600: it is unique to the phone) |
+| `titan-fm` (C) | FM tuner on `/dev/fm`: tune, seek, scan, signal strength |
+| `titan-radio` (sh) | FM on the loudspeaker: routes the MT6631's I2S audio through the AFE to the amp, then runs `titan-fm` |
+| `spk-hold` (C) | holds an ALSA hostless link open (used by `titan-radio` to keep the audio route powered) |
+| `titan-powerkey` (Python 3) | power key: screen off + suspend to RAM, wake on the power key only. Volume keys: speaker volume with a safe cap, saved across boots |
+| `titan-wlan-cmd` (C) | sends private commands to the gen3 Wi-Fi driver (e.g. `SETSUSPENDMODE 1`) |
+| `tinymix` | ALSA mixer tool from the bundled tinyalsa, used by `titan-radio` and `titan-powerkey` |
+
+systemd units: `titan-wmt.service` (WMT core), `titan-wifi.service`,
+`titan-bt.service` (both need `titan-wmt`), `titan-powerkey.service`.
+
+Build and install on the phone (or cross-compile with
+`CC=aarch64-linux-gnu-gcc`; `LDFLAGS=-static` for static binaries):
+
+```sh
+cd userspace
+make
+sudo make install            # /usr/local/{bin,sbin}, /etc/systemd/system
+sudo systemctl enable --now titan-wmt titan-wifi titan-bt titan-powerkey
+```
+
+The connectivity modules must be installed (`/lib/modules/$(uname -r)/`,
+then `depmod`), and the firmware from the table above must be in
+`/lib/firmware`. `titan-powerkey` needs Python 3 (standard library only).
+
+**tinyalsa:** `third_party/tinyalsa/` is tinyalsa 2.0.0 (BSD-3-Clause, see
+its `LICENSE`) with one fix applied
+(`third_party/tinyalsa-0001-rw-sync-ptr-keep-kernel-appl.patch`). In
+read/write mode, tinyalsa let `SYNC_PTR` overwrite the kernel's
+application pointer, so the stream rewound on this kernel and audio got
+overwritten. Debian 12 doesn't package tinyalsa.
 
 ## Known limitations
 
@@ -265,8 +307,8 @@ The drivers also need some userspace:
 | [drivers/fs1860.md](docs/drivers/fs1860.md) | speaker amplifier |
 
 The docs are working notes from bringing up a real device. Some of them
-mention userspace tools and build helpers that are not part of this
-repository.
+mention apps (desktop, IR, NFC tools) and build helpers that are not part
+of this repository.
 
 ## License
 
@@ -275,4 +317,5 @@ repository.
 - The connectivity modules are GPL-2.0 or "Dual BSD/GPL", as marked in
   each source file. The reconstructed platform files keep the GPL-2.0
   header of the MediaTek code they reimplement.
+- `userspace/third_party/tinyalsa/` is BSD-3-Clause (its `LICENSE`).
 - No vendor firmware, calibration data or NVRAM content is included.

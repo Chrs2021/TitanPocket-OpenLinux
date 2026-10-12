@@ -17,6 +17,9 @@ sed??????
 /kernel/.config
 /kernel/.config.old
 
+# userspace build output
+/userspace/build/
+
 # connectivity module build output
 /modules/connectivity/out/
 /modules/connectivity/**/*.o
