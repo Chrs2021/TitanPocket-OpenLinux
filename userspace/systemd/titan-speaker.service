@@ -1,0 +1,10 @@
+[Unit]
+Description=Loudspeaker power while audio plays (I2S clock + FS1860 amp)
+
+[Service]
+ExecStart=/usr/local/bin/titan-speakerd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

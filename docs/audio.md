@@ -88,13 +88,77 @@ toggled with the clock present. Fixed in the codec driver.
 - AFE IRQ rate in `/proc/interrupts` (`Afe_ISR_Handle`): should be
   rate / period_size per second.
 
+## Desktop audio: PipeWire
+
+Apps play through **PipeWire** (0.3.65, with WirePlumber and the PulseAudio
+layer `pipewire-pulse`), running in root's user session, which the desktop
+session starts (desktop.md):
+
+```
+app (Chromium via PulseAudio API, pw-play, ...)
+  -> "Loudspeaker"            filter-chain sink, the default: lookahead limiter, peaks <= -1 dBFS
+  -> "Loudspeaker (direct)"   ALSA hw:0,7, read/write access (mmap disabled), 48 kHz, 4 x 1024 frames
+  -> DL1 -> I2S3 -> FS1860    powered on demand by titan-speakerd
+```
+
+| Piece | Where | Why |
+|---|---|---|
+| Hardware sink | `/etc/pipewire/pipewire.conf.d/50-titan-speaker.conf` | the AFE card has ~40 PCMs and no UCM profile, so WirePlumber's ALSA monitor is off (`/etc/wireplumber/main.lua.d/51-titan.lua`) and the sink is defined by hand. `api.alsa.disable-mmap` avoids the silent mmap path; 16 KB buffer keeps it in DRAM |
+| Limiter | `.../60-titan-limiter.conf` | `swh-plugins` `fast_lookahead_limiter` (LADSPA): input gain 0 dB, ceiling -1 dB, release 0.2 s. Measured: -18 dBFS in -> -18.06 out; 0 and +6 dBFS in -> -1.00 out. Its output link is passive, so an idle system still closes the device |
+| Root user units | `/etc/systemd/user/{pipewire,pipewire-pulse,wireplumber}.*.d/titan-root.conf` | Debian's units skip root (`ConditionUser=!root`); the session runs as root |
+| Amp power | `titan-speakerd` (`titan-speaker.service`) | watches devices 7 (samples) and 21 (FM): while either is open, I2S clock on, **50 ms** to settle, then the amp link (device 30) opened. Without the settle time the FS1860 DSP sometimes stays idle (`0xBD` = `0x0803`, speaker silent); the daemon also checks `0xBD` over I2C and re-enables the amp if needed. Off 2 s after the devices close (PipeWire closes after 5 s of silence) |
+| Chromium | `titan-chromium` | runs as user `browser`; gets ACL access to `/run/user/0/pulse/native` and `PULSE_SERVER` |
+
+### Volume
+
+One master level: the FS1860 amp gain (`Speaker Amp Volume`, 0-224, 224
+shown as 100 %), stored in `/var/lib/titan-audio/volume`. Level 0 is muted.
+Everything that touches loudness goes through it:
+
+| Who | Reads | Writes |
+|---|---|---|
+| Side rocker and headset buttons (`titan-powerkey`, from every input device with volume keys: `mtk-kpd`, `ACCDET`) | before each step | file + amp |
+| Top-bar indicator (desktop shell) | inotify on the file | - |
+| **Sound** app, "All apps" (`titan-mixer`) | file monitor | file + amp |
+| `titan-speakerd` | every time it powers the amp on | amp |
+| `titan-powerkey` at start and after resume | file | amp |
+| FM (`titan-radio`) | follows the amp (FM bypasses PipeWire) | - |
+
+Two traps this closes:
+
+- **The codec's chip init writes full gain.** `fs1860.c` initializes the
+  chip once, on the first stream after boot (`hw_params → ensure_init`), and
+  both of its register tables set `0x06 = 0xff00`: volume 255, above the cap.
+  Before the fix the speaker played at full gain after every boot while the
+  file, indicator and mixer all showed the saved level. `titan-speakerd` now
+  re-applies the level right after it opens the amp link. (A kernel-side fix
+  would be to cache the volume in the driver and restore it after init.)
+- **A stale volume-key grab.** `titan-remote` takes the volume keys (for a
+  TV's volume) while it's focused, through `/run/titan-volume-keys.grab`. If
+  it was killed (desktop restart, crash), the file stayed and the keys were
+  dead until reboot. The file now holds the Remote's PID, and
+  `titan-powerkey` drops a grab whose process is gone.
+
+PipeWire's own sink volumes ("Loudspeaker" and "Loudspeaker (direct)") stay
+at 100 %: WirePlumber had restored them to 53 % and 81 % at times, silently
+scaling everything down. The mixer re-pins them when it runs and every volume
+key press does too (at most every 10 s). Per-app volume and mute are PipeWire
+stream volumes; WirePlumber remembers them.
+
+`titan-mixer` uses `pactl` (`pulseaudio-utils`): `pactl subscribe` for live
+updates, JSON listings, `set-sink-input-*`.
+
 ## Known limitations / TODO
 
+- Chromium sometimes pauses ("corks") its stream when a YouTube ad is
+  skipped and plays the video silently; PipeWire and the speaker are fine.
+  Open; `chrome://media-internals` should say why.
+
 - **MMAP access plays silence** on the DRAM path (the vendor buffer is not
-  mapped correctly through the generic ALSA mmap). PipeWire/alsa-lib prefer
-  mmap; either fix the driver's mmap or force read/write access.
+  mapped correctly through the generic ALSA mmap). PipeWire is set to
+  read/write access; fixing the driver's mmap is still open.
 - Volume scale of `Speaker Amp Volume` (0.5 dB/step) is inferred, not verified.
 - Only 44.1/48 kHz preset values are replayed; 16/32 kHz need preset index 1.
-- No ALSA UCM profile yet; the mixer steps above need to become one.
+- No ALSA UCM profile yet (titan-speakerd does the mixer steps instead).
 - Microphones and the earpiece path are untested.
 - Speaker protection coefficients are this unit's (see the FS1860 doc).

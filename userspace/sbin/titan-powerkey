@@ -4,9 +4,21 @@ titan-powerkey: power button → screen off + suspend to RAM, volume keys →
 speaker volume (Titan Pocket).
 
 Volume keys (screen on only) step the FS1860 amp ("Speaker Amp Volume",
-0-255) by VOL_STEP, capped at VOL_MAX so it never goes full blast; the
-level is kept in /var/lib/titan-audio/volume and applied at start
-(default 160).
+0-255) by VOL_STEP, capped at VOL_MAX so it never goes full blast. Volume
+keys are read from every input device that has them: the side rocker
+(mtk-kpd) and a headset's buttons (ACCDET).
+
+There is one speaker level, kept in /var/lib/titan-audio/volume and shared
+with the panel's volume indicator, the Sound app's "All apps" slider
+(titan-mixer) and titan-speakerd, which re-applies it whenever it powers the
+amp on (the codec's chip init writes full gain). It's re-read before every
+step and re-applied at start and after resume. PipeWire's own sink volumes
+are kept at 100 % (a key press re-pins them) so they can't quietly scale
+everything down.
+
+While an app owns the volume keys (titan-remote sends a TV's volume), it
+writes its PID into VOL_KEYS_GRABBED; the grab is ignored once that process
+is gone, so a crashed app can't leave the keys dead.
 
   awake      short press → blank the panel, suspend ("mem", deep)
              if the kernel refuses (e.g. USB cable connected): stay
@@ -30,8 +42,10 @@ import errno
 import os
 import select
 import struct
+import subprocess
 import sys
 import syslog
+import threading
 import time
 
 EVENT = struct.Struct("llHHi")      # struct input_event (64-bit)
@@ -44,9 +58,13 @@ VOL_FILE = "/var/lib/titan-audio/volume"
 VOL_DEFAULT = 160
 VOL_STEP = 8
 VOL_MAX = 224
-# while this file exists an app owns the volume keys (titan-remote sends the
-# TV's volume instead)
+# while this file names a live process, that app owns the volume keys
+# (titan-remote sends the TV's volume instead)
 VOL_KEYS_GRABBED = "/run/titan-volume-keys.grab"
+# PipeWire runs in root's user session; its sinks stay at 100 %
+PIPEWIRE_RUNTIME = "/run/user/0"
+PIPEWIRE_SINKS = ("titan-speaker-limited", "titan-speaker")
+PIN_INTERVAL_S = 10
 SHORT_PRESS_S = 1.5
 RETRY_S = 30
 WAKE_WINDOW_S = 1.5                  # wait for the waking key press after resume
@@ -61,23 +79,51 @@ def log(msg):
     syslog.syslog(syslog.LOG_INFO, msg)
 
 
-def find_power_key():
+def key_devices(code):
+    """(path, name) of every input device that can send key `code`"""
+    found = []
     for name in sorted(os.listdir("/dev/input")):
         if not name.startswith("event"):
             continue
         base = "/sys/class/input/%s/device" % name
         try:
             caps = open(base + "/capabilities/key").read().split()
+            dev = open(base + "/name").read().strip()
         except OSError:
             continue
         # bitmap, most significant word first, 64-bit words
         words = [int(w, 16) for w in reversed(caps)]
-        idx, bit = divmod(KEY_POWER, 64)
+        idx, bit = divmod(code, 64)
         if idx < len(words) and words[idx] >> bit & 1:
-            dev = open(base + "/name").read().strip()
-            if dev in ("mtk-kpd", "mtk-pmic-keys") or "kpd" in dev:
-                return "/dev/input/" + name, dev
+            found.append(("/dev/input/" + name, dev))
+    return found
+
+
+def find_power_key():
+    for path, dev in key_devices(KEY_POWER):
+        if dev in ("mtk-kpd", "mtk-pmic-keys") or "kpd" in dev:
+            return path, dev
     return None, None
+
+
+def keys_grabbed():
+    """True while a live app owns the volume keys; clears a stale grab"""
+    try:
+        data = open(VOL_KEYS_GRABBED).read().strip()
+    except OSError:
+        return False
+    try:
+        cmdline = open("/proc/%d/cmdline" % int(data), "rb").read()
+        if b"titan-remote" in cmdline:
+            return True
+    except (OSError, ValueError):
+        pass
+    log("volume keys: dropping stale grab (%s)" % (data or "no pid"))
+    try:
+        os.unlink(VOL_KEYS_GRABBED)
+    except OSError:
+        pass
+    return False
 
 
 def write(path, value):
@@ -99,18 +145,47 @@ def wifi(up):
 
 
 class Volume:
+    """
+    The speaker level (amp gain, 0-VOL_MAX) is shared through VOL_FILE: the
+    volume keys here, the mixer's "All apps" slider (titan-mixer), the
+    panel's volume indicator and titan-speakerd all use it. 0 is muted.
+    """
     def __init__(self):
-        try:
-            self.level = int(open(VOL_FILE).read())
-        except (OSError, ValueError):
-            self.level = VOL_DEFAULT
-        self.level = max(0, min(VOL_MAX, self.level))
+        self.level = VOL_DEFAULT
+        self.pinned_at = 0.0
+        self.reload()
         self.apply()
+
+    def reload(self):
+        try:
+            self.level = max(0, min(VOL_MAX, int(open(VOL_FILE).read())))
+        except (OSError, ValueError):
+            pass
 
     def apply(self):
         os.system("tinymix -D 0 set '%s' %d >/dev/null 2>&1" % (VOL_CONTROL, self.level))
 
+    def pin_pipewire(self):
+        """keep PipeWire's sinks at 100 %, unmuted (in the background)"""
+        now = time.monotonic()
+        if now - self.pinned_at < PIN_INTERVAL_S:
+            return
+        self.pinned_at = now
+
+        def run():
+            env = dict(os.environ, XDG_RUNTIME_DIR=PIPEWIRE_RUNTIME)
+            for sink in PIPEWIRE_SINKS:
+                for args in (["set-sink-volume", sink, "100%"], ["set-sink-mute", sink, "0"]):
+                    try:
+                        subprocess.run(["pactl"] + args, env=env, timeout=3,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except (OSError, subprocess.TimeoutExpired):
+                        return
+        threading.Thread(target=run, daemon=True).start()
+
     def step(self, up):
+        self.pin_pipewire()
+        self.reload()               # the mixer may have changed it
         new = max(0, min(VOL_MAX, self.level + (VOL_STEP if up else -VOL_STEP)))
         if new == self.level:
             return
@@ -118,8 +193,10 @@ class Volume:
         self.apply()
         try:
             os.makedirs(os.path.dirname(VOL_FILE), exist_ok=True)
-            with open(VOL_FILE, "w") as f:
+            tmp = VOL_FILE + ".tmp"
+            with open(tmp, "w") as f:
                 f.write("%d\n" % new)
+            os.replace(tmp, VOL_FILE)
         except OSError:
             pass
 
@@ -137,27 +214,52 @@ def suspend():
 
 
 class PowerKey:
-    def __init__(self, path, volume=None):
+    def __init__(self, path, volume=None, volume_paths=()):
         self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        # other devices with volume keys (headset buttons); volume only
+        self.volume_fds = []
+        for p in volume_paths:
+            try:
+                self.volume_fds.append(os.open(p, os.O_RDONLY | os.O_NONBLOCK))
+            except OSError as e:
+                log("volume keys: %s: %s" % (p, e))
         self.pressed_at = None
         self.volume = volume        # stepped on volume keys while set
 
     def drain(self):
-        try:
-            while os.read(self.fd, EVENT.size * 64):
+        for fd in [self.fd] + self.volume_fds:
+            try:
+                while os.read(fd, EVENT.size * 64):
+                    pass
+            except BlockingIOError:
                 pass
-        except BlockingIOError:
-            pass
         self.pressed_at = None
+
+    def volume_event(self, code, value):
+        if self.volume and value in (1, 2) and not keys_grabbed():   # press, autorepeat
+            self.volume.step(code == KEY_VOLUMEUP)
 
     def wait_press(self, timeout=None):
         """Wait for a short press (on release); False on timeout."""
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             left = None if deadline is None else max(0.0, deadline - time.monotonic())
-            r, _, _ = select.select([self.fd], [], [], left)
+            r, _, _ = select.select([self.fd] + self.volume_fds, [], [], left)
             if not r:
                 return False
+            for fd in r:
+                if fd == self.fd:
+                    continue
+                try:
+                    data = os.read(fd, EVENT.size * 64)
+                except BlockingIOError:
+                    continue
+                for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                    _, _, typ, code, value = EVENT.unpack_from(data, i)
+                    if typ == EV_KEY and code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
+                        self.volume_event(code, value)
+            if self.fd not in r:
+                continue
             try:
                 data = os.read(self.fd, EVENT.size * 64)
             except BlockingIOError:
@@ -165,9 +267,7 @@ class PowerKey:
             for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
                 _, _, typ, code, value = EVENT.unpack_from(data, i)
                 if typ == EV_KEY and code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
-                    if self.volume and value in (1, 2) and \
-                            not os.path.exists(VOL_KEYS_GRABBED):   # press, autorepeat
-                        self.volume.step(code == KEY_VOLUMEUP)
+                    self.volume_event(code, value)
                     continue
                 if typ != EV_KEY or code != KEY_POWER:
                     continue
@@ -188,7 +288,10 @@ def main():
     syslog.openlog("titan-powerkey")
     log("power key: %s (%s)" % (path, name))
     volume = Volume()
-    key = PowerKey(path, volume)
+    others = [p for p, d in key_devices(KEY_VOLUMEUP) if p != path]
+    for p in others:
+        log("volume keys also from %s" % p)
+    key = PowerKey(path, volume, others)
     while True:
         key.volume = volume         # screen on: volume keys work
         key.wait_press()
@@ -211,6 +314,8 @@ def main():
                 break
         wifi(True)
         panel(True)
+        volume.reload()             # the amp may have lost power while asleep
+        volume.apply()
         log("screen on")
 
 

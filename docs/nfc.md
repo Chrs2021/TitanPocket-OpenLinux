@@ -2,9 +2,10 @@
 
 Status (2026-10-12): the controller initializes and reports its identity;
 NDEF read works for NFC Forum Type 2 / Type 4 / Type 5 tags, NDEF write for
-Type 2 (NTAG / MIFARE Ultralight). An interactive terminal UI
-(`titan-nfc tui`) drives it. **Needs on-device testing with real tags.**
-MIFARE Classic is not done yet.
+Type 2 (NTAG / MIFARE Ultralight), and dumps MIFARE Classic cards with a key
+dictionary (`classic-dump`). A GTK app (`titan-nfc-gui`, in the app drawer)
+and a terminal UI (`titan-nfc tui`) drive it. **Needs on-device testing with
+real tags.**
 
 ## Hardware and driver
 
@@ -53,9 +54,28 @@ titan-nfc tui             # interactive UI (needs a terminal)
 
 `TITAN_NFC_TRACE=1` prints every NCI packet (`> ` sent, `< ` received).
 
+`classic-dump` authenticates each sector of a MIFARE Classic card and dumps
+its blocks. Keys come from the `keys` argument, else `$TITAN_NFC_KEYS`, else
+the card's factory key. The image ships the proxmark/Flipper default-key list
+(2475 keys) at `/usr/local/share/titan-nfc/mf_classic_dict.nfc`;
+`/etc/profile.d/titan-nfc.sh` points `TITAN_NFC_KEYS` at it for login shells,
+and the GTK app sets it explicitly. Card size comes from the SAK
+(`TITAN_NFC_CARD=mini|1k|2k|4k` overrides). MIFARE Classic is kept **out** of
+the general polling discovery map (the ST21NFC rejects proto `0x80` there,
+see below); `classic-dump` reaches the card through its own path.
+
+### The apps
+
+**NFC** in the app drawer launches `titan-nfc-gui` (GTK 3, same toolkit as
+the other apps). It runs `titan-nfc watch` and shows tapped tags live (type,
+UID, NDEF). The mode buttons: **Read**, **Write URL**, **Write Text**, and
+**MIFARE** — which stops scanning, and on **Dump card** runs `classic-dump`
+(with the key dictionary) and streams the sector dump into a scrollable
+view. Writing and dumping own the controller, so they pause scanning.
+
 ### The terminal UI
 
-In the dock as **NFC** (launches `foot titan-nfc tui`). A worker thread
+`titan-nfc tui` is the terminal front end. A worker thread
 keeps the controller in discovery; pick a mode, tap a card, watch the
 result:
 
@@ -85,15 +105,14 @@ tag the UI sends `RF_DEACTIVATE` (discovery) so the next tap is detected.
 
 ## Not done
 
-- **MIFARE Classic.** The ST21NFC runs the CRYPTO1 cipher in its own
-  firmware (unlike a Flipper Zero, whose ST25R front end does raw RF, so its
-  open CRYPTO1 code does not port here). Authenticated read/write therefore
-  goes through a controller-specific NCI command whose exact format must be
-  determined from a real card (does the chip activate it as protocol `0x80`,
-  and what does the Frame interface accept for `AUTH` with a key?). Command
-  bytes and sector layout are known (`AUTH_A 0x60`, `AUTH_B 0x61`,
-  `READ 0x30`, `WRITE 0xA0`; 1K = 16 sectors × 4 blocks, trailer = last block
-  of each sector); default-key dictionary still to add.
+- **MIFARE Classic on-device test.** `classic-dump` is in the active binary
+  and the GTK app, but has not yet been run against a real card.
+  **Finding:** the ST21NFC rejects protocol `0x80` (MIFARE Classic) in
+  `RF_DISCOVER_MAP` (`RF_DISCOVER_MAP_RSP` status `0x01`) — an early build
+  that put `0x80` in the *general* polling map broke all NFC ("controller
+  stopped"), so MIFARE must stay out of that map and be reached on its own
+  path. Still open: MIFARE **write**, and reading sectors whose keys are not
+  in the dictionary.
 - NDEF **write** for Type 4 and Type 5.
 - Tag **emulation** (card emulation / listen mode) and peer-to-peer.
 - A graphical (GTK) app — the TUI is the testing front end for now.

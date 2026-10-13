@@ -243,14 +243,16 @@ hardware, rewritten for a plain Linux system (systemd, BlueZ, ALSA).
 | `titan-bt-start` (sh) | loads `bt_drv`, reads the phone's Bluetooth address from NVRAM, starts `titan-btbridge` |
 | `titan-nvram-copy` (sh) | one-time, read-only copy of a factory NVRAM record from Android's `nvdata` partition (kept mode 600: it is unique to the phone) |
 | `titan-fm` (C) | FM tuner on `/dev/fm`: tune, seek, scan, signal strength |
-| `titan-radio` (sh) | FM on the loudspeaker: routes the MT6631's I2S audio through the AFE to the amp, then runs `titan-fm` |
-| `spk-hold` (C) | holds an ALSA hostless link open (used by `titan-radio` to keep the audio route powered) |
+| `titan-speakerd` (C) | powers the loudspeaker path (I2S clock, then the FS1860 amp) while a speaker playback device is open (samples on device 7, FM on device 21) and switches it off 2 s after they close. Any ALSA or PipeWire playback to device 7 is audible without manual mixer steps |
+| `titan-radio` (sh) | FM on the loudspeaker: holds the FM I2S link open (`titan-speakerd` powers the speaker) and runs `titan-fm` |
+| `spk-hold` (C) | holds an ALSA hostless link open (used by `titan-radio` for the FM link) |
 | `titan-powerkey` (Python 3) | power key: screen off + suspend to RAM, wake on the power key only. Volume keys: speaker volume with a safe cap, saved across boots |
 | `titan-wlan-cmd` (C) | sends private commands to the gen3 Wi-Fi driver (e.g. `SETSUSPENDMODE 1`) |
 | `tinymix` | ALSA mixer tool from the bundled tinyalsa, used by `titan-radio` and `titan-powerkey` |
 
 systemd units: `titan-wmt.service` (WMT core), `titan-wifi.service`,
-`titan-bt.service` (both need `titan-wmt`), `titan-powerkey.service`.
+`titan-bt.service` (both need `titan-wmt`), `titan-powerkey.service`,
+`titan-speaker.service`.
 
 Build and install on the phone (or cross-compile with
 `CC=aarch64-linux-gnu-gcc`; `LDFLAGS=-static` for static binaries):
@@ -259,7 +261,7 @@ Build and install on the phone (or cross-compile with
 cd userspace
 make
 sudo make install            # /usr/local/{bin,sbin}, /etc/systemd/system
-sudo systemctl enable --now titan-wmt titan-wifi titan-bt titan-powerkey
+sudo systemctl enable --now titan-speaker titan-wmt titan-wifi titan-bt titan-powerkey
 ```
 
 The connectivity modules must be installed (`/lib/modules/$(uname -r)/`,
