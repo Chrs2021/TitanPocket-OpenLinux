@@ -19,7 +19,7 @@ Wayland desktop.
 
 | Path | What |
 |---|---|
-| `kernel/` | the kernel tree: MediaTek 4.14.186 BSP for the Titan Pocket with our changes |
+| `kernel/` | the kernel tree: MediaTek 4.14.186 BSP for the Titan Pocket with changes needed to support this device. |
 | `modules/connectivity/` | out-of-tree MediaTek CONNSYS drivers: WMT core, Wi-Fi, Bluetooth, FM radio |
 | `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up) and the power/volume keys, with their systemd units |
 | `docs/` | hardware reference, per-driver notes, and how the vendor drivers were reverse-engineered |
