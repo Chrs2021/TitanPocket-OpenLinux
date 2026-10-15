@@ -67,6 +67,37 @@ no Esc/number row. `/etc/udev/rules.d/60-titanpocket-keyboard.rules` adds
 `AttrKeyboardIntegration=internal`. With both, libinput pairs it with the
 keyboard touchpad for disable-while-typing (see [touchpad.md](touchpad.md)).
 
+## Backlight
+
+The keyboard backlight is an LED driver on **GPIO 159** with single-wire
+pulse dimming, recovered from the stock kernel's `button_led_gpio_eint_work`
+(Agold's `CONFIG_AGOLD_BUTTON_BACKLIGHT_GPIO_G66`):
+
+| Line | Effect |
+|---|---|
+| low for > ~2.5 ms | driver shuts down (keys dark) |
+| first rising edge | LEDs on at full current |
+| each further low-high pulse | one step dimmer (16 levels) |
+
+So `n` pulses from off give level 17 − n: 1 pulse is brightest, 16 dimmest.
+Stock sent 15 pulses (5 µs each way), i.e. nearly the dimmest level, from a
+work item tied to the keyboard interrupt.
+
+Our kernel doesn't carry Agold's patch. In its place the stock device tree's
+`button-backlight` LED (`led_mode = 2`, GPIO) makes MediaTek's LED driver call
+the DT `data` value (`1`) **as a function pointer**, so **never write
+`/sys/class/leds/button-backlight/brightness`** on this kernel. Instead,
+`titan-kbd` drives the line from userspace through `/dev/gpiochip0` (GPIO v1
+line-handle ioctls; the kernel's own GPIO helpers don't claim the line). It
+runs `SCHED_FIFO` so a low pulse is never stretched into a shutdown; a pulse
+costs ~10-25 µs of ioctls. The pinctrl debug file
+`/sys/devices/platform/1000b000.pinctrl/mt_gpio` shows the line state
+(`159: MODE DIR DOUT ...`) but is read-only.
+
+The stock device tree also has an `awinic,aw9523_led` node (a second AW9523
+at 0x5A in LED mode), but neither the stock nor our kernel has a driver for
+it, and it isn't the keyboard backlight.
+
 ## Verifying
 
 ```sh

@@ -103,7 +103,11 @@ config VIDEOBUF2_VMALLOC
 	select DMA_SHARED_BUFFER
 
 config VIDEOBUF2_DMA_SG
-	tristate
+	tristate "videobuf2 scatter-gather memory" if VIDEO_V4L2
+	help
+	  Titan Pocket: let out-of-tree V4L2 drivers (titan_camera) use
+	  videobuf2-dma-sg without an in-tree driver selecting it.
+
 	depends on HAS_DMA
 	select VIDEOBUF2_CORE
 	select VIDEOBUF2_MEMOPS

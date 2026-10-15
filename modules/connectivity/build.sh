@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the MediaTek connectivity modules (WMT core, Wi-Fi char device,
-# gen3 Wi-Fi driver, Bluetooth char device, FM radio) out of tree against
+# gen3 Wi-Fi driver, Bluetooth char device, FM radio, GPS) out of tree against
 # our kernel. Runs in the build
 # container:
 #   container exec titan_build_ubuntu bash /workspace/modules/connectivity/build.sh [clean]
@@ -24,7 +24,7 @@ mk() {
 }
 
 if [ "${1:-}" = clean ]; then
-	for d in common wlan_adaptor wlan_gen3 bt/legacy fm; do mk $d clean; done
+	for d in common wlan_adaptor wlan_gen3 bt/legacy fm gps; do mk $d clean; done
 	rm -rf "$HERE/out"
 	exit 0
 fi
@@ -37,10 +37,12 @@ mk wlan_gen3 KBUILD_EXTRA_SYMBOLS="$HERE/common/Module.symvers $HERE/wlan_adapto
 # Bluetooth: /dev/stpbt (raw HCI over WMT/STP), FM: /dev/fm (MT6631)
 mk bt/legacy KBUILD_EXTRA_SYMBOLS="$HERE/common/Module.symvers" modules
 mk fm KBUILD_EXTRA_SYMBOLS="$HERE/common/Module.symvers" CFG_FM_CHIP=mt6631 modules
+# GPS: /dev/stpgps (raw GNSS data over WMT/STP) for MediaTek's mnld
+mk gps KBUILD_EXTRA_SYMBOLS="$HERE/common/Module.symvers" modules
 
 mkdir -p "$HERE/out"
 cp "$HERE/common/wmt_drv.ko" "$HERE/wlan_adaptor/wmt_chrdev_wifi.ko" "$HERE/wlan_gen3/wlan_drv_gen3.ko" \
-   "$HERE/bt/legacy/bt_drv.ko" "$HERE/fm/fmradio_drv.ko" "$HERE/out/"
+   "$HERE/bt/legacy/bt_drv.ko" "$HERE/fm/fmradio_drv.ko" "$HERE/gps/gps_drv.ko" "$HERE/out/"
 for m in "$HERE"/out/*.ko; do
 	echo "$(basename "$m"): $(modinfo -F vermagic "$m")"
 done

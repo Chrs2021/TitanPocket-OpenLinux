@@ -28,6 +28,9 @@ is gone, so a crashed app can't leave the keys dead.
              panel comes back. Any other wake source (RTC alarm, cable
              plugged in, ...) → straight back to sleep, panel stays off.
 
+The saved screen brightness (titan-brightness) is applied at start and every
+time the screen comes back on.
+
 TITAN_SLEEP_WIFI=off takes Wi-Fi down while asleep (experimental): while
 associated, the CONNSYS chip wakes the SoC within ~0.5 s even with the
 driver's suspend mode (measured, docs/power.md). wpa_supplicant and
@@ -69,6 +72,8 @@ SHORT_PRESS_S = 1.5
 RETRY_S = 30
 WAKE_WINDOW_S = 1.5                  # wait for the waking key press after resume
 FB_BLANK = "/sys/class/graphics/fb0/blank"
+# exists while the screen is off (titan-kbd keeps the keyboard backlight dark)
+SCREEN_OFF_FLAG = "/run/titan-screen.off"
 WIFI_IF = "wlan0"
 # off by default: taking wlan0 down before suspend (with Bluetooth on) hung
 # the phone once (hardware watchdog reset, 2026-10-12) - under investigation
@@ -133,9 +138,25 @@ def write(path, value):
 
 def panel(on):
     try:
+        if on:
+            os.unlink(SCREEN_OFF_FLAG)
+        else:
+            open(SCREEN_OFF_FLAG, "w").close()
+    except OSError:
+        pass
+    try:
         write(FB_BLANK, "0" if on else "4")
     except OSError as e:
         log("panel %s: %s" % ("on" if on else "off", e))
+
+
+def brightness():
+    """re-apply the saved screen brightness (titan-brightness)"""
+    try:
+        subprocess.run(["/usr/local/bin/titan-brightness", "apply"], timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def wifi(up):
@@ -288,6 +309,7 @@ def main():
     syslog.openlog("titan-powerkey")
     log("power key: %s (%s)" % (path, name))
     volume = Volume()
+    brightness()
     others = [p for p, d in key_devices(KEY_VOLUMEUP) if p != path]
     for p in others:
         log("volume keys also from %s" % p)
@@ -314,6 +336,7 @@ def main():
                 break
         wifi(True)
         panel(True)
+        brightness()                # the display driver may restore its own level
         volume.reload()             # the amp may have lost power while asleep
         volume.apply()
         log("screen on")
