@@ -11,6 +11,7 @@ loudspeaker. The test channel is 99.5 MHz.
 | Firmware: `mt6631_fm_v1_patch.bin`, `mt6631_fm_v1_coeff.bin`, `fm_cust.cfg` | `/lib/firmware` | vendor partition (not redistributable) |
 | `titan-fm`: tuner CLI | `userspace/src/titan-fm.c` | new |
 | `titan-radio`: audio routing + `titan-fm` | `userspace/debian/overlay/usr/local/bin/` | new |
+| `titan-radio-gui`: the **Radio** app (GTK 3) | `userspace/debian/overlay/usr/local/bin/` | new |
 
 The driver needs the WMT core (`titan-wmt.service`) to be running. Its
 module depends on `wmt_drv`, so `modprobe fmradio_drv` works at any time.
@@ -20,6 +21,26 @@ listen.
 
 ## Using it
 
+**Radio** in the app drawer opens `titan-radio-gui`. It starts playing the
+last station and stops when the window closes.
+- Big frequency readout; a dial (87.5–108); seek ⏮ ⏭, step ‹ › (100 kHz)
+  and power buttons; a volume slider (the AFE FM gain, −48…0 dB, default
+  −24 dB; the speaker level stays with the volume keys).
+- Signal meter (GETRSSI, about dBm) and a stereo/mono badge.
+- **Scan** lists the stations it finds (about 8 s for the band); the star
+  saves a favorite, listed first. Tap a row to tune.
+- Keys: ←/→ step, ↑/↓ seek, Space power, F favorite.
+- State (frequency, volume, favorites, last scan):
+  `~/.config/titan-radio/state.json`.
+
+It drives `/dev/fm` itself (the ioctls below, from Python) and sets up the
+audio the same way as `titan-radio`. `spk-hold` is started with
+`PR_SET_PDEATHSIG`, so the FM route closes even if the app is killed. Only
+the process that powered FM up may use the ioctls (others get `EPERM`), so
+`titan-fm` and the app can't share the tuner.
+
+From a shell:
+
 ```sh
 titan-radio            # 99.5 MHz on the speaker; type a frequency, u/d (±100 kHz),
                        # su/sd (seek), q (quit; routing is undone)
@@ -28,8 +49,11 @@ titan-fm scan          # list stations, no audio
 ```
 
 `titan-fm` prints the chip's raw RSSI as "signal": higher is stronger, and a
-channel counts as a station at -296 or above (`FM_RX_RSSI_TH_LONG`, about
--4 dBµV). The driver's unit conversion isn't documented, so no dBm is shown.
+channel counts as a station at -296 or above (`FM_RX_RSSI_TH_LONG`).
+`GETRSSI` returns the same register converted as raw × 6 / 16
+(`mt6631_fm_lib.c`), which MediaTek's app shows as dBm: the threshold is
+about −111 there. Indoors without a headset the stations here measure
+−100 to −110.
 
 ## Interface (`fm/inc/fm_ioctl.h`, magic `0xf5`)
 

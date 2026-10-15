@@ -6,8 +6,10 @@ Android. It is MediaTek's **4.14.186** BSP kernel, plus:
 - drivers for the board-specific hardware that Unihertz never released
   source for, recovered from the stock firmware;
 - a GPU and display stack (Panfrost + a KMS driver);
-- the MediaTek connectivity drivers (Wi-Fi, Bluetooth, FM) built from
-  source.
+- the MediaTek connectivity drivers (Wi-Fi, Bluetooth, FM, GPS) built
+  from source;
+- V4L2 support for the cameras (the camera drivers themselves are still
+  being brought up out of tree, see [docs/camera.md](docs/camera.md)).
 
 Everything here is source code. No stock kernel modules are loaded, and
 no vendor firmware is included.
@@ -20,8 +22,8 @@ Wayland desktop.
 | Path | What |
 |---|---|
 | `kernel/` | the kernel tree: MediaTek 4.14.186 BSP for the Titan Pocket with changes needed to support this device. |
-| `modules/connectivity/` | out-of-tree MediaTek CONNSYS drivers: WMT core, Wi-Fi, Bluetooth, FM radio |
-| `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up) and the power/volume keys, with their systemd units |
+| `modules/connectivity/` | out-of-tree MediaTek CONNSYS drivers: WMT core, Wi-Fi, Bluetooth, FM radio, GPS |
+| `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up), an FM radio app and the power/volume keys, with their systemd units |
 | `docs/` | hardware reference, per-driver notes, and how the vendor drivers were reverse-engineered |
 
 ## Hardware support
@@ -38,15 +40,15 @@ Wayland desktop.
 | Speaker amplifier (FourSemi FS1860) | `sound/soc/codecs/fs1860.c` (new) | ✅ |
 | Wi-Fi 2.4 + 5 GHz (CONNSYS gen3) | `modules/connectivity/` | ✅ |
 | Bluetooth | `modules/connectivity/bt/` | ✅ raw HCI (`/dev/stpbt`); pairing untested |
-| FM radio (MT6631) | `modules/connectivity/fm/` | ✅ `/dev/fm` |
+| FM radio (MT6631) | `modules/connectivity/fm/` | ✅ `/dev/fm`; Radio app (`titan-radio-gui`) |
 | IR blaster | BSP `mtk_irtx_pwm` + MT6370 LDO fix | ✅ `/dev/irtx` |
 | NFC (STMicro ST21NFC) | BSP `st21nfc` | ✅ `/dev/st21nfc` (NCI) |
 | USB gadget (serial + network) | BSP | ✅ |
 | CPU frequency scaling, suspend to RAM | BSP + fixes | ✅ |
 | Microphones, earpiece | BSP | ❓ untested |
-| GPS | CONNSYS | ❓ not built |
+| GPS / GNSS (MT6631) | `modules/connectivity/gps/` | ✅ 3D fix outdoors (GPS, GLONASS, BeiDou, SBAS). The driver is source; positioning runs on MediaTek's closed `libmnl.so` from the phone ([docs/gnss.md](docs/gnss.md)) |
 | Cellular modem | BSP CCCI | ❓ needs firmware loading + userspace |
-| Cameras | — | ❌ no sensor driver source; the ISP stack is Android-only |
+| Cameras (OV16880 rear, OV8865 front) | out of tree, not published yet | 🚧 both sensors stream raw Bayer frames at 30 fps through V4L2 (MIPI receiver + CAMSV DMA); rear autofocus motor works. No ISP or camera app yet ([docs/camera.md](docs/camera.md)) |
 
 ## Origin of the source
 
@@ -94,6 +96,7 @@ All changes are relative to `halium-11.0`. Each is explained in
 | USB gadget Ethernet (`u_ether.c`) | `eth_work` no longer requeues itself forever when the mtu3 ring is full | [docs/power.md](docs/power.md) |
 | Panfrost power | runtime suspend (MFG clock + MTCMOS off), system suspend (GPU bucks off), balanced runtime PM | [docs/power.md](docs/power.md) |
 | GPU frequency (`mtk_gpufreq_core.c`) | `mt_gpufreq_probed()` and exports so Panfrost can defer and drive power; kbase is no longer built | [docs/gpu.md](docs/gpu.md) |
+| V4L2 (`drivers/media/v4l2-core/Kconfig`) | `VIDEOBUF2_DMA_SG` gets a prompt, so an out-of-tree V4L2 driver can use it without an in-tree driver selecting it | [docs/camera.md](docs/camera.md) |
 | DRM core (`drm_gem.c`), `vgem` | skip NULL pages of sparse heap objects; clean caches before write-combined user mappings (arm64) | [docs/gpu.md](docs/gpu.md) |
 
 ### Fixes needed to boot and run
@@ -123,6 +126,8 @@ caused the DVFSRC bootloop.
 - a VT text console on the framebuffer;
 - USB gadget serial and network;
 - the DRM stack: Panfrost as a module, `mtkfb_kms` as a module;
+- V4L2 with the media controller and subdevice API, and videobuf2
+  scatter-gather buffers, for the camera drivers (other media areas off);
 - debugfs and `/dev/mem` access, for bring-up.
 
 The kernel version string ends in `-titanpocket`.
@@ -140,6 +145,7 @@ against `kernel/`:
 | `wlan_drv_gen3.ko` | `wlan0` (cfg80211) | Motorola `...-connectivity-wlan-core-gen3` (`android-15-release-vvob35`) |
 | `bt_drv.ko` | `/dev/stpbt`: raw H4 HCI over STP | Motorola `...-connectivity-bt-mt66xx` (`android-11-release-rrk`) |
 | `fmradio_drv.ko` | `/dev/fm` (MT6631) | Motorola `...-connectivity-fmradio` (`android-11-release-rrq`) |
+| `gps_drv.ko` | `/dev/stpgps`: raw GNSS data over STP | MediaTek `vendor-mediatek-kernel_modules-connectivity-gps` (android-11) |
 
 MediaTek never published two MT6771-specific files. They were
 **reconstructed** from the stock modules:
@@ -179,7 +185,7 @@ Connectivity modules, against that build:
 
 ```sh
 KDIR=$PWD/../build bash ../modules/connectivity/build.sh
-# -> modules/connectivity/out/{wmt_drv,wmt_chrdev_wifi,wlan_drv_gen3,bt_drv,fmradio_drv}.ko
+# -> modules/connectivity/out/{wmt_drv,wmt_chrdev_wifi,wlan_drv_gen3,bt_drv,fmradio_drv,gps_drv}.ko
 ```
 
 Rebuild the connectivity modules whenever the kernel configuration
@@ -213,6 +219,7 @@ Some hardware needs files that only exist on the phone itself:
 | Wi-Fi / Bluetooth | `WMT_SOC.cfg`, `ROMv4_be_patch_1_0_hdr.bin`, `ROMv4_be_patch_1_1_hdr.bin`, `WIFI_RAM_CODE_6759` → `/lib/firmware` | stock vendor partition |
 | FM radio | `mt6631_fm_v1_patch.bin`, `mt6631_fm_v1_coeff.bin`, `fm_cust.cfg` → `/lib/firmware` | stock vendor partition |
 | Speaker amplifier | `fs16xx_01s_mono.preset` → `/lib/firmware` | stock vendor partition |
+| GPS | MediaTek's `libmnl.so` (positioning engine, carries the GNSS DSP firmware patch) and the 32-bit Android runtime it links against: 8 files in a chroot | stock system image and runtime APEX |
 | Wi-Fi MAC, TX power, 5 GHz | factory NVRAM record `APCFG/APRDEB/WIFI` (first 1024 bytes, handed to `/dev/wmtWifi`) | the phone's `nvdata` partition, unique per unit |
 | Bluetooth address | NVRAM record `APCFG/APRDEB/BT_Addr`, set with HCI vendor command `0xFC1A` | the phone's `nvdata` partition, unique per unit |
 
@@ -225,6 +232,11 @@ The drivers also need userspace:
   chip on and serves the patch download. Bluetooth needs a relay from
   `/dev/stpbt` to `/dev/vhci` so it appears as BlueZ `hci0`. Both are in
   [`userspace/`](#userspace-programs).
+- **GPS:** `libmnl.so` needs a host process that loads it and feeds it
+  `/dev/stpgps`, and something to turn its output into NMEA for gpsd. The
+  interface (17 callbacks, the `/dev/stpgps` framing) is documented in
+  [docs/gnss.md](docs/gnss.md); the host programs aren't in this
+  repository yet.
 - **GPU:** Mesa 22.3 or later (Panfrost + `kmsro`). The KMS driver
   registers as `mediatek`, so Mesa pairs it with Panfrost.
 - **NFC:** an NCI stack talking to `/dev/st21nfc`
@@ -245,7 +257,8 @@ hardware, rewritten for a plain Linux system (systemd, BlueZ, ALSA).
 | `titan-fm` (C) | FM tuner on `/dev/fm`: tune, seek, scan, signal strength |
 | `titan-speakerd` (C) | powers the loudspeaker path (I2S clock, then the FS1860 amp) while a speaker playback device is open (samples on device 7, FM on device 21) and switches it off 2 s after they close. Any ALSA or PipeWire playback to device 7 is audible without manual mixer steps |
 | `titan-radio` (sh) | FM on the loudspeaker: holds the FM I2S link open (`titan-speakerd` powers the speaker) and runs `titan-fm` |
-| `spk-hold` (C) | holds an ALSA hostless link open (used by `titan-radio` for the FM link) |
+| `titan-radio-gui` (Python 3, GTK 3) | the **Radio** app: frequency dial, seek and step, station scan, favorites, signal meter, volume. Drives `/dev/fm` itself and sets up the FM audio like `titan-radio`; plays while its window is open |
+| `spk-hold` (C) | holds an ALSA hostless link open (used by `titan-radio` and `titan-radio-gui` for the FM link) |
 | `titan-powerkey` (Python 3) | power key: screen off + suspend to RAM, wake on the power key only. Volume keys: speaker volume with a safe cap, saved across boots |
 | `titan-wlan-cmd` (C) | sends private commands to the gen3 Wi-Fi driver (e.g. `SETSUSPENDMODE 1`) |
 | `tinymix` | ALSA mixer tool from the bundled tinyalsa, used by `titan-radio` and `titan-powerkey` |
@@ -266,7 +279,9 @@ sudo systemctl enable --now titan-speaker titan-wmt titan-wifi titan-bt titan-po
 
 The connectivity modules must be installed (`/lib/modules/$(uname -r)/`,
 then `depmod`), and the firmware from the table above must be in
-`/lib/firmware`. `titan-powerkey` needs Python 3 (standard library only).
+`/lib/firmware`. `titan-powerkey` needs Python 3 (standard library only);
+`titan-radio-gui` needs Python 3 with GTK 3 (`python3-gi`, `gir1.2-gtk-3.0`)
+and a Wayland or X session.
 
 **tinyalsa:** `third_party/tinyalsa/` is tinyalsa 2.0.0 (BSD-3-Clause, see
 its `LICENSE`) with one fix applied
@@ -285,7 +300,11 @@ overwritten. Debian 12 doesn't package tinyalsa.
 - GPU runs at a fixed frequency (no devfreq governor).
 - With Wi-Fi associated, the connectivity chip wakes the SoC from deep
   sleep about every 0.5 s.
-- Not done: cameras, modem, GPS, microphones/earpiece routing.
+- GPS depends on MediaTek's closed `libmnl.so`, and runs without
+  assistance data (no AGPS/EPO yet), so cold starts take minutes.
+- Cameras deliver raw Bayer frames only: no ISP (debayer, exposure, white
+  balance) and no libcamera support yet.
+- Not done: modem, microphones/earpiece routing, FM on headphones and RDS.
 
 ## Documentation
 
@@ -298,6 +317,8 @@ overwritten. Debian 12 doesn't package tinyalsa.
 | [gpu.md](docs/gpu.md) | Panfrost backport to 4.14, bugs found, the `mtkfb_kms` display driver |
 | [power.md](docs/power.md) | CPU frequency, idle, suspend to RAM, GPU power, wake sources |
 | [audio.md](docs/audio.md) | speaker signal chain and the bugs fixed in it |
+| [gnss.md](docs/gnss.md) | GPS: the `/dev/stpgps` protocol, the libmnl interface, running it without Android's mnld |
+| [camera.md](docs/camera.md) | cameras: sensors, power sequence, MIPI receiver, CAMSV DMA, raw capture |
 | [ir.md](docs/ir.md) | IR blaster: driver interface, bitstream format, the LED power fix |
 | [nfc.md](docs/nfc.md) | ST21NFC: driver interface, NCI, tag reading and writing |
 | [debugging.md](docs/debugging.md) | logs, debug interfaces, gotchas |
@@ -309,7 +330,7 @@ overwritten. Debian 12 doesn't package tinyalsa.
 | [drivers/fs1860.md](docs/drivers/fs1860.md) | speaker amplifier |
 
 The docs are working notes from bringing up a real device. Some of them
-mention apps (desktop, IR, NFC tools) and build helpers that are not part
+mention apps (desktop, IR, NFC, GPS and camera tools) and build helpers that are not part
 of this repository.
 
 ## License
