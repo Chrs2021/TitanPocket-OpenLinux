@@ -1,0 +1,831 @@
+#!/usr/bin/python3
+"""
+titan-camera-gui: camera app for the Titan Pocket (GTK 3 + GStreamer).
+
+Live preview, photos, a front/rear switch and autofocus, on libcamera
+(docs/camera.md): the libcamerasrc element runs the titan_camera driver
+through libcamera's simple pipeline handler and software ISP (debayer on the
+GPU, auto exposure, auto white balance).
+
+- Preview: 960x720 from the ISP, rotated (and mirrored for the front camera)
+  on the GPU by glvideoflip, shown by gtkglsink.
+- Photo: the camera allows one stream at a time, so the shutter stops the
+  preview, runs the camera at its largest size (rear 2332x1752, front
+  3260x2448), skips the frames auto exposure needs to settle, saves one as
+  JPEG under ~/Pictures/Camera and restarts the preview.
+- Rotation: the driver reports each sensor's mounting rotation
+  (V4L2_CID_CAMERA_SENSOR_ROTATION); the rotate button overrides it per
+  camera (~/.config/titan-camera/state.json), for photos too.
+- Autofocus (rear camera; the front one is fixed-focus): contrast detection.
+  A second branch of the preview pipeline hands each frame to an appsink;
+  the gradient energy of the focus region (green channel) measures
+  sharpness. The lens (AK7371, the sensor subdev's FOCUS_ABSOLUTE control;
+  libcamera leaves it alone) sweeps coarsely until sharpness has clearly
+  passed its peak, then finely around the best position. After a lens move
+  only frames whose capture started after the move (sensor timestamps) are
+  measured. Focused, the app watches sharpness and refocuses when it stays
+  well below the focused level. Tap the preview to focus there; dragging the
+  focus slider switches to manual focus until the next tap.
+
+Keys: Space/Enter take a photo, F switch camera, R rotate, A autofocus.
+"""
+import fcntl
+import json
+import os
+import struct
+import time
+
+os.environ.setdefault("NO_AT_BRIDGE", "1")
+# libcamera's GStreamer element lives in /usr/local (userspace/libcamera/build.sh)
+_gst_path = "/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0"
+if _gst_path not in os.environ.get("GST_PLUGIN_PATH", ""):
+    os.environ["GST_PLUGIN_PATH"] = ":".join(
+        p for p in (_gst_path, os.environ.get("GST_PLUGIN_PATH")) if p)
+os.environ.setdefault("LIBCAMERA_LOG_LEVELS", "*:ERROR")
+
+import numpy as np  # noqa: E402
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gst, Gtk  # noqa: E402
+
+SYSDEV = "/sys/devices/platform/1a050000.camsv1/"
+CAMERAS = [
+    # libcamera id, label, mirrored preview, still size, sensor device,
+    # focus motor, fallback rotation (clockwise)
+    {"id": "platform/1a050000.camsv1/rear ov16880", "label": "Rear",
+     "mirror": False, "still": (2332, 1752), "sysdir": SYSDEV + "rear",
+     "focus": True, "rotation": 90},
+    {"id": "platform/1a050000.camsv1/front ov8865", "label": "Front",
+     "mirror": True, "still": (3260, 2448), "sysdir": SYSDEV + "front",
+     "focus": False, "rotation": 270},
+]
+PREVIEW = (960, 720)
+SETTLE_FRAMES = 15          # auto exposure settles in ~8 frames
+JPEG_QUALITY = 92
+
+STATE_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or
+                         os.path.expanduser("~/.config"), "titan-camera")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+PHOTO_DIR = os.path.expanduser("~/Pictures/Camera")
+
+VIDIOC_G_CTRL = 0xc008561b
+VIDIOC_S_CTRL = 0xc008561c
+V4L2_CID_FOCUS_ABSOLUTE = 0x009a090a
+V4L2_CID_CAMERA_SENSOR_ROTATION = 0x009a0923   # degrees, counter-clockwise
+FOCUS_MAX = 1023
+
+# autofocus
+AF_COARSE_STEP = 64
+AF_FINE_STEP = 16
+AF_SETTLE_NS = 15_000_000   # lens settling after a move
+AF_FRAME_NS = 40_000_000    # longest exposure + readout we wait out
+AF_REGION = 0.3             # focus region: this fraction of width and height
+AF_FRAMES_PER_POS = 2       # frames averaged per lens position: coarse...
+AF_FINE_FRAMES = 4          # ...and fine (noisy in dim light)
+AF_MIN_RATIO = 1.25         # best/worst sharpness below this: low contrast
+AF_BASELINE_FRAMES = 8      # frames measured at the focused position
+AF_TRACK_FRAMES = 15        # median window while tracking (measured frames)
+AF_TRACK_EVERY = 3          # while tracking, measure every third frame
+AF_DROP = 0.6               # refocus when sharpness falls below this share...
+AF_DROP_FRAMES = 30         # ...for this many frames in a row...
+AF_MIN_GAP_S = 3.0          # ...and the last focus is this old
+
+
+def video_direction(rotation, mirror):
+    """GstVideoOrientationMethod nick for a clockwise rotation, then an
+    optional horizontal mirror"""
+    if not mirror:
+        return {0: "identity", 90: "90r", 180: "180", 270: "90l"}[rotation]
+    return {0: "horiz", 90: "ul-lr", 180: "vert", 270: "ur-ll"}[rotation]
+
+
+def subdev_node(sysdir):
+    """/dev/v4l-subdevN under a sensor's device directory"""
+    try:
+        for name in os.listdir(os.path.join(sysdir, "video4linux")):
+            if name.startswith("v4l-subdev"):
+                return "/dev/" + name
+    except OSError:
+        pass
+    return None
+
+
+def subdev_ctrl(sysdir, cid, value=None):
+    """read (value None) or write a control on a sensor subdev; None on error"""
+    node = subdev_node(sysdir)
+    if not node:
+        return None
+    try:
+        fd = os.open(node, os.O_RDWR)
+        try:
+            buf = bytearray(struct.pack("=Ii", cid, value or 0))
+            fcntl.ioctl(fd, VIDIOC_G_CTRL if value is None else VIDIOC_S_CTRL, buf, True)
+            return struct.unpack("=Ii", buf)[1]
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+
+
+def sharpness(data, w, h, region):
+    """gradient energy of the focus region of a BGRx frame: its green
+    channel, binned 2x2 against noise, normalised by brightness so auto
+    exposure changes don't look like focus changes. Only the region is
+    touched, straight in the buffer."""
+    stride = len(data) // h
+    a = np.frombuffer(data, np.uint8).reshape(h, stride)
+    cx, cy = region
+    rw, rh = int(w * AF_REGION) & ~1, int(h * AF_REGION) & ~1
+    x0 = min(max(int(cx * w) - rw // 2, 0), w - rw) & ~1
+    y0 = min(max(int(cy * h) - rh // 2, 0), h - rh) & ~1
+    g = a[y0:y0 + rh, 4 * x0 + 1:4 * (x0 + rw):4].astype(np.int32)
+    g = g[0::2, 0::2] + g[1::2, 0::2] + g[0::2, 1::2] + g[1::2, 1::2]
+    gx = g[:, 1:] - g[:, :-1]
+    gy = g[1:, :] - g[:-1, :]
+    energy = float((gx * gx).mean() + (gy * gy).mean())
+    mean = float(g.mean())
+    return energy / (mean * mean + 1024.0)
+
+
+class AutoFocus:
+    """contrast-detect autofocus, driven by sharpness samples (main thread)
+
+    states: off, sweep (coarse), fine, settle (measuring the focused level),
+    track (refocus when it drops), hold (low contrast: no tracking), manual
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.state = "off"
+        self.region = (0.5, 0.5)
+        self.pos = app.focus
+        self.start_pos = self.pos
+        self.moved_at = 0       # pipeline running time of the last move
+        self.frames = []        # valid samples at the current position
+        self.samples = {}       # position -> sharpness
+        self.queue = []         # positions still to measure
+        self.baseline = None
+        self.recent = []
+        self.low = 0
+        self.focused_at = 0.0
+
+    def start(self, region=None):
+        if region:
+            self.region = region
+        self.start_pos = self.pos
+        self.samples = {}
+        self.queue = list(range(0, FOCUS_MAX + 1, AF_COARSE_STEP)) + [FOCUS_MAX]
+        self.state = "sweep"
+        self.app.set_status("Focusing…")
+        self.move(self.queue.pop(0))
+
+    def stop(self, manual=False):
+        self.state = "manual" if manual else "off"
+
+    def resume(self):
+        """keep the lens where it is and watch sharpness from now on"""
+        self.frames = []
+        self.state = "settle"
+        self.moved_at = self.app.running_time()
+
+    def move(self, pos):
+        self.pos = pos
+        self.frames = []
+        self.app.set_lens(pos)
+        self.moved_at = self.app.running_time()
+
+    def valid(self, pts):
+        """a frame whose capture started after the lens settled"""
+        return pts is not None and pts >= self.moved_at + AF_SETTLE_NS + AF_FRAME_NS
+
+    def on_sample(self, pts, value):
+        if self.state in ("off", "manual", "hold"):
+            return
+        if self.state == "track":
+            self.track(value)
+            return
+        if not self.valid(pts):
+            return
+        self.frames.append(value)
+        if self.state == "settle":
+            if len(self.frames) >= AF_BASELINE_FRAMES:
+                self.baseline = float(np.median(self.frames))
+                self.recent = []
+                self.low = 0
+                self.state = "track"
+            return
+        if len(self.frames) < (AF_FINE_FRAMES if self.state == "fine" else AF_FRAMES_PER_POS):
+            return
+        value = sum(self.frames) / len(self.frames)
+        self.samples[self.pos] = value
+        if self.state == "sweep":
+            best = max(self.samples, key=self.samples.get)
+            past_peak = (self.pos - best >= 3 * AF_COARSE_STEP and
+                         value < 0.6 * self.samples[best])
+            if self.queue and not past_peak:
+                self.move(self.queue.pop(0))
+                return
+            self.state = "fine"
+            self.queue = [p for p in range(best - 3 * AF_FINE_STEP,
+                                           best + 3 * AF_FINE_STEP + 1, AF_FINE_STEP)
+                          if 0 <= p <= FOCUS_MAX and p not in self.samples]
+        if self.queue:
+            self.move(self.queue.pop(0))
+            return
+        # done
+        best = max(self.samples, key=self.samples.get)
+        if self.samples[best] < AF_MIN_RATIO * min(self.samples.values()):
+            self.move(self.start_pos)        # nothing to focus on here
+            self.state = "hold"
+            self.app.focus_done(None)
+            return
+        self.move(best)
+        self.state = "settle"
+        self.focused_at = time.monotonic()
+        self.app.focus_done(best)
+
+    def track(self, value):
+        self.recent = (self.recent + [value])[-AF_TRACK_FRAMES:]
+        if len(self.recent) < AF_TRACK_FRAMES:
+            return
+        level = float(np.median(self.recent))
+        if level > self.baseline:
+            self.baseline = 0.95 * self.baseline + 0.05 * level
+        if level < AF_DROP * self.baseline:
+            self.low += 1
+            if self.low >= AF_DROP_FRAMES and time.monotonic() - self.focused_at > AF_MIN_GAP_S:
+                self.start()
+        else:
+            self.low = 0
+
+
+CSS = b"""
+* { font-size: 20px; }
+.bar { background: #101012; padding: 8px 12px; }
+.round { min-width: 64px; min-height: 64px; border-radius: 32px; padding: 0;
+         background: #2a2a30; color: white; border: none; }
+.shutter { min-width: 92px; min-height: 92px; border-radius: 46px; padding: 0;
+           background: white; border: 6px solid #9a9aa0; }
+.shutter:active { background: #c8c8c8; }
+.shutter:disabled { background: #6a6a6a; }
+.thumb { min-width: 64px; min-height: 64px; padding: 0; border-radius: 8px;
+         background: #2a2a30; border: none; }
+.status { color: white; background: rgba(0,0,0,0.55); border-radius: 10px;
+          padding: 6px 14px; font-size: 20px; }
+.viewer { background: black; }
+.focuslbl { color: #c8c8c8; font-size: 16px; }
+.afmode { color: #101012; background: #f0c040; border-radius: 6px;
+          padding: 0 6px; font-size: 14px; font-weight: bold; }
+.afmode.manual { background: #8a8a90; }
+scale trough { min-height: 8px; }
+scale slider { min-width: 34px; min-height: 34px; border-radius: 17px; }
+"""
+
+
+class CameraApp(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Camera")
+        self.set_default_size(720, 680)
+        self.connect("destroy", self.on_quit)
+        self.connect("key-press-event", self.on_key)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        st = self.load_state()
+        self.cam = st.get("camera", 0) % len(CAMERAS)
+        saved = st.get("rotation", {})
+        self.rotation = {c["id"]: saved.get(c["id"], self.driver_rotation(c)) for c in CAMERAS}
+        self.focus = st.get("focus", 256)
+        self.last_photo = st.get("last_photo")
+
+        self.preview = None         # Gst.Pipeline
+        self.still = None
+        self.busy = False
+        self.syncing = False        # moving the focus slider from code
+        self.af = AutoFocus(self)
+
+        self.build()
+        self.build_preview()
+        GLib.idle_add(self.start_preview)
+
+    @staticmethod
+    def driver_rotation(c):
+        """clockwise correction from the driver's counter-clockwise one"""
+        ccw = subdev_ctrl(c["sysdir"], V4L2_CID_CAMERA_SENSOR_ROTATION)
+        return (360 - ccw) % 360 if ccw in (0, 90, 180, 270) else c["rotation"]
+
+    # ---- layout ----
+
+    def build(self):
+        self.stack = Gtk.Stack()
+        self.add(self.stack)
+
+        # camera page: preview with a status overlay, focus row, button bar
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.stack.add_named(page, "camera")
+        overlay = Gtk.Overlay()
+        overlay.get_style_context().add_class("viewer")
+        page.pack_start(overlay, True, True, 0)
+        self.view_box = Gtk.EventBox()
+        self.view_box.get_style_context().add_class("viewer")
+        self.view_box.connect("button-release-event", self.on_tap)
+        overlay.add(self.view_box)
+        self.status = Gtk.Label()
+        self.status.get_style_context().add_class("status")
+        self.status.set_halign(Gtk.Align.CENTER)
+        self.status.set_valign(Gtk.Align.START)
+        self.status.set_margin_top(12)
+        self.status.set_no_show_all(True)
+        overlay.add_overlay(self.status)
+
+        self.focus_row = Gtk.Box(spacing=10)
+        self.focus_row.get_style_context().add_class("bar")
+        page.pack_start(self.focus_row, False, False, 0)
+        self.af_label = Gtk.Label(label="AF")
+        self.af_label.get_style_context().add_class("afmode")
+        self.focus_row.pack_start(self.af_label, False, False, 0)
+        lbl = Gtk.Label(label="Far")
+        lbl.get_style_context().add_class("focuslbl")
+        self.focus_row.pack_start(lbl, False, False, 0)
+        self.focus_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, FOCUS_MAX, 1)
+        self.focus_scale.set_draw_value(False)
+        self.focus_scale.set_value(self.focus)
+        self.focus_scale.connect("value-changed", self.on_focus)
+        self.focus_row.pack_start(self.focus_scale, True, True, 0)
+        lbl = Gtk.Label(label="Near")
+        lbl.get_style_context().add_class("focuslbl")
+        self.focus_row.pack_start(lbl, False, False, 0)
+
+        bar = Gtk.Box(spacing=12)
+        bar.get_style_context().add_class("bar")
+        page.pack_start(bar, False, False, 0)
+
+        self.thumb = Gtk.Button()
+        self.thumb.get_style_context().add_class("thumb")
+        self.thumb.set_valign(Gtk.Align.CENTER)
+        self.thumb.connect("clicked", self.on_thumb)
+        bar.pack_start(self.thumb, False, False, 0)
+
+        self.rotate_btn = self.icon_button("object-rotate-right-symbolic", "round")
+        self.rotate_btn.connect("clicked", lambda b: self.rotate())
+        bar.pack_start(self.rotate_btn, False, False, 0)
+
+        self.shutter = Gtk.Button()
+        self.shutter.get_style_context().add_class("shutter")
+        self.shutter.set_halign(Gtk.Align.CENTER)
+        self.shutter.set_valign(Gtk.Align.CENTER)
+        self.shutter.connect("clicked", lambda b: self.take_photo())
+        bar.set_center_widget(self.shutter)
+
+        self.switch_btn = self.icon_button("camera-switch-symbolic", "round")
+        self.switch_btn.connect("clicked", lambda b: self.switch_camera())
+        bar.pack_end(self.switch_btn, False, False, 0)
+
+        # photo page: the last photo, tap to go back
+        photo = Gtk.EventBox()
+        photo.get_style_context().add_class("viewer")
+        photo.connect("button-release-event", lambda *a: self.show_camera())
+        self.photo_img = Gtk.Image()
+        photo.add(self.photo_img)
+        self.stack.add_named(photo, "photo")
+
+        self.update_thumb()
+
+    def icon_button(self, icon, cls):
+        b = Gtk.Button()
+        img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        img.set_pixel_size(30)
+        b.set_image(img)
+        b.get_style_context().add_class(cls)
+        b.set_valign(Gtk.Align.CENTER)
+        return b
+
+    def set_status(self, text, timeout_ms=0):
+        if text:
+            self.status.set_text(text)
+            self.status.show()
+        else:
+            self.status.hide()
+        if timeout_ms:
+            GLib.timeout_add(timeout_ms, self.clear_status, text)
+
+    def clear_status(self, text):
+        if self.status.get_text() == text:
+            self.status.hide()
+        return False
+
+    def show_af_mode(self):
+        manual = self.af.state == "manual"
+        self.af_label.set_text("MF" if manual else "AF")
+        ctx = self.af_label.get_style_context()
+        (ctx.add_class if manual else ctx.remove_class)("manual")
+
+    # ---- state ----
+
+    def load_state(self):
+        try:
+            with open(STATE_FILE) as f:
+                st = json.load(f)
+            return st if isinstance(st, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def save_state(self):
+        # only rotations that differ from the driver's are kept
+        rot = {c["id"]: self.rotation[c["id"]] for c in CAMERAS
+               if self.rotation[c["id"]] != self.driver_rotation(c)}
+        st = {"camera": self.cam, "rotation": rot, "focus": self.focus,
+              "last_photo": self.last_photo}
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.replace(tmp, STATE_FILE)
+        except OSError:
+            pass
+
+    # ---- preview ----
+
+    def build_preview(self):
+        """libcamerasrc -> tee: (1) glupload -> glvideoflip -> gtkglsink (all GPU
+        after the upload; videoflip + gtksink without GL), (2) the frames ->
+        appsink for autofocus (the same BGRx buffers, no copy)"""
+        w, h = PREVIEW
+        src = ("libcamerasrc name=src ! video/x-raw,format=BGRx,width=%d,height=%d ! "
+               "tee name=t ! queue max-size-buffers=2 leaky=downstream ! " % (w, h))
+        af = (" t. ! queue max-size-buffers=1 leaky=downstream ! "
+              "appsink name=af emit-signals=true max-buffers=1 drop=true sync=false")
+        sink = Gst.ElementFactory.make("gtkglsink", "view")
+        if sink:
+            self.preview = Gst.parse_launch(
+                src + "glupload ! glcolorconvert ! glvideoflip name=flip ! glsinkbin name=out" + af)
+            self.preview.get_by_name("out").set_property("sink", sink)
+        else:
+            sink = Gst.ElementFactory.make("gtksink", "view")
+            self.preview = Gst.parse_launch(
+                src + "videoflip name=flip ! videoconvert name=conv" + af)
+            self.preview.add(sink)
+            self.preview.get_by_name("conv").link(sink)
+        self.preview.get_by_name("af").connect("new-sample", self.on_af_sample)
+        widget = sink.get_property("widget")
+        widget.set_hexpand(True)
+        widget.set_vexpand(True)
+        self.view_box.add(widget)
+        widget.show()
+
+        bus = self.preview.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_preview_error)
+
+    def configure_preview(self):
+        c = CAMERAS[self.cam]
+        self.preview.get_by_name("src").set_property("camera-name", c["id"])
+        Gst.util_set_object_arg(self.preview.get_by_name("flip"), "video-direction",
+                                video_direction(self.rotation[c["id"]], c["mirror"]))
+
+    def start_preview(self, refocus=True):
+        self.configure_preview()
+        ret = self.preview.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            self.set_status("Camera not available")
+            return False
+        self.set_status(None)
+        c = CAMERAS[self.cam]
+        self.focus_row.set_visible(c["focus"])
+        if c["focus"]:
+            self.set_lens(self.focus)
+            if self.af.state != "manual" and refocus:
+                self.af_wait = 0
+                GLib.timeout_add(200, self.autofocus_when_playing)
+        self.show_af_mode()
+        return False
+
+    def stop_preview(self):
+        if self.af.state != "manual":
+            self.af.stop()
+        self.preview.set_state(Gst.State.NULL)
+
+    def running_time(self):
+        clock = self.preview.get_clock()
+        if not clock:
+            return 0
+        return clock.get_time() - self.preview.get_base_time()
+
+    def on_preview_error(self, bus, msg):
+        err, dbg = msg.parse_error()
+        self.set_status("Camera error: %s" % err.message)
+        self.stop_preview()
+
+    # ---- autofocus ----
+
+    def on_af_sample(self, sink):
+        """streaming thread: measure, hand the number to the main thread"""
+        sample = sink.emit("pull-sample")
+        if self.af.state in ("off", "manual", "hold"):
+            return Gst.FlowReturn.OK
+        self.af_count = getattr(self, "af_count", 0) + 1
+        if self.af.state == "track" and self.af_count % AF_TRACK_EVERY:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        ok, info = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        try:
+            value = sharpness(info.data, PREVIEW[0], PREVIEW[1], self.af.region)
+        finally:
+            buf.unmap(info)
+        pts = buf.pts if buf.pts != Gst.CLOCK_TIME_NONE else None
+        GLib.idle_add(self.af_sample, pts, value)
+        return Gst.FlowReturn.OK
+
+    def af_sample(self, pts, value):
+        if not self.busy and CAMERAS[self.cam]["focus"]:
+            self.af.on_sample(pts, value)
+        return False
+
+    def autofocus_when_playing(self):
+        """the first sweep, once frames flow and exposure had a moment"""
+        self.af_wait += 1
+        if self.preview.get_state(0)[1] != Gst.State.PLAYING:
+            return self.af_wait < 50 and not self.busy     # up to 10 s
+        if self.af_wait < 3:
+            return True
+        self.autofocus()
+        return False
+
+    def autofocus(self, region=None):
+        if self.busy or not CAMERAS[self.cam]["focus"]:
+            return False
+        if self.preview.get_state(0)[1] != Gst.State.PLAYING:
+            return False
+        self.af.start(region)
+        self.show_af_mode()
+        return False
+
+    def focus_done(self, pos):
+        """pos: the focused lens position, or None for low contrast"""
+        if pos is None:
+            self.set_status("Low contrast: tap something detailed", 1500)
+            pos = self.af.pos
+        else:
+            self.set_status("Focused", 800)
+        self.focus = pos
+        self.syncing = True
+        self.focus_scale.set_value(pos)
+        self.syncing = False
+        self.save_state()
+
+    def set_lens(self, pos):
+        c = CAMERAS[self.cam]
+        if c["focus"]:
+            subdev_ctrl(c["sysdir"], V4L2_CID_FOCUS_ABSOLUTE, int(pos))
+        if self.af.state in ("sweep", "fine", "settle", "hold"):
+            self.syncing = True
+            self.focus_scale.set_value(pos)
+            self.syncing = False
+
+    def on_focus(self, scale):
+        if self.syncing:
+            return
+        self.af.stop(manual=True)
+        self.show_af_mode()
+        self.focus = int(scale.get_value())
+        self.set_lens(self.focus)
+        self.save_state()
+
+    def on_tap(self, widget, ev):
+        """tap to focus: map the tap to the unrotated frame"""
+        c = CAMERAS[self.cam]
+        if not c["focus"] or self.busy:
+            return False
+        alloc = widget.get_allocation()
+        rot = self.rotation[c["id"]]
+        aspect = PREVIEW[0] / PREVIEW[1]
+        if rot in (90, 270):
+            aspect = 1 / aspect
+        if alloc.width / alloc.height > aspect:
+            dh, dw = alloc.height, alloc.height * aspect
+        else:
+            dw, dh = alloc.width, alloc.width / aspect
+        u = (ev.x - (alloc.width - dw) / 2) / dw
+        v = (ev.y - (alloc.height - dh) / 2) / dh
+        if not (0 <= u <= 1 and 0 <= v <= 1):
+            return False
+        if c["mirror"]:
+            u = 1 - u
+        x, y = {0: (u, v), 90: (v, 1 - u), 180: (1 - u, 1 - v), 270: (1 - v, u)}[rot]
+        self.autofocus((x, y))
+        return True
+
+    # ---- actions ----
+
+    def switch_camera(self):
+        if self.busy:
+            return
+        self.stop_preview()
+        self.cam = (self.cam + 1) % len(CAMERAS)
+        self.save_state()
+        self.set_status(CAMERAS[self.cam]["label"] + " camera", 1200)
+        GLib.idle_add(self.start_preview)
+
+    def rotate(self):
+        if self.busy:
+            return
+        cid = CAMERAS[self.cam]["id"]
+        self.rotation[cid] = (self.rotation[cid] + 90) % 360
+        self.save_state()
+        self.stop_preview()
+        GLib.idle_add(self.start_preview)
+
+    # ---- photo ----
+
+    def take_photo(self):
+        if self.busy:
+            return
+        self.busy = True
+        self.af_before_photo = self.af.state
+        self.shutter.set_sensitive(False)
+        self.set_status("Taking photo…")
+        self.stop_preview()
+
+        c = CAMERAS[self.cam]
+        w, h = c["still"]
+        desc = ("libcamerasrc name=src camera-name=\"%s\" ! "
+                "video/x-raw,format=BGRx,width=%d,height=%d ! "
+                "identity name=gate ! videoflip video-direction=%s ! videoconvert ! "
+                "jpegenc quality=%d ! appsink name=out emit-signals=true sync=false "
+                "max-buffers=1 drop=true"
+                % (c["id"], w, h, video_direction(self.rotation[c["id"]], False),
+                   JPEG_QUALITY))
+        self.still = Gst.parse_launch(desc)
+        self.still_frames = 0
+        self.still_done = False
+        # skip the frames auto exposure needs to settle
+        self.still.get_by_name("gate").get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self.on_still_buffer)
+        self.still.get_by_name("out").connect("new-sample", self.on_still_sample)
+        bus = self.still.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_still_error)
+        self.still_timeout = GLib.timeout_add_seconds(10, self.on_still_timeout)
+        if self.still.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            self.finish_photo(None, "Camera not available")
+
+    def on_still_buffer(self, pad, info):
+        self.still_frames += 1
+        if self.still_frames <= SETTLE_FRAMES or self.still_done:
+            return Gst.PadProbeReturn.DROP
+        self.still_done = True
+        return Gst.PadProbeReturn.OK
+
+    def on_still_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        buf = sample.get_buffer()
+        ok, info = buf.map(Gst.MapFlags.READ)
+        data = bytes(info.data) if ok else None
+        if ok:
+            buf.unmap(info)
+        GLib.idle_add(self.save_photo, data)
+        return Gst.FlowReturn.OK
+
+    def save_photo(self, data):
+        if not self.busy:
+            return False
+        path, err = None, None
+        try:
+            os.makedirs(PHOTO_DIR, exist_ok=True)
+            path = os.path.join(PHOTO_DIR, time.strftime("IMG_%Y%m%d_%H%M%S.jpg"))
+            n = 1
+            while os.path.exists(path):
+                path = path[:-4].split("-")[0] + "-%d.jpg" % n
+                n += 1
+            with open(path, "wb") as f:
+                f.write(data)
+        except (OSError, TypeError) as e:
+            path, err = None, "Save failed: %s" % e
+        self.finish_photo(path, err)
+        return False
+
+    def on_still_error(self, bus, msg):
+        err, dbg = msg.parse_error()
+        self.finish_photo(None, "Photo failed: %s" % err.message)
+
+    def on_still_timeout(self):
+        self.still_timeout = 0
+        self.finish_photo(None, "Photo timed out")
+        return False
+
+    def finish_photo(self, path, err):
+        if not self.busy:
+            return
+        if self.still_timeout:
+            GLib.source_remove(self.still_timeout)
+            self.still_timeout = 0
+        if self.still:
+            self.still.set_state(Gst.State.NULL)
+            self.still.get_bus().remove_signal_watch()
+            self.still = None
+        self.busy = False
+        self.shutter.set_sensitive(True)
+        if path:
+            self.last_photo = path
+            self.save_state()
+            self.update_thumb()
+            self.set_status("Saved " + os.path.basename(path), 1500)
+        else:
+            self.set_status(err, 3000)
+        # keep the focus: no new sweep after a photo
+        self.start_preview(refocus=False)
+        if CAMERAS[self.cam]["focus"] and self.af_before_photo not in ("off", "manual", "hold"):
+            self.af.resume()
+
+    # ---- last photo ----
+
+    def update_thumb(self):
+        pix = None
+        if self.last_photo and os.path.exists(self.last_photo):
+            try:
+                pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(self.last_photo, 64, 64, True)
+            except GLib.Error:
+                pix = None
+        if pix:
+            self.thumb.set_image(Gtk.Image.new_from_pixbuf(pix))
+            self.thumb.set_sensitive(True)
+        else:
+            img = Gtk.Image.new_from_icon_name("image-x-generic-symbolic", Gtk.IconSize.BUTTON)
+            img.set_pixel_size(30)
+            self.thumb.set_image(img)
+            self.thumb.set_sensitive(False)
+
+    def on_thumb(self, btn):
+        if self.busy or not self.last_photo:
+            return
+        alloc = self.get_allocation()
+        try:
+            pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                self.last_photo, alloc.width, alloc.height, True)
+        except GLib.Error:
+            return
+        self.photo_img.set_from_pixbuf(pix)
+        self.stop_preview()
+        self.stack.set_visible_child_name("photo")
+
+    def show_camera(self):
+        self.stack.set_visible_child_name("camera")
+        GLib.idle_add(self.start_preview)
+        return True
+
+    # ---- keys, quit ----
+
+    def on_key(self, win, ev):
+        name = Gdk.keyval_name(ev.keyval) or ""
+        if self.stack.get_visible_child_name() == "photo":
+            self.show_camera()
+            return True
+        if name in ("space", "Return", "KP_Enter"):
+            self.take_photo()
+        elif name in ("f", "F"):
+            self.switch_camera()
+        elif name in ("r", "R"):
+            self.rotate()
+        elif name in ("a", "A"):
+            self.autofocus((0.5, 0.5))
+        else:
+            return False
+        return True
+
+    def on_quit(self, *a):
+        if self.still:
+            self.still.set_state(Gst.State.NULL)
+        if self.preview:
+            self.preview.set_state(Gst.State.NULL)
+        Gtk.main_quit()
+
+
+def main():
+    Gst.init(None)
+    lock = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+                             "titan-camera-gui.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    win = CameraApp()
+    for sig in (2, 15, 1):      # SIGINT, SIGTERM, SIGHUP: release the camera
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda w=win: w.destroy() or False)
+    win.show_all()
+    win.status.hide()
+    win.focus_row.set_visible(CAMERAS[win.cam]["focus"])
+    win.maximize()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

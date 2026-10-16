@@ -1,0 +1,88 @@
+diff --git a/src/gstreamer/gstlibcamerasrc.cpp b/src/gstreamer/gstlibcamerasrc.cpp
+index 9061f9163..2bc8825d3 100644
+--- a/src/gstreamer/gstlibcamerasrc.cpp
++++ b/src/gstreamer/gstlibcamerasrc.cpp
+@@ -962,6 +962,14 @@ gst_libcamera_src_close(GstLibcameraSrc *self)
+ 
+ 	state->config_.reset();
+ 
++	/*
++	 * Stop delivering this camera's completions here: the camera object is
++	 * shared through the CameraManager, so a later user of it (another
++	 * libcamerasrc, or this one reopened, which connects again) would
++	 * otherwise also run this handler, on an empty or foreign request queue.
++	 */
++	state->cam_->requestCompleted.disconnect(state);
++
+ 	ret = state->cam_->release();
+ 	if (ret) {
+ 		GST_ELEMENT_WARNING(self, RESOURCE, BUSY,
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 9457d62b3..d086f7cd7 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -817,6 +817,19 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov8865", CameraSensorHelperOv8865)
+ 
++class CameraSensorHelperOv16880 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv16880()
++	{
++		/* Black level 64 at 10 bits (Titan Pocket rear camera) */
++		blackLevel_ = 4096;
++		/* 0x3508/0x3509 gain: 0x80 = 1x, as on the OV8865 */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 128 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov16880", CameraSensorHelperOv16880)
++
+ class CameraSensorHelperOv13858 : public CameraSensorHelper
+ {
+ public:
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index e26f438d9..b67b1f795 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -265,6 +265,7 @@ static const SimplePipelineInfo supportedDevices[] = {
+ 	{ "mxc-isi", {}, false },
+ 	{ "qcom-camss", {}, true },
+ 	{ "sun6i-csi", {}, false },
++	{ "titan-camera", {}, true },
+ };
+ 
+ bool isRaw(const StreamConfiguration &cfg)
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+index 28043150e..e6571651e 100644
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -470,6 +470,11 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 			},
+ 			.sensorDelays = { },
+ 		} },
++		{ "ov16880", {
++			.unitCellSize = { 1000, 1000 },
++			.testPatternModes = {},
++			.sensorDelays = { },
++		} },
+ 		{ "ov8865", {
+ 			.unitCellSize = { 1400, 1400 },
+ 			.testPatternModes = {
+diff --git a/src/libcamera/v4l2_videodevice.cpp b/src/libcamera/v4l2_videodevice.cpp
+index ca8759830..15194206b 100644
+--- a/src/libcamera/v4l2_videodevice.cpp
++++ b/src/libcamera/v4l2_videodevice.cpp
+@@ -583,7 +583,11 @@ int V4L2VideoDevice::open()
+ 		return ret;
+ 	}
+ 
+-	if (caps_.version < KERNEL_VERSION(5, 0, 0)) {
++	/*
++	 * Titan Pocket: its 4.14 kernel has the v5.0 buffer orphaning that
++	 * exportBuffers() relies on backported (videobuf2-core.c).
++	 */
++	if (caps_.version < KERNEL_VERSION(4, 14, 0)) {
+ 		LOG(V4L2, Error)
+ 			<< "V4L2 API v" << (caps_.version >> 16)
+ 			<< "." << ((caps_.version >> 8) & 0xff)

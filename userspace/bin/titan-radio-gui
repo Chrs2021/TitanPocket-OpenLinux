@@ -1,0 +1,765 @@
+#!/usr/bin/python3
+"""
+titan-radio-gui: touch-friendly FM radio for the Titan Pocket (GTK 3).
+
+Tunes the MT6631 through /dev/fm (fmradio_drv) with the same ioctls as
+titan-fm, and plays it on the loudspeaker the way titan-radio does: the AFE's
+FM gain ("Audio FM I2S Volume") is set with tinymix and the hostless FM
+route (PCM device 21) is held open with spk-hold; titan-speakerd powers the
+speaker amp while it is open. FM bypasses PipeWire.
+
+The driver powers the FM function down when the last handle on /dev/fm
+closes, so the radio plays while this window is open (or until the power
+button is tapped) and stops when it closes.
+
+Station scan and seek use the soft-mute tune ioctl, which measures a channel
+without unmuting it; a channel counts as a station at a raw RSSI of -296 or
+above (FM_RX_RSSI_TH_LONG, see docs/drivers/fm.md). GETRSSI, used for the
+signal meter, reports raw * 6 / 16 (the driver's conversion, shown as dBm by
+MediaTek's app), so the threshold is about -111 there; scan results are
+converted the same way.
+
+The last frequency, the volume, the favorites and the last scan are kept in
+~/.config/titan-radio/state.json.
+
+Keys: Left/Right step 100 kHz, Up/Down seek, Space power, F favorite.
+"""
+import ctypes
+import fcntl
+import json
+import os
+import signal
+import struct
+import subprocess
+import threading
+import time
+
+os.environ.setdefault("NO_AT_BRIDGE", "1")
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
+
+FM_DEV = "/dev/fm"
+SPK_HOLD = ["spk-hold", "0", "21", "48000"]     # hostless FM_I2S_Playback
+GAIN_CONTROL = "Audio FM I2S Volume"
+GAIN_0DB = 0x80000
+GAIN_DB_MIN, GAIN_DB_MAX, GAIN_DB_DEFAULT = -48, 0, -24
+
+STATE_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or
+                         os.path.expanduser("~/.config"), "titan-radio")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+# frequencies in 10 kHz units, as in the ioctls (9950 = 99.5 MHz)
+FREQ_MIN, FREQ_MAX, STEP = 8750, 10800, 10
+FREQ_DEFAULT = 9950
+
+# signal in GETRSSI units (raw * 6 / 16, ~dBm): the meter's range, from the
+# station threshold (raw -296 = -111) up to a strong station
+RSSI_LOW, RSSI_HIGH = -112, -72
+
+STATUS_MS = 1000            # signal / stereo refresh
+DIAL_DELAY_MS = 150         # coalesce dial drags into tune ioctls
+
+
+# fm_ioctl.h: magic 0xf5; the ioctls are declared with pointer types, so the
+# encoded size is sizeof(void *) = 8, except PRE/RESTORE_SEARCH (int)
+def _iowr(nr, size=8):
+    return (3 << 30) | (size << 16) | (0xf5 << 8) | nr
+
+
+FM_IOCTL_POWERUP = _iowr(0)
+FM_IOCTL_TUNE = _iowr(2)
+FM_IOCTL_GETRSSI = _iowr(7)
+FM_IOCTL_GETCHIPID = _iowr(10)
+FM_IOCTL_GETMONOSTERO = _iowr(13)
+FM_IOCTL_PRE_SEARCH = _iowr(45, 4)
+FM_IOCTL_RESTORE_SEARCH = _iowr(46, 4)
+FM_IOCTL_SOFT_MUTE_TUNE = _iowr(63)
+
+FM_BAND_UE, FM_SPACE_100K = 1, 1
+TUNE_PARM = "=BBBBBxH"      # err, band, space, hilo, deemphasis, freq
+SOFTMUTE = "=iHxxi"         # rssi, freq, valid
+
+
+def die_with_parent():
+    """preexec_fn: SIGTERM the child when this app dies, however it dies,
+    so spk-hold never keeps the FM route open on its own"""
+    PR_SET_PDEATHSIG = 1
+    ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+
+
+def icon_button(icon, cls, toggle=False, size=32):
+    b = (Gtk.ToggleButton if toggle else Gtk.Button)()
+    img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+    img.set_pixel_size(size)
+    b.set_image(img)
+    b.get_style_context().add_class(cls)
+    return b
+
+
+def set_icon(button, icon):
+    button.get_image().set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+
+
+def dbm(raw):
+    """soft-mute (raw) RSSI in GETRSSI units, as the driver converts it"""
+    return (raw * 6) >> 4
+
+
+def mhz(freq):
+    return "%d.%d" % (freq // 100, freq // 10 % 10)
+
+
+def clamp_freq(f):
+    return max(FREQ_MIN, min(FREQ_MAX, int(round(f / STEP)) * STEP))
+
+
+def wrap_freq(f):
+    if f > FREQ_MAX:
+        return FREQ_MIN
+    if f < FREQ_MIN:
+        return FREQ_MAX
+    return f
+
+
+class Tuner:
+    """/dev/fm. Every ioctl goes through self.lock: the status timer runs on
+    the GTK thread, scan and seek on a worker thread."""
+
+    def __init__(self):
+        self.fd = None
+        self.lock = threading.Lock()
+
+    @property
+    def is_open(self):
+        return self.fd is not None
+
+    def open(self):
+        if self.fd is None:
+            self.fd = os.open(FM_DEV, os.O_RDWR)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)       # last close powers FM down
+            self.fd = None
+
+    def _tune(self, req, freq):
+        buf = bytearray(struct.pack(TUNE_PARM, 0, FM_BAND_UE, FM_SPACE_100K, 0, 0, freq))
+        fcntl.ioctl(self.fd, req, buf, True)
+
+    def power_up(self, freq):
+        with self.lock:
+            self._tune(FM_IOCTL_POWERUP, freq)
+
+    def tune(self, freq):
+        with self.lock:
+            self._tune(FM_IOCTL_TUNE, freq)
+
+    def chip_id(self):
+        with self.lock:
+            buf = bytearray(8)
+            fcntl.ioctl(self.fd, FM_IOCTL_GETCHIPID, buf, True)
+            return struct.unpack_from("=H", buf)[0]
+
+    def status(self):
+        """(rssi, stereo), or None while a scan or seek holds the tuner"""
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            rssi, stereo = bytearray(8), bytearray(8)
+            fcntl.ioctl(self.fd, FM_IOCTL_GETRSSI, rssi, True)
+            fcntl.ioctl(self.fd, FM_IOCTL_GETMONOSTERO, stereo, True)
+            return struct.unpack_from("=i", rssi)[0], struct.unpack_from("=H", stereo)[0] != 0
+        finally:
+            self.lock.release()
+
+    def _probe(self, freq):
+        buf = bytearray(struct.pack(SOFTMUTE, 0, freq, 0))
+        fcntl.ioctl(self.fd, FM_IOCTL_SOFT_MUTE_TUNE, buf, True)
+        rssi, _, valid = struct.unpack(SOFTMUTE, buf)
+        return rssi, valid != 0
+
+    def seek(self, start, direction, cancel):
+        """next station from start in direction (+1/-1), or None; ends tuned
+        to the result (or back on start)"""
+        with self.lock:
+            fcntl.ioctl(self.fd, FM_IOCTL_PRE_SEARCH, 0)
+            found, f = None, start
+            try:
+                for _ in range((FREQ_MAX - FREQ_MIN) // STEP):
+                    if cancel.is_set():
+                        break
+                    f = wrap_freq(f + direction * STEP)
+                    if self._probe(f)[1]:
+                        found = f
+                        break
+            finally:
+                fcntl.ioctl(self.fd, FM_IOCTL_RESTORE_SEARCH, 0)
+                self._tune(FM_IOCTL_TUNE, found or start)
+            return found
+
+    def scan(self, current, progress, cancel):
+        """[(freq, rssi)] of every station in the band; ends back on current"""
+        stations = []
+        with self.lock:
+            fcntl.ioctl(self.fd, FM_IOCTL_PRE_SEARCH, 0)
+            try:
+                for f in range(FREQ_MIN, FREQ_MAX + STEP, STEP):
+                    if cancel.is_set():
+                        break
+                    rssi, valid = self._probe(f)
+                    if valid:
+                        stations.append((f, dbm(rssi)))
+                    progress((f - FREQ_MIN) / (FREQ_MAX - FREQ_MIN), f, len(stations))
+            finally:
+                fcntl.ioctl(self.fd, FM_IOCTL_RESTORE_SEARCH, 0)
+                self._tune(FM_IOCTL_TUNE, current)
+        return stations
+
+
+CSS = b"""
+* { font-size: 22px; }
+.freq { font-size: 96px; font-weight: bold; }
+.freq.off { color: #6a6a6a; }
+.unit { font-size: 30px; color: #9a9a9a; }
+.badge { font-size: 18px; border-radius: 8px; padding: 2px 10px;
+         background: #33363d; color: #8a8a8a; }
+.badge.on { background: #2f6a3a; color: white; }
+.state { font-size: 18px; color: #9a9a9a; }
+.state.err { color: #d85050; }
+.section { font-size: 16px; color: #9a9a9a; font-weight: bold; }
+.station { font-size: 26px; font-weight: bold; }
+.station.current { color: #58a0e0; }
+.detail { font-size: 16px; color: #9a9a9a; }
+.empty { font-size: 18px; color: #8a8a8a; }
+button { min-height: 64px; padding: 0 14px; }
+.nav { min-width: 92px; }
+.power { min-width: 110px; }
+.power:checked { background: #3a7a3a; color: white; }
+.fav { min-width: 72px; }
+.fav:checked { color: #f0c040; }
+.rowfav { min-width: 64px; min-height: 56px; color: #f0c040; }
+scale trough { min-height: 12px; border-radius: 6px; }
+scale slider { min-width: 40px; min-height: 40px; border-radius: 20px; }
+levelbar block { min-height: 14px; }
+levelbar block.filled { background: #5aba5a; }
+levelbar block.filled.low { background: #c89030; }
+list row { padding: 4px 12px; }
+progressbar trough, progressbar progress { min-height: 10px; }
+"""
+
+
+class RadioApp(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Radio")
+        self.set_default_size(720, 680)
+        self.connect("destroy", self.on_quit)
+        self.connect("key-press-event", self.on_key)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.tuner = Tuner()
+        self.hold = None            # spk-hold process: the FM audio route
+        self.worker = None          # scan / seek thread
+        self.cancel = threading.Event()
+        self.dial_timer = 0
+        self.gain_timer = 0
+        self.syncing = False        # setting widgets from code, not the user
+
+        st = self.load_state()
+        self.freq = clamp_freq(st.get("freq", FREQ_DEFAULT))
+        self.gain_db = max(GAIN_DB_MIN, min(GAIN_DB_MAX, st.get("gain_db", GAIN_DB_DEFAULT)))
+        self.favorites = sorted({clamp_freq(f) for f in st.get("favorites", [])})
+        self.stations = [(clamp_freq(f), r) for f, r in st.get("stations", [])]
+
+        self.build()
+        self.show_freq()
+        self.refresh_list()
+        GLib.timeout_add(STATUS_MS, self.on_status_timer)
+        GLib.idle_add(self.power_on)
+
+    # ---- layout ----
+
+    def build(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        root.set_border_width(14)
+        self.add(root)
+
+        # frequency + favorite
+        top = Gtk.Box(spacing=8)
+        root.pack_start(top, False, False, 0)
+        self.fav = icon_button("non-starred-symbolic", "fav", toggle=True, size=40)
+        self.fav.set_valign(Gtk.Align.CENTER)
+        self.fav.connect("toggled", self.on_fav)
+        top.pack_end(self.fav, False, False, 0)
+        freqbox = Gtk.Box(spacing=8)
+        freqbox.set_halign(Gtk.Align.CENTER)
+        top.pack_start(freqbox, True, True, 0)
+        self.freq_label = Gtk.Label()
+        self.freq_label.get_style_context().add_class("freq")
+        freqbox.pack_start(self.freq_label, False, False, 0)
+        unit = Gtk.Label(label="MHz")
+        unit.get_style_context().add_class("unit")
+        unit.set_valign(Gtk.Align.END)
+        unit.set_margin_bottom(18)
+        freqbox.pack_start(unit, False, False, 0)
+
+        # signal meter, stereo badge, state
+        sig = Gtk.Box(spacing=10)
+        root.pack_start(sig, False, False, 0)
+        self.meter = Gtk.LevelBar()
+        self.meter.set_mode(Gtk.LevelBarMode.DISCRETE)
+        self.meter.set_min_value(0)
+        self.meter.set_max_value(5)
+        self.meter.remove_offset_value(Gtk.LEVEL_BAR_OFFSET_LOW)
+        self.meter.remove_offset_value(Gtk.LEVEL_BAR_OFFSET_HIGH)
+        self.meter.add_offset_value("low", 1)
+        self.meter.set_size_request(150, -1)
+        self.meter.set_valign(Gtk.Align.CENTER)
+        sig.pack_start(self.meter, False, False, 0)
+        self.stereo = Gtk.Label(label="STEREO")
+        self.stereo.get_style_context().add_class("badge")
+        sig.pack_start(self.stereo, False, False, 0)
+        self.rssi_label = Gtk.Label()
+        self.rssi_label.get_style_context().add_class("detail")
+        sig.pack_start(self.rssi_label, False, False, 0)
+        self.state = Gtk.Label(xalign=1)
+        self.state.get_style_context().add_class("state")
+        self.state.set_ellipsize(Pango.EllipsizeMode.END)
+        sig.pack_end(self.state, True, True, 0)
+
+        # dial
+        self.dial = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL,
+                                             FREQ_MIN / 100, FREQ_MAX / 100, 0.1)
+        self.dial.set_digits(1)
+        self.dial.set_draw_value(False)
+        for f in range(88, 109, 4):
+            self.dial.add_mark(f, Gtk.PositionType.BOTTOM, str(f))
+        self.dial.connect("value-changed", self.on_dial)
+        root.pack_start(self.dial, False, False, 0)
+
+        # transport: seek down, step down, power, step up, seek up
+        nav = Gtk.Box(spacing=8, homogeneous=False)
+        nav.set_halign(Gtk.Align.CENTER)
+        root.pack_start(nav, False, False, 0)
+        for icon, cb, arg in (("media-skip-backward-symbolic", self.on_seek, -1),
+                              ("go-previous-symbolic", self.on_step, -1)):
+            b = icon_button(icon, "nav")
+            b.connect("clicked", cb, arg)
+            nav.pack_start(b, False, False, 0)
+        self.power = icon_button("system-shutdown-symbolic", "power", toggle=True, size=40)
+        self.power.connect("toggled", self.on_power)
+        nav.pack_start(self.power, False, False, 0)
+        for icon, cb, arg in (("go-next-symbolic", self.on_step, 1),
+                              ("media-skip-forward-symbolic", self.on_seek, 1)):
+            b = icon_button(icon, "nav")
+            b.connect("clicked", cb, arg)
+            nav.pack_start(b, False, False, 0)
+
+        # volume (the FM gain; the speaker level stays with the volume keys)
+        vol = Gtk.Box(spacing=10)
+        root.pack_start(vol, False, False, 0)
+        icon = Gtk.Image.new_from_icon_name("audio-volume-medium-symbolic", Gtk.IconSize.BUTTON)
+        icon.set_pixel_size(32)
+        vol.pack_start(icon, False, False, 0)
+        self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL,
+                                               GAIN_DB_MIN, GAIN_DB_MAX, 1)
+        self.volume.set_draw_value(False)
+        self.volume.set_value(self.gain_db)
+        self.volume.connect("value-changed", self.on_volume)
+        vol.pack_start(self.volume, True, True, 0)
+        self.vol_label = Gtk.Label()
+        self.vol_label.get_style_context().add_class("detail")
+        self.vol_label.set_width_chars(7)
+        vol.pack_start(self.vol_label, False, False, 0)
+        self.show_volume()
+
+        # stations
+        hdr = Gtk.Box(spacing=10)
+        root.pack_start(hdr, False, False, 6)
+        sec = Gtk.Label(label="STATIONS", xalign=0)
+        sec.get_style_context().add_class("section")
+        hdr.pack_start(sec, False, False, 0)
+        self.scan_btn = Gtk.Button(label="Scan")
+        self.scan_btn.connect("clicked", self.on_scan)
+        hdr.pack_end(self.scan_btn, False, False, 0)
+        self.progress = Gtk.ProgressBar()
+        self.progress.set_valign(Gtk.Align.CENTER)
+        self.progress.set_no_show_all(True)
+        hdr.pack_start(self.progress, True, True, 0)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_vexpand(True)
+        root.pack_start(sw, True, True, 0)
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.listbox.set_activate_on_single_click(True)
+        self.listbox.connect("row-activated", self.on_row)
+        empty = Gtk.Label(label="Tap Scan to find stations")
+        empty.get_style_context().add_class("empty")
+        empty.set_margin_top(24)
+        empty.show()
+        self.listbox.set_placeholder(empty)
+        sw.add(self.listbox)
+
+    # ---- state file ----
+
+    def load_state(self):
+        try:
+            with open(STATE_FILE) as f:
+                st = json.load(f)
+            return st if isinstance(st, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def save_state(self):
+        st = {"freq": self.freq, "gain_db": self.gain_db,
+              "favorites": self.favorites, "stations": self.stations}
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.replace(tmp, STATE_FILE)
+        except OSError:
+            pass
+
+    # ---- display ----
+
+    def set_state(self, text, err=False):
+        self.state.set_text(text)
+        ctx = self.state.get_style_context()
+        (ctx.add_class if err else ctx.remove_class)("err")
+
+    def show_freq(self):
+        self.freq_label.set_text(mhz(self.freq))
+        ctx = self.freq_label.get_style_context()
+        (ctx.remove_class if self.tuner.is_open else ctx.add_class)("off")
+        self.syncing = True
+        self.dial.set_value(self.freq / 100)
+        self.fav.set_active(self.freq in self.favorites)
+        set_icon(self.fav, "starred-symbolic" if self.freq in self.favorites
+                 else "non-starred-symbolic")
+        self.syncing = False
+        for row in self.listbox.get_children():
+            ctx = row.name_label.get_style_context()
+            (ctx.add_class if row.freq == self.freq else ctx.remove_class)("current")
+
+    def show_signal(self, rssi, stereo):
+        self.rssi_label.set_text("" if rssi is None else "%d dBm" % rssi)
+        if rssi is None:
+            self.meter.set_value(0)
+        else:
+            frac = (rssi - RSSI_LOW) / (RSSI_HIGH - RSSI_LOW)
+            self.meter.set_value(round(max(0, min(1, frac)) * 5))
+        ctx = self.stereo.get_style_context()
+        (ctx.add_class if stereo else ctx.remove_class)("on")
+        self.stereo.set_text("STEREO" if stereo else "MONO")
+
+    def show_volume(self):
+        self.vol_label.set_text("%d dB" % self.gain_db)
+
+    def refresh_list(self):
+        for row in self.listbox.get_children():
+            self.listbox.remove(row)
+        rssi = dict(self.stations)
+        favs = set(self.favorites)
+        for f in self.favorites + [f for f, _ in self.stations if f not in favs]:
+            self.listbox.add(self.make_row(f, rssi.get(f), f in favs))
+        self.listbox.show_all()
+        self.show_freq()
+
+    def make_row(self, freq, rssi, fav):
+        row = Gtk.ListBoxRow()
+        row.freq = freq
+        box = Gtk.Box(spacing=12)
+        row.add(box)
+        name = Gtk.Label(label=mhz(freq) + " MHz", xalign=0)
+        name.get_style_context().add_class("station")
+        box.pack_start(name, False, False, 0)
+        row.name_label = name
+        if rssi is not None:
+            d = Gtk.Label(label="%d dBm" % rssi, xalign=0)
+            d.get_style_context().add_class("detail")
+            box.pack_start(d, True, True, 0)
+        star = icon_button("starred-symbolic" if fav else "non-starred-symbolic", "rowfav")
+        star.set_relief(Gtk.ReliefStyle.NONE)
+        star.connect("clicked", lambda b, f=freq: self.toggle_favorite(f))
+        box.pack_end(star, False, False, 0)
+        return row
+
+    # ---- power / audio ----
+
+    def power_on(self):
+        if self.tuner.is_open:
+            return False
+        self.set_state("Starting…")
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        try:
+            if not os.path.exists(FM_DEV):
+                subprocess.run(["modprobe", "fmradio_drv"], timeout=10, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for _ in range(25):
+                    if os.path.exists(FM_DEV):
+                        break
+                    time.sleep(0.2)
+            self.apply_gain()
+            # the FM route first, then power up the tuner (as titan-radio)
+            self.hold = subprocess.Popen(SPK_HOLD, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL,
+                                         preexec_fn=die_with_parent)
+            self.tuner.open()
+            self.tuner.power_up(self.freq)
+            chip = self.tuner.chip_id()
+        except (OSError, subprocess.SubprocessError) as e:
+            self.power_off()
+            msg = getattr(e, "strerror", None) or str(e)
+            self.set_state("FM unavailable: %s" % msg, err=True)
+            self.sync_power(False)
+            return False
+        self.set_state("MT%04x" % chip if chip else "")
+        self.sync_power(True)
+        self.show_freq()
+        self.on_status_timer()
+        return False
+
+    def power_off(self):
+        self.cancel.set()
+        if self.worker:
+            self.worker.join(timeout=15)
+            self.worker = None
+        self.tuner.close()
+        if self.hold:
+            self.hold.terminate()
+            try:
+                self.hold.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.hold.kill()
+            self.hold = None
+        self.show_signal(None, False)
+        self.show_freq()
+
+    def sync_power(self, on):
+        self.syncing = True
+        self.power.set_active(on)
+        self.syncing = False
+
+    def apply_gain(self):
+        gain = int(GAIN_0DB * 10 ** (self.gain_db / 20))
+        subprocess.Popen(["tinymix", "-D", "0", "set", GAIN_CONTROL, str(gain)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait()
+
+    # ---- tuning ----
+
+    def tune_to(self, freq):
+        freq = clamp_freq(freq)
+        self.freq = freq
+        self.show_freq()
+        self.save_state()
+        if self.tuner.is_open and not self.busy():
+            try:
+                self.tuner.tune(freq)
+            except OSError as e:
+                self.set_state("Tune failed: %s" % e.strerror, err=True)
+                return
+            self.on_status_timer()
+
+    def busy(self):
+        return self.worker is not None and self.worker.is_alive()
+
+    def run_worker(self, target, done):
+        """run target(cancel) on a thread, then done(result) on the GTK thread"""
+        self.cancel.clear()
+
+        def body():
+            try:
+                res = target(self.cancel)
+            except OSError as e:
+                res = e
+            GLib.idle_add(finish, res)
+
+        def finish(res):
+            self.worker = None
+            self.scan_btn.set_label("Scan")
+            self.progress.hide()
+            if isinstance(res, OSError):
+                self.set_state("FM error: %s" % res.strerror, err=True)
+            else:
+                done(res)
+            self.on_status_timer()
+            return False
+
+        self.worker = threading.Thread(target=body, daemon=True)
+        self.worker.start()
+
+    # ---- callbacks ----
+
+    def on_power(self, btn):
+        if self.syncing:
+            return
+        if btn.get_active():
+            self.power_on()
+        else:
+            self.power_off()
+            self.set_state("Off")
+
+    def on_step(self, btn, direction):
+        if not self.busy():
+            self.tune_to(wrap_freq(self.freq + direction * STEP))
+
+    def on_seek(self, btn, direction):
+        if self.busy():
+            return
+        if not self.tuner.is_open:
+            self.power_on()
+            if not self.tuner.is_open:
+                return
+        self.set_state("Seeking…")
+        start = self.freq
+
+        def done(found):
+            if found:
+                self.freq = found
+                self.set_state("")
+            else:
+                self.set_state("No station found")
+            self.show_freq()
+            self.save_state()
+
+        self.run_worker(lambda c: self.tuner.seek(start, direction, c), done)
+
+    def on_scan(self, btn):
+        if self.busy():
+            self.cancel.set()           # the button reads "Stop" while scanning
+            return
+        if not self.tuner.is_open:
+            self.power_on()
+            if not self.tuner.is_open:
+                return
+        self.scan_btn.set_label("Stop")
+        self.progress.set_fraction(0)
+        self.progress.show()
+        self.set_state("Scanning…")
+        current = self.freq
+
+        def progress(frac, f, n):
+            GLib.idle_add(self.on_scan_progress, frac, f, n)
+
+        def done(stations):
+            if self.cancel.is_set():
+                self.set_state("Scan stopped")
+                return
+            self.stations = stations
+            self.set_state("%d station%s" % (len(stations), "" if len(stations) == 1 else "s"))
+            self.save_state()
+            self.refresh_list()
+
+        self.run_worker(lambda c: self.tuner.scan(current, progress, c), done)
+
+    def on_scan_progress(self, frac, f, n):
+        if self.busy():
+            self.progress.set_fraction(frac)
+            self.set_state("Scanning %s · %d found" % (mhz(f), n))
+        return False
+
+    def on_dial(self, scale):
+        if self.syncing:
+            return
+        self.freq_label.set_text(mhz(clamp_freq(scale.get_value() * 100)))
+        if self.dial_timer:
+            GLib.source_remove(self.dial_timer)
+        self.dial_timer = GLib.timeout_add(DIAL_DELAY_MS, self.on_dial_settled)
+
+    def on_dial_settled(self):
+        self.dial_timer = 0
+        if self.busy():
+            self.show_freq()
+        else:
+            self.tune_to(self.dial.get_value() * 100)
+        return False
+
+    def on_volume(self, scale):
+        self.gain_db = int(round(scale.get_value()))
+        self.show_volume()
+        if self.gain_timer:
+            GLib.source_remove(self.gain_timer)
+        self.gain_timer = GLib.timeout_add(DIAL_DELAY_MS, self.on_volume_settled)
+
+    def on_volume_settled(self):
+        self.gain_timer = 0
+        self.apply_gain()
+        self.save_state()
+        return False
+
+    def on_fav(self, btn):
+        if not self.syncing:
+            self.toggle_favorite(self.freq)
+
+    def toggle_favorite(self, freq):
+        if freq in self.favorites:
+            self.favorites.remove(freq)
+        else:
+            self.favorites = sorted(self.favorites + [freq])
+        self.save_state()
+        self.refresh_list()
+
+    def on_row(self, listbox, row):
+        if not self.busy():
+            if not self.tuner.is_open:
+                self.freq = row.freq
+                self.power_on()
+            self.tune_to(row.freq)
+
+    def on_status_timer(self):
+        if self.tuner.is_open:
+            try:
+                st = self.tuner.status()
+            except OSError:
+                st = None
+            if st:
+                self.show_signal(*st)
+        return True
+
+    def on_key(self, win, ev):
+        name = Gdk.keyval_name(ev.keyval) or ""
+        if name in ("Left", "Right"):
+            self.on_step(None, 1 if name == "Right" else -1)
+        elif name in ("Up", "Down"):
+            self.on_seek(None, 1 if name == "Up" else -1)
+        elif name == "space":
+            self.power.set_active(not self.power.get_active())
+        elif name in ("f", "F"):
+            self.toggle_favorite(self.freq)
+        else:
+            return False
+        return True
+
+    def on_quit(self, *a):
+        self.save_state()
+        self.power_off()
+        Gtk.main_quit()
+
+
+def main():
+    lock = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "titan-radio-gui.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    win = RadioApp()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda w=win: w.destroy() or False)
+    win.show_all()
+    win.maximize()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

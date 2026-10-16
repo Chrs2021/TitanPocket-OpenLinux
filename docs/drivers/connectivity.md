@@ -3,8 +3,11 @@
 Status: **working** (2026-10-11). `wlan0` comes up at boot, 2.4 + 5 GHz
 scanning, factory MAC and TX power calibration from the phone's NVRAM.
 Bluetooth: `hci0` (BlueZ) starts at boot through `titan-bt.service` and
-uses the factory address from NVRAM. Scanning works; pairing hasn't been
-tested yet. FM radio works ([fm.md](fm.md)). GPS shares the same chip and
+uses the factory address from NVRAM. Classic and LE scanning work, and
+LE connections reach BlueZ (fixed 2026-10-15, see "LE commands" below). A
+BlueZ GATT peripheral (a phone app connecting, subscribing to notifications
+and exchanging encrypted data) works end to end; classic (BR/EDR) pairing
+and audio are untested. FM radio works ([fm.md](fm.md)). GPS shares the same chip and
 core driver but isn't brought up yet.
 
 Everything is built **from source** (no stock `.ko`), so it can move to a
@@ -166,6 +169,24 @@ boundaries, because vhci expects one packet per write. Anything BlueZ
 writes goes to the controller unchanged.
 
 Controller: HCI version 0x0a (5.1), manufacturer 0x0046 (MediaTek).
+
+### LE commands
+
+The controller's reply to **Read Local Supported Commands** leaves octets
+25-28 (all the Bluetooth 4.0 LE commands) at zero, although it implements
+them. The 4.14 kernel builds the **LE event mask** from that list
+(`hci_init3_req` in `net/bluetooth/hci_core.c`: LE Create Connection
+enables LE Connection Complete, LE Set Scan Enable enables LE Advertising
+Report, ...), so it set the mask to `0x10` (LE Long Term Key Request only).
+- Symptom: LE advertising worked, but when a phone connected, BlueZ never
+  got LE Connection Complete. The client's first ATT packet arrived on an
+  unknown ACL handle and was dropped, and the connection timed out. LE scans
+  returned nothing.
+- Fix: `titan-btbridge` ORs the 4.0 LE command bits (`f7 ff ff 7f` into
+  octets 25-28) into that reply on its way to the host, and logs "added the
+  LE commands missing from Read Local Supported Commands". The kernel then
+  sets the LE event mask to `0x1f`, and every LE command BlueZ sends at init
+  succeeds.
 
 ### Address
 

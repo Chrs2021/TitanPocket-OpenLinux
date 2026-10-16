@@ -15,6 +15,13 @@
  * -a sets the public address first (MediaTek vendor command 0xFC1A, as the
  * stock HAL does from the factory NVRAM record APCFG/APRDEB/BT_Addr);
  * otherwise the controller uses its default 00:00:46:xx:xx:xx.
+ *
+ * The controller's Read Local Supported Commands reply leaves out every LE
+ * command (octets 25-28 are zero) although it implements them. The kernel
+ * enables LE events from that list, so it would mask LE Connection Complete
+ * and LE Advertising Report: advertising works, but no LE connection or scan
+ * result ever reaches BlueZ. The relay fills in the Bluetooth 4.0 LE command
+ * set (see fix_supported_commands).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -119,6 +126,32 @@ static int stp_next_packet(int fd, uint8_t *out, int timeout_ms)
 		if (timeout_ms < 0)	/* relay mode: one read per poll wakeup */
 			return h4_len(rxbuf, rxlen) > 0 ? stp_next_packet(fd, out, 0) : 0;
 	}
+}
+
+/*
+ * Read Local Supported Commands (0x1002) Command Complete: add the LE
+ * commands of Bluetooth 4.0 (mandatory for an LE controller) that the
+ * firmware leaves out. Octet 25: LE Set Event Mask .. LE Set Advertising Data
+ * (bit 3 reserved); 26: LE Set Scan Response Data .. LE Clear White List;
+ * 27: LE Add Device To White List .. LE Rand; 28: LE Start Encryption ..
+ * LE Test End.
+ */
+static void fix_supported_commands(uint8_t *p, int n)
+{
+	static const uint8_t le40[4] = { 0xf7, 0xff, 0xff, 0x7f };
+	static int logged;
+	uint8_t *cmds = p + 7;		/* H4 type, event, plen, ncmd, opcode[2], status */
+	int i, changed = 0;
+
+	if (n < 7 + 29 || p[0] != H4_EVT || p[1] != 0x0e ||
+	    (p[4] | p[5] << 8) != 0x1002 || p[6] != 0)
+		return;
+	for (i = 0; i < 4; i++) {
+		changed |= le40[i] & ~cmds[25 + i];
+		cmds[25 + i] |= le40[i];
+	}
+	if (changed && !logged++)
+		log("added the LE commands missing from Read Local Supported Commands");
 }
 
 /* send one HCI command and wait for its Command Complete/Status */
@@ -265,6 +298,7 @@ int main(int argc, char **argv)
 		}
 		if (p[0].revents & POLLIN) {	/* controller -> host */
 			while ((n = stp_next_packet(stp, pkt, -1)) > 0) {
+				fix_supported_commands(pkt, n);
 				if (write_all(vhci, pkt, n)) {
 					log("write vhci: %s", strerror(errno));
 					return 1;

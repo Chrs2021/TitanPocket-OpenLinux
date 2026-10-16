@@ -23,7 +23,8 @@ Wayland desktop.
 |---|---|
 | `kernel/` | the kernel tree: MediaTek 4.14.186 BSP for the Titan Pocket with changes needed to support this device. |
 | `modules/connectivity/` | out-of-tree MediaTek CONNSYS drivers: WMT core, Wi-Fi, Bluetooth, FM radio, GPS |
-| `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up), an FM radio app and the power/volume keys, with their systemd units |
+| `modules/camera/` | the camera driver (`v4l2/`: V4L2 + media controller), bring-up tools (`camprobe/`, `camcap/`) and the ISP register map (`isp/`) |
+| `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up), the FM radio and camera apps, the libcamera patch, and the power/volume keys, with their systemd units |
 | `docs/` | hardware reference, per-driver notes, and how the vendor drivers were reverse-engineered |
 
 ## Hardware support
@@ -48,7 +49,7 @@ Wayland desktop.
 | Microphones, earpiece | BSP | ❓ untested |
 | GPS / GNSS (MT6631) | `modules/connectivity/gps/` | ✅ 3D fix outdoors (GPS, GLONASS, BeiDou, SBAS). The driver is source; positioning runs on MediaTek's closed `libmnl.so` from the phone ([docs/gnss.md](docs/gnss.md)) |
 | Cellular modem | BSP CCCI | ❓ needs firmware loading + userspace |
-| Cameras (OV16880 rear, OV8865 front) | out of tree, not published yet | 🚧 both sensors stream raw Bayer frames at 30 fps through V4L2 (MIPI receiver + CAMSV DMA); rear autofocus motor works. No ISP or camera app yet ([docs/camera.md](docs/camera.md)) |
+| Cameras (OV16880 rear, OV8865 front) | `modules/camera/v4l2/` (new, out of tree) | ✅ both stream at 30 fps through V4L2 (MIPI receiver + CAMSV DMA) and libcamera (software ISP debayering on the GPU; `cam`, GStreamer); Camera app with autofocus. MediaTek's hardware ISP not used yet ([docs/camera.md](docs/camera.md)) |
 
 ## Origin of the source
 
@@ -83,6 +84,7 @@ All changes are relative to `halium-11.0`. Each is explained in
 | Panfrost (Linux 5.10) with MT6771 power glue | `drivers/gpu/drm/panfrost/` (`panfrost_mtk.c`) | [docs/gpu.md](docs/gpu.md) |
 | DRM infrastructure backported from 5.10 | `drivers/gpu/drm/scheduler/`, `drm_gem_shmem_helper.c`, `include/drm/*`, `include/linux/{dma-resv,io-pgtable}.h` | [docs/gpu.md](docs/gpu.md) |
 | `ARM_MALI_LPAE` IOMMU page-table format | `drivers/iommu/io-pgtable{,-arm}.[ch]` | [docs/gpu.md](docs/gpu.md) |
+| `udmabuf` (backported from 4.20): memfd pages as dma-bufs, for libcamera's software ISP | `drivers/dma-buf/udmabuf.c`, `include/uapi/linux/udmabuf.h` | [docs/camera.md](docs/camera.md) |
 
 ### Changes to existing drivers
 
@@ -97,6 +99,8 @@ All changes are relative to `halium-11.0`. Each is explained in
 | Panfrost power | runtime suspend (MFG clock + MTCMOS off), system suspend (GPU bucks off), balanced runtime PM | [docs/power.md](docs/power.md) |
 | GPU frequency (`mtk_gpufreq_core.c`) | `mt_gpufreq_probed()` and exports so Panfrost can defer and drive power; kbase is no longer built | [docs/gpu.md](docs/gpu.md) |
 | V4L2 (`drivers/media/v4l2-core/Kconfig`) | `VIDEOBUF2_DMA_SG` gets a prompt, so an out-of-tree V4L2 driver can use it without an in-tree driver selecting it | [docs/camera.md](docs/camera.md) |
+| videobuf2 (`videobuf2-core.c`) | Linux 5.0's buffer orphaning: `REQBUFS(0)` frees the queue while buffers are still mapped or exported (libcamera relies on it) | [docs/camera.md](docs/camera.md) |
+| V4L2 formats (`v4l2-ioctl.c`) | the name of 4.18's 14-bit Bayer format (`BG14`) | [docs/camera.md](docs/camera.md) |
 | DRM core (`drm_gem.c`), `vgem` | skip NULL pages of sparse heap objects; clean caches before write-combined user mappings (arm64) | [docs/gpu.md](docs/gpu.md) |
 
 ### Fixes needed to boot and run
@@ -128,6 +132,7 @@ caused the DVFSRC bootloop.
 - the DRM stack: Panfrost as a module, `mtkfb_kms` as a module;
 - V4L2 with the media controller and subdevice API, and videobuf2
   scatter-gather buffers, for the camera drivers (other media areas off);
+- `/dev/udmabuf`;
 - debugfs and `/dev/mem` access, for bring-up.
 
 The kernel version string ends in `-titanpocket`.
@@ -258,6 +263,8 @@ hardware, rewritten for a plain Linux system (systemd, BlueZ, ALSA).
 | `titan-speakerd` (C) | powers the loudspeaker path (I2S clock, then the FS1860 amp) while a speaker playback device is open (samples on device 7, FM on device 21) and switches it off 2 s after they close. Any ALSA or PipeWire playback to device 7 is audible without manual mixer steps |
 | `titan-radio` (sh) | FM on the loudspeaker: holds the FM I2S link open (`titan-speakerd` powers the speaker) and runs `titan-fm` |
 | `titan-radio-gui` (Python 3, GTK 3) | the **Radio** app: frequency dial, seek and step, station scan, favorites, signal meter, volume. Drives `/dev/fm` itself and sets up the FM audio like `titan-radio`; plays while its window is open |
+| `titan-camera-gui` (Python 3, GTK 3, GStreamer) | the **Camera** app: live preview, full-resolution photos, front/rear switch, contrast-detect autofocus with tap to focus, manual focus. Needs libcamera built with `libcamera/build.sh` |
+| `libcamera/` | `build.sh` builds libcamera v0.7.2 on the phone with `0001-titan-pocket.patch`: the `titan-camera` device for the simple pipeline handler, the 4.14 version check, an OV16880 sensor helper, and a `libcamerasrc` crash fix |
 | `spk-hold` (C) | holds an ALSA hostless link open (used by `titan-radio` and `titan-radio-gui` for the FM link) |
 | `titan-powerkey` (Python 3) | power key: screen off + suspend to RAM, wake on the power key only. Volume keys: speaker volume with a safe cap, saved across boots |
 | `titan-wlan-cmd` (C) | sends private commands to the gen3 Wi-Fi driver (e.g. `SETSUSPENDMODE 1`) |
@@ -302,8 +309,8 @@ overwritten. Debian 12 doesn't package tinyalsa.
   sleep about every 0.5 s.
 - GPS depends on MediaTek's closed `libmnl.so`, and runs without
   assistance data (no AGPS/EPO yet), so cold starts take minutes.
-- Cameras deliver raw Bayer frames only: no ISP (debayer, exposure, white
-  balance) and no libcamera support yet.
+- Cameras run on libcamera's software ISP (a patched v0.7.2, see
+  docs/camera.md), not MediaTek's hardware ISP; no tuning files yet.
 - Not done: modem, microphones/earpiece routing, FM on headphones and RDS.
 
 ## Documentation

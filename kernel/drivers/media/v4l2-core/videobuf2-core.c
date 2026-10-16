@@ -672,11 +672,14 @@ int vb2_core_reqbufs(struct vb2_queue *q, enum vb2_memory memory,
 		 * are not in use and can be freed.
 		 */
 		mutex_lock(&q->mmap_lock);
-		if (q->memory == VB2_MEMORY_MMAP && __buffers_in_use(q)) {
-			mutex_unlock(&q->mmap_lock);
-			dprintk(1, "memory in use, cannot free\n");
-			return -EBUSY;
-		}
+		/*
+		 * Titan Pocket: Linux 5.0's buffer orphaning (commit d65842f7126a,
+		 * "media: vb2: Allow reqbufs(0) with "in use" MMAP buffers"). The
+		 * memory of buffers still mmapped or exported as dma-bufs stays
+		 * alive through the allocator's refcount; libcamera depends on it.
+		 */
+		if (q->memory == VB2_MEMORY_MMAP && __buffers_in_use(q))
+			dprintk(1, "memory in use, orphaning buffers\n");
 
 		/*
 		 * Call queue_cancel to clean up any buffers in the PREPARED or

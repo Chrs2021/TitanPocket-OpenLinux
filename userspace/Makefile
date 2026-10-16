@@ -21,7 +21,7 @@ TINYALSA_SRC := $(addprefix $(TINYALSA)/src/,pcm.c pcm_hw.c pcm_plugin.c \
 TOOLS        := titan-wmt titan-btbridge titan-fm titan-wlan-cmd
 ALSA_TOOLS   := spk-hold titan-speakerd tinymix
 SBIN_SCRIPTS := titan-bt-start titan-nvram-copy titan-wifi-on titan-powerkey
-BIN_SCRIPTS  := titan-radio
+BIN_SCRIPTS  := titan-radio titan-radio-gui titan-camera-gui
 UNITS        := titan-wmt.service titan-wifi.service titan-bt.service \
                 titan-powerkey.service titan-speaker.service
 
