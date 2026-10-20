@@ -416,6 +416,31 @@ builds the MT6370 flashlight driver.
   `SET_DUTY`, then `SET_ONOFF` 1 for both; off: `SET_ONOFF` 0 both,
   scenario 0, `SET_DRIVER` 0.
 
+### When the flash won't light: power throttling
+
+On 2026-10-18 the flash and the torch stopped. The kernel logged
+`flashlight: fl_enable: Failed to enable since pt(0,1,0), pt strict(1)`
+(`/sys/class/flashlight_core/flashlight/flashlight_pt` showed `0 1 0 1`).
+
+- **The cause.** MediaTek's flashlight core blocks the LEDs in strict mode
+  whenever it thinks the battery is low. One of its sources is the PMIC
+  driver's battery-percentage notifier (`pmic_throttling_dlpt.c`). Every
+  10 s, if not charging, it reads `battery_get_uisoc()` and raises
+  "level 1" at 15 % or below.
+- **Why it misfired.** That percentage is MediaTek's own fuel gauge, which
+  this board doesn't use. The real gauge is the OZ8806 (`oz8806-battery`,
+  92 % at the time); MediaTek's `battery` supply read -1. So the flash was
+  blocked at 92 %. It had worked on the 16th, when the stale value
+  happened to be above 15 %.
+- **The fix.** `titan-flash-pt.service` (oneshot, at boot):
+  - writes `1` to the PMIC's `battery_percent_protect_stop`, which stops
+    the notifier calling anyone;
+  - writes `0 0 0 1` to `flashlight_pt`, which clears the flags and keeps
+    strict mode.
+- **What still protects the battery.** The low-voltage protection, the
+  PMIC's battery voltage comparator, isn't touched: a truly sagging
+  battery still blocks the flash.
+
 ## The Camera app (titan-camera-gui)
 
 `userspace/debian/overlay/usr/local/bin/titan-camera-gui` (Python, GTK 3,

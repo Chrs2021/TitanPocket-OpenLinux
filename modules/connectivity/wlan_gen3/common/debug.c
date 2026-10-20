@@ -670,6 +670,10 @@ VOID wlanPrintFwLog(PUINT_8 pucLogContent, UINT_16 u2MsgSize, UINT_8 ucMsgType)
 	}
 	switch (ucMsgType) {
 	case DEBUG_MSG_TYPE_ASCII:
+		/* Titan Pocket: the firmware's chatter (scan, CNM aborts) only
+		 * with RX INFO on (/proc/net/wlan/dbgLevel) */
+		if (!(aucDebugModule[DBG_RX_IDX] & DBG_CLASS_INFO))
+			break;
 		pucLogContent[u2MsgSize] = '\0';
 		LOG_FUNC("%s\n", pucLogContent);
 		break;

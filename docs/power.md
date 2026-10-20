@@ -1,9 +1,12 @@
 # Power management
 
-Status (2026-10-12): CPU frequency scaling works (it was pinned at the top
-OPP). The GPU powers off when idle. The power button blanks the panel,
-takes Wi-Fi down and suspends to RAM. Suspend and power-key wake are
-verified, including with Weston running.
+Status (2026-10-20): CPU frequency scaling works (it was pinned at the top
+OPP). The GPU powers off when idle. The power button blanks the panel and
+suspends to RAM (Wi-Fi stays up by default, see below); Weston stops drawing
+while the screen is off. Suspend and power-key wake work, including with
+Weston running. The occasional reset during sleep was a deliberate kernel
+oops, now a refused suspend (kernel #33, [below](#the-suspend-crash)); a
+rarer hang while bringing CPUs back on resume is not understood yet.
 
 ## CPU frequency
 
@@ -132,6 +135,47 @@ tests of Wi-Fi down with Bluetooth on, logging each step to a synced file.
 `titan-wlan-cmd [-i wlan0] CMD ...` sends any gen3 driver private command
 (ioctl `SIOCDEVPRIVATE+1`, `struct priv_driver_cmd_s`).
 
+## The suspend crash
+
+The "watchdog resets" during sleep (2026-10-18/19) were a deliberate kernel
+oops. Before the SoC sleeps, MediaTek's `slp_suspend_ops_enter()` calls
+`subsys_if_on()` (`clk-mt6771-pg.c`), which checks the MTCMOS power domains
+and did `BUG_ON(1)` if the display, GPU (MFG), ISP, camera, video or VPU
+domain was still on; the panic handler then reset the phone. pstore had it:
+`Internal error: Oops - BUG` in titan-powerkey's `pm_suspend` →
+`slp_suspend_ops_enter` → `subsys_if_on`. Which domain was on that time fell
+into a gap in the saved log.
+
+Kernel #33: the check sets `slp_subsys_busy` instead, and suspend entry
+refuses (-EBUSY) with "CANNOT SLEEP: N power domain(s) still on"; the
+"suspend warning: SYS_xxx is on!!!" lines before it name them.
+titan-powerkey treats EBUSY as "retry in 30 s". The next time it happens the
+journal says which driver to fix.
+
+Separately, on 2026-10-18 21:40 a resume stopped while bringing CPU1 back
+online (the journal's last line `Detected VIPT I-cache on CPU1`) with no
+pstore record: a real hang, not understood yet.
+
+## Log volume
+
+Persistent, the journal grew to 4 GB in a week: ~1,700 lines a minute, 92 %
+kernel, much of it MediaTek debug output logged as err/warn/notice (so no
+level filter separates it). Now:
+- the journal is in RAM, 96 MB ([debugging.md](debugging.md));
+- **Weston draws nothing while the screen is off**: the shell watches
+  `/run/titan-screen.off` (inotify) and keeps the compositor offscreen while
+  it exists (also after input or the idle timer). Before, every commit became
+  a refused display update, two error lines each, several per second, after
+  the GPU had rendered it (20 s off: ~70 → 0 lines, apart from one burst
+  after a touch);
+- the Wi-Fi driver logs warnings and errors only (`titan-wifi-on` writes
+  `0xff:0x03` to `/proc/net/wlan/dbgLevel`; the default 0x27 adds INFO and
+  STATE), and the firmware's own text log only at RX INFO (driver patch);
+- kernel #34: no SODI line for each non-timer wake (a summary once a
+  minute), PMIC IRQ enable/disable and SD clock changes at debug.
+Still there: the watchdog kicker (`[wdk-c]`, ~28 a minute; its records
+pointed at the crash), SCSI cache syncs, battery ADC readings.
+
 ## Power button: `titan-powerkey`
 
 `/usr/local/sbin/titan-powerkey` (`titan-powerkey.service`) reads
@@ -153,6 +197,17 @@ The **volume keys** (same `mtk-kpd` device) step the speaker amp
 owns the keys (`titan-remote` sends the TV's volume) and the phone's volume
 is left alone.
 
+**Screenshot:** the red key on the left side (`KEY_RED`, 250: `0xfa` in the
+stock device tree's `mediatek,kpd-hw-init-map`, on the same `mtk-kpd`
+device) together with volume up, in either order, while the screen is on.
+`fbgrab` copies the frame on the panel and it's saved in the background as
+`~/Pictures/Screenshots/Screenshot_<date>_<time>.png` (written to a dot
+file, then renamed, so Photos never sees half a file). As a shutter the
+backlight dips to a fifth for 120 ms, then `titan-brightness apply` puts
+the saved level back. While the red key is held, volume up doesn't change
+the volume; if volume up came first, its step (made under 2 s before) is
+undone.
+
 Long presses are ignored; holding the key for ~10 s makes the PMIC reset
 the phone. systemd-logind would otherwise act on the key (the device is
 tagged `power-switch`, and logind's default is **poweroff**), so
@@ -164,8 +219,10 @@ tagged `power-switch`, and logind's default is **poweroff**), so
   mode (DTIM skipping, ARP offload, multicast filters).
 
 - Wake on keyboard/touch (only the power key, RTC and cable wake it now).
-- Lid-style idle blanking (screen off after inactivity), DPMS in the KMS
-  driver, and Weston being told the screen is off (it keeps drawing into the
-  blanked framebuffer).
+- The resume hang (CPU1 coming online, no pstore record) and which power
+  domain refused suspend, once kernel #33 logs it.
+- DPMS in the KMS driver (titan-powerkey blanks through mtkfb; Weston idle
+  ([core] idle-time) locks and asks titan-powerkey for the screen off, and
+  stays offscreen while it's off).
 - Measured current draw in suspend.
 - cpuidle/hotplug tuning, thermal limits.

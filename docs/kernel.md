@@ -62,6 +62,8 @@ tree for exact hunks.
 | `sound/soc/mediatek/common_int/mtk-soc-afe-control.c` | `mtk_mem_dlblk_copy()` honours ALSA `pos` | [audio.md](audio.md) |
 | `drivers/gpu/drm/scheduler/`, `drm_gem_shmem_helper.c`, `include/drm/{gpu_scheduler,spsc_queue,drm_gem_shmem_helper,drm_backport}.h` | DRM infrastructure backported from 5.10 | [gpu.md](gpu.md) |
 | `drivers/iommu/io-pgtable{,-arm}.[ch]` | `ARM_MALI_LPAE` page-table format (5.2) | [gpu.md](gpu.md) |
+| `drivers/clk/mediatek/clk-mt6771-pg.c`, `base/power/spm_v4/mtk_sleep.c` | a power domain still on at suspend refuses the suspend (-EBUSY) instead of `BUG_ON` (#33) | [power.md](power.md#the-suspend-crash) |
+| `base/power/spm_v4/mtk_spm_sodi.c`, `pmic/mt6358/v1/pmic_irq.c`, `mmc/host/mediatek/ComboA/sd.c` | quieter logs: no SODI line per non-timer wake (summary once a minute), PMIC IRQ enable and SD clock lines at debug (#34) | [power.md](power.md#log-volume) |
 | `drivers/gpu/drm/vgem/vgem_drv.c` | clean pages to PoC before the WC user mapping (arm64) | [gpu.md](gpu.md) |
 | `drivers/gpu/drm/panfrost/` (5.10 + `panfrost_mtk.c`), `drivers/gpu/drm/drm_gem.c` (sparse `put_pages`), `drivers/misc/mediatek/gpu/Makefile` (no kbase), `base/power/mt6771/mtk_gpufreq_core.c` (`mt_gpufreq_probed()` + exports), `drivers/iommu/io-pgtable.c` (exports) | Panfrost on MT6771 | [gpu.md](gpu.md) |
 

@@ -196,6 +196,33 @@ daemon applies the level itself, whenever the file changes:
   indicator shows headphones instead of a speaker
   (desktop.md).
 
+## Microphones
+
+Two analog MEMS microphones (Knowles SPH1642HT5H, −41 dB sensitivity, per
+the stock `MicInfo_AudioParam.xml`): the main one at the bottom on the
+MT6358's preamp input `IN_ADC1`, the back one on `IN_ADC3` (`IN_ADC2` is
+the headset mic). The device tree's mic mode is **DCC** (`Audio_MIC_Mode`
+reads 2); DMIC mode records exact zeros, ACC records but is not what the
+board uses.
+
+The stock path (`builtin_Mic_Mic1` in `/vendor/etc/audio_device.xml`):
+`Audio_MicSource1_Setting` ADC1, `Audio_ADC_1_Switch` and `_2_` On,
+`Audio_Preamp1_Switch` and `_2_` `IN_ADC1` (`IN_ADC3` for the back mic,
+one of each for dual). **Gotcha:** the codec powers the uplink (mic bias
+1.9 V on `AUDENC_ANA_CON9`, PGA, ADC) when `Audio_ADC_1_Switch` goes Off →
+On, in the `Audio_MIC1_Mode_Select` mode set at that moment; changing the
+mode while it is on does nothing. `titan-mic on [main|back|dual] [GAIN]` /
+`off` does the sequence. Capture is **ALSA device 1** (`MultiMedia1_Capture`),
+48 kHz stereo S16: left = preamp 1, right = preamp 2.
+
+Measured (PGA 18 dB, 2026-10-19): a quiet room −64 to −68 dBFS on either
+mic; the vibration motor running lifts the main mic by 20 dB. A 1 kHz tone
+from the speaker did not show up in a capture taken at the same time (not
+investigated: the speaker may not run while the uplink starts).
+
+**Recorder** (`titan-recorder`, desktop.md)
+records the main mic at PGA 30 dB.
+
 ## Known limitations / TODO
 
 - Chromium sometimes pauses ("corks") its stream when a YouTube ad is
@@ -208,5 +235,5 @@ daemon applies the level itself, whenever the file changes:
 - Volume scale of `Speaker Amp Volume` (0.5 dB/step) is inferred, not verified.
 - Only 44.1/48 kHz preset values are replayed; 16/32 kHz need preset index 1.
 - No ALSA UCM profile yet (titan-speakerd does the mixer steps instead).
-- Microphones and the earpiece path are untested.
+- The earpiece path is untested.
 - Speaker protection coefficients are this unit's (see the FS1860 doc).

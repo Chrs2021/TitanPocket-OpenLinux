@@ -33,7 +33,7 @@ Wayland desktop.
 |---|---|---|
 | Hardware keyboard (AW9523 matrix) | `drivers/misc/mediatek/aw9523/` | ✅ stock keymap, Alt symbol layer |
 | Keyboard touchpad (Synaptics RMI4) | `drivers/input/misc/titanpocket-touchpad.c` + RMI4 | ✅ multitouch |
-| Touchscreen (Goodix GT1151QM) | BSP | ⚠️ present, lightly tested |
+| Touchscreen (Goodix GT1151QM) | BSP | ✅ the desktop and apps are used by touch |
 | Display | `drivers/gpu/drm/mtkfb_kms/` (new) on the BSP `mtkfb` | ✅ DRM/KMS, 720×720 @ 60 Hz |
 | GPU (Mali-G72 MP3) | `drivers/gpu/drm/panfrost/` (backported from 5.10) | ✅ OpenGL ES 3.1 with Mesa |
 | Battery fuel gauge (O2Micro OZ8806) | `drivers/power/supply/oz8806_battery.c` (new) | ✅ voltage, current, temperature, capacity |
@@ -45,9 +45,13 @@ Wayland desktop.
 | Headphone jack (MT6358 accdet) | BSP | ✅ plug detection (`SW_HEADPHONE_INSERT`); sound and FM switch to the headphones with their own volume (`titan-speakerd`, [docs/audio.md](docs/audio.md#headphones)) |
 | IR blaster | BSP `mtk_irtx_pwm` + MT6370 LDO fix | ✅ `/dev/irtx` |
 | NFC (STMicro ST21NFC) | BSP `st21nfc` | ✅ `/dev/st21nfc` (NCI) |
-| USB gadget (serial + network) | BSP | ✅ |
-| CPU frequency scaling, suspend to RAM | BSP + fixes | ✅ |
-| Microphones, earpiece, headset mic | BSP | ❓ untested |
+| USB gadget (serial + network) | BSP | ✅ plus a mass-storage LUN that lends the microSD card to a computer on request |
+| microSD card | BSP (`msdc1`) | ✅ |
+| CPU frequency scaling, suspend to RAM | BSP + fixes | ⚠️ works; a power domain left on at suspend now refuses the suspend instead of an oops and a reset; a rare hang on resume is open ([docs/power.md](docs/power.md)) |
+| Microphones (two analog MEMS, MT6358 codec) | BSP | ✅ DCC mode, ALSA device 1 ([docs/audio.md](docs/audio.md#microphones)) |
+| Earpiece, headset mic | BSP | ❓ untested |
+| Accelerometer, gyroscope, magnetometer | BSP sensor hub (SCP) | ✅ readings in SI units; reported uncalibrated, offsets learned in userspace ([docs/hardware.md](docs/hardware.md#motion-sensors)) |
+| Vibration motor | BSP | ✅ |
 | GPS / GNSS (MT6631) | `modules/connectivity/gps/` | ✅ 3D fix outdoors (GPS, GLONASS, BeiDou, SBAS). The driver is source; positioning runs on MediaTek's closed `libmnl.so` from the phone ([docs/gnss.md](docs/gnss.md)) |
 | Cellular modem | BSP CCCI | ❓ needs firmware loading + userspace |
 | Cameras (OV16880 rear, OV8865 front) | `modules/camera/v4l2/` (new, out of tree) | ✅ both stream at 30 fps through V4L2 (MIPI receiver + CAMSV DMA) and libcamera (software ISP debayering on the GPU; `cam`, GStreamer); Camera app with autofocus, fed by MediaTek's ISP AF statistics (pass 1, run beside the capture path). The rest of the hardware ISP isn't used yet ([docs/camera.md](docs/camera.md)) |
@@ -103,6 +107,8 @@ All changes are relative to `halium-11.0`. Each is explained in
 | videobuf2 (`videobuf2-core.c`) | Linux 5.0's buffer orphaning: `REQBUFS(0)` frees the queue while buffers are still mapped or exported (libcamera relies on it) | [docs/camera.md](docs/camera.md) |
 | V4L2 formats (`v4l2-ioctl.c`) | the name of 4.18's 14-bit Bayer format (`BG14`) | [docs/camera.md](docs/camera.md) |
 | DRM core (`drm_gem.c`), `vgem` | skip NULL pages of sparse heap objects; clean caches before write-combined user mappings (arm64) | [docs/gpu.md](docs/gpu.md) |
+| Suspend (`clk-mt6771-pg.c`, `spm_v4/mtk_sleep.c`) | a power domain still on at suspend refuses the suspend (`-EBUSY`) instead of `BUG_ON`, which reset the phone | [docs/power.md](docs/power.md) |
+| Logging (`spm_v4/mtk_spm_sodi.c`, `pmic/mt6358/v1/pmic_irq.c`, `mmc/host/mediatek/ComboA/sd.c`) | no SODI line for every non-timer wake (a summary once a minute); PMIC IRQ enable and SD clock lines at debug level | [docs/power.md](docs/power.md) |
 
 ### Fixes needed to boot and run
 

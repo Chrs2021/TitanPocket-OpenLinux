@@ -4403,6 +4403,8 @@ static void dump_cg_state(const char *clkname)
 		__clk_get_enable_count(c));
 }
 
+extern int slp_subsys_busy;
+
 void subsys_if_on(void)
 {
 	unsigned int sta = spm_read(PWR_STATUS);
@@ -4491,8 +4493,13 @@ void subsys_if_on(void)
 			dump_cg_state(vdec_clks[i]);
 		ret++;
 	}
-	if (ret > 0)
-		BUG_ON(1);
+	/*
+	 * Titan Pocket: a domain still on here used to be BUG_ON(1), i.e. a
+	 * kernel oops and a watchdog reset in the middle of suspend. Tell
+	 * slp_suspend_ops_enter() instead; it refuses the suspend (-EBUSY) and
+	 * the domains named above are in the log.
+	 */
+	slp_subsys_busy = ret;
 #if 0
 	for (i = 0; i < num; i++)
 		dump_cg_state(clks[i]);

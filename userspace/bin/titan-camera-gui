@@ -108,6 +108,7 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Gst", "1.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gst, Gtk, Pango  # noqa: E402
+import titan_ui  # noqa: E402  (the TitanWater look: header, membrane)
 
 SYSDEV = "/sys/devices/platform/1a050000.camsv1/"
 CAMERAS = [
@@ -540,32 +541,42 @@ class AutoFocus:
 
 CSS = b"""
 * { font-size: 20px; }
-.bar { background: #101012; padding: 8px 12px; }
-.round { min-width: 64px; min-height: 64px; border-radius: 32px; padding: 0;
-         background: #2a2a30; color: white; border: none; }
+.bar { background: #0B0D12; padding: 8px 12px; }
+.round { min-width: 64px; min-height: 64px; border-radius: 32px; padding: 0; }
+/* the shutter: a big bead of lit water */
 .shutter { min-width: 92px; min-height: 92px; border-radius: 46px; padding: 0;
-           background: white; border: 6px solid #9a9aa0; }
-.shutter:active { background: #c8c8c8; }
-.shutter:disabled { background: #6a6a6a; }
-.thumb { min-width: 64px; min-height: 64px; padding: 0; border-radius: 8px;
-         background: #2a2a30; border: none; }
-.status { color: white; background: rgba(0,0,0,0.55); border-radius: 10px;
-          padding: 6px 14px; font-size: 20px; }
+           background-color: rgba(255, 255, 255, 0.90);
+           background-image: radial-gradient(ellipse 30% 30% at 32% 28%, #FFFFFF, rgba(255,255,255,0)),
+                             radial-gradient(ellipse closest-side at 50% 50%, rgba(255,255,255,0) 70%,
+                                             rgba(160,170,190,0.55) 86%, rgba(255,255,255,0));
+           border: 2px solid #FFFFFF;
+           box-shadow: inset 0 0 14px rgba(150,160,180,0.55), 0 0 0 4px rgba(255,255,255,0.35),
+                       0 8px 16px rgba(0,0,0,0.45); }
+.shutter:disabled { background-color: rgba(255, 255, 255, 0.35); }
+.thumb { min-width: 64px; min-height: 64px; padding: 0; border-radius: 16px; }
+/* glass over the preview */
+.status, .camback { color: white; background-color: rgba(18, 24, 48, 0.55);
+          border: 1px solid rgba(255,255,255,0.40);
+          box-shadow: inset 0 1px 0 rgba(255,255,255,0.5), 0 6px 18px rgba(0,0,0,0.35); }
+.status { border-radius: 20px; padding: 6px 16px; font-size: 20px; }
+.camback { min-width: 46px; min-height: 46px; border-radius: 23px; padding: 0;
+           background-image: none; }
 .viewer { background: black; }
-.focuslbl { color: #c8c8c8; font-size: 16px; }
+.focuslbl { color: @titan_dim; font-size: 16px; }
 .flash { min-width: 96px; font-size: 16px; padding: 0 8px; }
-.flash.lit { background: #f0c040; color: #101012; }
-.afmode { color: #101012; background: #f0c040; border-radius: 6px;
-          padding: 0 6px; font-size: 14px; font-weight: bold; }
-.afmode.manual { background: #8a8a90; }
-.qr { background: rgba(16,16,18,0.82); border-radius: 12px; padding: 4px 6px 4px 10px;
-      border: 2px solid rgba(255,255,255,0.15); }
-.qr.fresh { border-color: #f0c040; }
-.qrkind { color: #101012; background: #f0c040; border-radius: 6px; padding: 0 6px;
-          font-size: 13px; font-weight: bold; }
+.flash.lit { background-color: rgba(255, 210, 74, 0.92); color: #141821; text-shadow: none; }
+.afmode { color: #141821; background: @titan_accent; border-radius: 7px;
+          padding: 1px 7px; font-size: 14px; font-weight: bold; text-shadow: none; }
+.afmode.manual { background: rgba(255, 255, 255, 0.80); }
+.qr { background-color: rgba(18, 24, 48, 0.72); border-radius: 22px; padding: 4px 6px 4px 12px;
+      border: 1px solid rgba(255,255,255,0.40);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.45), 0 6px 18px rgba(0,0,0,0.35); }
+.qr.fresh { border-color: @titan_accent; }
+.qrkind { color: #141821; background: @titan_accent; border-radius: 6px; padding: 0 6px;
+          font-size: 13px; font-weight: bold; text-shadow: none; }
 .qrtext { color: white; font-size: 16px; }
 .qr button { min-height: 40px; min-width: 40px; padding: 0 10px; border-radius: 20px;
-             background: #2a2a30; color: white; border: none; font-size: 15px; }
+             font-size: 15px; }
 scale trough { min-height: 8px; }
 scale slider { min-width: 34px; min-height: 34px; border-radius: 17px; }
 """
@@ -646,6 +657,16 @@ class CameraApp(Gtk.Window):
         self.qr_box.set_margin_bottom(10)
         overlay.add_overlay(self.qr_box)    # only as tall as its chips
         self.qr_chips = {}          # code text -> chip
+        # the design's back button, floating over the preview
+        back = Gtk.Button.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.BUTTON)
+        back.get_style_context().add_class("camback")
+        back.set_halign(Gtk.Align.START)
+        back.set_valign(Gtk.Align.START)
+        back.set_margin_top(12)
+        back.set_margin_start(12)
+        back.set_tooltip_text("Back (Esc)")
+        back.connect("clicked", lambda b: self.destroy())
+        overlay.add_overlay(back)
 
         self.focus_row = Gtk.Box(spacing=10)
         self.focus_row.get_style_context().add_class("bar")
@@ -1501,6 +1522,8 @@ class CameraApp(Gtk.Window):
             return True
         if name in ("space", "Return", "KP_Enter"):
             self.take_photo()
+        elif name in ("Escape", "XF86Back"):     # the back button's key
+            self.destroy()
         elif name in ("f", "F"):
             self.switch_camera()
         elif name in ("r", "R"):
@@ -1533,6 +1556,7 @@ def main():
     win = CameraApp()
     for sig in (2, 15, 1):      # SIGINT, SIGTERM, SIGHUP: release the camera
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda w=win: w.destroy() or False)
+    titan_ui.install(win)
     win.show_all()
     win.status.hide()
     win.focus_row.set_visible(CAMERAS[win.cam]["focus"])

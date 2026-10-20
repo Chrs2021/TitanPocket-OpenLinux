@@ -22,6 +22,14 @@ else
 fi
 
 echo 1 > /dev/wmtWifi
-for i in $(seq 75); do [ -e /sys/class/net/wlan0 ] && exit 0; sleep 0.2; done
+for i in $(seq 75); do
+	if [ -e /sys/class/net/wlan0 ]; then
+		# the driver logs INFO and STATE for every module by default (0x27):
+		# hundreds of lines a minute in the journal; keep warnings and errors
+		echo "0xff:0x03" > /proc/net/wlan/dbgLevel 2>/dev/null || true
+		exit 0
+	fi
+	sleep 0.2
+done
 echo "titan-wifi-on: wlan0 did not appear" >&2
 exit 1

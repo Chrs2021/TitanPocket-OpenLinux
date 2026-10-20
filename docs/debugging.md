@@ -14,6 +14,21 @@ mount -t pstore pstore /sys/fs/pstore; cat /sys/fs/pstore/console-ramoops*
 `PANIC_TIMEOUT=1`, so a panic reboots after one second; the bootloader then
 reports `androidboot.bootreason=kernel_panic` on the next command line. A plain `fastboot reboot` shows up as `PMIC_cold_reboot` (pstore is empty after it), so don't mistake a flash for a crash.
 
+On Debian, **systemd-pstore** collects them at boot: the previous crash's
+console is in `/var/lib/systemd/pstore/console-ramoops*` (2026-10-20: this
+found the suspend `BUG_ON`, [power.md](power.md#the-suspend-crash)). Check
+`/proc/aed/reboot-reason` too (`WDT status: 2` and all SPM fields 0 = a
+reset outside the sleep firmware).
+
+**The journal is in RAM** (`/etc/systemd/journald.conf.d/titan.conf`:
+`Storage=volatile`, 96 MB in `/run/log/journal`): nothing reaches the flash,
+and it starts empty at every boot, so `journalctl -b -1` shows nothing.
+Crash evidence comes from pstore above. To keep a journal across reboots
+while chasing something, set `Storage=persistent` there and restart
+`systemd-journald`. (Persistent, it had grown to 4 GB in a week: ~2.4
+million lines a day, mostly MediaTek kernel debug output; see
+[power.md](power.md#log-volume).)
+
 **Live:** `sh_cmd.py 'dmesg | tail'`, or `telnet 172.16.42.1`.
 
 ## Useful interfaces

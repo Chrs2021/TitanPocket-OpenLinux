@@ -73,7 +73,9 @@ enum spm_sodi_logout_reason {
 
 #define LOG_BUF_SIZE					(256)
 #define SODI_LOGOUT_TIMEOUT_CRITERIA	(20)
-#define SODI_LOGOUT_INTERVAL_CRITERIA	(5000U)	/* unit:ms */
+/* Titan Pocket: once a minute (was 5 s; with the Wi-Fi chip's wakes the
+ * log took hundreds of lines a minute) */
+#define SODI_LOGOUT_INTERVAL_CRITERIA	(60000U)	/* unit:ms */
 
 static struct pwr_ctrl sodi_ctrl;
 
@@ -212,7 +214,7 @@ static inline bool spm_sodi_assert(struct wake_status *wakesta)
 	return (wakesta->assert_pc != 0) || (wakesta->r12 == 0);
 }
 
-static bool spm_sodi_is_not_gpt_event(
+static bool __maybe_unused spm_sodi_is_not_gpt_event(
 	struct wake_status *wakesta, long int curr_time, long int prev_time)
 {
 	static int by_md2ap_count;
@@ -316,10 +318,8 @@ unsigned int spm_sodi_output_log(struct wake_status *wakesta,
 
 		if (spm_sodi_assert(wakesta))
 			need_log_out = SODI_LOGOUT_ASSERT;
-		else if (spm_sodi_is_not_gpt_event(wakesta,
-						   sodi_logout_curr_time,
-						   sodi_logout_prev_time))
-			need_log_out = SODI_LOGOUT_NOT_GPT_EVENT;
+		/* Titan Pocket: a wake by a non-timer event (the Wi-Fi chip,
+		 * keys) is ordinary; no log line for each one */
 		else if (spm_sodi_abnormal_residency(wakesta))
 			need_log_out = SODI_LOGOUT_RESIDENCY_ABNORMAL;
 		else if (spm_sodi_change_emi_state(wakesta,

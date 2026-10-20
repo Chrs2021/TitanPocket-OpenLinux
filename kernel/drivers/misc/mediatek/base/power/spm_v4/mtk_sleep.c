@@ -283,6 +283,9 @@ unsigned int spm_go_to_sleep_dpidle(u32 spm_flags, u32 spm_data)
 	return WR_NONE;
 }
 
+/* set by subsys_if_on(): power domains still on (MTCMOS) at suspend */
+int slp_subsys_busy;
+
 void __attribute__((weak)) subsys_if_on(void)
 {
 	printk_deferred("[name:spm&]NO %s !!!\n", __func__);
@@ -360,7 +363,14 @@ static int slp_suspend_ops_enter(suspend_state_t state)
 
 #if !defined(CONFIG_FPGA_EARLY_PORTING)
 	pll_if_on();
+	slp_subsys_busy = 0;
 	subsys_if_on();
+	if (slp_subsys_busy) {
+		slp_error("CANNOT SLEEP: %d power domain(s) still on\n",
+			  slp_subsys_busy);
+		ret = -EBUSY;
+		goto LEAVE_SLEEP;
+	}
 #endif /* CONFIG_FPGA_EARLY_PORTING */
 
 	if (is_infra_pdn(slp_spm_flags) && !is_cpu_pdn(slp_spm_flags)) {

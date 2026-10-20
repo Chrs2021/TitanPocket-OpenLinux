@@ -3,15 +3,20 @@
 titan-gallery: photo gallery for the Titan Pocket (GTK 3).
 
 - Grid: every JPEG/PNG under ~/Pictures (the Camera app saves into
-  ~/Pictures/Camera), newest first, three square thumbnails per row.
+  ~/Pictures/Camera), newest first, four square thumbnails per row.
+- Selecting: hold a photo (or tap Select): it's picked and taps pick or
+  unpick more; the header counts them and offers Select all and Delete
+  (to the trash, after asking). Back or Escape ends it.
   Thumbnails are made on a worker thread and cached in
   ~/.cache/titan-gallery (keyed by path, size and mtime); new and removed
   files show up by themselves (a file monitor on each folder).
 - Viewer: tap a thumbnail. The photo fits the window; swipe or Left/Right
   for the previous/next one, pinch or double-tap to zoom, drag to pan when
   zoomed. The toolbar has back, previous, next, info and delete; delete asks
-  first and moves the photo to the trash (~/.local/share/Trash), it isn't
-  erased.
+  first and moves the photo to the trash, it isn't erased: on the SD card
+  (where ~/Pictures is, see titan-usb-storage) the card's own .Trash-0,
+  reached through /media/sdcard since GIO won't trash on the ~/Pictures bind
+  mount; elsewhere ~/.local/share/Trash.
 - QR codes: a background thread scans every photo once (newest first;
   the one being viewed jumps the queue), QR only: zxing-cpp at full
   resolution (~0.2 s for 16 MP), then libzbar at 2000 px on the long side
@@ -23,7 +28,8 @@ titan-gallery: photo gallery for the Titan Pocket (GTK 3).
 - titan-gallery PATH opens the viewer on that photo.
 
 Keys: Left/Right previous/next, Escape/Backspace back to the grid,
-Delete delete, I info, +/- zoom.
+Delete delete, I info, +/- zoom. On the grid: Escape ends selecting (or
+closes), Delete deletes the picked photos.
 """
 import ctypes
 import fcntl
@@ -31,6 +37,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -45,6 +52,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
+import titan_ui  # noqa: E402  (the TitanWater look: header, membrane)
 
 try:
     import numpy as np  # noqa: E402
@@ -59,8 +67,8 @@ PICTURES = os.path.expanduser("~/Pictures")
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
                      "titan-gallery")
 EXTENSIONS = (".jpg", ".jpeg", ".png")
-COLUMNS = 3
-THUMB = 226                  # px, square
+COLUMNS = 4                  # the design's grid: 4 across, 3 px apart
+THUMB = 177                  # px, square (4 across 720 px)
 ZOOM_STEPS = (1.0, 2.0, 4.0)
 SWIPE_MIN = 300              # px/s for a page swipe
 QR_CACHE = os.path.join(CACHE, "qr.json")
@@ -69,28 +77,82 @@ BROWSER = "/usr/local/bin/titan-chromium"
 
 CSS = b"""
 * { font-size: 20px; }
-.grid { background: #101012; }
-.thumb { background: #202024; border-radius: 4px; }
-.empty { color: #8a8a8a; font-size: 20px; }
+/* selecting: a ring on every photo, white with a check when picked */
+.pick { min-width: 26px; min-height: 26px; border-radius: 15px;
+        border: 2px solid rgba(255,255,255,0.92); background-color: rgba(0,0,0,0.28);
+        color: #141821; font-size: 16px; font-weight: bold; text-shadow: none;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.45); }
+.pick.on { background-color: #FFFFFF; }
+.grid { background: #0B0D12; }
+.thumb { background: #1B1E26; }
+.empty { color: @titan_dim; font-size: 20px; }
 .viewer { background: black; }
-.bar { background: #101012; padding: 6px 10px; }
-.bar button { min-width: 64px; min-height: 56px; border-radius: 28px;
-              background: #2a2a30; color: white; border: none; }
-.bar button.danger { background: #6a2020; }
+.bar { background: #0B0D12; padding: 8px 12px; }
+.bar button { min-width: 64px; min-height: 56px; border-radius: 28px; }
+.bar button.danger { background-color: rgba(255, 90, 110, 0.55); }
 .caption { color: #d0d0d0; background: rgba(0,0,0,0.55); border-radius: 8px;
            padding: 4px 10px; font-size: 16px; }
 .info { color: white; background: rgba(0,0,0,0.75); border-radius: 10px;
         padding: 10px 14px; font-size: 17px; }
-.qrbadge { color: #101012; background: #f0c040; border-radius: 6px; padding: 0 6px;
-           font-size: 13px; font-weight: bold; }
+.qrbadge { color: #141821; background: @titan_accent; border-radius: 6px; padding: 1px 6px;
+           font-size: 12px; font-weight: bold; text-shadow: none; }
 .qr { background: rgba(16,16,18,0.82); border-radius: 12px; padding: 4px 6px 4px 10px;
       border: 2px solid rgba(255,255,255,0.15); }
-.qrkind { color: #101012; background: #f0c040; border-radius: 6px; padding: 0 6px;
-          font-size: 13px; font-weight: bold; }
+.qrkind { color: #141821; background: @titan_accent; border-radius: 6px; padding: 0 6px;
+          font-size: 13px; font-weight: bold; text-shadow: none; }
 .qrtext { color: white; font-size: 16px; }
 .qr button { min-height: 40px; min-width: 40px; padding: 0 10px; border-radius: 20px;
-             background: #2a2a30; color: white; border: none; font-size: 15px; }
+             font-size: 15px; }
 """
+
+
+def same_file_elsewhere(path):
+    """The same file through another mount of its filesystem, or None.
+
+    ~/Pictures is a bind mount of the SD card's Pictures folder
+    (titan-usb-storage), and GIO refuses to trash there ("Trashing on system
+    internal mounts is not supported"); through the card's own mount point
+    (/media/sdcard) it uses the card's trash, .Trash-0. From
+    /proc/self/mountinfo: the mount holding path, then another mount of the
+    same device whose root contains that mount's root."""
+    try:
+        with open("/proc/self/mountinfo") as f:
+            mounts = [line.split() for line in f]
+    except OSError:
+        return None
+    real = os.path.realpath(path)
+    best = None
+    for m in mounts:            # id parent major:minor root mountpoint ...
+        mp = m[4]
+        if real == mp or real.startswith(mp.rstrip("/") + "/"):
+            if best is None or len(mp) > len(best[4]):
+                best = m
+    if best is None:
+        return None
+    dev, root, mp = best[2], best[3], best[4]
+    inner = os.path.join(root, os.path.relpath(real, mp)).replace("//", "/")
+    for m in mounts:
+        if m is best or m[2] != dev:
+            continue
+        r = m[3].rstrip("/") + "/"
+        if inner == m[3] or inner.startswith(r) or m[3] == "/":
+            rel = os.path.relpath(inner, m[3])
+            other = os.path.normpath(os.path.join(m[4], rel))
+            if os.path.exists(other):
+                return other
+    return None
+
+
+def trash(path):
+    """Move a photo to the trash; through the card's own mount when GIO
+    refuses the bind mount. Raises GLib.Error."""
+    try:
+        Gio.File.new_for_path(path).trash(None)
+    except GLib.Error:
+        other = same_file_elsewhere(path)
+        if other is None:
+            raise
+        Gio.File.new_for_path(other).trash(None)
 
 
 def find_photos():
@@ -110,7 +172,7 @@ def find_photos():
 
 
 def thumb_path(path, mtime):
-    key = hashlib.sha1(("%s\0%d" % (path, int(mtime))).encode()).hexdigest()
+    key = hashlib.sha1(("%s\0%d\0%d" % (path, int(mtime), THUMB)).encode()).hexdigest()
     return os.path.join(CACHE, key + ".png")
 
 
@@ -267,6 +329,8 @@ class Gallery(Gtk.Window):
             Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         self.photos = []            # [(path, mtime)]
+        self.selecting = False      # picking photos (hold one, or Select)
+        self.selected = set()       # their paths
         self.tiles = {}             # path -> Gtk.Image in the grid
         self.index = 0              # the photo in the viewer
         self.zoom = 1.0             # 1 = fit
@@ -291,6 +355,7 @@ class Gallery(Gtk.Window):
 
         self.build()
         self.rescan()
+        self.show_count()
         if start and os.path.exists(start):
             paths = [p for p, _ in self.photos]
             if os.path.abspath(start) in paths:
@@ -315,10 +380,18 @@ class Gallery(Gtk.Window):
         self.flow.set_homogeneous(True)
         self.flow.set_selection_mode(Gtk.SelectionMode.NONE)
         self.flow.set_activate_on_single_click(True)
-        self.flow.set_row_spacing(4)
-        self.flow.set_column_spacing(4)
-        self.flow.set_border_width(4)
+        self.flow.set_row_spacing(3)
+        self.flow.set_column_spacing(3)
+        # room to scroll the first and last rows out from under the floating
+        # header and filter
+        self.flow.set_margin_top(84)
+        self.flow.set_margin_bottom(84)
+        self.flow.set_filter_func(self.filter_tile)
         self.flow.connect("child-activated", self.on_tile)
+        # hold a photo to start picking photos
+        self.hold = Gtk.GestureLongPress.new(self.flow)
+        self.hold.connect("pressed", self.on_hold)
+        self.held = False           # the tap that ends a hold opens nothing
         self.empty = Gtk.Label(label="No photos yet.\nThe Camera app saves into ~/Pictures/Camera.")
         self.empty.get_style_context().add_class("empty")
         self.empty.set_justify(Gtk.Justification.CENTER)
@@ -327,7 +400,44 @@ class Gallery(Gtk.Window):
         grid.pack_start(self.flow, False, False, 0)
         grid.pack_start(self.empty, True, True, 0)
         sw.add(grid)
-        self.stack.add_named(sw, "grid")
+        # the design's photo frame: the grid edge to edge, a glass header and
+        # a filter floating over it
+        frame = Gtk.Overlay()
+        frame.add(sw)
+        # the header's actions: Select; while selecting, Select all and
+        # Delete (and its back button ends selecting)
+        self.select_btn = Gtk.Button(label="Select")
+        self.select_btn.connect("clicked", lambda b: self.start_selecting())
+        self.all_btn = Gtk.Button(label="All")
+        self.all_btn.connect("clicked", lambda b: self.select_all())
+        self.del_btn = Gtk.Button.new_from_icon_name("user-trash-symbolic", Gtk.IconSize.BUTTON)
+        self.del_btn.get_style_context().add_class("destructive-action")
+        self.del_btn.set_tooltip_text("Delete the picked photos")
+        self.del_btn.connect("clicked", lambda b: self.delete_selected())
+        for b in (self.all_btn, self.del_btn):
+            b.set_no_show_all(True)
+        self.header, self.header_title, self.header_sub = titan_ui.header(
+            "Photos", " ", on_back=self.go_back,
+            actions=[self.select_btn, self.all_btn, self.del_btn])
+        self.header.set_valign(Gtk.Align.START)
+        for side in ("top", "start", "end"):
+            getattr(self.header, "set_margin_" + side)(12)
+        frame.add_overlay(self.header)
+        self.filter = "all"
+        seg = Gtk.Box(spacing=4)
+        seg.get_style_context().add_class("titan-segmented")
+        seg.set_halign(Gtk.Align.CENTER)
+        seg.set_valign(Gtk.Align.END)
+        seg.set_margin_bottom(16)
+        first = None
+        for key, label in (("all", "All"), ("camera", "Camera"), ("qr", "With QR")):
+            b = Gtk.RadioButton.new_with_label_from_widget(first, label)
+            b.set_mode(False)       # a button, not a radio dot
+            b.connect("toggled", self.on_filter, key)
+            seg.pack_start(b, False, False, 0)
+            first = first or b
+        frame.add_overlay(seg)
+        self.stack.add_named(frame, "grid")
 
         # viewer page: zoomable image, caption, info, toolbar
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -401,47 +511,73 @@ class Gallery(Gtk.Window):
 
     # ---- the photo list ----
 
+    def make_tile(self, path, mtime):
+        """a grid tile: the thumbnail (filled in later), the QR badge, the
+        pick mark"""
+        tile = Gtk.Overlay()
+        tile.path = path
+        tile.mtime = mtime
+        tile.img = Gtk.Image()
+        tile.has_thumb = False
+        tile.img.set_size_request(THUMB, THUMB)
+        tile.img.get_style_context().add_class("thumb")
+        tile.add(tile.img)
+        tile.badge = Gtk.Label(label="QR")
+        tile.badge.get_style_context().add_class("qrbadge")
+        tile.badge.set_halign(Gtk.Align.END)
+        tile.badge.set_valign(Gtk.Align.START)
+        tile.badge.set_margin_top(6)
+        tile.badge.set_margin_end(6)
+        tile.badge.set_no_show_all(True)
+        tile.add_overlay(tile.badge)
+        tile.pick = Gtk.Label()
+        tile.pick.get_style_context().add_class("pick")
+        tile.pick.set_halign(Gtk.Align.START)
+        tile.pick.set_valign(Gtk.Align.START)
+        tile.pick.set_margin_top(8)
+        tile.pick.set_margin_start(8)
+        tile.pick.set_no_show_all(True)
+        tile.add_overlay(tile.pick)
+        return tile
+
     def rescan(self):
+        """bring the grid up to date with ~/Pictures, in place: tiles of
+        photos that went are taken out, new ones go in at their place, the
+        rest stay as they are (no reflow, the scroll position kept)"""
         self.refresh_pending = 0
         photos = find_photos()
         if photos == self.photos:
             return False
-        old = {p for p, _ in self.photos}
         self.photos = photos
         self.generation += 1
-        for child in self.flow.get_children():
-            self.flow.remove(child)
-        keep = {}
+        now = dict(photos)
+        for path, tile in list(self.tiles.items()):
+            if now.get(path) != tile.mtime:     # gone, or changed
+                child = tile.get_parent()
+                if child is not None:
+                    self.flow.remove(child)
+                del self.tiles[path]
         pending = []
-        for path, mtime in photos:
-            tile = self.tiles.get(path) if path in old else None
-            if tile is None or tile.mtime != mtime:
-                tile = Gtk.Overlay()
-                tile.mtime = mtime
-                tile.img = Gtk.Image()
-                tile.img.set_size_request(THUMB, THUMB)
-                tile.img.get_style_context().add_class("thumb")
-                tile.add(tile.img)
-                tile.badge = Gtk.Label(label="QR")
-                tile.badge.get_style_context().add_class("qrbadge")
-                tile.badge.set_halign(Gtk.Align.END)
-                tile.badge.set_valign(Gtk.Align.START)
-                tile.badge.set_margin_top(6)
-                tile.badge.set_margin_end(6)
-                tile.badge.set_no_show_all(True)
-                tile.add_overlay(tile.badge)
-                pending.append((path, mtime, tile.img))
-            else:
-                tile.get_parent() and tile.get_parent().remove(tile)
-            tile.path = path
+        for i, (path, mtime) in enumerate(photos):     # newest first
+            tile = self.tiles.get(path)
+            if tile is None:
+                tile = self.make_tile(path, mtime)
+                self.flow.insert(tile, i)
+                tile.get_parent().show_all()
+                self.tiles[path] = tile
+                pending.append((path, mtime, tile))
+            elif not tile.has_thumb:
+                # its thumbnail was still to come from a scan that this one
+                # replaces (a delete during the first thumbnailing)
+                pending.append((path, mtime, tile))
             tile.badge.set_visible(bool(self.qr_codes(path, mtime)))
-            keep[path] = tile
-            self.flow.add(tile)
-        self.tiles = keep
-        self.flow.show_all()
+        keep = self.tiles
+        self.selected &= set(keep)  # deleted elsewhere: no longer picked
+        self.show_picks()
         self.qr_enqueue([(p, m) for p, m in photos if self.qr_codes(p, m) is None])
         self.empty.set_visible(not photos)
         self.set_title("Photos (%d)" % len(photos) if photos else "Photos")
+        self.show_count()
         if pending:
             gen = self.generation
             threading.Thread(target=self.thumb_worker, args=(pending, gen), daemon=True).start()
@@ -501,6 +637,9 @@ class Gallery(Gtk.Window):
         tile = self.tiles.get(path)
         if tile is not None and tile.mtime == mtime:
             tile.badge.set_visible(bool(codes))
+            if self.filter == "qr":
+                self.flow.invalidate_filter()
+                self.show_count()
         if path == self.current() and self.stack.get_visible_child_name() == "viewer":
             self.show_qr()
         return False
@@ -569,16 +708,18 @@ class Gallery(Gtk.Window):
                                         self.caption.set_text(old), False)[1])
 
     def thumb_worker(self, jobs, gen):
-        for path, mtime, img in jobs:
+        for path, mtime, tile in jobs:
             if gen != self.generation:
-                return
+                return              # a newer scan asks for what's left
             pix = make_thumb(path, mtime)
             if pix:
-                GLib.idle_add(self.set_thumb, img, pix, gen)
+                GLib.idle_add(self.set_thumb, tile, mtime, pix)
 
-    def set_thumb(self, img, pix, gen):
-        if gen == self.generation:
-            img.set_from_pixbuf(pix)
+    def set_thumb(self, tile, mtime, pix):
+        # still right for the tile, whichever scan asked for it
+        if tile.mtime == mtime:
+            tile.img.set_from_pixbuf(pix)
+            tile.has_thumb = True
         return False
 
     def watch(self):
@@ -602,9 +743,138 @@ class Gallery(Gtk.Window):
             GLib.source_remove(self.refresh_pending)
         self.refresh_pending = GLib.timeout_add(600, self.rescan)
 
+    # ---- the filter (All, Camera, With QR) ----
+
+    def shown(self, path, mtime):
+        if self.filter == "camera":
+            return os.path.dirname(path) == os.path.join(PICTURES, "Camera")
+        if self.filter == "qr":
+            return bool(self.qr_codes(path, mtime))
+        return True
+
+    def filter_tile(self, child):
+        tile = child.get_child()
+        return self.shown(tile.path, tile.mtime)
+
+    def on_filter(self, button, key):
+        if button.get_active():
+            self.filter = key
+            self.flow.invalidate_filter()
+            if self.selecting:
+                self.show_picks()
+            else:
+                self.show_count()
+
+    def show_count(self):
+        if self.selecting:          # the header says what's picked
+            return
+        n = sum(1 for p, m in self.photos if self.shown(p, m))
+        where = {"all": "All photos", "camera": "Camera", "qr": "With QR codes"}[self.filter]
+        titan_ui.set_subtitle(self.header_sub, "%s · %d photo%s" % (where, n, "" if n == 1 else "s"))
+
     # ---- viewer ----
 
+    # ---- selecting (hold a photo, or Select) ----
+
+    def on_hold(self, gesture, x, y):
+        child = self.flow.get_child_at_pos(int(x), int(y))
+        if child is None:
+            return
+        # the hold is ours: the flow box doesn't also take it as a tap
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self.held = True
+        if shutil.which("titan-vibrate"):
+            subprocess.Popen(["titan-vibrate", "tick"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        path = child.get_child().path
+        if not self.selecting:
+            self.start_selecting()
+        self.selected.add(path)
+        self.show_picks()
+
+    def start_selecting(self):
+        self.selecting = True
+        self.show_picks()
+
+    def stop_selecting(self):
+        self.selecting = False
+        self.selected.clear()
+        self.show_picks()
+
+    def select_all(self):
+        shown = {p for p, m in self.photos if self.shown(p, m)}
+        if shown <= self.selected:
+            self.selected -= shown          # all picked already: none
+        else:
+            self.selected |= shown
+        self.show_picks()
+
+    def go_back(self):
+        """the header's back button: out of selecting, or close"""
+        if self.selecting:
+            self.stop_selecting()
+        else:
+            self.destroy()
+
+    def show_picks(self):
+        """the tiles' pick marks and the header, for the selection"""
+        for path, tile in self.tiles.items():
+            on = path in self.selected
+            tile.pick.set_visible(self.selecting)
+            tile.pick.set_text("✓" if on else "")
+            ctx = tile.pick.get_style_context()
+            (ctx.add_class if on else ctx.remove_class)("on")
+            tile.img.set_opacity(0.6 if on else 1.0)
+        self.select_btn.set_visible(not self.selecting)
+        self.all_btn.set_visible(self.selecting)
+        self.del_btn.set_visible(self.selecting)
+        self.del_btn.set_sensitive(bool(self.selected))
+        if self.selecting:
+            n = len(self.selected)
+            shown = {p for p, m in self.photos if self.shown(p, m)}
+            self.all_btn.set_label("None" if shown and shown <= self.selected else "All")
+            self.header_title.set_text("%d selected" % n if n else "Select photos")
+            titan_ui.set_subtitle(self.header_sub, "Tap photos to pick them")
+        else:
+            self.header_title.set_text("Photos")
+            self.show_count()
+
+    def delete_selected(self):
+        paths = sorted(self.selected)
+        if not paths:
+            return
+        n = len(paths)
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True,
+                                message_type=Gtk.MessageType.QUESTION,
+                                buttons=Gtk.ButtonsType.NONE,
+                                text="Delete %d photo%s?" % (n, "" if n == 1 else "s"))
+        dlg.format_secondary_text("They go to the trash." if n > 1 else "It goes to the trash.")
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Delete", Gtk.ResponseType.OK)
+        resp = dlg.run()
+        dlg.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+        failed = 0
+        for path in paths:
+            try:
+                trash(path)
+            except GLib.Error:
+                failed += 1
+        self.stop_selecting()
+        self.rescan()
+        if failed:
+            titan_ui.set_subtitle(self.header_sub, "%d could not be deleted" % failed)
+
     def on_tile(self, flow, child):
+        if self.held:               # the end of a hold, not a tap
+            self.held = False
+            return
+        if self.selecting:
+            path = child.get_child().path
+            self.selected ^= {path}
+            self.show_picks()
+            return
         paths = [p for p, _ in self.photos]
         self.open_viewer(paths.index(child.get_child().path))
 
@@ -759,7 +1029,7 @@ class Gallery(Gtk.Window):
         if resp != Gtk.ResponseType.OK:
             return
         try:
-            Gio.File.new_for_path(path).trash(None)
+            trash(path)
         except GLib.Error as e:
             self.caption.set_text("Delete failed: %s" % e.message)
             return
@@ -770,6 +1040,12 @@ class Gallery(Gtk.Window):
     def on_key(self, win, ev):
         name = Gdk.keyval_name(ev.keyval) or ""
         if self.stack.get_visible_child_name() != "viewer":
+            if name in ("Escape", "XF86Back"):
+                self.go_back()
+                return True
+            if name == "Delete" and self.selecting:
+                self.delete_selected()
+                return True
             return False
         if name in ("Left", "Right"):
             self.step(-1 if name == "Left" else 1)
@@ -795,6 +1071,7 @@ def main():
     except OSError:
         return
     win = Gallery(sys.argv[1] if len(sys.argv) > 1 else None)
+    titan_ui.install(win)
     win.show_all()
     win.empty.set_visible(not win.photos)
     win.maximize()

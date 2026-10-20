@@ -49,6 +49,7 @@ import gi  # noqa: E402
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
+import titan_ui  # noqa: E402  (the TitanWater look: header, membrane)
 
 FM_DEV = "/dev/fm"
 SPK_HOLD = ["spk-hold", "0", "21", "48000"]     # hostless FM_I2S_Playback
@@ -297,33 +298,30 @@ class Tuner:
 CSS = b"""
 * { font-size: 22px; }
 .freq { font-size: 72px; font-weight: bold; }
-.freq.off { color: #6a6a6a; }
-.unit { font-size: 30px; color: #9a9a9a; }
-.badge { font-size: 18px; border-radius: 8px; padding: 2px 10px;
-         background: #33363d; color: #8a8a8a; }
-.badge.on { background: #2f6a3a; color: white; }
-.state { font-size: 18px; color: #9a9a9a; }
-.state.err { color: #d85050; }
-.section { font-size: 16px; color: #9a9a9a; font-weight: bold; }
+.freq.off { color: rgba(255, 255, 255, 0.45); }
+.unit { font-size: 30px; color: @titan_dim; }
+.badge { font-size: 18px; }
+.state { font-size: 18px; color: @titan_dim; }
+.state.err { color: @titan_danger; }
+.section { font-size: 16px; color: @titan_dim; font-weight: bold; }
 .station { font-size: 26px; font-weight: bold; }
-.station.current { color: #58a0e0; }
-.detail { font-size: 16px; color: #9a9a9a; }
+.station.current { color: @titan_accent; }
+.detail { font-size: 16px; color: @titan_dim; }
 .ps { font-size: 24px; font-weight: bold; }
-.rt { font-size: 17px; color: #5a5a5a; }
-.rowps { font-size: 20px; color: #3a6ea5; font-weight: bold; }
-.empty { font-size: 18px; color: #8a8a8a; }
+.rt { font-size: 17px; color: @titan_dim; }
+.rowps { font-size: 20px; color: @titan_accent; font-weight: bold; }
+.empty { font-size: 18px; color: @titan_dim; }
 button { min-height: 56px; padding: 0 14px; }
 .nav { min-width: 92px; }
 .power { min-width: 110px; }
-.power:checked { background: #3a7a3a; color: white; }
 .fav { min-width: 72px; }
-.fav:checked { color: #f0c040; }
-.rowfav { min-width: 64px; min-height: 56px; color: #f0c040; }
+.fav:checked { color: #B07A00; }
+.rowfav { min-width: 64px; min-height: 56px; color: @titan_accent; }
 scale trough { min-height: 12px; border-radius: 6px; }
 scale slider { min-width: 40px; min-height: 40px; border-radius: 20px; }
 levelbar block { min-height: 14px; }
-levelbar block.filled { background: #5aba5a; }
-levelbar block.filled.low { background: #c89030; }
+levelbar block.filled { background-color: rgba(255, 255, 255, 0.88); }
+levelbar block.filled.low { background-color: @titan_accent; }
 list row { padding: 4px 12px; }
 progressbar trough, progressbar progress { min-height: 10px; }
 """
@@ -367,16 +365,20 @@ class RadioApp(Gtk.Window):
 
     def build(self):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        root.set_border_width(10)
+        root.set_border_width(12)
         self.add(root)
 
-        # frequency + favorite
-        top = Gtk.Box(spacing=8)
-        root.pack_start(top, False, False, 0)
-        self.fav = icon_button("non-starred-symbolic", "fav", toggle=True, size=40)
+        # the design's header, the favourite star its action
+        self.fav = icon_button("non-starred-symbolic", "fav", toggle=True, size=32)
         self.fav.set_valign(Gtk.Align.CENTER)
         self.fav.connect("toggled", self.on_fav)
-        top.pack_end(self.fav, False, False, 0)
+        header, _, _ = titan_ui.header("Radio", "FM", actions=[self.fav])
+        root.pack_start(header, False, False, 0)
+        titan_ui.escape_closes(self)
+
+        # the frequency
+        top = Gtk.Box(spacing=8)
+        root.pack_start(top, False, False, 0)
         freqbox = Gtk.Box(spacing=8)
         freqbox.set_halign(Gtk.Align.CENTER)
         top.pack_start(freqbox, True, True, 0)
@@ -918,6 +920,7 @@ def main():
     win = RadioApp()
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda w=win: w.destroy() or False)
+    titan_ui.install(win)
     win.show_all()
     win.maximize()
     Gtk.main()

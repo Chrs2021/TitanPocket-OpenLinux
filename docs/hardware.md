@@ -127,3 +127,57 @@ check which end sound comes from. See [audio.md](audio.md).
   
   Patterns are timed in userspace and the command returns when they end
   (`double` takes 246 ms, `notify` 457 ms).
+
+## Motion sensors
+
+The accelerometer, gyroscope and magnetometer (i2c1 0x0c) are read by the
+SCP's sensor hub; the kernel's MediaTek `sensors-1.0` framework
+(`accelhub`, `gyrohub`, `maghub`) passes the readings on. For each, with
+`<s>` = `acc`, `gyro` or `mag`:
+
+- `/dev/m_<s>_misc`: packed `struct sensor_event` records (int64 timestamp,
+  handle, flush_action, status, reserved, int32 word[6]); x, y, z in
+  word[0..2], `flush_action` 0 for data.
+- `/sys/class/sensor/m_<s>_misc/<s>batch`: `handle,flag,period_ns,latency_ns`.
+- `/sys/class/sensor/m_<s>_misc/<s>active`: write 1/0. **Reading it gives
+  the divisor to SI units:** acc 1000 (m/s²), gyro 7505747 (rad/s), mag 100
+  (µT).
+
+Axes are Android's: x right, y to the top of the screen, z out of it. The
+accelerometer reads +9.8 on the axis pointing up. Measured rates: acc ~60 Hz
+at a 50 Hz request, gyro ~93 Hz at 100 Hz, mag 50 Hz.
+
+**Calibration (2026-10-18):** on Linux both the gyro and the magnetometer
+report status 0 (uncalibrated); Android's HAL loaded the factory
+calibration from NVRAM.
+- The gyro's first ~0.5 s after enabling swing by up to 1 rad/s. In one test
+  it then sat at (−4.4, −7.8, −0.8) °/s at rest; later the offset was near
+  zero, so the hub seems to correct it after a while.
+- The magnetometer read 96 µT at first (a hard-iron offset), later a
+  plausible 40 µT, still with status 0. The hub seems to start applying its
+  own calibration during a session without saying so.
+
+The magnetometer's axes match the accelerometer's: turned flat in the
+hand, its heading tracked the gyro's yaw in the right direction. Avoid the
+fusion device (`/dev/m_fusion_misc`, sensor IDs such as 13 for the
+uncalibrated magnetometer and 2 for orientation): enabling those left the
+SCP's IPI busy (`scp_ipi_send: ... mutex busy`) and the writer blocked in
+`nanohub_ipi_read` until it was killed.
+
+`titan_sensors.py` (`/usr/local/lib/python3.11/dist-packages`) wraps all of
+this for our apps: `Sensor` (start, read in SI units, stop; `keep_alive()`
+turns a sensor back on when another program, e.g. the lock screen, switched
+it off), `GyroBias` (learns the offset whenever the phone lies still) and
+`MagCal` (a least-squares sphere fit of readings from many directions; kept
+only when tight, and used only when it explains the field better than the
+raw readings). Both are saved in `~/.local/share/titan-sensors/`.
+**Maze** and **Compass** use it (desktop.md).
+
+## microSD card
+
+`/dev/mmcblk0` (28.8 GB, one FAT32 partition, label `TITAN`; formatted by
+Android as portable storage, its empty Android folders kept). It holds
+**Pictures**: `titan-usb-storage.service` mounts it at `/media/sdcard` and
+binds its `Pictures` folder on `~/Pictures`, and lends it to a computer as a
+USB drive on request (desktop.md).
+
