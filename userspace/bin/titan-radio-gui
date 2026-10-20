@@ -19,8 +19,16 @@ signal meter, reports raw * 6 / 16 (the driver's conversion, shown as dBm by
 MediaTek's app), so the threshold is about -111 there; scan results are
 converted the same way.
 
-The last frequency, the volume, the favorites and the last scan are kept in
-~/.config/titan-radio/state.json.
+RDS: the driver parses RDS itself (FM_IOCTL_RDS_ONOFF turns it on); read()
+on /dev/fm returns its struct rds_t (688 bytes on arm64, offsets below) when
+something changed, else nothing, so the status timer polls it. Shown: the
+station name (PS, the twice-confirmed copy PS_Data.PS[3]), the radio text
+(RT_Data.TextData[3], TextLength), the programme type (RBDS names in the
+Americas, RDS names elsewhere) and, for North American stations whose PI
+code follows NRSC-4, the call letters.
+
+The last frequency, the volume, the favorites, the last scan and the station
+names RDS reported are kept in ~/.config/titan-radio/state.json.
 
 Keys: Left/Right step 100 kHz, Up/Down seek, Space power, F favorite.
 """
@@ -78,6 +86,55 @@ FM_IOCTL_GETMONOSTERO = _iowr(13)
 FM_IOCTL_PRE_SEARCH = _iowr(45, 4)
 FM_IOCTL_RESTORE_SEARCH = _iowr(46, 4)
 FM_IOCTL_SOFT_MUTE_TUNE = _iowr(63)
+FM_IOCTL_RDS_ONOFF = _iowr(18)
+
+# struct rds_t (fm_rds.h) on arm64
+RDS_SIZE = 688
+RDS_PI, RDS_PTY = 24, 27
+RDS_PS = 248 + 3 * 8            # PS_Data.PS[3]
+RDS_RT = 290 + 3 * 64           # RT_Data.TextData[3]
+RDS_RT_LEN = 548                # RT_Data.TextLength
+RDS_EVENT = 554                 # event_status
+RDS_EV_PI, RDS_EV_PTY, RDS_EV_PS, RDS_EV_RT = 0x2, 0x4, 0x8, 0x40
+
+PTY_RBDS = ["", "News", "Information", "Sports", "Talk", "Rock", "Classic Rock",
+            "Adult Hits", "Soft Rock", "Top 40", "Country", "Oldies", "Soft",
+            "Nostalgia", "Jazz", "Classical", "R&B", "Soft R&B", "Language",
+            "Religious Music", "Religious Talk", "Personality", "Public", "College",
+            "Spanish Talk", "Spanish Music", "Hip Hop", "", "", "Weather",
+            "Emergency Test", "Emergency"]
+PTY_RDS = ["", "News", "Current Affairs", "Information", "Sport", "Education",
+           "Drama", "Culture", "Science", "Varied", "Pop Music", "Rock Music",
+           "Easy Listening", "Light Classical", "Serious Classical", "Other Music",
+           "Weather", "Finance", "Children's", "Social Affairs", "Religion",
+           "Phone-In", "Travel", "Leisure", "Jazz", "Country", "National Music",
+           "Oldies", "Folk", "Documentary", "Alarm Test", "Alarm"]
+
+
+def rbds_region():
+    """North America uses RBDS programme types (and PI call letters)"""
+    try:
+        tz = os.path.realpath("/etc/localtime")
+    except OSError:
+        return False
+    return "/America/" in tz or "/US/" in tz or "/Canada/" in tz
+
+
+def call_letters(pi):
+    """NRSC-4 call letters from a North American PI code, or None"""
+    if 0x1000 <= pi <= 0x54a7:
+        prefix, n = "K", pi - 0x1000
+    elif 0x54a8 <= pi <= 0x994f:
+        prefix, n = "W", pi - 0x54a8
+    else:
+        return None
+    return prefix + chr(65 + n // 676) + chr(65 + n % 676 // 26) + chr(65 + n % 26)
+
+
+def rds_text(raw):
+    """RDS characters (basic set ~ ASCII) to a clean string"""
+    t = "".join(chr(b) if 0x20 <= b < 0x7f else " " for b in raw)
+    return " ".join(t.split())
 
 FM_BAND_UE, FM_SPACE_100K = 1, 1
 TUNE_PARM = "=BBBBBxH"      # err, band, space, hilo, deemphasis, freq
@@ -158,6 +215,23 @@ class Tuner:
         with self.lock:
             self._tune(FM_IOCTL_TUNE, freq)
 
+    def rds_on(self, on=True):
+        with self.lock:
+            buf = bytearray(struct.pack("=H", 1 if on else 0)) + bytearray(6)
+            fcntl.ioctl(self.fd, FM_IOCTL_RDS_ONOFF, buf, True)
+
+    def read_rds(self):
+        """the driver's struct rds_t if something changed, else None"""
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            data = os.read(self.fd, RDS_SIZE)
+        except OSError:
+            data = b""
+        finally:
+            self.lock.release()
+        return data if len(data) == RDS_SIZE else None
+
     def chip_id(self):
         with self.lock:
             buf = bytearray(8)
@@ -222,7 +296,7 @@ class Tuner:
 
 CSS = b"""
 * { font-size: 22px; }
-.freq { font-size: 96px; font-weight: bold; }
+.freq { font-size: 72px; font-weight: bold; }
 .freq.off { color: #6a6a6a; }
 .unit { font-size: 30px; color: #9a9a9a; }
 .badge { font-size: 18px; border-radius: 8px; padding: 2px 10px;
@@ -234,8 +308,11 @@ CSS = b"""
 .station { font-size: 26px; font-weight: bold; }
 .station.current { color: #58a0e0; }
 .detail { font-size: 16px; color: #9a9a9a; }
+.ps { font-size: 24px; font-weight: bold; }
+.rt { font-size: 17px; color: #5a5a5a; }
+.rowps { font-size: 20px; color: #3a6ea5; font-weight: bold; }
 .empty { font-size: 18px; color: #8a8a8a; }
-button { min-height: 64px; padding: 0 14px; }
+button { min-height: 56px; padding: 0 14px; }
 .nav { min-width: 92px; }
 .power { min-width: 110px; }
 .power:checked { background: #3a7a3a; color: white; }
@@ -276,6 +353,9 @@ class RadioApp(Gtk.Window):
         self.gain_db = max(GAIN_DB_MIN, min(GAIN_DB_MAX, st.get("gain_db", GAIN_DB_DEFAULT)))
         self.favorites = sorted({clamp_freq(f) for f in st.get("favorites", [])})
         self.stations = [(clamp_freq(f), r) for f, r in st.get("stations", [])]
+        self.names = {int(f): n for f, n in st.get("names", {}).items()}
+        self.rbds = rbds_region()
+        self.rds = {}
 
         self.build()
         self.show_freq()
@@ -286,8 +366,8 @@ class RadioApp(Gtk.Window):
     # ---- layout ----
 
     def build(self):
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        root.set_border_width(14)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        root.set_border_width(10)
         self.add(root)
 
         # frequency + favorite
@@ -306,10 +386,28 @@ class RadioApp(Gtk.Window):
         unit = Gtk.Label(label="MHz")
         unit.get_style_context().add_class("unit")
         unit.set_valign(Gtk.Align.END)
-        unit.set_margin_bottom(18)
+        unit.set_margin_bottom(12)
         freqbox.pack_start(unit, False, False, 0)
 
         # signal meter, stereo badge, state
+        # RDS: station name, call letters / programme type, radio text
+        rdsbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        root.pack_start(rdsbox, False, False, 0)
+        line = Gtk.Box(spacing=10)
+        line.set_halign(Gtk.Align.CENTER)
+        rdsbox.pack_start(line, False, False, 0)
+        self.ps_label = Gtk.Label()
+        self.ps_label.get_style_context().add_class("ps")
+        line.pack_start(self.ps_label, False, False, 0)
+        self.pty_label = Gtk.Label()
+        self.pty_label.get_style_context().add_class("detail")
+        line.pack_start(self.pty_label, False, False, 0)
+        self.rt_label = Gtk.Label()
+        self.rt_label.get_style_context().add_class("rt")
+        self.rt_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.rt_label.set_max_width_chars(48)
+        rdsbox.pack_start(self.rt_label, False, False, 0)
+
         sig = Gtk.Box(spacing=10)
         root.pack_start(sig, False, False, 0)
         self.meter = Gtk.LevelBar()
@@ -420,7 +518,8 @@ class RadioApp(Gtk.Window):
 
     def save_state(self):
         st = {"freq": self.freq, "gain_db": self.gain_db,
-              "favorites": self.favorites, "stations": self.stations}
+              "favorites": self.favorites, "stations": self.stations,
+              "names": {str(f): n for f, n in self.names.items()}}
         try:
             os.makedirs(STATE_DIR, exist_ok=True)
             tmp = STATE_FILE + ".tmp"
@@ -450,6 +549,55 @@ class RadioApp(Gtk.Window):
         for row in self.listbox.get_children():
             ctx = row.name_label.get_style_context()
             (ctx.add_class if row.freq == self.freq else ctx.remove_class)("current")
+
+    def clear_rds(self):
+        self.rds = {}
+        self.show_rds()
+
+    def show_rds(self):
+        r = self.rds
+        self.ps_label.set_text(r.get("ps", ""))
+        extra = []
+        if r.get("pi") and self.rbds:
+            cl = call_letters(r["pi"])
+            if cl:
+                extra.append(cl)
+        pty = r.get("pty", 0)
+        names = PTY_RBDS if self.rbds else PTY_RDS
+        if 0 < pty < len(names) and names[pty]:
+            extra.append(names[pty])
+        self.pty_label.set_text(" · ".join(extra))
+        self.rt_label.set_text(r.get("rt", ""))
+
+    def poll_rds(self):
+        data = self.tuner.read_rds()
+        if not data:
+            return
+        ev = struct.unpack_from("=H", data, RDS_EVENT)[0]
+        pi = struct.unpack_from("=H", data, RDS_PI)[0]
+        changed = False
+        if pi and (ev & RDS_EV_PI or "pi" not in self.rds):
+            self.rds["pi"] = pi
+            changed = True
+        if ev & RDS_EV_PTY or ("pty" not in self.rds and data[RDS_PTY]):
+            self.rds["pty"] = data[RDS_PTY] & 0x1f
+            changed = True
+        ps = rds_text(data[RDS_PS:RDS_PS + 8])
+        if ps and (ev & RDS_EV_PS or "ps" not in self.rds):
+            self.rds["ps"] = ps
+            changed = True
+            if self.names.get(self.freq) != ps:
+                self.names[self.freq] = ps
+                self.save_state()
+                self.refresh_list()
+        if ev & RDS_EV_RT:
+            n = min(data[RDS_RT_LEN], 64)
+            rt = rds_text(data[RDS_RT:RDS_RT + n])
+            if rt:
+                self.rds["rt"] = rt
+                changed = True
+        if changed:
+            self.show_rds()
 
     def show_signal(self, rssi, stereo):
         self.rssi_label.set_text("" if rssi is None else "%d dBm" % rssi)
@@ -484,6 +632,10 @@ class RadioApp(Gtk.Window):
         name.get_style_context().add_class("station")
         box.pack_start(name, False, False, 0)
         row.name_label = name
+        if self.names.get(freq):
+            ps = Gtk.Label(label=self.names[freq], xalign=0)
+            ps.get_style_context().add_class("rowps")
+            box.pack_start(ps, False, False, 0)
         if rssi is not None:
             d = Gtk.Label(label="%d dBm" % rssi, xalign=0)
             d.get_style_context().add_class("detail")
@@ -518,6 +670,10 @@ class RadioApp(Gtk.Window):
             self.tuner.open()
             self.tuner.power_up(self.freq)
             chip = self.tuner.chip_id()
+            try:
+                self.tuner.rds_on()
+            except OSError:
+                pass        # no RDS: the radio still plays
         except (OSError, subprocess.SubprocessError) as e:
             self.power_off()
             msg = getattr(e, "strerror", None) or str(e)
@@ -544,6 +700,7 @@ class RadioApp(Gtk.Window):
                 self.hold.kill()
             self.hold = None
         self.show_signal(None, False)
+        self.clear_rds()
         self.show_freq()
 
     def sync_power(self, on):
@@ -560,6 +717,8 @@ class RadioApp(Gtk.Window):
 
     def tune_to(self, freq):
         freq = clamp_freq(freq)
+        if freq != self.freq:
+            self.clear_rds()
         self.freq = freq
         self.show_freq()
         self.save_state()
@@ -625,6 +784,7 @@ class RadioApp(Gtk.Window):
         start = self.freq
 
         def done(found):
+            self.clear_rds()
             if found:
                 self.freq = found
                 self.set_state("")
@@ -725,6 +885,8 @@ class RadioApp(Gtk.Window):
                 st = None
             if st:
                 self.show_signal(*st)
+            if not self.busy():
+                self.poll_rds()
         return True
 
     def on_key(self, win, ev):

@@ -20,6 +20,16 @@
  * blanking, plus read-only horizontal blanking and pixel rate; the rear one
  * also its focus motor (FOCUS_ABSOLUTE).
  *
+ * Autofocus statistics: while the rear camera streams, CAM A (MediaTek's ISP
+ * pass 1) runs beside CAMSV on the same seninf output in statistics-only
+ * mode: TG -> DMX -> SGG1 -> AF, written by its AFO DMA (16 x 12 blocks of 40
+ * bytes, the stock default AF configuration; docs/camera.md, "Hardware AF
+ * statistics"). /sys/.../rear/af_stats returns the latest set; af_pgn sets
+ * SGG1's gain in front of the AF filters, by default automatically: the AF
+ * filter outputs scale with 1/gain and saturate when the gain is too small
+ * for the scene, so the gain follows the scene brightness (the blocks' pixel
+ * sums, word 3, measured before SGG1).
+ *
  * Everything is driven from here, without device tree changes: sensor power
  * through the BSP imgsensor node's pin states and PMIC regulators, clocks
  * straight from their providers, buffers mapped through the M4U. Bring-up
@@ -44,6 +54,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 #include <media/media-device.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -59,6 +70,7 @@
 #include "../camcap/seninf_reg.h"
 #include "../camcap/ov8865_regs.h"
 #include "../camcap/ov16880_regs.h"
+#include "../camcap/af_regs_rear.h"
 
 /* 5.8's camera location control; libcamera reads it for front/back */
 #ifndef V4L2_CID_CAMERA_ORIENTATION
@@ -119,6 +131,7 @@ struct sensor_mode {
 	u32 width, height;
 	u32 hts, vts;		/* stock line length and frame length */
 	u32 fps;		/* measured with the stock timing */
+	bool pix2;		/* seninf and CAMSV move 2 pixels per clock */
 };
 
 struct sensor_desc {
@@ -143,9 +156,10 @@ struct sensor_desc {
 };
 
 #define TBL(t) t, ARRAY_SIZE(t)
-/* 1-pixel mode only so far; the rear 4672x3504 mode needs 2-pixel mode */
+/* the rear full-resolution mode is too fast for 1 pixel per clock */
 static const struct sensor_mode ov16880_modes[] = {
 	{ TBL(ov16880_preview), 2336, 1752, 2512, 3824, 30 },
+	{ TBL(ov16880_capture), 4672, 3504, 5024, 3824, 30, true },
 };
 static const struct sensor_mode ov8865_modes[] = {
 	{ TBL(ov8865_preview), 1632, 1224, 1923, 1280, 30 },
@@ -205,7 +219,7 @@ struct titan_cam {
 	struct titan_sensor sensor[NSENSORS];
 	struct titan_sensor *active;	/* the streaming sensor */
 
-	void __iomem *seninf, *mipi_rx, *camsv;
+	void __iomem *seninf, *mipi_rx, *camsv, *cama;
 	int irq;
 	struct pinctrl *pctl;
 	struct clk *mclk_parent;
@@ -221,6 +235,17 @@ struct titan_cam {
 	struct list_head queued;
 	struct titan_buf *cur, *next;	/* in the DMA now / programmed for the next frame */
 	unsigned int scratch_mva;	/* one page: CAMSV's frame headers */
+	/* AF statistics (CAM A AFO) */
+	struct page *afo_pages[2];
+	struct sg_table afo_sgt;
+	unsigned int afo_mva;
+	void *afo_vaddr;		/* uncached */
+	struct mutex af_lock;
+	bool af_running;
+	u32 af_pgn;
+	bool af_pgn_auto;
+	unsigned long af_pgn_changed;	/* jiffies */
+	struct delayed_work af_work;
 	struct sg_table scratch_sgt;
 	struct page **scratch_pages;
 	int scratch_npages;
@@ -812,7 +837,7 @@ static void rmw(void __iomem *a, u32 keep, u32 set)
 	writel((readl(a) & keep) | set, a);
 }
 
-static void seninf_start(struct titan_cam *tc, int p)
+static void seninf_start(struct titan_cam *tc, int p, bool pix2)
 {
 	void __iomem *top = tc->seninf;
 	void __iomem *s = tc->seninf + 0x1000 * port_seninf[p];
@@ -895,7 +920,9 @@ static void seninf_start(struct titan_cam *tc, int p)
 	rmw(top + SENINF1_MUX_CTRL, 0xffff0fff, 0x8000);
 	rmw(top + SENINF1_MUX_CTRL_EXT, 0xfffffffc, 0x1);
 	rmw(top + SENINF1_MUX_CTRL_EXT, 0xffffffef, 0);
-	rmw(top + SENINF1_MUX_CTRL, 0xfffffeff, 0);
+	/* pixel mode (the HAL's setSeninfMuxCtrl): 1 pixel per clock = bit 8
+	 * and EXT bit 4 clear, 2 = bit 8, 4 = EXT bit 4 */
+	rmw(top + SENINF1_MUX_CTRL, 0xfffffeff, pix2 ? 0x100 : 0);
 	rmw(top + SENINF1_MUX_CTRL, 0xcfffffff, 0x20000000);
 	rmw(top + SENINF1_MUX_CTRL, 0xf000ffff, 0x6df0000);
 	rmw(top + SENINF1_MUX_CTRL, 0xfffff9ff, 0);
@@ -950,7 +977,7 @@ static void sv_rmw(struct titan_cam *tc, u32 reg, u32 keep, u32 set)
 	writel((readl(tc->camsv + reg) & keep) | set, tc->camsv + reg);
 }
 
-static void camsv_start(struct titan_cam *tc, unsigned int first)
+static void camsv_start(struct titan_cam *tc, unsigned int first, bool pix2)
 {
 	int i;
 
@@ -977,6 +1004,14 @@ static void camsv_start(struct titan_cam *tc, unsigned int first)
 		writel(1, tc->camsv + SV_FMT_SEL);
 		sv_rmw(tc, SV_PAK, ~0x37U, 0x1);
 	}
+	/*
+	 * Pixel mode, from the HAL (isp_function_camsv.cpp): the packer's
+	 * PAK bits 4-5 (0 = 1, 1 = 2, 2 = 4 pixels), the TG's SEN_MODE bit 1
+	 * (2 pixels; bit 13 too for 4) and the IMGO bus size in STRIDE bits
+	 * 16-18 (BusSizeCal: 1, 3, 7 for raw formats).
+	 */
+	if (pix2)
+		sv_rmw(tc, SV_PAK, ~0x30U, 0x10);
 	writel(SV_INT_SOF | SV_INT_DONE | SV_INT_IMGO_ERR | SV_INT_OVERRUN,
 	       tc->camsv + SV_INT_EN);
 	writel(0, tc->camsv + SV_DMA_EN);
@@ -985,7 +1020,7 @@ static void camsv_start(struct titan_cam *tc, unsigned int first)
 	sv_rmw(tc, 0x018, ~0U, 0x61000000);
 
 	/* TG: the whole frame, continuous (single-frame + FBC writes nothing) */
-	sv_rmw(tc, SV_TG_SEN_MODE, ~0x60003U, 0x10000);
+	sv_rmw(tc, SV_TG_SEN_MODE, ~0x62003U, 0x10000 | (pix2 ? 0x2 : 0));
 	sv_rmw(tc, SV_TG_VF_CON, ~0x2U, 0);
 	writel(tc->width << 16, tc->camsv + SV_TG_GRAB_PXL);
 	writel(tc->height << 16, tc->camsv + SV_TG_GRAB_LIN);
@@ -993,7 +1028,7 @@ static void camsv_start(struct titan_cam *tc, unsigned int first)
 	/* IMGO DMA; the buffer address is switched at every start of frame */
 	writel(tc->width * tc->fmt->bytes - 1, tc->camsv + SV_IMGO_XSIZE);
 	writel(tc->height - 1, tc->camsv + SV_IMGO_YSIZE);
-	writel(tc->stride | 0x1010000, tc->camsv + SV_IMGO_STRIDE);
+	writel(tc->stride | 0x1000000 | (pix2 ? 3 : 1) << 16, tc->camsv + SV_IMGO_STRIDE);
 	writel(0, tc->camsv + SV_IMGO_CROP);
 	writel(0x80000080, tc->camsv + SV_IMGO_CON);
 	writel(0x20002, tc->camsv + SV_IMGO_CON2);
@@ -1071,6 +1106,300 @@ static irqreturn_t camsv_irq(int irq, void *data)
 	spin_unlock_irqrestore(&tc->qlock, flags);
 	return IRQ_HANDLED;
 }
+
+/* ------------------------------------------------------------------ */
+/* CAM A (ISP pass 1): autofocus statistics only                       */
+
+/*
+ * Sequence from the HAL (CAM_TOP_CTRL, CAM_TG_CTRL, CAM_DMX_CTRL, DMAO_B,
+ * ISP_MGR_AF_STAT_CONFIG, TuningMgrImp::enableEngine) as worked out with
+ * titan_camcap p1=1 p1af=1. The layout is CAMSV's with the blocks moved:
+ * control at 0x000, TG at 0x230, DMA at 0x1000.
+ */
+#define CAMA_BASE	0x1a004000
+#define CAMA_SIZE	0x2000
+#define CA_CTL_EN	0x004
+#define CA_CTL_DMA_EN	0x008
+#define CA_CTL_FMT_SEL	0x00c
+#define CA_CTL_SEL	0x010
+#define CA_CTL_EN2	0x018
+#define CA_INT_EN	0x020
+#define CA_SW_CTL	0x040
+#define CA_DB_EN	0x088
+#define CA_TG_SEN_MODE	0x230
+#define CA_TG_VF_CON	0x234
+#define CA_TG_GRAB_PXL	0x238
+#define CA_TG_GRAB_LIN	0x23c
+#define CA_TG_INTER_ST	0x26c		/* frame counter in the top byte */
+#define CA_DMX_CTL	0x330
+#define CA_DMX_CROP	0x334
+#define CA_DMX_VSIZE	0x338
+#define CA_SGG1_PGN	0x810
+#define CA_AFO_BASE	0x10b0
+#define CA_AFO_OFST	0x10b8
+#define CA_AFO_XSIZE	0x10c0
+#define CA_AFO_YSIZE	0x10c4
+#define CA_AFO_STRIDE	0x10c8
+#define CA_AFO_CON	0x10cc
+#define CA_AFO_CON2	0x10d0
+#define CA_AFO_CON3	0x10d4
+#define CA_EN_TG	BIT(0)
+#define CA_EN_DMX	BIT(1)
+#define CA_EN_AF	BIT(17)		/* tuning function 15 */
+#define CA_EN_SGG1	BIT(18)		/* function 14: the AF input gain/gamma */
+#define CA_EN2_SGG5	BIT(31)		/* function 22 */
+#define CA_DMA_AFO	BIT(3)
+#define M4U_PORT_CAM_AFO	64	/* larb6 port 3 */
+
+#define AF_NX		16
+#define AF_NY		12
+#define AF_BLOCK	40
+#define AFO_LINE	(AF_NX * AF_BLOCK)
+#define AFO_STRIDE	656		/* ALIGN(AFO_LINE + 1, 16) */
+#define AFO_SIZE	(AFO_STRIDE * AF_NY)
+#define AF_HDR_WORDS	8
+
+static unsigned int af_pgn_default = 0x80;
+module_param_named(af_pgn, af_pgn_default, uint, 0444);
+MODULE_PARM_DESC(af_pgn, "SGG1 gain in front of the AF filters at start (stock 0x10 saturates)");
+
+/*
+ * Automatic SGG1 gain: PGN = AF_PGN_REF x brightness / AF_W3_REF, where
+ * brightness is the mean pixel sum (word 3) of a block. Reference: 0x80 gave
+ * a clean focus curve at 23.3 per pixel (raw ~88 at 10 bits, black 64) with
+ * 146 x 146-pixel blocks. Changed only when off by more than 1/8, at most
+ * every AF_PGN_HOLD_MS, so a focus sweep sees few steps (and the app scales
+ * the filter energy by the gain anyway).
+ */
+#define AF_PGN_REF	0x80
+#define AF_W3_REF	(23300ULL * 146 * 146 / 1000)	/* per block */
+#define AF_PGN_MIN	0x20
+#define AF_PGN_MAX	0x7ff
+#define AF_PGN_HOLD_MS	500
+#define AF_WORK_MS	100
+
+static void ca_rmw(struct titan_cam *tc, u32 reg, u32 keep, u32 set)
+{
+	writel((readl(tc->cama + reg) & keep) | set, tc->cama + reg);
+}
+
+static int af_alloc(struct titan_cam *tc)
+{
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(tc->afo_pages); i++) {
+		tc->afo_pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!tc->afo_pages[i])
+			return -ENOMEM;
+	}
+	tc->afo_vaddr = vmap(tc->afo_pages, ARRAY_SIZE(tc->afo_pages), VM_MAP,
+			     pgprot_writecombine(PAGE_KERNEL));
+	if (!tc->afo_vaddr)
+		return -ENOMEM;
+	ret = sg_alloc_table_from_pages(&tc->afo_sgt, tc->afo_pages, ARRAY_SIZE(tc->afo_pages),
+					0, ARRAY_SIZE(tc->afo_pages) * PAGE_SIZE, GFP_KERNEL);
+	if (ret)
+		return ret;
+	return m4u_alloc_mva(tc->m4u_client, M4U_PORT_CAM_AFO, 0, &tc->afo_sgt,
+			     ARRAY_SIZE(tc->afo_pages) * PAGE_SIZE, M4U_PROT_RW, 0, &tc->afo_mva);
+}
+
+static void af_free(struct titan_cam *tc)
+{
+	int i;
+
+	if (tc->afo_mva && camsys_get(tc) == 0) {
+		m4u_dealloc_mva(tc->m4u_client, M4U_PORT_CAM_AFO, tc->afo_mva);
+		camsys_put(tc);
+	}
+	if (tc->afo_sgt.sgl)
+		sg_free_table(&tc->afo_sgt);
+	if (tc->afo_vaddr)
+		vunmap(tc->afo_vaddr);
+	for (i = 0; i < ARRAY_SIZE(tc->afo_pages); i++)
+		if (tc->afo_pages[i])
+			__free_page(tc->afo_pages[i]);
+}
+
+/* camsys is on (streaming) */
+static void af_start(struct titan_cam *tc, const struct sensor_mode *m)
+{
+	int i;
+
+	if (!tc->cama || !tc->afo_mva || m->width != 2336)
+		return;		/* the AF table is for the rear camera's mode */
+	mutex_lock(&tc->af_lock);
+	writel(1, tc->cama + CA_SW_CTL);	/* reset: 1, wait for 2, 4, 0 */
+	for (i = 0; i < 10000 && readl(tc->cama + CA_SW_CTL) != 2; i++)
+		udelay(1);
+	writel(4, tc->cama + CA_SW_CTL);
+	writel(0, tc->cama + CA_SW_CTL);
+
+	writel(1 << 12 | 1 << 2, tc->cama + CA_CTL_FMT_SEL);	/* TG RAW10 */
+	writel(0x060a5010, tc->cama + CA_CTL_SEL);	/* Path_sel_RAW, 2nd variant */
+	writel(CA_EN_TG | CA_EN_DMX | CA_EN_AF | CA_EN_SGG1, tc->cama + CA_CTL_EN);
+	writel(CA_EN2_SGG5, tc->cama + CA_CTL_EN2);
+	writel(0, tc->cama + CA_INT_EN);	/* MediaTek's camera-isp owns the IRQ */
+	ca_rmw(tc, 0x13b0, 0x7fffffff, 0);
+	writel(0xffffffff, tc->cama + 0x13c4);
+	writel(0, tc->cama + 0x1400);
+
+	ca_rmw(tc, CA_DMX_CTL, 0x7ff00000, 0xf0000);
+	writel((m->width - 1) << 16, tc->cama + CA_DMX_CROP);
+	writel(m->height, tc->cama + CA_DMX_VSIZE);
+
+	ca_rmw(tc, CA_TG_SEN_MODE, ~0x70003U, 0x20000);
+	ca_rmw(tc, CA_TG_VF_CON, ~0x2U, 0);
+	writel(m->width << 16, tc->cama + CA_TG_GRAB_PXL);
+	writel(m->height << 16, tc->cama + CA_TG_GRAB_LIN);
+	ca_rmw(tc, 0x25c, ~0U, 0x20);
+	ca_rmw(tc, 0x240, ~0U, 0x8000);
+
+	for (i = 0; i < ARRAY_SIZE(af_regs_2336x1752); i++)
+		writel(af_regs_2336x1752[i].val, tc->cama + af_regs_2336x1752[i].off);
+	writel(tc->af_pgn, tc->cama + CA_SGG1_PGN);
+
+	writel(AFO_LINE - 1, tc->cama + CA_AFO_XSIZE);
+	writel(AF_NY - 1, tc->cama + CA_AFO_YSIZE);
+	writel(AFO_STRIDE, tc->cama + CA_AFO_STRIDE);
+	writel(0x80000100, tc->cama + CA_AFO_CON);
+	writel(0x00800080, tc->cama + CA_AFO_CON2);
+	writel(0x00550055, tc->cama + CA_AFO_CON3);
+	writel(0, tc->cama + CA_AFO_OFST);
+	writel(tc->afo_mva, tc->cama + CA_AFO_BASE);
+	writel(1, tc->cama + CA_DB_EN);
+
+	writel(CA_DMA_AFO, tc->cama + CA_CTL_DMA_EN);
+	ca_rmw(tc, CA_TG_SEN_MODE, ~0U, 1);	/* CMOS_EN */
+	ca_rmw(tc, CA_TG_VF_CON, ~0U, 1);	/* VFDATA_EN */
+	tc->af_running = true;
+	tc->af_pgn_changed = jiffies;
+	mutex_unlock(&tc->af_lock);
+	schedule_delayed_work(&tc->af_work, msecs_to_jiffies(AF_PGN_HOLD_MS));
+}
+
+/* the gain from the last statistics (af_lock held) */
+static u32 af_auto_pgn(struct titan_cam *tc)
+{
+	u64 sum = 0;
+	int x, y;
+
+	for (y = 0; y < AF_NY; y++)
+		for (x = 0; x < AF_NX; x++)
+			sum += *(u32 *)((u8 *)tc->afo_vaddr + y * AFO_STRIDE + x * AF_BLOCK + 12);
+	sum = div_u64(sum * AF_PGN_REF, AF_W3_REF * AF_NX * AF_NY);
+	return clamp_t(u64, sum, AF_PGN_MIN, AF_PGN_MAX);
+}
+
+static void af_work_fn(struct work_struct *work)
+{
+	struct titan_cam *tc = container_of(to_delayed_work(work), struct titan_cam, af_work);
+	u32 target;
+
+	mutex_lock(&tc->af_lock);
+	if (!tc->af_running) {
+		mutex_unlock(&tc->af_lock);
+		return;
+	}
+	if (tc->af_pgn_auto &&
+	    time_after(jiffies, tc->af_pgn_changed + msecs_to_jiffies(AF_PGN_HOLD_MS))) {
+		target = af_auto_pgn(tc);
+		if (abs((int)target - (int)tc->af_pgn) * 8 > tc->af_pgn) {
+			tc->af_pgn = target;
+			tc->af_pgn_changed = jiffies;
+			writel(target, tc->cama + CA_SGG1_PGN);	/* latched at the next frame */
+		}
+	}
+	mutex_unlock(&tc->af_lock);
+	schedule_delayed_work(&tc->af_work, msecs_to_jiffies(AF_WORK_MS));
+}
+
+static void af_stop(struct titan_cam *tc)
+{
+	cancel_delayed_work_sync(&tc->af_work);
+	mutex_lock(&tc->af_lock);
+	if (tc->af_running) {
+		ca_rmw(tc, CA_TG_VF_CON, ~1U, 0);
+		ca_rmw(tc, CA_TG_SEN_MODE, ~1U, 0);
+		writel(0, tc->cama + CA_CTL_DMA_EN);
+		tc->af_running = false;
+	}
+	mutex_unlock(&tc->af_lock);
+}
+
+/*
+ * /sys/devices/platform/1a050000.camsv1/rear/af_stats: a header of 8 u32
+ * (magic "TAF1", frame counter (8 bits, wraps), running, blocks x, blocks y,
+ * bytes per block, line stride, SGG1 gain) and the AFO data, AF_NY lines of
+ * AFO_STRIDE bytes. The data is the last set written; with the camera off it
+ * is stale and "running" is 0.
+ */
+static ssize_t af_stats_read(struct file *f, struct kobject *kobj, struct bin_attribute *attr,
+			     char *buf, loff_t off, size_t count)
+{
+	struct titan_sensor *s = container_of(kobj_to_dev(kobj), struct titan_sensor, dev);
+	struct titan_cam *tc = s->tc;
+	u32 hdr[AF_HDR_WORDS] = { 0x31464154, 0, 0, AF_NX, AF_NY, AF_BLOCK, AFO_STRIDE, 0 };
+	size_t total = sizeof(hdr) + AFO_SIZE;
+
+	if (off >= total)
+		return 0;
+	count = min_t(size_t, count, total - off);
+	mutex_lock(&tc->af_lock);
+	hdr[2] = tc->af_running;
+	hdr[7] = tc->af_pgn;
+	if (tc->af_running)
+		hdr[1] = readl(tc->cama + CA_TG_INTER_ST) >> 24;
+	if (off < sizeof(hdr)) {
+		size_t n = min_t(size_t, count, sizeof(hdr) - off);
+
+		memcpy(buf, (u8 *)hdr + off, n);
+		if (count > n)
+			memcpy(buf + n, tc->afo_vaddr, count - n);
+	} else {
+		memcpy(buf, (u8 *)tc->afo_vaddr + off - sizeof(hdr), count);
+	}
+	mutex_unlock(&tc->af_lock);
+	return count;
+}
+
+static struct bin_attribute af_stats_attr = {
+	.attr = { .name = "af_stats", .mode = 0444 },
+	.size = AF_HDR_WORDS * 4 + AFO_SIZE,
+	.read = af_stats_read,
+};
+
+static ssize_t af_pgn_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct titan_sensor *s = container_of(dev, struct titan_sensor, dev);
+
+	return sprintf(buf, "%s%#x\n", s->tc->af_pgn_auto ? "auto " : "", s->tc->af_pgn);
+}
+
+static ssize_t af_pgn_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t len)
+{
+	struct titan_sensor *s = container_of(dev, struct titan_sensor, dev);
+	struct titan_cam *tc = s->tc;
+	unsigned int v;
+
+	if (sysfs_streq(buf, "auto")) {
+		mutex_lock(&tc->af_lock);
+		tc->af_pgn_auto = true;
+		mutex_unlock(&tc->af_lock);
+		return len;
+	}
+	if (kstrtouint(buf, 0, &v) || !v || v > 0x7ff)
+		return -EINVAL;
+	mutex_lock(&tc->af_lock);
+	tc->af_pgn_auto = false;
+	tc->af_pgn = v;
+	if (tc->af_running)
+		writel(v, tc->cama + CA_SGG1_PGN);	/* latched at the next frame */
+	mutex_unlock(&tc->af_lock);
+	return len;
+}
+static DEVICE_ATTR_RW(af_pgn);
 
 /* ------------------------------------------------------------------ */
 /* the video node                                                      */
@@ -1207,13 +1536,15 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
 	tc->next = first;	/* latched at the first start of frame */
 	spin_unlock_irqrestore(&tc->qlock, flags);
 
-	seninf_start(tc, s->d->csi_port);
+	seninf_start(tc, s->d->csi_port, s->mode->pix2);
 	ret = sensor_start(s);
 	if (ret) {
 		dev_err(&tc->pdev->dev, "%s: start failed: %d\n", s->d->name, ret);
 		goto err_sensor;
 	}
-	camsv_start(tc, first->mva);
+	camsv_start(tc, first->mva, s->mode->pix2);
+	if (s->d->has_focus)
+		af_start(tc, s->mode);
 	tc->active = s;
 	ret = request_irq(tc->irq, camsv_irq, 0, DRV, tc);
 	if (ret) {
@@ -1241,6 +1572,7 @@ static void stop_streaming(struct vb2_queue *q)
 
 	/* vb2 calls this with the queue lock (tc->lock) held */
 	if (tc->active) {
+		af_stop(tc);
 		camsv_stop(tc);
 		free_irq(tc->irq, tc);
 		msleep(40);	/* let a frame in flight finish */
@@ -1506,6 +1838,7 @@ static void titan_cleanup(struct titan_cam *tc)
 	v4l2_device_unregister(&tc->v4l2);
 	media_device_cleanup(&tc->mdev);
 	scratch_free(tc);
+	af_free(tc);
 	if (tc->m4u_client)
 		m4u_destroy_client(tc->m4u_client);
 	for (i = 0; i < ARRAY_SIZE(clks); i++)
@@ -1521,6 +1854,8 @@ static void titan_cleanup(struct titan_cam *tc)
 		iounmap(tc->mipi_rx);
 	if (tc->camsv)
 		iounmap(tc->camsv);
+	if (tc->cama)
+		iounmap(tc->cama);
 	kfree(tc);
 }
 
@@ -1552,6 +1887,13 @@ static int sensor_add_device(struct titan_cam *tc, struct titan_sensor *s)
 		return ret;
 	}
 	s->dev_added = true;
+	if (s->d->has_focus) {		/* the AF statistics follow the focus motor */
+		ret = device_create_bin_file(&s->dev, &af_stats_attr);
+		if (!ret)
+			ret = device_create_file(&s->dev, &dev_attr_af_pgn);
+		if (ret)
+			return ret;
+	}
 	return s->sd.devnode ? device_move(&s->sd.devnode->dev, &s->dev, DPM_ORDER_NONE) : 0;
 }
 
@@ -1577,6 +1919,10 @@ static int titan_probe(struct platform_device *pdev)
 	mutex_init(&tc->lock);
 	mutex_init(&tc->pm_lock);
 	mutex_init(&tc->sensor_lock);
+	mutex_init(&tc->af_lock);
+	tc->af_pgn = af_pgn_default;
+	tc->af_pgn_auto = true;
+	INIT_DELAYED_WORK(&tc->af_work, af_work_fn);
 	spin_lock_init(&tc->qlock);
 	INIT_LIST_HEAD(&tc->queued);
 
@@ -1589,6 +1935,7 @@ static int titan_probe(struct platform_device *pdev)
 		goto err;
 	}
 	tc->camsv = ioremap(res->start, resource_size(res));
+	tc->cama = ioremap(CAMA_BASE, CAMA_SIZE);
 	tc->seninf = ioremap(SENINF_BASE, SENINF_SIZE);
 	tc->mipi_rx = ioremap(MIPI_RX_BASE, MIPI_RX_SIZE);
 	if (!tc->camsv || !tc->seninf || !tc->mipi_rx) {
@@ -1634,6 +1981,8 @@ static int titan_probe(struct platform_device *pdev)
 	if (ret)
 		goto err;
 	ret = scratch_alloc(tc);
+	if (!ret)
+		ret = af_alloc(tc);
 	camsys_put(tc);
 	if (ret)
 		goto err;

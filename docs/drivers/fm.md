@@ -27,6 +27,9 @@ last station and stops when the window closes.
   and power buttons; a volume slider (the AFE FM gain, −48…0 dB, default
   −24 dB; the speaker level stays with the volume keys).
 - Signal meter (GETRSSI, about dBm) and a stereo/mono badge.
+- **RDS:** station name, call letters and programme type under the
+  frequency, radio text below them; station names are remembered and
+  shown in the station list (see "RDS" below).
 - **Scan** lists the stations it finds (about 8 s for the band); the star
   saves a favorite, listed first. Tap a row to tune.
 - Keys: ←/→ step, ↑/↓ seek, Space power, F favorite.
@@ -68,6 +71,26 @@ with pointer types. Frequencies are in 10 kHz units (`9950` = 99.5 MHz).
 | `PRE_SEARCH` / `RESTORE_SEARCH` (45/46) | mute around a scan |
 | `GETRSSI` (7), `GETMONOSTERO` (13), `GETCHIPID` (10) | status |
 
+## RDS
+
+The driver decodes RDS itself (`core/fm_rds_parser.c`): `FM_IOCTL_RDS_ONOFF`
+(18, a `uint16_t` 1/0) turns it on, and `read()` on `/dev/fm` returns the
+whole `struct rds_t` (`inc/fm_rds.h`, **688 bytes** on arm64) when something
+changed since the last read, or 0 bytes: it never blocks, so the app polls
+it once a second. `event_status` (offset 554) says what changed and is
+cleared by the read; the driver clears its RDS state on every tune.
+
+| field | offset | use |
+|---|---|---|
+| `PI` | 24 | programme identification; for North American stations (NRSC-4) the call letters: 0x1000–0x54A7 = K + 3 letters, 0x54A8–0x994F = W + 3 letters (base 26 from AAA) |
+| `PTY` | 27 | programme type, 0–31: RBDS names in the Americas (5 Rock, 9 Top 40, 10 Country …), RDS names elsewhere (the app picks by time zone) |
+| `PS_Data.PS[3]` | 272 | station name, 8 characters: the copy the parser confirmed by receiving it twice the same (`PS[0..2]` are work buffers; `PS_ON` is another network's name) |
+| `RT_Data.TextData[3]` | 482 | radio text, up to 64 characters, length `RT_Data.TextLength` (548), set when a text completed (`RDS_EVENT_LAST_RADIOTEXT`) |
+
+Offsets came from compiling the header's structs for arm64
+(`out/fm/rds_layout.c`). First reception (2026-10-15, headphones in): 91.5
+MHz → "WUML-FM", PI = WUML, PTY Rock, stereo, −65 dBm.
+
 ## Audio path
 
 ```
@@ -94,6 +117,8 @@ titan-fm 99.5
 
 ## Not done
 
-- Stereo is reported as mono in tests so far. Without a headset there is no
-  long antenna, so this is probably signal-related; not investigated.
-- Headset output, RDS, the FM-over-Bluetooth path (`FM_MRGTX`, device 14).
+- Without headphones there is no long antenna: weak signals, mono. With
+  headphones in, stations come in strong and in stereo, and FM plays in the
+  headphones (`titan-speakerd`, [../audio.md](../audio.md#headphones)).
+- The FM-over-Bluetooth path (`FM_MRGTX`, device 14); RDS clock time and
+  alternative frequencies are decoded by the driver but unused.

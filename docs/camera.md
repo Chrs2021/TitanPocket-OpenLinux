@@ -18,8 +18,12 @@ work.
   tap to focus) and manual focus (rear).
 - The driver reports each sensor's location and mounting rotation, so
   libcamera knows them too.
-- Not yet: the rear 4672×3504 mode (needs CAMSV 2-pixel mode), the flash
-  LED, video recording, MediaTek's hardware ISP.
+- **Flash:** the dual-tone LED pair works (Off / Auto / On / Torch in the
+  app).
+- The rear camera's full 4672×3504 mode runs in 2-pixel mode (photos
+  4668×3504, 16 MP).
+- Not yet: video
+  recording, the rest of MediaTek's hardware ISP.
 
 ## Plan: an open V4L2 stack
 
@@ -288,6 +292,29 @@ exported; Linux 5.0 (commit d65842f7126a) allows it, because the
 allocators reference-count the memory anyway. `videobuf2-core.c` carries
 that change.
 
+### Full resolution: 2-pixel mode (rear 4672×3504)
+
+The OV16880's capture mode (4672×3504, line length 5024, about 576 Mpixel/s
+at 30 fps) is too fast for one pixel per clock, so seninf and CAMSV move
+two pixels per clock in that mode (`sensor_mode.pix2`). From the HAL
+(`setSeninfMuxCtrl`; `isp_function_camsv.cpp` TG, TOP and `BusSizeCal`):
+
+| Block | 1 pixel | 2 pixels | 4 pixels (unused) |
+|---|---|---|---|
+| seninf `SENINF1_MUX_CTRL` bit 8 / `MUX_CTRL_EXT` bit 4 | 0 / 0 | 1 / 0 | 0 / 1 |
+| CAMSV `TG_SEN_MODE` bits 1, 13 | 0, 0 | 1, 0 | 1, 1 |
+| CAMSV `PAK` bits 4-5 | 0 | 1 | 2 |
+| IMGO bus size, `STRIDE` bits 16-18 (raw formats) | 1 | 3 | 7 |
+
+- Raw stream: 4672×3504 `BA81` at 20.6 fps with libcamera's default
+  vertical blanking (frame length 5576), the same field of view as the
+  2336×1752 mode, no tearing or line slips.
+- libcamera offers RGB up to 4668×3504 and picks the smallest sensor mode
+  that covers the request, so the 960×720 preview keeps the 2336×1752
+  mode. The software ISP does ~9.5 fps at 16 MP.
+- The CAM A AF statistics only run in the 2336×1752 mode (their table is
+  for it; CAM A would need 2-pixel mode too).
+
 ## Phase 3: libcamera
 
 libcamera v0.7.2, built on the phone by `userspace/libcamera/build.sh` into
@@ -322,6 +349,21 @@ gst-launch-1.0 libcamerasrc camera-name="platform/1a050000.camsv1/rear ov16880" 
   element reopened) also ran the stale handler on an empty request queue:
   an assertion, then a crash freeing the wrong request. The app hit it at
   every photo (preview stopped, still pipeline started).
+- **manual exposure in the software ISP's AE** (`src/ipa/simple/algorithms/agc.cpp`):
+  - The upstream AE ignores `AeEnable`, `ExposureTimeMode`,
+    `AnalogueGainMode`, `ExposureTime` and `AnalogueGain` and doesn't
+    advertise them.
+  - The patch registers them and stores them per request. When manual,
+    it uses the requested time (converted to lines, clamped) and gain
+    instead of its own step.
+  - Back in auto, AE continues from the last manual values.
+- **another `libcamerasrc` fix:** controls set while streaming were lost.
+  - `queueRequest()` merged the pending controls into a new request and
+    cleared them before acquiring buffers.
+  - When no buffer was free (usual while streaming) the request was
+    dropped, and its controls with it.
+  - The controls are now applied only once the request is certain to be
+    queued, and take effect about 250 ms after being set.
 
 **What the driver needed for libcamera:**
 - `V4L2_CAP_IO_MC` on the video node (else libcamera won't ask for the
@@ -341,6 +383,39 @@ libcamera still warns that there are no tuning files (`uncalibrated.yaml`
 is used) and no sensor delay values. It can't rotate by 90°, so
 applications rotate the picture themselves (the Camera app does).
 
+## Flash (MT6370, dual tone)
+
+The rear flash is a **dual-tone pair** on the MT6370 PMIC's two flash
+channels: channel 1 is the white (cool) LED, channel 2 the yellowish (warm)
+one. The device tree also has an LM3643 node (i2c3 0x63), a leftover of
+MediaTek's reference design: no driver binds it, and the stock kernel only
+builds the MT6370 flashlight driver.
+
+- **Interfaces:** Richtek's flashlight class
+  (`/sys/class/flashlight/mt-flash-led1`, `-led2`: brightness only; `mode`
+  is read-only and stays "Off" even while lit) and MediaTek's
+  `flashlight-core` above it: `/dev/flashlight` ioctls (`flashlight.h`:
+  `struct {type_id, ct_id, arg}`, 1-based: type 1 = rear, ct 1/2 = the
+  channels) and `/sys/class/flashlight_core/flashlight/flashlight_strobe`
+  ("TYPE CT PART LEVEL DURATION_ms", 0-based, lights for the duration
+  inside the write).
+- **Levels** (`flashlights-mt6370.c`): 0–15 torch, 25–400 mA in 25 mA
+  steps; 16–31 strobe, 450–1200 mA (strobe has a hardware timeout,
+  2.4 s at most).
+- **The trap: coupled mode.** The default scenario is "coupled", and
+  `mt6370_operate()` only switches anything on once **both** channels have
+  a state; each `flashlight_strobe` write and each driver enable resets
+  both to "none". So one channel alone does nothing (the enable register,
+  `FLEDEN` 0x7E on i2c-5 0x34, stays 0x08). Either set the decoupled
+  scenario (`FLASH_IOC_SET_SCENARIO` = camera | decouple = 3: one channel
+  at a time) or give both channels a level and an on/off (coupled: both
+  LEDs together, `FLEDEN` 0x0B). Channel 1 alone reads 0x0A, channel 2
+  0x09.
+- **Sequence** (as the stock HAL): `FLASHLIGHTIOC_X_SET_DRIVER` 1,
+  `FLASH_IOC_SET_SCENARIO`, per channel `SET_TIME_OUT_TIME_MS` and
+  `SET_DUTY`, then `SET_ONOFF` 1 for both; off: `SET_ONOFF` 0 both,
+  scenario 0, `SET_DRIVER` 0.
+
 ## The Camera app (titan-camera-gui)
 
 `userspace/debian/overlay/usr/local/bin/titan-camera-gui` (Python, GTK 3,
@@ -350,12 +425,15 @@ GStreamer), **Camera** in the app drawer.
   camera) by `glvideoflip` and shown by `gtkglsink`, so after the ISP
   everything stays on the GPU.
 - **Photo:** one stream at a time, so the shutter stops the preview, runs
-  the camera at its largest RGB size (rear 2332×1752, front 3260×2448: the
-  OV8865's full mode), drops the first 15 frames while auto exposure
-  settles (it converges in about 8), rotates, encodes one frame as JPEG
-  (quality 92) into `~/Pictures/Camera/IMG_<date>_<time>.jpg` and restarts
-  the preview: about 2 s. The thumbnail shows the last photo; tap it to
-  view it.
+  the camera at its largest RGB size (rear 4668×3504 from the sensor's
+  full-resolution mode, front 3260×2448: the OV8865's full mode), drops
+  the first 15 frames while auto exposure settles (it converges in about
+  8), rotates, encodes one frame as JPEG (quality 92) into
+  `~/Pictures/Camera/IMG_<date>_<time>.jpg` and restarts the preview.
+  Front about 2 s; rear about 4 s (the software ISP debayers 16 MP at
+  ~9.5 fps). The thumbnail shows the last photo; tap it to
+  view it. All photos are browsable in the **Photos** app
+  (`titan-gallery`, desktop.md).
 - **Rotation:** from the driver's `camera_sensor_rotation` (clockwise in
   the app: rear 90°, front 270°, both checked upright on the phone; the
   stock HAL's angles weren't found, MTK compiles them into its custom
@@ -379,7 +457,96 @@ GStreamer), **Camera** in the app drawer.
   - tap the preview to focus there; dragging the Far–Near slider switches
     to manual focus (MF) until the next tap. A photo keeps the focus;
   - CPU: the measurement thread takes ~5 %; the app ~55 % with preview.
-- Keys: Space/Enter photo, F switch camera, R rotate, A autofocus.
+- **Flash** (rear camera, button beside rotate; T): Off → Auto → On →
+  Torch, both LEDs together (coupled). On: 400 mA each (the torch
+  maximum) for the whole photo capture, since the still pipeline needs
+  ~4 s at full resolution, longer than a strobe; a 6 s hardware
+  timeout backs it up (measured: lit 3.7 s of a 3.8 s capture). Auto: fires when auto exposure has raised the
+  sensor's analogue gain to 4× or more. Torch: 175 mA each while the
+  app runs; off on another mode, the front camera, or quitting.
+- **Flash exposure (pre-flash metering)**, for flash photos (Auto when
+  it fires, On):
+  - **The problem:** libcamera's software AE starts a still capture from
+    the dark-scene settings (full exposure, ~15× gain) and moves at most
+    10–15 % a frame (a gain step about every 4 frames). With the flash on,
+    every frame up to the saved one was 100 % clipped; reaching a
+    flash-lit exposure would take hundreds of frames.
+  - **Metering:** with the preview still running, the app switches it to
+    manual exposure (400 µs, gain 1×), lights the flash at full power and
+    reads the hardware AF statistics. Their block pixel sums (word 3,
+    before any processing) are linear: raw / 8 per pixel, black about 8,
+    clipping at about 119.
+  - **Timing:** a control change reaches the sensor a few requests later,
+    so the app waits until the sensor's exposure register shows the new
+    value, then 3 frames.
+  - **Stepping:** while the 97th-percentile block clips, the exposure
+    drops 8× (down to 40 µs); while the scene is too dark, it rises 8×
+    (up to 25.6 ms). Usually 1–2 steps, under 0.5 s.
+  - **Dimming the pre-flash:** if it still clips at 40 µs (a very close
+    subject), the pre-flash itself steps down about 4× (level 15 → 3 → 0).
+    The model scales its share back to full power.
+  - **Choosing the exposure:** the ambient levels just before metering
+    (at the preview AE's exposure × gain) separate the flash's share from
+    the ambient light. The app then picks the exposure × gain that puts
+    the centre-weighted mean at 32 with the 97th-percentile block at most
+    66. Measured against the output, a block level s comes out as about
+    303 × (s / 111)^(1/2.2), so that's a photo mean of about 80 with
+    highlights at about 240.
+  - **Dimming:** if that would be under the sensor's shortest exposure (4
+    lines, 35 µs: a close subject), the flash itself is dimmed (level
+    0–15, about 25 mA × (level + 1)).
+  - **Splitting:** exposure up to 1/30 s (3800 lines), the rest as gain
+    up to 8×.
+  - **Capture:** the still pipeline starts with that manual exposure and
+    the flash at that level, so it skips only 6 frames instead of 15.
+  - **Results:** before, flash photos of a close bottle were 100 %
+    clipped. Now two scenes metered to 31 and 108 lines both came out with
+    mean 60 and highlights at 222–244 of 255 (0.4–1.4 % clipped:
+    glints), label text readable, in 4.2 s per photo.
+  - **Close subjects** (bottle label, held by hand):
+    - at ~5 cm: flash level 11 at 4 lines, mean 73, 0.8 % clipped;
+    - at ~2 cm: pre-flash stepped down to level 3, photo at level 2
+      (~75 mA per LED), mean 79, 0.6 % clipped. Before the pre-flash could
+      dim, its reading clipped and the photo had 20 % clipped.
+    - Both show a green cast (the software ISP's white balance under
+      flash) and the 2 cm one is closer than the lens focuses.
+- **AF assist** (flash Auto or On, when it's dark: the same 4× gain):
+  - both LEDs light at torch level (175 mA) for the autofocus run;
+  - the sweep waits 500 ms first, so auto exposure settles on the lit
+    scene (it converges in ~8 frames);
+  - the light goes off as soon as the lens is placed, about 3 s in all;
+  - the focus is then held rather than tracked, since a tracking refocus
+    in the dark would keep switching the light on. Tap to refocus;
+  - auto exposure needs a moment to recover after the light goes off, so
+    Auto treats the scene as dark for 2 s afterwards. A photo taken during
+    or right after an assisted focus still gets the flash;
+  - tested with the threshold forced to 0: FLEDEN read 0x0b from the start
+    of the wait to the focused position, then 0x08.
+- **QR codes**, found passively while the preview runs (either camera):
+  - **Inline:** a third branch of the preview's `tee`, straight after
+    `libcamerasrc` and before the GPU upload: `videorate max-rate=5` → a
+    leaky one-buffer queue → 640×480 `GRAY8` → appsink. The decoding
+    thread is that branch's own, so a slow scan only drops QR frames, never
+    preview frames.
+  - **Decoder:** libzbar through ctypes, configured for QR only and every
+    second line and column (`ZBAR_CFG_X/Y_DENSITY` 2). GStreamer's `zbar`
+    element tries every symbology on every line and can't be configured:
+    136 ms per 640×480 frame of sensor noise, against 14 ms (37 ms QR-only
+    at density 1). Live, with a code in view: 5 scans/s at ~30 ms, ~15 %
+    of a core.
+  - **Alert:** each code becomes a chip over the bottom of the preview
+    ("QR · LINK/WI-FI/TEXT/…" and what it holds), up to 3, newest on top. A
+    chip stays (sticky) until its ✕ is tapped, across camera switches and
+    photos, and is outlined in yellow while its code is in view (1.2 s
+    after the last sighting). Copy puts the text on the clipboard; links
+    also get Open (Chromium, `titan-chromium`). Nothing opens on its own;
+    Wi-Fi codes show the network name, and Copy gives the whole `WIFI:`
+    string.
+  - **Buzz:** a new chip comes with a short double buzz of the vibration
+    motor (40 ms, 90 ms pause, 40 ms; [hardware.md](hardware.md#vibration-motor)).
+    It isn't repeated while the code stays in view, only for a new code or
+    one whose chip was dismissed.
+- Keys: Space/Enter photo, F switch camera, R rotate, A autofocus, T flash.
 
 ## MediaTek ISP (hardware), work in progress
 
@@ -429,12 +596,151 @@ control (FBC). The HAL normally writes pass-1 registers through **CQ**
 buffers in memory that the hardware loads each frame (ChromeOS's
 `CQ_THR0_BASEADDR` 0x198), which is why few writes show up as plain MMIO.
 
+### First frame through pass 1 (2026-10-15)
+
+`titan_camcap p1=1 p1sel=1` captures through CAM A instead of CAMSV
+(front camera, 1632×1224): **TG → DMX → IMGO**, every processing block
+off. Correct colours, same BGGR raw as CAMSV.
+
+```sh
+insmod titan_camcap.ko cam=1 p1=1 p1sel=1 p1fmt=0   # 16-bit; p1fmt=9 packed RAW10
+cat /sys/kernel/debug/titan_camcap                 # TG frames, CTL_*, IMGO error status
+cat /sys/kernel/debug/titan_camcap_frame > f.raw
+```
+
+- **Layout:** CAMSV's with the blocks moved: control at 0x000 (CAMSV
+  0x500), TG at 0x230 (same), DMA at 0x1000 (CAMSV 0x000; IMGO base 0x1020,
+  `XSIZE` 0x1030 ...). The DMA error setup at 0x13b0/0x13c4 is CAMSV's
+  0x3b0/0x3c4.
+- **Routing:** `SENINF_TOP_CAM_MUX_CTRL` = 0 already feeds seninf mux 0 to
+  every camera input, so CAM A's TG sees the sensor as soon as it runs.
+- **Sequence** (from the HAL's `CAM_TOP_CTRL`, `CAM_TG_CTRL`,
+  `CAM_DMX_CTRL`, `DMAO_B`, `Cam_path_sel`, decoded with
+  `tools/re/hal_regseq.py`, and the BSP driver):
+  1. reset `SW_CTL` 0x40: 1, wait for 2, 4, 0;
+  2. `CTL_FMT_SEL` 0x0c: TG input format in bits 14:12 (RAW10 = 1; the HAL
+     rejects others as "unsupported TG format"), IMGO format in 8:4
+     (8 = 8-bit, 9 = packed 10-bit, 0 = 16-bit, samples << 4 as on CAMSV),
+     RRZO format in 3:2, pixel mode in 21:20;
+  3. `CTL_SEL` 0x10 = 0x060a5010: `Path_sel_RAW`'s second variant. The
+     first (0x07025010) leaves IMGO without a source: nothing or scattered
+     zero bursts get written, IMGO error status 0x8280;
+  4. `CTL_EN` 0x04 = TG (bit 0) | DMX (bit 1). With the TG alone no data
+     reaches IMGO;
+  5. DMX: `DMX_CTL` 0x330 bits 19:16 set, bit 31 clear; `DMX_CROP` 0x334
+     = (width − 1) << 16; `DMX_VSIZE` 0x338 = height;
+  6. TG as on CAMSV (`SEN_MODE` bit 17 instead of 16 per the HAL, grab
+     window, continuous);
+  7. IMGO: the BSP's FIFO settings (`CON` 0x80000180, `CON2` 0x00400040,
+     `CON3` 0x00200020), continuous without FBC, M4U port 61 (larb6 port
+     0; all larb6 ports already have the MMU on);
+  8. `CTL_DMA_EN` bit 0, `CMOS_EN`, `VFDATA_EN` (the BSP kernel driver
+     starts the TG the same way, in its `ISP_VF_LOG` ioctl).
+- Interrupts stay off: MediaTek's `camera-isp` driver still owns CAM A's
+  IRQ. The tool watches the TG frame counter and IMGO's error status.
+
+### Hardware AF statistics (2026-10-15)
+
+`titan_camcap p1=1 p1sel=1 p1af=1` also runs the AF block and its DMA
+(AFO), and they measure focus: in a lens sweep on a book, the filter
+outputs peak at the same lens position as the image's own sharpness.
+
+- **Configuration:** the HAL's `ISP_MGR_AF_STAT_CONFIG::config()`
+  (`libcam.hal3a.v3.so`) turns an `AF_CONFIG_T` into register values. The
+  stock default `AF_CONFIG_T` is built at run time by `_getAFConfig` in
+  `libcameracustom.so`: `tools/re/emu_so.py` runs it in Unicorn and dumps
+  it (`out/camera/re/af_config_default.bin`), and `tools/camera/af_regs.py`
+  applies the HAL's formulas: AF_CON 0x610, thresholds, 12 filter
+  registers (H0/H1 FIR taps 15, 36, 43, 36, 22, 10, 2; IIR −10, −22, −36,
+  −43 as 11-bit fields), lookup tables, plus the gain/gamma stages SGG1
+  (0x810) and SGG5 (0xcb0). Geometry (from the sensor mode): `AF_SIZE`
+  0x640 = width, `AF_VLD` 0x644 = window start, `AF_BLK_0` 0x648 = block
+  size (even width ≤ 254), `AF_BLK_1` 0x64c = block count; 16 × 12 here.
+- **Enables:** the HAL asks `TuningMgrImp::enableEngine`
+  (`libcamdrv_tuning_mgr.so`) for tuning functions 15 (AF), 14 (SGG1), 22
+  (SGG5): `CTL_EN` bit 17, `CTL_EN` bit 18, `CTL_EN2` bit 31; AFO is
+  `CTL_DMA_EN` bit 3 (DMA port 0x19; ChromeOS's `AFO_DONE_ST` is bit 5 of
+  the second interrupt status). Turning SGG1 off while streaming stalls AFO
+  until the next reset.
+- **AFO:** base 0x10b0, sizes 0x10c0/0x10c4, stride 0x10c8, FIFO
+  0x80000100/0x00800080/0x00550055 (BSP), M4U port 64. 40 bytes per block,
+  one line per block row. The HAL's `config()` writes the sizes without
+  the usual −1 (a lower layer subtracts it): written as is, AFO reports
+  error 0x8280 and packs the rows without the stride.
+- **Block format** (ten 32-bit words): w0, w1, w2, w4 are filter outputs
+  (zero with the filters zeroed; w1 = w4 because the stock H0 and H1
+  filters are identical); w3, w6, w7 are pixel sums (they follow the
+  block's brightness); w5's top half is constant (0x5344).
+- **SGG1 gain:** with the stock `SGG1_PGN` (0x10) the outputs are large
+  and flat; at 0x80 (sweep below, a book under a lamp, 15× analogue gain)
+  they peak where the image is sharpest. MediaTek's 3A presumably sets it
+  from the exposure; ours will have to as well.
+
+  | lens | 0 | 192 | 320 | 384 | 448 | 576 | 1023 |
+  |---|---|---|---|---|---|---|---|
+  | w0 | 230 | 391 | 630 | **781** | 743 | 493 | 224 |
+  | w1 (M) | 25.8 | 28.3 | 33.2 | **34.4** | 33.2 | 28.5 | 25.6 |
+  | image gradient | 19 | – | 51 | **65** | 52 | – | 14 |
+
+- **Live tuning:** the AF registers latch every frame, so
+  `/dev/mem` writes to 0x1a004000 + offset while camcap streams (and
+  `echo N > /sys/kernel/debug/titan_camcap_focus` for the lens) make
+  experiments quick; module reloads in quick succession sometimes leave
+  the sensor without MIPI packets.
+
+### AF statistics in the driver (2026-10-16)
+
+While the rear camera streams, `titan_camera` also runs CAM A in
+statistics-only mode, on the same seninf output as CAMSV: TG → DMX → SGG1 →
+AF, written by AFO (16 × 12 blocks, the stock default AF configuration,
+SGG1 gain `af_pgn`, automatic by default, see below). No IMGO, no interrupts; libcamera still
+gets 30 fps from CAMSV.
+
+```sh
+R=/sys/devices/platform/1a050000.camsv1/rear
+cat $R/af_pgn            # "auto 0x66": SGG1 gain; echo 0x100 > $R/af_pgn fixes it,
+                         # echo auto > $R/af_pgn goes back (applied next frame)
+od -A d -t x4 -N 32 $R/af_stats
+```
+
+`af_stats` is a 32-byte header (8 × u32: magic `TAF1`, the ISP's 8-bit
+frame counter (`TG_INTER_ST` top byte), running, 16, 12, 40 bytes per
+block, 656-byte line stride, SGG1 gain) and then the AFO data: 12 lines of
+656 bytes, the last set the DMA wrote (it overwrites one buffer every
+frame). The buffer is two pages mapped on M4U port 64 at probe.
+
+The Camera app reads it once a frame for the rear camera: sharpness is the
+H0 filter energy (w1) of the focus region's blocks divided by their pixel
+sum (w3), from sets at least 3 frames after a lens move; no frame analysis
+on the CPU then. Without `af_stats` (older driver) it falls back to
+measuring the preview frames.
+
+**SGG1 gain, automatic:** measured with `af_pgn` stepped live: words 3, 6,
+7 and 8 don't change with the gain (they are taken before SGG1; word 3 is
+the block's pixel sum), while the filter outputs scale with 1/gain (w1
+halves per doubling: 0x100 → 67 M, 0x200 → 32.5 M, 0x400 → 15.3 M) and
+saturate below ~0x40. So the gain works as a divisor and has to grow with
+the scene's brightness. The driver keeps the AF input level constant:
+every 100 ms while the statistics run, PGN = 0x80 × (mean word 3 per
+block) / (23.3 × 146 × 146), 0x80 being the gain that gave a clean focus
+curve at 23.3 per pixel (raw ~88 with the black level of 64), clamped to
+0x20–0x7ff, changed only when more than 1/8 off and at most every 0.5 s.
+In darkness it settles at ~0x63 (black level only). The app multiplies the
+filter energy by the gain from the header, so a gain step in the middle of
+a sweep doesn't look like a focus change.
+
+**Status:** the mechanics work (the app finds the statistics, frame-count
+timing, a sweep in ~3 s). In the first test the rear camera faced
+darkness, so the focus curve under libcamera's auto exposure (and whether
+0x80 still suits the brighter, AE-regulated input) is still to check with
+a lit scene.
+
 **Plan:**
-1. Route seninf's mux to CAM A's TG instead of CAMSV and get a raw frame
-   out of IMGO with every processing block off (the CAMSV result, through
-   the ISP).
-2. Turn on AF statistics (AFO) and use them for autofocus instead of the
-   app's software measurement.
+1. ✅ A raw frame out of CAM A's IMGO.
+2. ✅ AF statistics (AFO) that measure focus, ✅ in the V4L2 driver beside
+   CAMSV, ✅ used by the Camera app (see "AF statistics in the driver").
+   ✅ SGG1's gain follows the scene brightness (below). Open: checking
+   the focus curve on a lit scene under libcamera's auto exposure.
 3. OBC, LSC (tables from `libCamera_ov16880mipiraw_*.so`), RPG, and the AA
    statistics for exposure and white balance; the rear 4672×3504 mode.
 4. Pass 2 (DIP) with the stock tuning.

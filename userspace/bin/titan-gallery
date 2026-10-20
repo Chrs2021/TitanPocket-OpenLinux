@@ -1,0 +1,805 @@
+#!/usr/bin/python3
+"""
+titan-gallery: photo gallery for the Titan Pocket (GTK 3).
+
+- Grid: every JPEG/PNG under ~/Pictures (the Camera app saves into
+  ~/Pictures/Camera), newest first, three square thumbnails per row.
+  Thumbnails are made on a worker thread and cached in
+  ~/.cache/titan-gallery (keyed by path, size and mtime); new and removed
+  files show up by themselves (a file monitor on each folder).
+- Viewer: tap a thumbnail. The photo fits the window; swipe or Left/Right
+  for the previous/next one, pinch or double-tap to zoom, drag to pan when
+  zoomed. The toolbar has back, previous, next, info and delete; delete asks
+  first and moves the photo to the trash (~/.local/share/Trash), it isn't
+  erased.
+- QR codes: a background thread scans every photo once (newest first;
+  the one being viewed jumps the queue), QR only: zxing-cpp at full
+  resolution (~0.2 s for 16 MP), then libzbar at 2000 px on the long side
+  if that finds nothing (either decoder alone works too). Results
+  are cached in ~/.cache/titan-gallery/qr.json by path and mtime. Grid
+  tiles of photos with codes get a "QR" badge; the viewer shows each code
+  as a chip (what it holds; Copy, and Open for web links: nothing opens
+  without a tap).
+- titan-gallery PATH opens the viewer on that photo.
+
+Keys: Left/Right previous/next, Escape/Backspace back to the grid,
+Delete delete, I info, +/- zoom.
+"""
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from urllib.parse import urlsplit
+
+os.environ.setdefault("NO_AT_BRIDGE", "1")
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
+
+try:
+    import numpy as np  # noqa: E402
+except ImportError:         # no QR scanning without it
+    np = None
+try:
+    import zxingcpp  # noqa: E402  (python3-zxing-cpp)
+except ImportError:
+    zxingcpp = None
+
+PICTURES = os.path.expanduser("~/Pictures")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                     "titan-gallery")
+EXTENSIONS = (".jpg", ".jpeg", ".png")
+COLUMNS = 3
+THUMB = 226                  # px, square
+ZOOM_STEPS = (1.0, 2.0, 4.0)
+SWIPE_MIN = 300              # px/s for a page swipe
+QR_CACHE = os.path.join(CACHE, "qr.json")
+QR_FIRST_SIZE = 2000         # px, long side of the first QR pass
+BROWSER = "/usr/local/bin/titan-chromium"
+
+CSS = b"""
+* { font-size: 20px; }
+.grid { background: #101012; }
+.thumb { background: #202024; border-radius: 4px; }
+.empty { color: #8a8a8a; font-size: 20px; }
+.viewer { background: black; }
+.bar { background: #101012; padding: 6px 10px; }
+.bar button { min-width: 64px; min-height: 56px; border-radius: 28px;
+              background: #2a2a30; color: white; border: none; }
+.bar button.danger { background: #6a2020; }
+.caption { color: #d0d0d0; background: rgba(0,0,0,0.55); border-radius: 8px;
+           padding: 4px 10px; font-size: 16px; }
+.info { color: white; background: rgba(0,0,0,0.75); border-radius: 10px;
+        padding: 10px 14px; font-size: 17px; }
+.qrbadge { color: #101012; background: #f0c040; border-radius: 6px; padding: 0 6px;
+           font-size: 13px; font-weight: bold; }
+.qr { background: rgba(16,16,18,0.82); border-radius: 12px; padding: 4px 6px 4px 10px;
+      border: 2px solid rgba(255,255,255,0.15); }
+.qrkind { color: #101012; background: #f0c040; border-radius: 6px; padding: 0 6px;
+          font-size: 13px; font-weight: bold; }
+.qrtext { color: white; font-size: 16px; }
+.qr button { min-height: 40px; min-width: 40px; padding: 0 10px; border-radius: 20px;
+             background: #2a2a30; color: white; border: none; font-size: 15px; }
+"""
+
+
+def find_photos():
+    """(path, mtime) of every photo under ~/Pictures, newest first"""
+    found = []
+    for dirpath, dirs, files in os.walk(PICTURES):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if name.lower().endswith(EXTENSIONS) and not name.startswith("."):
+                path = os.path.join(dirpath, name)
+                try:
+                    found.append((path, os.stat(path).st_mtime))
+                except OSError:
+                    pass
+    found.sort(key=lambda p: p[1], reverse=True)
+    return found
+
+
+def thumb_path(path, mtime):
+    key = hashlib.sha1(("%s\0%d" % (path, int(mtime))).encode()).hexdigest()
+    return os.path.join(CACHE, key + ".png")
+
+
+def make_thumb(path, mtime):
+    """a THUMB x THUMB centre crop, from the cache or made now"""
+    cached = thumb_path(path, mtime)
+    if os.path.exists(cached):
+        try:
+            return GdkPixbuf.Pixbuf.new_from_file(cached)
+        except GLib.Error:
+            pass
+    try:
+        info = GdkPixbuf.Pixbuf.get_file_info(path)
+        w, h = info[1], info[2]
+        if not w or not h:
+            return None
+        scale = THUMB / min(w, h)
+        pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+            path, max(THUMB, round(w * scale)), max(THUMB, round(h * scale)), True)
+        pix = pix.apply_embedded_orientation()
+    except (GLib.Error, TypeError):
+        return None
+    x = (pix.get_width() - THUMB) // 2
+    y = (pix.get_height() - THUMB) // 2
+    pix = pix.new_subpixbuf(max(0, x), max(0, y), min(THUMB, pix.get_width()),
+                            min(THUMB, pix.get_height())).copy()
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        pix.savev(cached + ".tmp", "png", [], [])
+        os.replace(cached + ".tmp", cached)
+    except (GLib.Error, OSError):
+        pass
+    return pix
+
+
+class QrScanner:
+    """libzbar (ctypes), QR codes only"""
+    Y800 = 0x30303859
+    QRCODE = 64
+    lib = None
+
+    @classmethod
+    def load(cls):
+        if cls.lib is None:
+            try:
+                z = ctypes.CDLL("libzbar.so.0")
+            except OSError:
+                cls.lib = False
+                return False
+            vp, ui, ul = ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulong
+            for name, res, args in (
+                    ("zbar_image_scanner_create", vp, []),
+                    ("zbar_image_scanner_set_config", ctypes.c_int, [vp, ctypes.c_int, ctypes.c_int, ctypes.c_int]),
+                    ("zbar_image_create", vp, []),
+                    ("zbar_image_destroy", None, [vp]),
+                    ("zbar_image_set_format", None, [vp, ul]),
+                    ("zbar_image_set_size", None, [vp, ui, ui]),
+                    ("zbar_image_set_data", None, [vp, vp, ul, vp]),
+                    ("zbar_scan_image", ctypes.c_int, [vp, vp]),
+                    ("zbar_image_first_symbol", vp, [vp]),
+                    ("zbar_symbol_next", vp, [vp]),
+                    ("zbar_symbol_get_type", ctypes.c_int, [vp]),
+                    ("zbar_symbol_get_data", vp, [vp]),
+                    ("zbar_symbol_get_data_length", ui, [vp])):
+                f = getattr(z, name)
+                f.restype, f.argtypes = res, args
+            cls.lib = z
+        return bool(cls.lib)
+
+    def __init__(self):
+        z = self.lib
+        self.sc = z.zbar_image_scanner_create()
+        z.zbar_image_scanner_set_config(self.sc, 0, 0, 0)               # all off...
+        z.zbar_image_scanner_set_config(self.sc, self.QRCODE, 0, 1)     # ...but QR
+
+    def scan(self, gray, w, h):
+        """the QR codes in a w x h 8-bit image (bytes), as text"""
+        z = self.lib
+        buf = ctypes.create_string_buffer(gray, len(gray))
+        im = z.zbar_image_create()
+        z.zbar_image_set_format(im, self.Y800)
+        z.zbar_image_set_size(im, w, h)
+        z.zbar_image_set_data(im, ctypes.addressof(buf), len(gray), None)
+        found = []
+        if z.zbar_scan_image(self.sc, im) > 0:
+            sym = z.zbar_image_first_symbol(im)
+            while sym:
+                if z.zbar_symbol_get_type(sym) == self.QRCODE:
+                    data = ctypes.string_at(z.zbar_symbol_get_data(sym),
+                                            z.zbar_symbol_get_data_length(sym))
+                    found.append(data.decode("utf-8", "replace"))
+                sym = z.zbar_symbol_next(sym)
+        z.zbar_image_destroy(im)
+        return found
+
+
+def pixbuf_gray(pix):
+    """a pixbuf as an 8-bit luma array (h x w)"""
+    n, rs, w, h = pix.get_n_channels(), pix.get_rowstride(), pix.get_width(), pix.get_height()
+    data = pix.get_pixels()
+    data = data + bytes(rs * h - len(data))         # the last row isn't padded
+    a = np.frombuffer(data, np.uint8).reshape(h, rs)[:, :w * n].reshape(h, w, n)
+    g = (a[:, :, 0].astype(np.uint16) * 77 + a[:, :, 1].astype(np.uint16) * 150 +
+         a[:, :, 2].astype(np.uint16) * 29) >> 8
+    return np.ascontiguousarray(g.astype(np.uint8))
+
+
+def scan_photo(scanner, path):
+    """the QR codes in a photo: zxing-cpp at full size, else zbar at
+    QR_FIRST_SIZE (scanner None: no zbar)"""
+    try:
+        pix = GdkPixbuf.Pixbuf.new_from_file(path)
+    except GLib.Error:
+        return []
+    g = pixbuf_gray(pix)
+    del pix
+    codes = []
+    if zxingcpp is not None:
+        codes = [r.text for r in zxingcpp.read_barcodes(
+            g, formats=zxingcpp.BarcodeFormat.QRCode) if r.text]
+    if not codes and scanner is not None:
+        step = max(1, -(-max(g.shape) // QR_FIRST_SIZE))
+        small = np.ascontiguousarray(g[::step, ::step])
+        codes = scanner.scan(small.tobytes(), small.shape[1], small.shape[0])
+    return list(dict.fromkeys(codes))
+
+
+def qr_describe(text):
+    """(kind, what to show, URL to open or None)"""
+    t = text.strip()
+    if re.match(r"(?i)https?://\S+$", t):
+        u = urlsplit(t)
+        return "LINK", u.netloc + u.path.rstrip("/") + ("?" + u.query if u.query else ""), t
+    if t[:5].upper() == "WIFI:":
+        m = re.search(r"(?:^WIFI:|;)S:((?:\\.|[^;])*)", t, re.I)
+        ssid = re.sub(r"\\(.)", r"\1", m.group(1)) if m else "?"
+        return "WI-FI", "Network \u201c%s\u201d" % ssid, None
+    for prefix, kind in (("mailto:", "EMAIL"), ("tel:", "PHONE"), ("geo:", "PLACE"),
+                         ("BEGIN:VCARD", "CONTACT"), ("BEGIN:VEVENT", "EVENT")):
+        if t[:len(prefix)].lower() == prefix.lower():
+            return kind, t[len(prefix):].strip() if ":" in prefix else t, None
+    return "TEXT", " ".join(t.split()), None
+
+
+class Gallery(Gtk.Window):
+    def __init__(self, start=None):
+        super().__init__(title="Photos")
+        self.set_default_size(720, 595)
+        self.connect("destroy", lambda *a: Gtk.main_quit())
+        self.connect("key-press-event", self.on_key)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.photos = []            # [(path, mtime)]
+        self.tiles = {}             # path -> Gtk.Image in the grid
+        self.index = 0              # the photo in the viewer
+        self.zoom = 1.0             # 1 = fit
+        self.full = None            # full-size pixbuf of the viewer's photo (zoomed)
+        self.fit = None             # fitted pixbuf
+        self.monitors = []
+        self.generation = 0         # thumbnail jobs of an older scan are dropped
+        self.refresh_pending = 0
+        # QR codes: path -> [mtime, [codes]], and the scanning thread's queue
+        self.qr = {}
+        try:
+            with open(QR_CACHE) as f:
+                self.qr = json.load(f)
+        except (OSError, ValueError):
+            pass
+        self.qr_queue = []
+        self.qr_cond = threading.Condition()
+        if np is not None and (zxingcpp is not None or QrScanner.load()):
+            threading.Thread(target=self.qr_worker, daemon=True).start()
+        else:
+            self.qr_cond = None
+
+        self.build()
+        self.rescan()
+        if start and os.path.exists(start):
+            paths = [p for p, _ in self.photos]
+            if os.path.abspath(start) in paths:
+                GLib.idle_add(self.open_viewer, paths.index(os.path.abspath(start)))
+
+    # ---- layout ----
+
+    def build(self):
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(120)
+        self.add(self.stack)
+
+        # grid page
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.get_style_context().add_class("grid")
+        self.flow = Gtk.FlowBox()
+        self.flow.set_valign(Gtk.Align.START)
+        self.flow.set_max_children_per_line(COLUMNS)
+        self.flow.set_min_children_per_line(COLUMNS)
+        self.flow.set_homogeneous(True)
+        self.flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.flow.set_activate_on_single_click(True)
+        self.flow.set_row_spacing(4)
+        self.flow.set_column_spacing(4)
+        self.flow.set_border_width(4)
+        self.flow.connect("child-activated", self.on_tile)
+        self.empty = Gtk.Label(label="No photos yet.\nThe Camera app saves into ~/Pictures/Camera.")
+        self.empty.get_style_context().add_class("empty")
+        self.empty.set_justify(Gtk.Justification.CENTER)
+        self.empty.set_vexpand(True)
+        grid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        grid.pack_start(self.flow, False, False, 0)
+        grid.pack_start(self.empty, True, True, 0)
+        sw.add(grid)
+        self.stack.add_named(sw, "grid")
+
+        # viewer page: zoomable image, caption, info, toolbar
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.stack.add_named(page, "viewer")
+        overlay = Gtk.Overlay()
+        page.pack_start(overlay, True, True, 0)
+        self.view_sw = Gtk.ScrolledWindow()
+        self.view_sw.get_style_context().add_class("viewer")
+        self.view_sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.view_ev = Gtk.EventBox()
+        self.view_ev.get_style_context().add_class("viewer")
+        self.image = Gtk.Image()
+        self.view_ev.add(self.image)
+        self.view_sw.add(self.view_ev)
+        overlay.add(self.view_sw)
+        self.view_sw.connect("size-allocate", self.on_view_size)
+
+        self.caption = Gtk.Label()
+        self.caption.get_style_context().add_class("caption")
+        self.caption.set_halign(Gtk.Align.CENTER)
+        self.caption.set_valign(Gtk.Align.START)
+        self.caption.set_margin_top(8)
+        self.caption.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        overlay.add_overlay(self.caption)
+        self.info = Gtk.Label(xalign=0)
+        self.info.get_style_context().add_class("info")
+        self.info.set_halign(Gtk.Align.CENTER)
+        self.info.set_valign(Gtk.Align.CENTER)
+        self.info.set_no_show_all(True)
+        overlay.add_overlay(self.info)
+        self.qr_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.qr_box.set_valign(Gtk.Align.END)
+        self.qr_box.set_halign(Gtk.Align.FILL)
+        for side in ("start", "end", "bottom"):
+            getattr(self.qr_box, "set_margin_" + side)(10)
+        overlay.add_overlay(self.qr_box)
+
+        bar = Gtk.Box(spacing=10)
+        bar.get_style_context().add_class("bar")
+        page.pack_start(bar, False, False, 0)
+        for icon, cb, cls in (("go-previous-symbolic", lambda b: self.close_viewer(), None),
+                              ("media-skip-backward-symbolic", lambda b: self.step(-1), None),
+                              ("media-skip-forward-symbolic", lambda b: self.step(1), None),
+                              ("help-about-symbolic", lambda b: self.toggle_info(), None),
+                              ("user-trash-symbolic", lambda b: self.delete_current(), "danger")):
+            b = Gtk.Button()
+            img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+            img.set_pixel_size(28)
+            b.set_image(img)
+            if cls:
+                b.get_style_context().add_class(cls)
+            b.connect("clicked", cb)
+            if cls == "danger":
+                bar.pack_end(b, False, False, 0)
+            else:
+                bar.pack_start(b, False, False, 0)
+
+        # gestures: swipe pages, pinch zooms, double-tap toggles zoom, drag pans
+        self.swipe = Gtk.GestureSwipe.new(self.view_ev)
+        self.swipe.connect("swipe", self.on_swipe)
+        self.pinch = Gtk.GestureZoom.new(self.view_ev)
+        self.pinch.connect("begin", self.on_pinch_begin)
+        self.pinch.connect("scale-changed", self.on_pinch)
+        self.pinch.connect("end", self.on_pinch_end)
+        self.pinch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        self.mtap = Gtk.GestureMultiPress.new(self.view_ev)
+        self.mtap.connect("pressed", self.on_taps)
+        self.drag = Gtk.GestureDrag.new(self.view_ev)
+        self.drag.connect("drag-begin", self.on_drag_begin)
+        self.drag.connect("drag-update", self.on_drag_update)
+
+    # ---- the photo list ----
+
+    def rescan(self):
+        self.refresh_pending = 0
+        photos = find_photos()
+        if photos == self.photos:
+            return False
+        old = {p for p, _ in self.photos}
+        self.photos = photos
+        self.generation += 1
+        for child in self.flow.get_children():
+            self.flow.remove(child)
+        keep = {}
+        pending = []
+        for path, mtime in photos:
+            tile = self.tiles.get(path) if path in old else None
+            if tile is None or tile.mtime != mtime:
+                tile = Gtk.Overlay()
+                tile.mtime = mtime
+                tile.img = Gtk.Image()
+                tile.img.set_size_request(THUMB, THUMB)
+                tile.img.get_style_context().add_class("thumb")
+                tile.add(tile.img)
+                tile.badge = Gtk.Label(label="QR")
+                tile.badge.get_style_context().add_class("qrbadge")
+                tile.badge.set_halign(Gtk.Align.END)
+                tile.badge.set_valign(Gtk.Align.START)
+                tile.badge.set_margin_top(6)
+                tile.badge.set_margin_end(6)
+                tile.badge.set_no_show_all(True)
+                tile.add_overlay(tile.badge)
+                pending.append((path, mtime, tile.img))
+            else:
+                tile.get_parent() and tile.get_parent().remove(tile)
+            tile.path = path
+            tile.badge.set_visible(bool(self.qr_codes(path, mtime)))
+            keep[path] = tile
+            self.flow.add(tile)
+        self.tiles = keep
+        self.flow.show_all()
+        self.qr_enqueue([(p, m) for p, m in photos if self.qr_codes(p, m) is None])
+        self.empty.set_visible(not photos)
+        self.set_title("Photos (%d)" % len(photos) if photos else "Photos")
+        if pending:
+            gen = self.generation
+            threading.Thread(target=self.thumb_worker, args=(pending, gen), daemon=True).start()
+        self.watch()
+        if self.stack.get_visible_child_name() == "viewer":
+            if not photos:
+                self.close_viewer()
+            else:
+                self.index = min(self.index, len(photos) - 1)
+                self.show_photo()
+        return False
+
+    # ---- QR codes ----
+
+    def qr_codes(self, path, mtime):
+        """the cached codes of a photo, or None if not scanned yet"""
+        e = self.qr.get(path)
+        return e[1] if e and e[0] == int(mtime) else None
+
+    def qr_enqueue(self, items, first=False):
+        if not self.qr_cond:
+            return
+        with self.qr_cond:
+            for it in items:
+                if it in self.qr_queue:
+                    self.qr_queue.remove(it)
+            self.qr_queue = (list(items) + self.qr_queue) if first else (self.qr_queue + list(items))
+            self.qr_cond.notify()
+
+    def qr_worker(self):
+        try:
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)
+        except (OSError, AttributeError):
+            pass
+        scanner = QrScanner() if QrScanner.load() else None
+        while True:
+            with self.qr_cond:
+                while not self.qr_queue:
+                    self.qr_cond.wait()
+                path, mtime = self.qr_queue.pop(0)
+            if self.qr_codes(path, mtime) is not None or not os.path.exists(path):
+                continue
+            codes = scan_photo(scanner, path)
+            GLib.idle_add(self.qr_done, path, mtime, codes)
+
+    def qr_done(self, path, mtime, codes):
+        self.qr[path] = [int(mtime), codes]
+        live = {p for p, _ in self.photos}
+        self.qr = {p: e for p, e in self.qr.items() if p in live}
+        try:
+            os.makedirs(CACHE, exist_ok=True)
+            with open(QR_CACHE + ".tmp", "w") as f:
+                json.dump(self.qr, f)
+            os.replace(QR_CACHE + ".tmp", QR_CACHE)
+        except OSError:
+            pass
+        tile = self.tiles.get(path)
+        if tile is not None and tile.mtime == mtime:
+            tile.badge.set_visible(bool(codes))
+        if path == self.current() and self.stack.get_visible_child_name() == "viewer":
+            self.show_qr()
+        return False
+
+    def show_qr(self):
+        """the viewed photo's codes as chips (scanning it first if needed)"""
+        for child in self.qr_box.get_children():
+            self.qr_box.remove(child)
+        if not self.photos:
+            return
+        path, mtime = self.photos[self.index]
+        codes = self.qr_codes(path, mtime)
+        if codes is None:
+            self.qr_enqueue([(path, mtime)], first=True)
+            return
+        for text in codes[:3]:
+            self.qr_box.pack_start(self.qr_chip(text), False, False, 0)
+        self.qr_box.show_all()
+
+    def qr_chip(self, text):
+        kind, shown, url = qr_describe(text)
+        chip = Gtk.Box(spacing=8)
+        chip.get_style_context().add_class("qr")
+        badge = Gtk.Label(label="QR \u00b7 " + kind)
+        badge.get_style_context().add_class("qrkind")
+        badge.set_valign(Gtk.Align.CENTER)
+        chip.pack_start(badge, False, False, 0)
+        label = Gtk.Label(label=shown, xalign=0)
+        label.get_style_context().add_class("qrtext")
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        label.set_line_wrap(True)
+        label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        label.set_lines(2)
+        chip.pack_start(label, True, True, 0)
+        if url:
+            b = Gtk.Button(label="Open")
+            b.set_valign(Gtk.Align.CENTER)
+            b.connect("clicked", lambda b: self.qr_open(url))
+            chip.pack_start(b, False, False, 0)
+        b = Gtk.Button(label="Copy")
+        b.set_valign(Gtk.Align.CENTER)
+        b.connect("clicked", lambda b: self.qr_copy(text))
+        chip.pack_start(b, False, False, 0)
+        return chip
+
+    def qr_copy(self, text):
+        clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clip.set_text(text, -1)
+        clip.store()
+        self.note("Copied")
+
+    def qr_open(self, url):
+        try:
+            subprocess.Popen([BROWSER, url], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            self.note("Opening link…")
+        except OSError as e:
+            self.note("Can't open: %s" % e)
+
+    def note(self, text):
+        """a short message in the caption"""
+        old = self.caption.get_text()
+        self.caption.set_text(text)
+        GLib.timeout_add(1200, lambda: (self.caption.get_text() == text and
+                                        self.caption.set_text(old), False)[1])
+
+    def thumb_worker(self, jobs, gen):
+        for path, mtime, img in jobs:
+            if gen != self.generation:
+                return
+            pix = make_thumb(path, mtime)
+            if pix:
+                GLib.idle_add(self.set_thumb, img, pix, gen)
+
+    def set_thumb(self, img, pix, gen):
+        if gen == self.generation:
+            img.set_from_pixbuf(pix)
+        return False
+
+    def watch(self):
+        """file monitors on ~/Pictures and every folder below"""
+        for m in self.monitors:
+            m.cancel()
+        self.monitors = []
+        dirs = [PICTURES] + [os.path.join(d, n) for d, ds, _ in os.walk(PICTURES)
+                             for n in ds if not n.startswith(".")]
+        for d in dirs:
+            try:
+                m = Gio.File.new_for_path(d).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+            except GLib.Error:
+                continue
+            m.connect("changed", self.on_changed)
+            self.monitors.append(m)
+
+    def on_changed(self, *a):
+        # a photo being written fires several events: rescan once it settles
+        if self.refresh_pending:
+            GLib.source_remove(self.refresh_pending)
+        self.refresh_pending = GLib.timeout_add(600, self.rescan)
+
+    # ---- viewer ----
+
+    def on_tile(self, flow, child):
+        paths = [p for p, _ in self.photos]
+        self.open_viewer(paths.index(child.get_child().path))
+
+    def open_viewer(self, index):
+        self.index = index
+        self.stack.set_visible_child_name("viewer")
+        self.info.hide()
+        self.show_photo()
+        return False
+
+    def close_viewer(self):
+        self.stack.set_visible_child_name("grid")
+        self.full = self.fit = None
+
+    def step(self, d):
+        if not self.photos:
+            return
+        self.index = (self.index + d) % len(self.photos)
+        self.show_photo()
+
+    def current(self):
+        return self.photos[self.index][0] if self.photos else None
+
+    def view_size(self):
+        a = self.view_sw.get_allocation()
+        return max(a.width, 100), max(a.height, 100)
+
+    def show_photo(self):
+        path = self.current()
+        if not path:
+            return
+        self.zoom = 1.0
+        self.full = None
+        w, h = self.view_size()
+        try:
+            pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, w, h, True)
+            self.fit = pix.apply_embedded_orientation()
+        except GLib.Error as e:
+            self.fit = None
+            self.image.clear()
+            self.caption.set_text("%s: %s" % (os.path.basename(path), e.message))
+            return
+        self.image.set_from_pixbuf(self.fit)
+        self.caption.set_text("%s  ·  %d / %d" % (os.path.basename(path), self.index + 1,
+                                                 len(self.photos)))
+        self.show_qr()
+        if self.info.get_visible():
+            self.toggle_info(update=True)
+
+    def on_view_size(self, widget, alloc):
+        if self.fit and self.zoom == 1.0 and self.stack.get_visible_child_name() == "viewer":
+            fw, fh = self.fit.get_width(), self.fit.get_height()
+            if abs(fw - alloc.width) > 2 and abs(fh - alloc.height) > 2:
+                GLib.idle_add(self.show_photo)
+
+    def set_zoom(self, zoom, cx=None, cy=None):
+        """zoom relative to the fitted size, keeping (cx, cy) in place"""
+        path = self.current()
+        if not path or not self.fit:
+            return
+        zoom = max(1.0, min(ZOOM_STEPS[-1], zoom))
+        if zoom == 1.0:
+            self.zoom = 1.0
+            self.image.set_from_pixbuf(self.fit)
+            return
+        if self.full is None:
+            try:
+                self.full = GdkPixbuf.Pixbuf.new_from_file(path).apply_embedded_orientation()
+            except GLib.Error:
+                return
+        hadj, vadj = self.view_sw.get_hadjustment(), self.view_sw.get_vadjustment()
+        w, h = self.view_size()
+        cx = w / 2 if cx is None else cx
+        cy = h / 2 if cy is None else cy
+        # the point under (cx, cy) as a fraction of the image
+        iw = self.fit.get_width() * self.zoom
+        ih = self.fit.get_height() * self.zoom
+        fx = (hadj.get_value() + cx - max(0, (w - iw) / 2)) / iw
+        fy = (vadj.get_value() + cy - max(0, (h - ih) / 2)) / ih
+        nw = int(self.fit.get_width() * zoom)
+        nh = int(self.fit.get_height() * zoom)
+        self.image.set_from_pixbuf(self.full.scale_simple(nw, nh, GdkPixbuf.InterpType.BILINEAR))
+        self.zoom = zoom
+
+        def recentre():
+            hadj.set_value(max(0, fx * nw - cx))
+            vadj.set_value(max(0, fy * nh - cy))
+            return False
+        GLib.idle_add(recentre)
+
+    def on_taps(self, gesture, n, x, y):
+        if n == 2:
+            nxt = [z for z in ZOOM_STEPS if z > self.zoom + 0.01]
+            self.set_zoom(nxt[0] if nxt else 1.0, x, y)
+
+    def on_pinch_begin(self, gesture, seq):
+        self.pinch_start = self.zoom
+
+    def on_pinch(self, gesture, scale):
+        self.pinch_target = self.pinch_start * scale
+
+    def on_pinch_end(self, gesture, seq):
+        ok, x, y = gesture.get_bounding_box_center()
+        self.set_zoom(getattr(self, "pinch_target", self.zoom), x if ok else None,
+                      y if ok else None)
+
+    def on_swipe(self, gesture, vx, vy):
+        if self.zoom > 1.0 or abs(vx) < SWIPE_MIN or abs(vx) < abs(vy):
+            return
+        self.step(-1 if vx > 0 else 1)
+
+    def on_drag_begin(self, gesture, x, y):
+        self.drag_from = (self.view_sw.get_hadjustment().get_value(),
+                          self.view_sw.get_vadjustment().get_value())
+
+    def on_drag_update(self, gesture, dx, dy):
+        if self.zoom > 1.0:
+            self.view_sw.get_hadjustment().set_value(self.drag_from[0] - dx)
+            self.view_sw.get_vadjustment().set_value(self.drag_from[1] - dy)
+
+    def toggle_info(self, update=False):
+        if self.info.get_visible() and not update:
+            self.info.hide()
+            return
+        path = self.current()
+        if not path:
+            return
+        try:
+            st = os.stat(path)
+            fmt, w, h = GdkPixbuf.Pixbuf.get_file_info(path)
+        except (OSError, TypeError):
+            return
+        self.info.set_text("%s\n%d × %d  ·  %.1f MB\n%s\n%s" % (
+            os.path.basename(path), w, h, st.st_size / 1e6,
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+            os.path.dirname(path).replace(os.path.expanduser("~"), "~")))
+        self.info.show()
+
+    def delete_current(self):
+        path = self.current()
+        if not path:
+            return
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True,
+                                message_type=Gtk.MessageType.QUESTION,
+                                buttons=Gtk.ButtonsType.NONE,
+                                text="Delete %s?" % os.path.basename(path))
+        dlg.format_secondary_text("It goes to the trash.")
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Delete", Gtk.ResponseType.OK)
+        resp = dlg.run()
+        dlg.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+        try:
+            Gio.File.new_for_path(path).trash(None)
+        except GLib.Error as e:
+            self.caption.set_text("Delete failed: %s" % e.message)
+            return
+        self.rescan()
+
+    # ---- keys ----
+
+    def on_key(self, win, ev):
+        name = Gdk.keyval_name(ev.keyval) or ""
+        if self.stack.get_visible_child_name() != "viewer":
+            return False
+        if name in ("Left", "Right"):
+            self.step(-1 if name == "Left" else 1)
+        elif name in ("Escape", "BackSpace"):
+            self.close_viewer()
+        elif name == "Delete":
+            self.delete_current()
+        elif name in ("i", "I"):
+            self.toggle_info()
+        elif name in ("plus", "equal", "KP_Add"):
+            self.set_zoom(self.zoom * 2)
+        elif name in ("minus", "KP_Subtract"):
+            self.set_zoom(self.zoom / 2)
+        else:
+            return False
+        return True
+
+
+def main():
+    lock = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "titan-gallery.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    win = Gallery(sys.argv[1] if len(sys.argv) > 1 else None)
+    win.show_all()
+    win.empty.set_visible(not win.photos)
+    win.maximize()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

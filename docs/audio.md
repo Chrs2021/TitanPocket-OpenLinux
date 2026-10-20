@@ -120,7 +120,7 @@ Everything that touches loudness goes through it:
 | Side rocker and headset buttons (`titan-powerkey`, from every input device with volume keys: `mtk-kpd`, `ACCDET`) | before each step | file + amp |
 | Top-bar indicator (desktop shell) | inotify on the file | - |
 | **Sound** app, "All apps" (`titan-mixer`) | file monitor | file + amp |
-| `titan-speakerd` | every time it powers the amp on | amp |
+| `titan-speakerd` | every time it powers the amp on; with headphones, on every change | amp, or the headphone gain; on a jack change it swaps the file with `volume.speaker` / `volume.headphones` |
 | `titan-powerkey` at start and after resume | file | amp |
 | FM (`titan-radio`) | follows the amp (FM bypasses PipeWire) | - |
 
@@ -147,6 +147,54 @@ stream volumes; WirePlumber remembers them.
 
 `titan-mixer` uses `pactl` (`pulseaudio-utils`): `pactl subscribe` for live
 updates, JSON listings, `set-sink-input-*`.
+
+## Headphones
+
+The 3.5 mm jack is watched by the MT6358's accessory detection: the BSP
+`accdet` driver (`drivers/misc/mediatek/accdet/mt6358/`) works as is and
+reports standard input switches on the `ACCDET` input device:
+`SW_HEADPHONE_INSERT` (3-pole headphones), `SW_MICROPHONE_INSERT` (4-pole
+headset), `SW_LINEOUT_INSERT`, plus the headset buttons as keys. Checked
+with `evtest /dev/input/event0` (`evtest --query /dev/input/event0 EV_SW
+SW_HEADPHONE_INSERT` exits 10 while plugged).
+
+**Sound:** DL1's samples reach the MT6358 codec's DAC as well as I2S3, so
+the headphones need no separate stream, only the codec's headphone amps.
+The stock HAL's `headphone_output` path (`/vendor/etc/audio_device.xml`)
+is just `Audio_Amp_R_Switch` / `Audio_Amp_L_Switch` On; the gain is
+`Headset_PGAL_GAIN` / `Headset_PGAR_GAIN` (+8 dB to −10 dB in 1 dB steps,
+or −40 dB). The amps must be switched on **after** the stream started:
+switched on before, they stayed silent in the first test.
+
+`titan-speakerd` does the switching: with headphones (or a line-out cable)
+in the jack, playback on devices 7 and 21 powers the headphone amps (300 ms
+after the device opened) instead of the speaker; plugging in or out while
+something plays moves the sound over. FM follows too; the headphone cable
+is also the FM antenna.
+
+**Volume per output:** the shared level file keeps working for the volume
+keys, the Sound app and the panel indicator, but it follows the output in
+use. On a jack change `titan-speakerd` saves the level to
+`volume.speaker` or `volume.headphones` and loads the other one;
+`volume.output` says whose level the file holds. For the headphones the
+daemon applies the level itself, whenever the file changes:
+
+- Full scale (level 224, 100 %) is **−8 dB**: the codec's +8 dB top is far
+  too loud, so the headphones get only the bottom tenth of its range.
+  Below that the level spreads 42 dB: −8 − 42 × (224 − level) / 224 dB,
+  1.5 dB per volume-key step (8). Level 0 mutes.
+- The codec's gain only has 1 dB steps, down to −10 dB. It is set to the
+  step at or above the target (−10, −9 or −8 dB), and **PipeWire's sink
+  volume** takes the rest (`pactl set-sink-volume @DEFAULT_SINK@`, linear;
+  the speaker is off meanwhile). Back on the speaker the sink returns to
+  100 %; the Sound app, which otherwise keeps the sink at 100 %, leaves it
+  alone while `volume.output` is `headphones`.
+- FM bypasses PipeWire, so on headphones its fine level is the Radio app's
+  own (AFE) gain; the volume keys move only the codec step for it.
+- Headphones start at level 107 (about −30 dB).
+- The top bar shows a headphone icon while they're in use, and the volume
+  indicator shows headphones instead of a speaker
+  (desktop.md).
 
 ## Known limitations / TODO
 

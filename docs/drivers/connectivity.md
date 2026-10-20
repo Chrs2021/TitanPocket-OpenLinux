@@ -127,6 +127,38 @@ and `titan-bt.service` both `Require` it.
 MT6759 RAM code). The rootfs build copies them from
 `Firmware/super_ext/vendor_ext/firmware/`.
 
+#### Wi-Fi RAM code layout (2026-10-16)
+
+`WIFI_RAM_CODE_6759` (480,704 bytes) is in MediaTek's "divided download"
+format (`FIRMWARE_DIVIDED_DOWNLOAD_T`, `wlan_lib.h`). The header is the magic
+`MTKE`, a CRC32 of everything after the first 8 bytes, a count of 4 and a
+section table of `{offset, key index, encrypted, length, destination}`:
+
+| Section | Offset | Length | Loaded at | Encrypted | Content |
+|---|---|---|---|---|---|
+| 0 | 0x58 | 0x6d80 | 0x020a1000 | yes, key 0 | one 16-byte block repeated 1,536 times: a block cipher in ECB mode over padding |
+| 1 | 0x6dd8 | 0x83f0 | 0x000a5800 | yes, key 0 | entropy 7.99, opaque |
+| 2 | 0xf1c8 | 0x538f0 | 0xf0000000 | no | entropy 6.6: probably code |
+| 3 | 0x62ab8 | 0x12af0 | 0xf0055000 | no | ~1,600 readable debug/log strings |
+
+- **No cryptographic signature is visible.** The only check is the CRC32,
+  which can be recomputed.
+- **Encrypted sections are decrypted inside the chip.** The driver sets
+  `DOWNLOAD_CONFIG_ENCRYPTION_MODE` and the key index per section
+  (`CFG_ENABLE_FW_ENCRYPTION`, `wlanImageSectionConfig`). The key is in the
+  chip, so sections 0 and 1 can't be read or changed.
+- **About 400 KB (85 %) is plaintext.**
+- **Untested:** whether the chip's ROM verifies anything else (a hash of the
+  plaintext held in an encrypted section, for instance). A cheap, reversible
+  test: change one character of a log string in section 3, fix the CRC,
+  load it and see whether Wi-Fi comes up. Restore the original file
+  afterwards.
+- **Why it matters:** raw 802.11 transmit (frame injection, needed for
+  AWDL/AirDrop through OWL) would mean patching the firmware's TX path. The
+  driver's sniffer interface (`radiotap%d`, `CFG_SUPPORT_SNIFFER`) is
+  receive-only: its netdev has no `ndo_start_xmit`. See the AirDrop item in
+  roadmap.md.
+
 ### NVRAM (per phone)
 
 The factory record `APCFG/APRDEB/WIFI` lives in the Android `nvdata`

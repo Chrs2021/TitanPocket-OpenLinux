@@ -1,8 +1,33 @@
 diff --git a/src/gstreamer/gstlibcamerasrc.cpp b/src/gstreamer/gstlibcamerasrc.cpp
-index 9061f9163..2bc8825d3 100644
+index 9061f9163..7d3be8a90 100644
 --- a/src/gstreamer/gstlibcamerasrc.cpp
 +++ b/src/gstreamer/gstlibcamerasrc.cpp
-@@ -962,6 +962,14 @@ gst_libcamera_src_close(GstLibcameraSrc *self)
+@@ -186,9 +186,6 @@ int GstLibcameraSrcState::queueRequest()
+ 	if (!request)
+ 		return -ENOMEM;
+ 
+-	/* Apply controls */
+-	controls_.applyControls(request);
+-
+ 	std::unique_ptr<RequestWrap> wrap =
+ 		std::make_unique<RequestWrap>(std::move(request));
+ 
+@@ -212,6 +209,14 @@ int GstLibcameraSrcState::queueRequest()
+ 
+ 	GST_TRACE_OBJECT(src_, "Requesting buffers");
+ 
++	/*
++	 * Apply the controls only now that the request will be queued: a
++	 * request dropped above for lack of buffers would otherwise take the
++	 * pending controls with it, and controls set while streaming (whose
++	 * next request often finds no free buffer) would never take effect.
++	 */
++	controls_.applyControls(wrap->request_);
++
+ 	{
+ 		GLibLocker locker(&lock_);
+ 		cam_->queueRequest(wrap->request_.get());
+@@ -962,6 +967,14 @@ gst_libcamera_src_close(GstLibcameraSrc *self)
  
  	state->config_.reset();
  
@@ -41,6 +66,157 @@ index 9457d62b3..d086f7cd7 100644
  class CameraSensorHelperOv13858 : public CameraSensorHelper
  {
  public:
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index a13a75528..ed548d5e3 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -65,6 +65,78 @@ Agc::Agc()
+ {
+ }
+ 
++/*
++ * Titan Pocket: manual exposure time and analogue gain (AeEnable,
++ * ExposureTimeMode, AnalogueGainMode, ExposureTime, AnalogueGain), so an
++ * application can meter a scene itself, e.g. for a flash photo, instead of
++ * waiting for the stepwise AE to converge.
++ */
++int Agc::init(IPAContext &context, [[maybe_unused]] const ValueNode &tuningData)
++{
++	context.ctrlMap[&controls::AeEnable] = ControlInfo(false, true, true);
++	context.ctrlMap[&controls::ExposureTimeMode] =
++		ControlInfo(controls::ExposureTimeModeValues,
++			    ControlValue(static_cast<int32_t>(controls::ExposureTimeModeAuto)));
++	context.ctrlMap[&controls::AnalogueGainMode] =
++		ControlInfo(controls::AnalogueGainModeValues,
++			    ControlValue(static_cast<int32_t>(controls::AnalogueGainModeAuto)));
++	context.ctrlMap[&controls::ExposureTime] = ControlInfo(1, 1000000, 10000);
++	context.ctrlMap[&controls::AnalogueGain] = ControlInfo(1.0f, 64.0f, 1.0f);
++	return 0;
++}
++
++int Agc::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &configInfo)
++{
++	auto &agc = context.activeState.agc;
++
++	agc.manualExposure = false;
++	agc.manualGain = false;
++	agc.manualExposureUs = 10000;
++	agc.manualGain_ = 1.0;
++	return 0;
++}
++
++void Agc::queueRequest(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		       [[maybe_unused]] IPAFrameContext &frameContext,
++		       const ControlList &controls)
++{
++	auto &agc = context.activeState.agc;
++
++	const auto &aeEnable = controls.get(controls::AeEnable);
++	if (aeEnable.has_value())
++		agc.manualExposure = agc.manualGain = !aeEnable.value();
++	const auto &expMode = controls.get(controls::ExposureTimeMode);
++	if (expMode.has_value())
++		agc.manualExposure = expMode.value() == controls::ExposureTimeModeManual;
++	const auto &gainMode = controls.get(controls::AnalogueGainMode);
++	if (gainMode.has_value())
++		agc.manualGain = gainMode.value() == controls::AnalogueGainModeManual;
++	const auto &exposureTime = controls.get(controls::ExposureTime);
++	if (exposureTime.has_value())
++		agc.manualExposureUs = exposureTime.value();
++	const auto &gain = controls.get(controls::AnalogueGain);
++	if (gain.has_value())
++		agc.manualGain_ = gain.value();
++}
++
++void Agc::applyManual(IPAContext &context, IPAFrameContext &frameContext)
++{
++	auto &agc = context.activeState.agc;
++	const auto &cfg = context.configuration.agc;
++
++	if (agc.manualExposure) {
++		double lineUs = cfg.lineDuration.get<std::micro>();
++		int32_t lines = lineUs > 0 ? static_cast<int32_t>(agc.manualExposureUs / lineUs + 0.5)
++					   : frameContext.sensor.exposure;
++		frameContext.sensor.exposure = std::clamp(lines, cfg.exposureMin, cfg.exposureMax);
++		agc.exposure = frameContext.sensor.exposure;
++	}
++	if (agc.manualGain) {
++		frameContext.sensor.gain = std::clamp(agc.manualGain_, cfg.againMin, cfg.againMax);
++		agc.again = frameContext.sensor.gain;
++	}
++}
++
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
+ {
+ 	int32_t &exposure = frameContext.sensor.exposure;
+@@ -145,6 +217,11 @@ void Agc::process(IPAContext &context,
+ 		context.activeState.agc.valid = true;
+ 	}
+ 
++	if (context.activeState.agc.manualExposure && context.activeState.agc.manualGain) {
++		applyManual(context, frameContext);
++		return;
++	}
++
+ 	if (!stats->valid) {
+ 		/*
+ 		 * Use the new exposure and gain values calculated the last time
+@@ -152,6 +229,7 @@ void Agc::process(IPAContext &context,
+ 		 */
+ 		frameContext.sensor.exposure = context.activeState.agc.exposure;
+ 		frameContext.sensor.gain = context.activeState.agc.again;
++		applyManual(context, frameContext);
+ 		return;
+ 	}
+ 
+@@ -190,6 +268,7 @@ void Agc::process(IPAContext &context,
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+ 	updateExposure(context, frameContext, exposureMSV);
++	applyManual(context, frameContext);
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+diff --git a/src/ipa/simple/algorithms/agc.h b/src/ipa/simple/algorithms/agc.h
+index 112d9f5a1..0daf9c315 100644
+--- a/src/ipa/simple/algorithms/agc.h
++++ b/src/ipa/simple/algorithms/agc.h
+@@ -19,6 +19,11 @@ public:
+ 	Agc();
+ 	~Agc() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
++	void queueRequest(IPAContext &context, const uint32_t frame,
++			  IPAFrameContext &frameContext,
++			  const ControlList &controls) override;
+ 	void process(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+@@ -26,6 +31,7 @@ public:
+ 
+ private:
+ 	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++	void applyManual(IPAContext &context, IPAFrameContext &frameContext);
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff --git a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+index 8ccfacb46..22105b5ce 100644
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -40,6 +40,11 @@ struct IPAActiveState {
+ 		int32_t exposure;
+ 		double again;
+ 		bool valid;
++		/* Titan Pocket: manual exposure time and gain */
++		bool manualExposure;
++		bool manualGain;
++		double manualExposureUs;
++		double manualGain_;
+ 	} agc;
+ 
+ 	struct {
 diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
 index e26f438d9..b67b1f795 100644
 --- a/src/libcamera/pipeline/simple/simple.cpp

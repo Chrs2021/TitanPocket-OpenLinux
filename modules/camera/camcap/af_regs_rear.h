@@ -1,0 +1,46 @@
+/* AF statistics registers from the stock default AF config,
+ * 2336x1752 input, 16x12 blocks (tools/camera/af_regs.py) */
+static const struct { u16 off; u32 val; } af_regs_2336x1752[] = {
+	{ 0x610, 0x00701731 },	/* AF_CON */
+	{ 0x614, 0x00010001 },	/* AF_TH_0 */
+	{ 0x618, 0xf0f0f001 },	/* AF_TH_1 */
+	{ 0x61c, 0x242b240f },	/* AF_FLT_1 */
+	{ 0x620, 0x00020a16 },	/* AF_FLT_2 */
+	{ 0x624, 0x00000000 },	/* AF_FLT_3 */
+	{ 0x628, 0x242b240f },	/* AF_FLT_4 */
+	{ 0x62c, 0x00020a16 },	/* AF_FLT_5 */
+	{ 0x630, 0x00000000 },	/* AF_FLT_6 */
+	{ 0x634, 0x07ea07f6 },	/* AF_FLT_7 */
+	{ 0x638, 0x07d507dc },	/* AF_FLT_8 */
+	{ 0x640, 0x00000920 },	/* AF_SIZE */
+	{ 0x644, 0x00000000 },	/* AF_VLD */
+	{ 0x648, 0x00920092 },	/* AF_BLK_0 */
+	{ 0x64c, 0x000c0010 },	/* AF_BLK_1 */
+	{ 0x650, 0xffffffff },	/* AF_TH_2 */
+	{ 0x654, 0x07f107dc },	/* AF_FLT_9 */
+	{ 0x658, 0x0024000f },	/* AF_FLT_10 */
+	{ 0x65c, 0x0024002b },	/* AF_FLT_11 */
+	{ 0x660, 0x000a0016 },	/* AF_FLT_12 */
+	{ 0x670, 0x00000200 },	/* AF_LUT_H0_0 */
+	{ 0x674, 0x00000000 },	/* AF_LUT_H0_1 */
+	{ 0x678, 0x00000000 },	/* AF_LUT_H0_2 */
+	{ 0x67c, 0x00000000 },	/* AF_LUT_H0_3 */
+	{ 0x680, 0x00000000 },	/* AF_LUT_H0_4 */
+	{ 0x690, 0x00000200 },	/* AF_LUT_H1_0 */
+	{ 0x694, 0x80604020 },	/* AF_LUT_H1_1 */
+	{ 0x698, 0xffe0c0a0 },	/* AF_LUT_H1_2 */
+	{ 0x69c, 0x00000000 },	/* AF_LUT_H1_3 */
+	{ 0x6a0, 0x00000000 },	/* AF_LUT_H1_4 */
+	{ 0x6b0, 0x00000200 },	/* AF_LUT_V_0 */
+	{ 0x6b4, 0x00000000 },	/* AF_LUT_V_1 */
+	{ 0x6b8, 0x00000000 },	/* AF_LUT_V_2 */
+	{ 0x6bc, 0x00000000 },	/* AF_LUT_V_3 */
+	{ 0x6c0, 0x00000000 },	/* AF_LUT_V_4 */
+	{ 0x6c4, 0x00000040 },	/* AF_CON2 */
+	{ 0x810, 0x00000010 },	/* SGG1_PGN */
+	{ 0x814, 0x3e2b1d14 },	/* SGG1_GMRC_1 */
+	{ 0x818, 0x00b47e58 },	/* SGG1_GMRC_2 */
+	{ 0xcb0, 0x00000010 },	/* SGG5_PGN */
+	{ 0xcb4, 0x10080402 },	/* SGG5_GMRC_1 */
+	{ 0xcb8, 0x00804020 },	/* SGG5_GMRC_2 */
+};

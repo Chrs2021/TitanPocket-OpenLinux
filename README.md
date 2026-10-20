@@ -24,7 +24,7 @@ Wayland desktop.
 | `kernel/` | the kernel tree: MediaTek 4.14.186 BSP for the Titan Pocket with changes needed to support this device. |
 | `modules/connectivity/` | out-of-tree MediaTek CONNSYS drivers: WMT core, Wi-Fi, Bluetooth, FM radio, GPS |
 | `modules/camera/` | the camera driver (`v4l2/`: V4L2 + media controller), bring-up tools (`camprobe/`, `camcap/`) and the ISP register map (`isp/`) |
-| `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up), the FM radio and camera apps, the libcamera patch, and the power/volume keys, with their systemd units |
+| `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up), the FM radio, camera and photo gallery apps, the libcamera patch, and the power/volume keys, with their systemd units |
 | `docs/` | hardware reference, per-driver notes, and how the vendor drivers were reverse-engineered |
 
 ## Hardware support
@@ -40,16 +40,17 @@ Wayland desktop.
 | Charging (MT6370) | BSP | ⚠️ works, not characterized |
 | Speaker amplifier (FourSemi FS1860) | `sound/soc/codecs/fs1860.c` (new) | ✅ |
 | Wi-Fi 2.4 + 5 GHz (CONNSYS gen3) | `modules/connectivity/` | ✅ |
-| Bluetooth | `modules/connectivity/bt/` | ✅ raw HCI (`/dev/stpbt`); pairing untested |
-| FM radio (MT6631) | `modules/connectivity/fm/` | ✅ `/dev/fm`; Radio app (`titan-radio-gui`) |
+| Bluetooth | `modules/connectivity/bt/` | ✅ BlueZ via raw HCI (`/dev/stpbt`); LE scanning and GATT peripheral connections work (with the supported-commands fix in `titan-btbridge`); classic pairing and audio untested |
+| FM radio (MT6631) | `modules/connectivity/fm/` | ✅ `/dev/fm`; Radio app (`titan-radio-gui`) with RDS (station name, call letters, programme type, radio text) |
+| Headphone jack (MT6358 accdet) | BSP | ✅ plug detection (`SW_HEADPHONE_INSERT`); sound and FM switch to the headphones with their own volume (`titan-speakerd`, [docs/audio.md](docs/audio.md#headphones)) |
 | IR blaster | BSP `mtk_irtx_pwm` + MT6370 LDO fix | ✅ `/dev/irtx` |
 | NFC (STMicro ST21NFC) | BSP `st21nfc` | ✅ `/dev/st21nfc` (NCI) |
 | USB gadget (serial + network) | BSP | ✅ |
 | CPU frequency scaling, suspend to RAM | BSP + fixes | ✅ |
-| Microphones, earpiece | BSP | ❓ untested |
+| Microphones, earpiece, headset mic | BSP | ❓ untested |
 | GPS / GNSS (MT6631) | `modules/connectivity/gps/` | ✅ 3D fix outdoors (GPS, GLONASS, BeiDou, SBAS). The driver is source; positioning runs on MediaTek's closed `libmnl.so` from the phone ([docs/gnss.md](docs/gnss.md)) |
 | Cellular modem | BSP CCCI | ❓ needs firmware loading + userspace |
-| Cameras (OV16880 rear, OV8865 front) | `modules/camera/v4l2/` (new, out of tree) | ✅ both stream at 30 fps through V4L2 (MIPI receiver + CAMSV DMA) and libcamera (software ISP debayering on the GPU; `cam`, GStreamer); Camera app with autofocus. MediaTek's hardware ISP not used yet ([docs/camera.md](docs/camera.md)) |
+| Cameras (OV16880 rear, OV8865 front) | `modules/camera/v4l2/` (new, out of tree) | ✅ both stream at 30 fps through V4L2 (MIPI receiver + CAMSV DMA) and libcamera (software ISP debayering on the GPU; `cam`, GStreamer); Camera app with autofocus, fed by MediaTek's ISP AF statistics (pass 1, run beside the capture path). The rest of the hardware ISP isn't used yet ([docs/camera.md](docs/camera.md)) |
 
 ## Origin of the source
 

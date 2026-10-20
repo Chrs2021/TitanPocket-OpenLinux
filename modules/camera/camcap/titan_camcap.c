@@ -39,6 +39,8 @@
 #include <dt-bindings/clock/mt6771-clk.h>
 
 #include "seninf_reg.h"
+#include "af_regs_front.h"
+#include "af_regs_rear.h"
 #include "ov8865_regs.h"
 #include "ov16880_regs.h"
 
@@ -62,6 +64,29 @@ module_param(unpak, int, 0444);
 MODULE_PARM_DESC(unpak, "experiment: 0 packed RAW10, 1 packer off, 2 packer off + bit 3");
 static int focus = 256;
 module_param(focus, int, 0444);
+
+/* ISP pass 1 instead of CAMSV: CAM A's IMGO, every processing block off */
+static int p1;
+module_param(p1, int, 0444);
+static int p1fmt = 9;		/* CTL_FMT_SEL IMGO format: 9 RAW10 packed, 0 16-bit, 8 RAW8 */
+module_param(p1fmt, int, 0444);
+static int p1sel;		/* CTL_SEL variant (HAL Cam_path_sel::Path_sel_RAW) */
+module_param(p1sel, int, 0444);
+static int p1selor;		/* bits ORed into CTL_SEL (HAL Path_sel: 0x190000, |2) */
+module_param(p1selor, int, 0444);
+static int p1en = 0x3;		/* CTL_EN: bit 0 TG, bit 1 DMX (the demux after TG) */
+module_param(p1en, int, 0444);
+static int p1en2;		/* CTL_EN2 */
+module_param(p1en2, int, 0444);
+static int p1dmx;		/* DMX_CTL bits 15:0 (HAL: from a capability query) */
+module_param(p1dmx, int, 0444);
+static int p1af;		/* AF statistics through AFO */
+module_param(p1af, int, 0444);
+static int p1afm1 = 1;		/* AFO sizes minus one, as for every DMA. The HAL's
+				 * config() leaves the -1 to a lower layer; written
+				 * as is, AFO reports error 0x8280 and ignores the
+				 * stride */
+module_param(p1afm1, int, 0444);
 MODULE_PARM_DESC(focus, "rear lens position 0..1023 (0 = far)");
 
 #define SENINF_BASE	0x1a040000
@@ -114,7 +139,7 @@ static struct i2c_adapter *adap;
 static struct regulator *dovdd, *avdd, *dvdd, *afvdd;
 static struct clk *mclk, *mclk_parent;
 static bool mclk_on;
-static void __iomem *seninf, *mipi_rx, *camsv;
+static void __iomem *seninf, *mipi_rx, *camsv, *cama;
 static struct dentry *dbg, *dbg_frame;
 static struct debugfs_blob_wrapper frame_blob;
 static bool smi_on;
@@ -497,6 +522,15 @@ static void seninf_setup(void)
 
 /* BSP m4u 2.4 API (not exported to modules: found through kallsyms) */
 #define M4U_PORT_CAM_SOCO	72	/* larb6 port 11: CAMSV output */
+#define M4U_PORT_CAM_IMGO	61	/* larb6 port 0: CAM IMGO */
+#define M4U_PORT_CAM_AFO	64	/* larb6 port 3: CAM AFO */
+#define buf_port()		(p1 ? M4U_PORT_CAM_IMGO : M4U_PORT_CAM_SOCO)
+
+/* AF statistics: 16 x 12 blocks of 40 bytes (tools/camera/af_regs.py) */
+#define AF_NX		16
+#define AF_NY		12
+#define AFO_LINE	(AF_NX * 40)
+#define AFO_STRIDE	ALIGN(AFO_LINE + 1, 16)
 #define M4U_PROT_READ		(1 << 0)
 #define M4U_PROT_WRITE		(1 << 1)
 
@@ -507,7 +541,9 @@ static struct {
 	size_t size;
 	struct sg_table sgt;
 	unsigned int mva;	/* the device address */
-} frame, header;
+} frame, header, afo;
+static struct dentry *dbg_afo, *dbg_focus;
+static struct debugfs_blob_wrapper afo_blob;
 static void *m4u_client;
 
 static void *m4u_fn(const char *name)
@@ -546,7 +582,7 @@ static int buf_alloc(typeof(frame) *b, size_t size)
 	ret = sg_alloc_table_from_pages(&b->sgt, b->pages, b->npages, 0, b->size, GFP_KERNEL);
 	if (ret)
 		return ret;
-	ret = alloc_mva(m4u_client, M4U_PORT_CAM_SOCO, 0, &b->sgt, b->size,
+	ret = alloc_mva(m4u_client, b == &afo ? M4U_PORT_CAM_AFO : buf_port(), 0, &b->sgt, b->size,
 			M4U_PROT_READ | M4U_PROT_WRITE, 0, &b->mva);
 	if (ret)
 		pr_err("titan_camcap: m4u_alloc_mva: %d\n", ret);
@@ -560,7 +596,7 @@ static void buf_free(typeof(frame) *b)
 	int i;
 
 	if (b->mva && dealloc_mva)
-		dealloc_mva(m4u_client, M4U_PORT_CAM_SOCO, b->mva);
+		dealloc_mva(m4u_client, b == &afo ? M4U_PORT_CAM_AFO : buf_port(), b->mva);
 	b->mva = 0;
 	if (b->sgt.sgl)
 		sg_free_table(&b->sgt);
@@ -592,6 +628,8 @@ static int buffers_alloc(void)
 	ret = buf_alloc(&frame, stride * m->height);
 	if (!ret)
 		ret = buf_alloc(&header, PAGE_SIZE);
+	if (!ret && p1af)
+		ret = buf_alloc(&afo, AFO_STRIDE * AF_NY);
 	if (ret)
 		return ret;
 	frame_blob.data = frame.vaddr;
@@ -606,6 +644,7 @@ static void buffers_free(void)
 
 	buf_free(&frame);
 	buf_free(&header);
+	buf_free(&afo);
 	if (m4u_client && destroy_client)
 		destroy_client(m4u_client);
 	m4u_client = NULL;
@@ -713,6 +752,153 @@ static void camsv_stop(void)
 	msleep(100);	/* let a frame in flight finish before the memory goes */
 }
 
+/* ---- ISP pass 1, CAM A (docs/camera.md, "MediaTek ISP") ----
+ *
+ * From the HAL's CAM_TOP_CTRL / CAM_TG_CTRL / DMAO_B / Cam_path_sel and the
+ * BSP kernel driver; register names: ../isp/cam_p1_regs.h. The layout is
+ * CAMSV's with the blocks moved: control at 0x000 (CAMSV 0x500), TG at
+ * 0x230 (same), DMA at 0x1000 (CAMSV 0x000).
+ */
+#define P1_BASE		0x1a004000	/* CAM A */
+#define P1_SIZE		0x2000
+#define P1_CTL_EN	0x004
+#define P1_CTL_DMA_EN	0x008
+#define P1_CTL_FMT_SEL	0x00c
+#define P1_CTL_SEL	0x010
+#define P1_CTL_EN2	0x018
+#define P1_INT_EN	0x020
+#define P1_INT_STAT	0x024
+#define P1_INT2_STAT	0x034
+#define P1_SW_CTL	0x040
+#define P1_DB_EN	0x088		/* HAL writes 1 last (double buffering?) */
+#define P1_FBC_IMGO	0x110		/* assumed: CAMSV's FBC_CTL1 offset */
+#define P1_DMX_CTL	0x330
+#define P1_DMX_CROP	0x334
+#define P1_DMX_VSIZE	0x338
+#define P1_TG_SEN_MODE	0x230
+#define P1_TG_VF_CON	0x234
+#define P1_TG_GRAB_PXL	0x238
+#define P1_TG_GRAB_LIN	0x23c
+#define P1_TG_SIZE	0x268
+#define P1_TG_INTER_ST	0x26c
+#define P1_IMGO_BASE	0x1020
+#define P1_IMGO_OFST	0x1028
+#define P1_IMGO_XSIZE	0x1030
+#define P1_IMGO_YSIZE	0x1034
+#define P1_IMGO_STRIDE	0x1038
+#define P1_IMGO_CON	0x103c
+#define P1_IMGO_CON2	0x1040
+#define P1_IMGO_CON3	0x1044
+#define P1_IMGO_CROP	0x1048
+#define P1_IMGO_ERR	0x1360		/* ChromeOS REG_IMGO_ERR_STAT */
+#define P1_AFO_BASE	0x10b0
+#define P1_AFO_OFST	0x10b8
+#define P1_AFO_XSIZE	0x10c0
+#define P1_AFO_YSIZE	0x10c4
+#define P1_AFO_STRIDE	0x10c8
+#define P1_AFO_CON	0x10cc
+#define P1_AFO_CON2	0x10d0
+#define P1_AFO_CON3	0x10d4
+#define P1_AFO_ERR	0x136c		/* ChromeOS REG_AFO_ERR_STAT */
+#define P1_EN_AF	BIT(17)		/* tuning function 15 (TuningMgrImp::enableEngine) */
+#define P1_EN_SGG1	BIT(18)		/* function 14: the AF input gamma */
+#define P1_EN2_SGG5	BIT(31)		/* function 22 */
+#define P1_DMA_AFO	BIT(3)
+
+static void p1_rmw(u32 reg, u32 keep, u32 set)
+{
+	writel((readl(cama + reg) & keep) | set, cama + reg);
+}
+
+static void p1_start(void)
+{
+	int i;
+
+	/* reset: 1, wait for 2, 4, 0 */
+	writel(1, cama + P1_SW_CTL);
+	for (i = 0; i < 10000 && readl(cama + P1_SW_CTL) != 2; i++)
+		udelay(1);
+	writel(4, cama + P1_SW_CTL);
+	writel(0, cama + P1_SW_CTL);
+	pr_info("titan_camcap: cam A reset %s\n", i < 10000 ? "done" : "timed out");
+
+	/* format: TG RAW10 (bits 14:12), IMGO format (8:4), RRZO 10 bit (3:2),
+	 * one pixel per clock (21:20) */
+	writel(1 << 12 | (p1fmt & 0x1f) << 4 | 1 << 2, cama + P1_CTL_FMT_SEL);
+	writel((p1sel ? 0x060a5010 : 0x07025010) | p1selor, cama + P1_CTL_SEL);
+	writel(p1en, cama + P1_CTL_EN);
+	writel(p1en2, cama + P1_CTL_EN2);
+	/* DMX (HAL CAM_DMX_CTRL): bits 19:16 set, bit 31 clear; the whole width
+	 * and height */
+	p1_rmw(P1_DMX_CTL, 0x7ff00000, 0xf0000 | (p1dmx & 0xffff));
+	writel((m->width - 1) << 16, cama + P1_DMX_CROP);
+	writel(m->height, cama + P1_DMX_VSIZE);
+	writel(0, cama + P1_INT_EN);		/* the BSP driver owns the IRQ */
+	p1_rmw(0x13b0, 0x7fffffff, 0);
+	writel(0xffffffff, cama + 0x13c4);
+	writel(0, cama + 0x1400);
+
+	/* TG: whole frame, continuous */
+	p1_rmw(P1_TG_SEN_MODE, ~0x70003U, 0x20000);
+	p1_rmw(P1_TG_VF_CON, ~0x2U, 0);
+	writel(m->width << 16, cama + P1_TG_GRAB_PXL);
+	writel(m->height << 16, cama + P1_TG_GRAB_LIN);
+	p1_rmw(0x25c, ~0U, 0x20);
+	p1_rmw(0x240, ~0U, 0x8000);
+
+	/* IMGO: FIFO settings from the BSP's ISP_ConfigDMAControl() */
+	writel(line_bytes - 1, cama + P1_IMGO_XSIZE);
+	writel(m->height - 1, cama + P1_IMGO_YSIZE);
+	writel(stride | 0x1010000, cama + P1_IMGO_STRIDE);
+	writel(0, cama + P1_IMGO_CROP);
+	writel(0x80000180, cama + P1_IMGO_CON);
+	writel(0x00400040, cama + P1_IMGO_CON2);
+	writel(0x00200020, cama + P1_IMGO_CON3);
+	writel(0, cama + P1_IMGO_OFST);
+	writel(frame.mva, cama + P1_IMGO_BASE);
+	writel(0, cama + P1_FBC_IMGO);
+	writel(1, cama + P1_DB_EN);
+
+	if (p1af) {
+		/* AF statistics (HAL ISP_MGR_AF_STAT_CONFIG with the stock default
+		 * AF config) and their DMA, AFO */
+		int i, n = cam ? ARRAY_SIZE(af_regs_1632x1224) : ARRAY_SIZE(af_regs_2336x1752);
+
+		for (i = 0; i < n; i++) {
+			if (cam)
+				writel(af_regs_1632x1224[i].val, cama + af_regs_1632x1224[i].off);
+			else
+				writel(af_regs_2336x1752[i].val, cama + af_regs_2336x1752[i].off);
+		}
+		p1_rmw(P1_CTL_EN, ~0U, P1_EN_AF | P1_EN_SGG1);
+		p1_rmw(P1_CTL_EN2, ~0U, P1_EN2_SGG5);
+		writel(AFO_LINE - !!p1afm1, cama + P1_AFO_XSIZE);
+		writel(AF_NY - !!p1afm1, cama + P1_AFO_YSIZE);
+		writel(AFO_STRIDE, cama + P1_AFO_STRIDE);
+		writel(0x80000100, cama + P1_AFO_CON);
+		writel(0x00800080, cama + P1_AFO_CON2);
+		writel(0x00550055, cama + P1_AFO_CON3);
+		writel(0, cama + P1_AFO_OFST);
+		writel(afo.mva, cama + P1_AFO_BASE);
+		p1_rmw(P1_CTL_DMA_EN, ~0U, P1_DMA_AFO);
+	}
+
+	/* go */
+	p1_rmw(P1_CTL_DMA_EN, ~0U, 1);		/* IMGO */
+	p1_rmw(P1_TG_SEN_MODE, ~0U, 1);		/* CMOS_EN */
+	p1_rmw(P1_TG_VF_CON, ~0U, 1);		/* VFDATA_EN */
+}
+
+static void p1_stop(void)
+{
+	if (!cama)
+		return;
+	p1_rmw(P1_TG_VF_CON, ~1U, 0);
+	p1_rmw(P1_TG_SEN_MODE, ~1U, 0);
+	writel(0, cama + P1_CTL_DMA_EN);
+	msleep(100);
+}
+
 /* ---- debugfs ---- */
 
 static int status_show(struct seq_file *s, void *v)
@@ -730,6 +916,27 @@ static int status_show(struct seq_file *s, void *v)
 		   readl(seninf + SENINF1_MUX_CTRL), readl(seninf + SENINF1_MUX_INTSTA),
 		   readl(seninf + SENINF1_MUX_DEBUG_2) >> 16,
 		   readl(seninf + SENINF1_MUX_DEBUG_2) & 0xffff);
+	if (cama) {
+		u32 sz = readl(cama + P1_TG_SIZE);
+
+		seq_printf(s, "cam A: int %08x int2 %08x  frames %u  measured %u x %u\n"
+			   "  ctl_en %08x dma_en %08x fmt %08x sel %08x  imgo err %08x\n",
+			   readl(cama + P1_INT_STAT), readl(cama + P1_INT2_STAT),
+			   readl(cama + P1_TG_INTER_ST) >> 24, sz >> 16, sz & 0xffff,
+			   readl(cama + P1_CTL_EN), readl(cama + P1_CTL_DMA_EN),
+			   readl(cama + P1_CTL_FMT_SEL), readl(cama + P1_CTL_SEL),
+			   readl(cama + P1_IMGO_ERR));
+		if (afo.vaddr) {
+			const u32 *w = afo.vaddr;
+
+			seq_printf(s, "  afo err %08x  block(0,0): %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				   readl(cama + P1_AFO_ERR), w[0], w[1], w[2], w[3], w[4], w[5],
+				   w[6], w[7], w[8], w[9]);
+		}
+		seq_printf(s, "  dmx %08x %08x %08x  en2 %08x\n", readl(cama + P1_DMX_CTL),
+			   readl(cama + P1_DMX_CROP), readl(cama + P1_DMX_VSIZE),
+			   readl(cama + P1_CTL_EN2));
+	}
 	if (camsv) {
 		u32 sz = readl(camsv + SV_TG_SIZE);
 
@@ -752,17 +959,39 @@ static const struct file_operations status_fops = {
 	.release = single_release,
 };
 
+/* lens position at run time: echo 384 > /sys/kernel/debug/titan_camcap_focus */
+static int focus_get(void *data, u64 *val)
+{
+	*val = focus;
+	return 0;
+}
+
+static int focus_set(void *data, u64 val)
+{
+	if (val > 1023)
+		return -EINVAL;
+	focus = val;
+	af_set(focus);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(focus_fops, focus_get, focus_set, "%llu\n");
+
 /* ---- module ---- */
 
 static void teardown(void)
 {
 	debugfs_remove(dbg);
 	debugfs_remove(dbg_frame);
-	dbg = dbg_frame = NULL;
+	debugfs_remove(dbg_afo);
+	debugfs_remove(dbg_focus);
+	dbg = dbg_frame = dbg_afo = dbg_focus = NULL;
 	camsv_stop();
+	p1_stop();
 	if (camsv)
 		iounmap(camsv);
-	camsv = NULL;
+	if (cama)
+		iounmap(cama);
+	camsv = cama = NULL;
 	if (adap) {
 		sensor_write(0x0100, 0);	/* stream off */
 		i2c_put_adapter(adap);
@@ -798,7 +1027,10 @@ static int __init camcap_init(void)
 		return -EINVAL;
 	c = &cams[cam];
 	m = &c->modes[mode];
-	line_bytes = unpak ? m->width * 2 : m->width * 10 / 8;	/* 16-bit or packed RAW10 */
+	if (p1)
+		line_bytes = p1fmt == 8 ? m->width : p1fmt == 9 ? m->width * 10 / 8 : m->width * 2;
+	else
+		line_bytes = unpak ? m->width * 2 : m->width * 10 / 8;	/* 16-bit or packed RAW10 */
 	stride = ALIGN(line_bytes, 16);
 	if (exposure < 0)
 		exposure = m->vts - 64;
@@ -827,8 +1059,11 @@ static int __init camcap_init(void)
 		smi_on = true;
 	seninf = ioremap(SENINF_BASE, SENINF_SIZE);
 	mipi_rx = ioremap(MIPI_RX_BASE, MIPI_RX_SIZE);
-	camsv = ioremap(CAMSV_BASE + sv * 0x1000, 0x1000);
-	if (!seninf || !mipi_rx || !camsv) {
+	if (p1)
+		cama = ioremap(P1_BASE, P1_SIZE);
+	else
+		camsv = ioremap(CAMSV_BASE + sv * 0x1000, 0x1000);
+	if (!seninf || !mipi_rx || !(camsv || cama)) {
 		ret = -ENOMEM;
 		goto err;
 	}
@@ -878,13 +1113,28 @@ static int __init camcap_init(void)
 		readl(seninf + SENINF1_MUX_DEBUG_2) >> 16,
 		readl(seninf + SENINF1_MUX_DEBUG_2) & 0xffff);
 
-	camsv_start();
-	msleep(400);
-	pr_info("titan_camcap: camsv%d int %08x, %u frames\n", sv,
-		readl(camsv + SV_INT_STATUS), readl(camsv + SV_TG_INTER_ST) >> 24);
+	if (p1) {
+		p1_start();
+		msleep(400);
+		pr_info("titan_camcap: cam A int %08x, %u frames, measured %08x, imgo err %08x\n",
+			readl(cama + P1_INT_STAT), readl(cama + P1_TG_INTER_ST) >> 24,
+			readl(cama + P1_TG_SIZE), readl(cama + P1_IMGO_ERR));
+	} else {
+		camsv_start();
+		msleep(400);
+		pr_info("titan_camcap: camsv%d int %08x, %u frames\n", sv,
+			readl(camsv + SV_INT_STATUS), readl(camsv + SV_TG_INTER_ST) >> 24);
+	}
 
 	dbg = debugfs_create_file("titan_camcap", 0444, NULL, NULL, &status_fops);
 	dbg_frame = debugfs_create_blob("titan_camcap_frame", 0444, NULL, &frame_blob);
+	if (cam == 0)
+		dbg_focus = debugfs_create_file("titan_camcap_focus", 0644, NULL, NULL, &focus_fops);
+	if (afo.vaddr) {
+		afo_blob.data = afo.vaddr;
+		afo_blob.size = AFO_STRIDE * AF_NY;
+		dbg_afo = debugfs_create_blob("titan_camcap_afo", 0444, NULL, &afo_blob);
+	}
 	return 0;
 
 err:

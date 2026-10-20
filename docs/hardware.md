@@ -104,3 +104,26 @@ check which end sound comes from. See [audio.md](audio.md).
 - Sense resistor 10 mOhm.
 - OZ8806 keeps its coulomb counter powered from the battery, so remaining
   capacity survives reboots and kernel changes.
+
+## Vibration motor
+
+- **Supply:** the MT6358 PMIC's VIBR LDO (`RG_LDO_VIBR_EN`). Its voltage
+  is `RG_VIBR_VOSEL` = the device tree's `vib_vol` (11).
+- **Driver:** the BSP's (`drivers/misc/mediatek/vibrator/`, platform
+  `mt6771`) works as is. It is exposed through the LED class at
+  `/sys/class/leds/vibrator`:
+  - write a time in ms to `duration`, then 1 to `activate`; a kernel
+    timer ends the pulse;
+  - `activate` reads 1 while it runs (`state` is just a stored value);
+  - pulses shorter than `vib_timer` (25 ms) are stretched to 25 ms, and
+    pulses are capped at 15 s;
+  - an over-current interrupt (`INT_VIBR_OC`) stops it.
+- **`titan-vibrate`** (Rust, `userspace/titan-vibrate/`, static musl):
+  - with no argument, a 25 ms tick;
+  - `MS` for one pulse;
+  - `ON,OFF,ON,…` for a pattern in ms;
+  - the names `tick`, `click`, `double`, `heartbeat`, `notify`, `long`;
+  - `stop`.
+  
+  Patterns are timed in userspace and the command returns when they end
+  (`double` takes 246 ms, `notify` 457 ms).

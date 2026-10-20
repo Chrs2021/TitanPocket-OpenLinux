@@ -26,9 +26,36 @@
  * stream after boot writes full gain (0xff), and a power loss resets it too.
  *
  * Only 48 kHz: the clock rate is fixed, PipeWire's sink runs at 48 kHz.
+ *
+ * Headphones: the same samples also reach the MT6358 codec's DAC. With
+ * headphones (or a line-out cable) in the jack, as reported by the PMIC's
+ * accessory detection (input device "ACCDET", SW_HEADPHONE_INSERT /
+ * SW_LINEOUT_INSERT), the speaker stays off and the codec's headphone amps
+ * (Audio_Amp_L/R_Switch, the stock HAL's headphone_output path) are switched
+ * on instead, HP_DELAY_MS after the stream opened: switched on before the
+ * stream runs, they stay silent. Plugging in or out while something plays
+ * moves the sound over. Each output keeps its own level: on a jack change
+ * the shared level file is saved for the old output (volume.speaker,
+ * volume.headphones) and loaded with the new one's, so the volume keys, the
+ * mixer and the panel indicator always work on the output in use. For the
+ * headphones the level is applied here whenever the file changes.
+ *
+ * Headphone loudness: full scale is HP_MAX_DB (-8 dB, the bottom tenth of
+ * the codec's -10..+8 dB headphone gain, which is loud enough), and the
+ * level spreads HP_RANGE_DB below it, 1.5 dB per volume-key step. The
+ * codec's gain only has 1 dB steps down to -10 dB, so it is set to the
+ * step at or above the target and PipeWire's sink volume (software, the
+ * speaker is off meanwhile) takes the rest; back on the speaker the sink
+ * returns to 100 %. FM bypasses PipeWire: its finer level is the Radio
+ * app's own (AFE) gain. Level 0 mutes (-40 dB, sink 0).
  */
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/i2c.h>
+#include <linux/input.h>
+#include <math.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <linux/i2c-dev.h>
 #include <signal.h>
 #include <stdio.h>
@@ -52,8 +79,22 @@
 #define VOL_FILE	"/var/lib/titan-audio/volume"
 #define VOL_CONTROL	"Speaker Amp Volume"
 #define VOL_MAX		224	/* same cap as titan-powerkey and titan-mixer */
+#define VOL_DEFAULT	160
 #define CLOCK_CTL	"Audio_i2s0_SideGen_Switch"
 #define CLOCK_ON	"On48000"
+#define LEVEL_DIR	"/var/lib/titan-audio"
+#define VOL_SPEAKER	LEVEL_DIR "/volume.speaker"
+#define VOL_HEADPHONES	LEVEL_DIR "/volume.headphones"
+#define VOL_OWNER	LEVEL_DIR "/volume.output"	/* whose level VOL_FILE holds */
+#define HP_DEFAULT	107	/* about -30 dB */
+#define HP_DELAY_MS	300
+#define HP_MAX_DB	-8.0	/* level VOL_MAX */
+#define HP_RANGE_DB	42.0	/* level 0+ .. VOL_MAX: 1.5 dB per key step of 8 */
+#define HP_PGA_MIN	-10	/* the codec's lowest step above -40 dB */
+#define PACTL_ENV	"XDG_RUNTIME_DIR=/run/user/0"	/* PipeWire runs in root's session */
+#define JACK_NAME	"ACCDET"
+
+enum output { OUT_NONE, OUT_SPEAKER, OUT_HEADPHONES };
 
 static const unsigned int watched[] = { 7, 21 };
 
@@ -147,6 +188,200 @@ static int set_clock(const char *value)
 	return ret;
 }
 
+static int read_level(const char *path, int def)
+{
+	FILE *f = fopen(path, "r");
+	int level;
+
+	if (!f)
+		return def;
+	if (fscanf(f, "%d", &level) != 1 || level < 0 || level > VOL_MAX)
+		level = def;
+	fclose(f);
+	return level;
+}
+
+/* atomically, so the panel indicator (watching for renames) sees it */
+static void write_text(const char *path, const char *text)
+{
+	char tmp[128];
+	FILE *f;
+
+	snprintf(tmp, sizeof tmp, "%s.tmp", path);
+	f = fopen(tmp, "w");
+	if (!f)
+		return;
+	fputs(text, f);
+	if (fclose(f) == 0)
+		rename(tmp, path);
+}
+
+static void write_level(const char *path, int level)
+{
+	char buf[16];
+
+	snprintf(buf, sizeof buf, "%d\n", level);
+	write_text(path, buf);
+}
+
+/* the jack: "ACCDET" among the input devices; -1 if absent */
+static int jack_open(void)
+{
+	struct dirent *e;
+	DIR *d = opendir("/dev/input");
+	int fd = -1;
+
+	while (d && (e = readdir(d))) {
+		char path[300], name[64] = "";
+
+		if (strncmp(e->d_name, "event", 5))
+			continue;
+		snprintf(path, sizeof path, "/dev/input/%s", e->d_name);
+		fd = open(path, O_RDONLY | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+		if (ioctl(fd, EVIOCGNAME(sizeof name - 1), name) >= 0 &&
+		    !strcmp(name, JACK_NAME))
+			break;
+		close(fd);
+		fd = -1;
+	}
+	if (d)
+		closedir(d);
+	return fd;
+}
+
+/* headphones or a line-out cable in the jack */
+static int headphones_in(void)
+{
+	static int fd = -1;
+	unsigned long sw[(SW_MAX + 8 * sizeof(long)) / (8 * sizeof(long))] = { 0 };
+
+	if (fd < 0 && (fd = jack_open()) < 0)
+		return 0;
+	if (ioctl(fd, EVIOCGSW(sizeof sw), sw) < 0) {
+		close(fd);
+		fd = -1;
+		return 0;
+	}
+	return (sw[0] >> SW_HEADPHONE_INSERT & 1) || (sw[0] >> SW_LINEOUT_INSERT & 1);
+}
+
+/* the shared level file follows the output: save the old one's, load the new one's */
+static void switch_levels(int to_headphones)
+{
+	char owner[32] = "";
+	FILE *f = fopen(VOL_OWNER, "r");
+	int from_headphones, cur;
+
+	if (f) {
+		if (!fgets(owner, sizeof owner, f))
+			owner[0] = '\0';
+		fclose(f);
+	}
+	/* no owner yet: the level file always belonged to the speaker */
+	from_headphones = !strncmp(owner, "headphones", 10);
+	mkdir(LEVEL_DIR, 0755);
+	if (from_headphones == to_headphones) {
+		if (!owner[0])
+			write_text(VOL_OWNER, "speaker\n");
+		return;
+	}
+	cur = read_level(VOL_FILE, -1);
+	if (cur >= 0)
+		write_level(from_headphones ? VOL_HEADPHONES : VOL_SPEAKER, cur);
+	if (to_headphones)
+		write_level(VOL_FILE, read_level(VOL_HEADPHONES, HP_DEFAULT));
+	else
+		write_level(VOL_FILE, read_level(VOL_SPEAKER, cur >= 0 ? cur : VOL_DEFAULT));
+	write_text(VOL_OWNER, to_headphones ? "headphones\n" : "speaker\n");
+	fprintf(stderr, "titan-speakerd: %s, level %d\n",
+		to_headphones ? "headphones in" : "headphones out", read_level(VOL_FILE, -1));
+}
+
+static int set_enum(const char *control, const char *value)
+{
+	struct mixer *mixer = mixer_open(CARD);
+	struct mixer_ctl *ctl;
+	int ret = -1;
+
+	if (!mixer)
+		return -1;
+	ctl = mixer_get_ctl_by_name(mixer, control);
+	if (ctl)
+		ret = mixer_ctl_set_enum_by_string(ctl, value);
+	if (ret)
+		fprintf(stderr, "titan-speakerd: %s = %s failed\n", control, value);
+	mixer_close(mixer);
+	return ret;
+}
+
+/* PipeWire's default sink volume (linear amplitude); remembered to skip repeats */
+static double sink_volume = -1;
+
+static void set_sink_volume(double v)
+{
+	char cmd[160];
+
+	if (fabs(v - sink_volume) < 1e-6)
+		return;
+	snprintf(cmd, sizeof cmd, PACTL_ENV " pactl set-sink-volume @DEFAULT_SINK@ %.6f "
+		 ">/dev/null 2>&1", v);
+	if (system(cmd) == 0)
+		sink_volume = v;
+}
+
+/* the shared level (0..VOL_MAX) as codec gain + sink volume */
+static void headphones_level(void)
+{
+	int level = read_level(VOL_FILE, HP_DEFAULT);
+	double target;
+	int pga;
+	char db[16];
+
+	if (level == 0) {
+		set_enum("Headset_PGAL_GAIN", "-40Db");
+		set_enum("Headset_PGAR_GAIN", "-40Db");
+		set_sink_volume(0);
+		return;
+	}
+	target = HP_MAX_DB - HP_RANGE_DB * (VOL_MAX - level) / VOL_MAX;
+	pga = (int)ceil(target - 1e-9);
+	if (pga < HP_PGA_MIN)
+		pga = HP_PGA_MIN;
+	snprintf(db, sizeof db, "%dDb", pga);
+	set_enum("Headset_PGAL_GAIN", db);
+	set_enum("Headset_PGAR_GAIN", db);
+	set_sink_volume(pow(10, (target - pga) / 20));
+}
+
+static void headphones_on(void)
+{
+	headphones_level();
+	sleep_ms(HP_DELAY_MS);	/* amps switched on before the stream runs stay silent */
+	set_enum("Audio_Amp_L_Switch", "On");
+	set_enum("Audio_Amp_R_Switch", "On");
+	fprintf(stderr, "titan-speakerd: headphones on\n");
+}
+
+static void headphones_off(void)
+{
+	set_enum("Audio_Amp_L_Switch", "Off");
+	set_enum("Audio_Amp_R_Switch", "Off");
+	if (!headphones_in())
+		set_sink_volume(1.0);	/* the speaker's level is the amp gain alone */
+	fprintf(stderr, "titan-speakerd: headphones off\n");
+}
+
+static long long file_mtime(const char *path)
+{
+	struct stat st;
+
+	if (stat(path, &st))
+		return 0;
+	return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+}
+
 /* set the amp to the shared speaker level */
 static void apply_level(void)
 {
@@ -212,7 +447,8 @@ static struct pcm *amp_on(void)
 
 static void amp_off(struct pcm *pcm)
 {
-	pcm_close(pcm);
+	if (pcm)
+		pcm_close(pcm);
 	set_clock("Off");
 	fprintf(stderr, "titan-speakerd: speaker off\n");
 }
@@ -221,28 +457,69 @@ int main(void)
 {
 	struct timespec tick = { 0, POLL_MS * 1000000L };
 	struct pcm *amp = NULL;
+	enum output out = OUT_NONE;
 	int idle_ms = 0, backoff_ms = 0;
 	int check_ms = -1, retries = 0;	/* DSP start check, -1 = done */
+	int hp, last_hp;
+	long long level_mtime = 0;
 
 	signal(SIGTERM, on_signal);
 	signal(SIGINT, on_signal);
 	setvbuf(stderr, NULL, _IOLBF, 0);
 
+	last_hp = headphones_in();
+	switch_levels(last_hp);		/* the level file may belong to the other output */
+
 	while (!stop) {
+		hp = headphones_in();
+		if (hp != last_hp) {
+			switch_levels(hp);
+			last_hp = hp;
+			if (!hp)
+				set_sink_volume(1.0);
+		}
 		if (backoff_ms > 0) {
 			backoff_ms -= POLL_MS;
 		} else if (any_open()) {
+			enum output want = hp ? OUT_HEADPHONES : OUT_SPEAKER;
+
 			idle_ms = 0;
-			if (!amp) {
-				amp = amp_on();
-				if (!amp)
-					backoff_ms = RETRY_MS;
-				check_ms = 0;
-				retries = 0;
+			if (out != want) {
+				if (out == OUT_SPEAKER) {
+					amp_off(amp);
+					amp = NULL;
+				} else if (out == OUT_HEADPHONES) {
+					headphones_off();
+				}
+				out = OUT_NONE;
+				if (want == OUT_SPEAKER) {
+					amp = amp_on();
+					if (amp)
+						out = OUT_SPEAKER;
+					else
+						backoff_ms = RETRY_MS;
+					check_ms = 0;
+					retries = 0;
+				} else {
+					headphones_on();
+					level_mtime = file_mtime(VOL_FILE);
+					out = OUT_HEADPHONES;
+				}
 			}
-		} else if (amp && (idle_ms += POLL_MS) >= LINGER_MS) {
-			amp_off(amp);
-			amp = NULL;
+		} else if (out != OUT_NONE && (idle_ms += POLL_MS) >= LINGER_MS) {
+			if (out == OUT_SPEAKER) {
+				amp_off(amp);
+				amp = NULL;
+			} else {
+				headphones_off();
+			}
+			out = OUT_NONE;
+		}
+
+		/* volume keys / mixer changed the level: the headphones follow */
+		if (out == OUT_HEADPHONES && file_mtime(VOL_FILE) != level_mtime) {
+			level_mtime = file_mtime(VOL_FILE);
+			headphones_level();
 		}
 
 		/* the DSP must have started; else give the amp a new enable edge */
@@ -264,6 +541,7 @@ int main(void)
 					if (!amp) {
 						set_clock("Off");
 						backoff_ms = RETRY_MS;
+						out = OUT_NONE;
 					}
 				}
 			}
@@ -272,5 +550,7 @@ int main(void)
 	}
 	if (amp)
 		amp_off(amp);
+	if (out == OUT_HEADPHONES)
+		headphones_off();
 	return 0;
 }

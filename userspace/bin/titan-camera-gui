@@ -10,8 +10,9 @@ GPU, auto exposure, auto white balance).
 - Preview: 960x720 from the ISP, rotated (and mirrored for the front camera)
   on the GPU by glvideoflip, shown by gtkglsink.
 - Photo: the camera allows one stream at a time, so the shutter stops the
-  preview, runs the camera at its largest size (rear 2332x1752, front
-  3260x2448), skips the frames auto exposure needs to settle, saves one as
+  preview, runs the camera at its largest size (rear 4668x3504, 16 MP, from
+  the sensor's full-resolution mode; front 3260x2448), skips the frames
+  auto exposure needs to settle, saves one as
   JPEG under ~/Pictures/Camera and restarts the preview.
 - Rotation: the driver reports each sensor's mounting rotation
   (V4L2_CID_CAMERA_SENSOR_ROTATION); the rotate button overrides it per
@@ -26,14 +27,70 @@ GPU, auto exposure, auto white balance).
   measured. Focused, the app watches sharpness and refocuses when it stays
   well below the focused level. Tap the preview to focus there; dragging the
   focus slider switches to manual focus until the next tap.
+  With the titan_camera driver's hardware statistics (/sys/.../rear/af_stats:
+  MediaTek's ISP AF block, run beside the capture path), sharpness comes from
+  them instead: the H0 filter energy of the focus region's blocks over their
+  pixel sum, times the SGG1 gain the driver sets from the scene brightness, from frames at least AF_HW_SETTLE frames after the lens moved
+  (the ISP's own frame counter). No CPU spent on frames then.
 
-Keys: Space/Enter take a photo, F switch camera, R rotate, A autofocus.
+- Flash (rear camera): a dual-tone pair on the MT6370 PMIC's two flash
+  channels, channel 1 white (cool), channel 2 yellowish (warm), driven
+  together through MediaTek's /dev/flashlight (flashlight-core +
+  flashlights-mt6370). Modes: Off, Auto (fires when auto exposure has
+  raised the sensor's analogue gain to 4x or more), On (both LEDs at the
+  torch maximum, 400 mA each, for the whole photo capture: the still
+  pipeline needs ~2 s for exposure to settle, longer than a strobe pulse;
+  a 6 s hardware timeout backs it up), Torch (both at 175 mA while the app
+  runs). The driver's default "coupled" scenario only switches anything on
+  once both channels have a state, so both get a level and an on/off.
+- Flash exposure (rear camera): libcamera's software AE starts a still
+  capture from the dark-scene settings and moves 10-15 % a frame, so with
+  the flash every frame used to be blown out. Instead the app meters with a
+  pre-flash: the preview switches to a short manual exposure (gain 1x) with
+  the flash on, and the hardware AF statistics (linear raw block sums,
+  measured before any processing) show how bright the lit scene is, the
+  exposure stepping down 8x while blocks clip and up 8x while the scene is
+  dark; at the shortest exposure the pre-flash itself steps down 4x while
+  blocks still clip (a very close subject). From that and the ambient
+  statistics just before, the app picks the
+  exposure time and gain that put the centre-weighted level at
+  METER_TARGET with the brightest blocks below METER_HIGHLIGHT; when even
+  the shortest exposure would be too bright (a close subject), the flash
+  itself is dimmed. The still capture then starts with that exposure
+  (libcamera manual exposure: our patch to the software ISP's AE) and the
+  flash at that level, so its first frames are already right.
+- AF assist: in Auto and On, when it's dark (the same 4x gain), both LEDs
+  light at torch level while autofocus runs. Auto exposure gets
+  AF_ASSIST_WAIT_MS to settle on the lit scene before the sweep starts; the
+  light goes off when the lens has found focus. The focus is then held (no
+  tracking, which would keep re-lighting in the dark) until a tap.
+
+- QR codes: a third branch of the preview tee, right after libcamerasrc
+  (before the GPU upload), takes QR_RATE frames a second through a leaky
+  one-buffer queue, scales them to QR_SIZE grayscale and scans them with
+  libzbar (ctypes) in that branch's own thread, so decoding never holds up
+  the preview. zbar looks for QR codes only and reads every second line and
+  column: ~14 ms a frame, against ~140 ms for GStreamer's zbar element,
+  which tries every symbology on every line. Codes show as sticky chips
+  over the bottom of the preview (up to QR_MAX, newest on top), outlined
+  while the code is in view. A chip stays until its X is tapped. It shows
+  what the code holds (link, Wi-Fi network, text) and offers Copy, and
+  Open for web links: nothing is opened without a tap. A new chip comes
+  with a short double buzz of the vibration motor (not repeated while the
+  code stays in view).
+
+Keys: Space/Enter take a photo, F switch camera, R rotate, A autofocus,
+T flash mode.
 """
+import ctypes
 import fcntl
 import json
 import os
+import re
 import struct
+import subprocess
 import time
+from urllib.parse import urlsplit
 
 os.environ.setdefault("NO_AT_BRIDGE", "1")
 # libcamera's GStreamer element lives in /usr/local (userspace/libcamera/build.sh)
@@ -50,14 +107,14 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Gst", "1.0")
-from gi.repository import Gdk, GdkPixbuf, GLib, Gst, Gtk  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, GLib, Gst, Gtk, Pango  # noqa: E402
 
 SYSDEV = "/sys/devices/platform/1a050000.camsv1/"
 CAMERAS = [
     # libcamera id, label, mirrored preview, still size, sensor device,
     # focus motor, fallback rotation (clockwise)
     {"id": "platform/1a050000.camsv1/rear ov16880", "label": "Rear",
-     "mirror": False, "still": (2332, 1752), "sysdir": SYSDEV + "rear",
+     "mirror": False, "still": (4668, 3504), "sysdir": SYSDEV + "rear",
      "focus": True, "rotation": 90},
     {"id": "platform/1a050000.camsv1/front ov8865", "label": "Front",
      "mirror": True, "still": (3260, 2448), "sysdir": SYSDEV + "front",
@@ -65,6 +122,14 @@ CAMERAS = [
 ]
 PREVIEW = (960, 720)
 SETTLE_FRAMES = 15          # auto exposure settles in ~8 frames
+QR_RATE = 5                 # preview frames a second the QR decoder looks at
+QR_SIZE = (640, 480)        # ...scaled to this, grayscale
+QR_DENSITY = 2              # zbar reads every 2nd line and column
+QR_MAX = 3                  # QR chips kept on screen
+QR_FRESH_MS = 1200          # a chip stays outlined this long after its code was seen
+BROWSER = "/usr/local/bin/titan-chromium"
+VIBRATOR = "/sys/class/leds/vibrator"
+QR_BUZZ = (40, 90, 40)      # ms on, off, on: a new QR code was found
 JPEG_QUALITY = 92
 
 STATE_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or
@@ -75,6 +140,173 @@ PHOTO_DIR = os.path.expanduser("~/Pictures/Camera")
 VIDIOC_G_CTRL = 0xc008561b
 VIDIOC_S_CTRL = 0xc008561c
 V4L2_CID_FOCUS_ABSOLUTE = 0x009a090a
+V4L2_CID_ANALOGUE_GAIN = 0x009e0903
+V4L2_CID_EXPOSURE = 0x00980911
+
+# MediaTek flashlight-core ioctls (flashlight.h): struct {type_id, ct_id, arg},
+# 1-based ids; type 1 = rear; ct 1 = white LED, ct 2 = warm LED
+_FL = ord("S")
+FLASH_SET_DRIVER = (3 << 30) | (4 << 16) | (_FL << 8) | 30
+FLASH_SET_TIMEOUT = (2 << 30) | (4 << 16) | (_FL << 8) | 100
+FLASH_SET_DUTY = (2 << 30) | (4 << 16) | (_FL << 8) | 110
+FLASH_SET_ONOFF = (2 << 30) | (4 << 16) | (_FL << 8) | 115
+FLASH_SET_SCENARIO = (3 << 30) | (4 << 16) | (_FL << 8) | 215
+FLASH_SCENARIO_CAMERA = 1           # coupled (both channels together)
+FLASH_PHOTO_LEVEL = 15              # 400 mA per LED (torch maximum)
+FLASH_TORCH_LEVEL = 6               # 175 mA per LED
+FLASH_PHOTO_TIMEOUT_MS = 6000    # a full-resolution capture takes ~4 s
+FLASH_AUTO_GAIN = 512               # analogue gain code, 128 = 1x
+FLASH_MODES = ["off", "auto", "on", "torch"]
+AF_ASSIST_LEVEL = FLASH_TORCH_LEVEL
+# flash metering, in units of the AF statistics' pixel sums (word 3 per
+# block, over STAT_NPIX pixels): raw/8, black ~8, clipping at ~119
+STAT_NPIX = 146 * 146       # pixels per statistics block (2336x1752 mode)
+STAT_BLACK = 8.0
+STAT_CLIP = 110.0           # a block above this is (nearly) clipped
+# measured against the software ISP's output: block level s maps to about
+# 303 x (s / 111) ^ (1 / 2.2) in the photo (its gamma and AWB gains); its own
+# AE settles near a centre-weighted 40 with the highlights clipped
+METER_TARGET = 32.0         # centre-weighted mean above black (photo ~80)...
+METER_HIGHLIGHT = 66.0      # ...with the 97th-percentile block at most this (~240)
+METER_START_US = 400        # first pre-flash exposure (gain 1x)
+METER_MIN_US = 40
+METER_MAX_US = 25600
+METER_SETTLE = 3            # frames after the sensor has the new exposure
+METER_TIMEOUT_MS = 2500
+LINE_US = 2512 / 288.0      # line time of both rear modes (HTS / pixel rate)
+FLASH_MIN_LINES = 4         # the sensor's shortest exposure
+FLASH_MAX_LINES = 3800      # longest flash exposure (~1/30 s), then gain
+FLASH_MAX_GAIN = 8.0
+FLASH_SETTLE_FRAMES = 6     # still frames skipped with a metered exposure
+AF_ASSIST_GAIN = FLASH_AUTO_GAIN    # dark: auto exposure is at 4x or more
+AF_ASSIST_WAIT_MS = 500             # auto exposure settles on the lit scene
+AF_ASSIST_DARK_S = 2.0              # gain is low this long after the light
+
+
+def vibrate(pattern):
+    """the vibration motor: on, off, on, ... (ms), without blocking. The
+    BSP driver's LED-class node: a duration, then activate; it stops by
+    itself (docs/hardware.md)"""
+    def pulse(ms):
+        try:
+            with open(VIBRATOR + "/duration", "w") as f:
+                f.write(str(ms))
+            with open(VIBRATOR + "/activate", "w") as f:
+                f.write("1")
+        except OSError:
+            pass
+        return False
+    t = 0
+    for i, ms in enumerate(pattern):
+        if i % 2 == 0:
+            if t:
+                GLib.timeout_add(t, pulse, ms)
+            else:
+                pulse(ms)
+        t += ms
+
+
+class QrScanner:
+    """libzbar (ctypes), QR codes only; one per decoding thread"""
+    Y800 = 0x30303859
+    QRCODE = 64
+    CFG_ENABLE, CFG_X_DENSITY, CFG_Y_DENSITY = 0, 0x100, 0x101
+    lib = None
+
+    @classmethod
+    def load(cls):
+        if cls.lib is None:
+            try:
+                z = ctypes.CDLL("libzbar.so.0")
+            except OSError:
+                cls.lib = False
+                return False
+            vp, ui, ul = ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulong
+            for name, res, args in (
+                    ("zbar_image_scanner_create", vp, []),
+                    ("zbar_image_scanner_set_config", ctypes.c_int, [vp, ctypes.c_int, ctypes.c_int, ctypes.c_int]),
+                    ("zbar_image_create", vp, []),
+                    ("zbar_image_destroy", None, [vp]),
+                    ("zbar_image_set_format", None, [vp, ul]),
+                    ("zbar_image_set_size", None, [vp, ui, ui]),
+                    ("zbar_image_set_data", None, [vp, vp, ul, vp]),
+                    ("zbar_scan_image", ctypes.c_int, [vp, vp]),
+                    ("zbar_image_first_symbol", vp, [vp]),
+                    ("zbar_symbol_next", vp, [vp]),
+                    ("zbar_symbol_get_type", ctypes.c_int, [vp]),
+                    ("zbar_symbol_get_data", vp, [vp]),
+                    ("zbar_symbol_get_data_length", ui, [vp])):
+                f = getattr(z, name)
+                f.restype, f.argtypes = res, args
+            cls.lib = z
+        return bool(cls.lib)
+
+    def __init__(self):
+        z = self.lib
+        self.sc = z.zbar_image_scanner_create()
+        z.zbar_image_scanner_set_config(self.sc, 0, self.CFG_ENABLE, 0)
+        z.zbar_image_scanner_set_config(self.sc, self.QRCODE, self.CFG_ENABLE, 1)
+        z.zbar_image_scanner_set_config(self.sc, 0, self.CFG_X_DENSITY, QR_DENSITY)
+        z.zbar_image_scanner_set_config(self.sc, 0, self.CFG_Y_DENSITY, QR_DENSITY)
+
+    def scan(self, gray, w, h):
+        """the QR codes in a w x h 8-bit image (bytes-like), as text"""
+        z = self.lib
+        buf = (ctypes.c_char * len(gray)).from_buffer_copy(gray)
+        im = z.zbar_image_create()
+        z.zbar_image_set_format(im, self.Y800)
+        z.zbar_image_set_size(im, w, h)
+        z.zbar_image_set_data(im, ctypes.addressof(buf), len(gray), None)
+        found = []
+        if z.zbar_scan_image(self.sc, im) > 0:
+            sym = z.zbar_image_first_symbol(im)
+            while sym:
+                if z.zbar_symbol_get_type(sym) == self.QRCODE:
+                    data = ctypes.string_at(z.zbar_symbol_get_data(sym),
+                                            z.zbar_symbol_get_data_length(sym))
+                    found.append(data.decode("utf-8", "replace"))
+                sym = z.zbar_symbol_next(sym)
+        z.zbar_image_destroy(im)
+        return found
+
+
+class Flash:
+    """both rear flash LEDs through /dev/flashlight"""
+
+    def __init__(self):
+        self.fd = None
+
+    def _io(self, req, ct, arg):
+        fcntl.ioctl(self.fd, req, struct.pack("=iii", 1, ct, arg))
+
+    def on(self, level, timeout_ms=0):
+        self.off()
+        try:
+            self.fd = os.open("/dev/flashlight", os.O_RDWR | os.O_CLOEXEC)
+            self._io(FLASH_SET_DRIVER, 1, 1)
+            self._io(FLASH_SET_SCENARIO, 1, FLASH_SCENARIO_CAMERA)
+            for ct in (1, 2):
+                self._io(FLASH_SET_TIMEOUT, ct, timeout_ms)
+                self._io(FLASH_SET_DUTY, ct, level)
+            for ct in (1, 2):
+                self._io(FLASH_SET_ONOFF, ct, 1)
+            return True
+        except OSError:
+            self.off()
+            return False
+
+    def off(self):
+        if self.fd is None:
+            return
+        try:
+            for ct in (1, 2):
+                self._io(FLASH_SET_ONOFF, ct, 0)
+            self._io(FLASH_SET_SCENARIO, 1, 0)
+            self._io(FLASH_SET_DRIVER, 1, 0)
+        except OSError:
+            pass
+        os.close(self.fd)
+        self.fd = None
 V4L2_CID_CAMERA_SENSOR_ROTATION = 0x009a0923   # degrees, counter-clockwise
 FOCUS_MAX = 1023
 
@@ -87,12 +319,16 @@ AF_REGION = 0.3             # focus region: this fraction of width and height
 AF_FRAMES_PER_POS = 2       # frames averaged per lens position: coarse...
 AF_FINE_FRAMES = 4          # ...and fine (noisy in dim light)
 AF_MIN_RATIO = 1.25         # best/worst sharpness below this: low contrast
+AF_HW_MIN_RATIO = 1.15      # the same for the hardware statistics
+AF_HW_POLL_MS = 33          # hardware statistics: one frame
+AF_HW_SETTLE = 3            # frames after a lens move before a set counts
 AF_BASELINE_FRAMES = 8      # frames measured at the focused position
 AF_TRACK_FRAMES = 15        # median window while tracking (measured frames)
 AF_TRACK_EVERY = 3          # while tracking, measure every third frame
 AF_DROP = 0.6               # refocus when sharpness falls below this share...
 AF_DROP_FRAMES = 30         # ...for this many frames in a row...
 AF_MIN_GAP_S = 3.0          # ...and the last focus is this old
+AF_IDLE = ("off", "manual", "hold", "wait")     # states that take no samples
 
 
 def video_direction(rotation, mirror):
@@ -101,6 +337,37 @@ def video_direction(rotation, mirror):
     if not mirror:
         return {0: "identity", 90: "90r", 180: "180", 270: "90l"}[rotation]
     return {0: "horiz", 90: "ul-lr", 180: "vert", 270: "ur-ll"}[rotation]
+
+
+def read_af_stats(path):
+    """(frame, running, words[12][16][10], SGG1 gain) from the driver's
+    af_stats, or None"""
+    try:
+        with open(path, "rb") as f:
+            d = f.read()
+    except OSError:
+        return None
+    if len(d) < 32:
+        return None
+    magic, frame, running, nx, ny, blk, stride, pgn = struct.unpack_from("<8I", d)
+    if magic != 0x31464154 or blk != 40 or len(d) < 32 + stride * ny:
+        return None
+    rows = [np.frombuffer(d, np.uint32, nx * 10, 32 + y * stride).reshape(nx, 10)
+            for y in range(ny)]
+    return frame, running, np.stack(rows), pgn
+
+
+def hw_sharpness(words, region, pgn):
+    """H0 filter energy (w1) over pixel sum (w3) of the region's blocks. The
+    filter energy scales with 1/SGG1 gain (which the driver adjusts to the
+    scene brightness), so it is multiplied by the gain"""
+    ny, nx = words.shape[:2]
+    bw, bh = max(1, round(nx * AF_REGION)), max(1, round(ny * AF_REGION))
+    x0 = min(max(int(region[0] * nx - bw / 2 + 0.5), 0), nx - bw)
+    y0 = min(max(int(region[1] * ny - bh / 2 + 0.5), 0), ny - bh)
+    r = words[y0:y0 + bh, x0:x0 + bw].astype(np.float64)
+    light = r[:, :, 3].sum()
+    return r[:, :, 1].sum() * pgn / light if light else 0.0
 
 
 def subdev_node(sysdir):
@@ -154,8 +421,9 @@ def sharpness(data, w, h, region):
 class AutoFocus:
     """contrast-detect autofocus, driven by sharpness samples (main thread)
 
-    states: off, sweep (coarse), fine, settle (measuring the focused level),
-    track (refocus when it drops), hold (low contrast: no tracking), manual
+    states: off, wait (AF assist light on, exposure settling), sweep
+    (coarse), fine, settle (measuring the focused level), track (refocus when
+    it drops), hold (low contrast or focused in the dark: no tracking), manual
     """
 
     def __init__(self, app):
@@ -165,6 +433,7 @@ class AutoFocus:
         self.pos = app.focus
         self.start_pos = self.pos
         self.moved_at = 0       # pipeline running time of the last move
+        self.moved_frame = 0    # the ISP's frame counter then (hardware statistics)
         self.frames = []        # valid samples at the current position
         self.samples = {}       # position -> sharpness
         self.queue = []         # positions still to measure
@@ -191,19 +460,24 @@ class AutoFocus:
         self.frames = []
         self.state = "settle"
         self.moved_at = self.app.running_time()
+        self.moved_frame = self.app.af_frame()
 
     def move(self, pos):
         self.pos = pos
         self.frames = []
         self.app.set_lens(pos)
         self.moved_at = self.app.running_time()
+        self.moved_frame = self.app.af_frame()
 
     def valid(self, pts):
-        """a frame whose capture started after the lens settled"""
+        """a frame whose capture started after the lens settled: a pipeline
+        timestamp, or ("hw", ISP frame counter) for the hardware statistics"""
+        if isinstance(pts, tuple):
+            return (pts[1] - self.moved_frame) & 0xff >= AF_HW_SETTLE
         return pts is not None and pts >= self.moved_at + AF_SETTLE_NS + AF_FRAME_NS
 
     def on_sample(self, pts, value):
-        if self.state in ("off", "manual", "hold"):
+        if self.state in AF_IDLE:
             return
         if self.state == "track":
             self.track(value)
@@ -238,7 +512,8 @@ class AutoFocus:
             return
         # done
         best = max(self.samples, key=self.samples.get)
-        if self.samples[best] < AF_MIN_RATIO * min(self.samples.values()):
+        ratio = AF_HW_MIN_RATIO if self.app.hw_af else AF_MIN_RATIO
+        if self.samples[best] < ratio * min(self.samples.values()):
             self.move(self.start_pos)        # nothing to focus on here
             self.state = "hold"
             self.app.focus_done(None)
@@ -258,7 +533,7 @@ class AutoFocus:
         if level < AF_DROP * self.baseline:
             self.low += 1
             if self.low >= AF_DROP_FRAMES and time.monotonic() - self.focused_at > AF_MIN_GAP_S:
-                self.start()
+                self.app.autofocus()
         else:
             self.low = 0
 
@@ -278,9 +553,19 @@ CSS = b"""
           padding: 6px 14px; font-size: 20px; }
 .viewer { background: black; }
 .focuslbl { color: #c8c8c8; font-size: 16px; }
+.flash { min-width: 96px; font-size: 16px; padding: 0 8px; }
+.flash.lit { background: #f0c040; color: #101012; }
 .afmode { color: #101012; background: #f0c040; border-radius: 6px;
           padding: 0 6px; font-size: 14px; font-weight: bold; }
 .afmode.manual { background: #8a8a90; }
+.qr { background: rgba(16,16,18,0.82); border-radius: 12px; padding: 4px 6px 4px 10px;
+      border: 2px solid rgba(255,255,255,0.15); }
+.qr.fresh { border-color: #f0c040; }
+.qrkind { color: #101012; background: #f0c040; border-radius: 6px; padding: 0 6px;
+          font-size: 13px; font-weight: bold; }
+.qrtext { color: white; font-size: 16px; }
+.qr button { min-height: 40px; min-width: 40px; padding: 0 10px; border-radius: 20px;
+             background: #2a2a30; color: white; border: none; font-size: 15px; }
 scale trough { min-height: 8px; }
 scale slider { min-width: 34px; min-height: 34px; border-radius: 17px; }
 """
@@ -303,12 +588,22 @@ class CameraApp(Gtk.Window):
         self.rotation = {c["id"]: saved.get(c["id"], self.driver_rotation(c)) for c in CAMERAS}
         self.focus = st.get("focus", 256)
         self.last_photo = st.get("last_photo")
+        self.flash_mode = st.get("flash", "off")
+        if self.flash_mode not in FLASH_MODES:
+            self.flash_mode = "off"
+        self.flash = Flash()
 
         self.preview = None         # Gst.Pipeline
         self.still = None
         self.busy = False
         self.syncing = False        # moving the focus slider from code
+        self.hw_af = False          # the driver's ISP AF statistics in use
+        self.hw_timer = 0
+        self.hw_last = -1
         self.af = AutoFocus(self)
+        self.assist = False         # the AF assist light is on
+        self.assist_timer = 0
+        self.assist_off_at = 0.0    # monotonic time the assist light went off
 
         self.build()
         self.build_preview()
@@ -343,6 +638,14 @@ class CameraApp(Gtk.Window):
         self.status.set_margin_top(12)
         self.status.set_no_show_all(True)
         overlay.add_overlay(self.status)
+        self.qr_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.qr_box.set_valign(Gtk.Align.END)
+        self.qr_box.set_halign(Gtk.Align.FILL)
+        self.qr_box.set_margin_start(10)
+        self.qr_box.set_margin_end(10)
+        self.qr_box.set_margin_bottom(10)
+        overlay.add_overlay(self.qr_box)    # only as tall as its chips
+        self.qr_chips = {}          # code text -> chip
 
         self.focus_row = Gtk.Box(spacing=10)
         self.focus_row.get_style_context().add_class("bar")
@@ -375,6 +678,13 @@ class CameraApp(Gtk.Window):
         self.rotate_btn = self.icon_button("object-rotate-right-symbolic", "round")
         self.rotate_btn.connect("clicked", lambda b: self.rotate())
         bar.pack_start(self.rotate_btn, False, False, 0)
+
+        self.flash_btn = Gtk.Button()
+        self.flash_btn.get_style_context().add_class("round")
+        self.flash_btn.get_style_context().add_class("flash")
+        self.flash_btn.set_valign(Gtk.Align.CENTER)
+        self.flash_btn.connect("clicked", lambda b: self.cycle_flash())
+        bar.pack_start(self.flash_btn, False, False, 0)
 
         self.shutter = Gtk.Button()
         self.shutter.get_style_context().add_class("shutter")
@@ -441,6 +751,7 @@ class CameraApp(Gtk.Window):
         rot = {c["id"]: self.rotation[c["id"]] for c in CAMERAS
                if self.rotation[c["id"]] != self.driver_rotation(c)}
         st = {"camera": self.cam, "rotation": rot, "focus": self.focus,
+              "flash": self.flash_mode,
               "last_photo": self.last_photo}
         try:
             os.makedirs(STATE_DIR, exist_ok=True)
@@ -462,6 +773,13 @@ class CameraApp(Gtk.Window):
                "tee name=t ! queue max-size-buffers=2 leaky=downstream ! " % (w, h))
         af = (" t. ! queue max-size-buffers=1 leaky=downstream ! "
               "appsink name=af emit-signals=true max-buffers=1 drop=true sync=false")
+        if QrScanner.load():
+            # QR codes: a few frames a second, never blocking the preview
+            af += (" t. ! videorate max-rate=%d drop-only=true ! "
+                   "queue max-size-buffers=1 leaky=downstream ! videoscale ! "
+                   "video/x-raw,width=%d,height=%d ! videoconvert ! "
+                   "video/x-raw,format=GRAY8 ! appsink name=qr emit-signals=true "
+                   "max-buffers=1 drop=true sync=false" % ((QR_RATE,) + QR_SIZE))
         sink = Gst.ElementFactory.make("gtkglsink", "view")
         if sink:
             self.preview = Gst.parse_launch(
@@ -474,6 +792,10 @@ class CameraApp(Gtk.Window):
             self.preview.add(sink)
             self.preview.get_by_name("conv").link(sink)
         self.preview.get_by_name("af").connect("new-sample", self.on_af_sample)
+        qr = self.preview.get_by_name("qr")
+        if qr:
+            self.qr_scanner = None      # made in the decoding thread
+            qr.connect("new-sample", self.on_qr_sample)
         widget = sink.get_property("widget")
         widget.set_hexpand(True)
         widget.set_vexpand(True)
@@ -499,6 +821,13 @@ class CameraApp(Gtk.Window):
         self.set_status(None)
         c = CAMERAS[self.cam]
         self.focus_row.set_visible(c["focus"])
+        self.show_flash()
+        self.apply_torch()
+        path = self.af_stats_path()
+        self.hw_af = bool(path and os.path.exists(path))
+        if self.hw_af and not self.hw_timer:
+            self.hw_last = -1
+            self.hw_timer = GLib.timeout_add(AF_HW_POLL_MS, self.poll_hw_af)
         if c["focus"]:
             self.set_lens(self.focus)
             if self.af.state != "manual" and refocus:
@@ -507,9 +836,72 @@ class CameraApp(Gtk.Window):
         self.show_af_mode()
         return False
 
+    # ---- flash ----
+
+    def show_flash(self):
+        rear = CAMERAS[self.cam]["focus"]
+        self.flash_btn.set_visible(rear)
+        self.flash_btn.set_label({"off": "⚡ Off", "auto": "⚡ Auto", "on": "⚡ On",
+                                  "torch": "Torch"}[self.flash_mode])
+        ctx = self.flash_btn.get_style_context()
+        (ctx.add_class if self.flash_mode != "off" else ctx.remove_class)("lit")
+
+    def cycle_flash(self):
+        if self.busy:
+            return
+        self.flash_mode = FLASH_MODES[(FLASH_MODES.index(self.flash_mode) + 1) % len(FLASH_MODES)]
+        self.save_state()
+        self.apply_torch()
+        self.show_flash()
+
+    def apply_torch(self):
+        """the torch is on while the rear camera runs in torch mode"""
+        if self.flash_mode == "torch" and CAMERAS[self.cam]["focus"]:
+            if self.flash.fd is None:
+                self.flash.on(FLASH_TORCH_LEVEL)
+            self.assist = False
+        elif not self.busy:
+            self.assist_off()
+            self.flash.off()
+
+    def dark(self):
+        """auto exposure has raised the analogue gain to the flash threshold
+        (or did, before the AF assist light lit the scene)"""
+        if self.assist or time.monotonic() - self.assist_off_at < AF_ASSIST_DARK_S:
+            return True
+        gain = subdev_ctrl(CAMERAS[self.cam]["sysdir"], V4L2_CID_ANALOGUE_GAIN)
+        return gain is not None and gain >= AF_ASSIST_GAIN
+
+    def needs_assist(self):
+        return (CAMERAS[self.cam]["focus"] and self.flash_mode in ("auto", "on")
+                and self.dark())
+
+    def assist_on(self):
+        if not self.assist:
+            self.assist = self.flash.on(AF_ASSIST_LEVEL)
+
+    def assist_off(self):
+        if self.assist_timer:
+            GLib.source_remove(self.assist_timer)
+            self.assist_timer = 0
+        if self.assist:
+            self.assist = False
+            self.assist_off_at = time.monotonic()
+            self.flash.off()
+
+    def photo_needs_flash(self):
+        if not CAMERAS[self.cam]["focus"] or self.flash_mode == "torch":
+            return False
+        if self.flash_mode == "on":
+            return True
+        if self.flash_mode == "auto":
+            return self.dark()
+        return False
+
     def stop_preview(self):
         if self.af.state != "manual":
             self.af.stop()
+        self.assist_off()
         self.preview.set_state(Gst.State.NULL)
 
     def running_time(self):
@@ -525,10 +917,38 @@ class CameraApp(Gtk.Window):
 
     # ---- autofocus ----
 
+    def af_stats_path(self):
+        c = CAMERAS[self.cam]
+        return os.path.join(c["sysdir"], "af_stats") if c["focus"] else None
+
+    def af_frame(self):
+        """the ISP's frame counter (hardware statistics), else 0"""
+        if not self.hw_af:
+            return 0
+        st = read_af_stats(self.af_stats_path())
+        return st[0] if st else 0
+
+    def poll_hw_af(self):
+        """main thread, once a frame: the hardware statistics"""
+        if not self.hw_af:
+            self.hw_timer = 0
+            return False
+        if self.busy or self.af.state in AF_IDLE:
+            return True
+        st = read_af_stats(self.af_stats_path())
+        if not st or not st[1] or st[0] == self.hw_last:
+            return True
+        self.hw_last = st[0]
+        self.af_count = getattr(self, "af_count", 0) + 1
+        if self.af.state == "track" and self.af_count % AF_TRACK_EVERY:
+            return True
+        self.af.on_sample(("hw", st[0]), hw_sharpness(st[2], self.af.region, st[3]))
+        return True
+
     def on_af_sample(self, sink):
         """streaming thread: measure, hand the number to the main thread"""
         sample = sink.emit("pull-sample")
-        if self.af.state in ("off", "manual", "hold"):
+        if self.hw_af or self.af.state in AF_IDLE:
             return Gst.FlowReturn.OK
         self.af_count = getattr(self, "af_count", 0) + 1
         if self.af.state == "track" and self.af_count % AF_TRACK_EVERY:
@@ -565,8 +985,26 @@ class CameraApp(Gtk.Window):
             return False
         if self.preview.get_state(0)[1] != Gst.State.PLAYING:
             return False
+        if not self.assist and self.needs_assist():
+            # light the scene, let auto exposure settle, then sweep
+            self.assist_on()
+            if self.assist:
+                if self.assist_timer:
+                    GLib.source_remove(self.assist_timer)
+                self.af.state = "wait"
+                self.set_status("Focusing…")
+                self.assist_timer = GLib.timeout_add(AF_ASSIST_WAIT_MS, self.assisted_start,
+                                                     region)
+                self.show_af_mode()
+                return False
         self.af.start(region)
         self.show_af_mode()
+        return False
+
+    def assisted_start(self, region):
+        self.assist_timer = 0
+        if not self.busy and self.af.state == "wait":
+            self.af.start(region)
         return False
 
     def focus_done(self, pos):
@@ -581,6 +1019,10 @@ class CameraApp(Gtk.Window):
         self.focus_scale.set_value(pos)
         self.syncing = False
         self.save_state()
+        if self.assist:
+            # focused in the dark: hold, tracking would keep re-lighting
+            self.assist_off()
+            self.af.state = "hold"
 
     def set_lens(self, pos):
         c = CAMERAS[self.cam]
@@ -595,6 +1037,7 @@ class CameraApp(Gtk.Window):
         if self.syncing:
             return
         self.af.stop(manual=True)
+        self.assist_off()
         self.show_af_mode()
         self.focus = int(scale.get_value())
         self.set_lens(self.focus)
@@ -649,20 +1092,161 @@ class CameraApp(Gtk.Window):
     def take_photo(self):
         if self.busy:
             return
+        flash = self.photo_needs_flash()   # before the preview stops (gain)
+        self.af_before_photo = "hold" if self.assist else self.af.state
         self.busy = True
-        self.af_before_photo = self.af.state
         self.shutter.set_sensitive(False)
+        if flash and self.hw_af and self.meter_start():
+            return                          # capture() follows the metering
+        self.capture(FLASH_PHOTO_LEVEL if flash else None)
+
+    # ---- flash metering ----
+
+    def meter_levels(self):
+        """(ISP frame counter, block signal levels above black) or None"""
+        st = read_af_stats(self.af_stats_path())
+        if not st or not st[1]:
+            return None
+        return st[0], np.maximum(st[2][:, :, 3].astype(np.float64) / STAT_NPIX - STAT_BLACK, 0)
+
+    def meter_start(self):
+        """pre-flash: the preview at a short manual exposure, flash on"""
+        amb = self.meter_levels()
+        c = CAMERAS[self.cam]
+        e = subdev_ctrl(c["sysdir"], V4L2_CID_EXPOSURE)
+        g = subdev_ctrl(c["sysdir"], V4L2_CID_ANALOGUE_GAIN)
+        if not amb or not e or not g:
+            return False
+        self.set_status("Metering…")
+        self.assist_off()
+        ny, nx = amb[1].shape
+        yy, xx = np.mgrid[0:ny, 0:nx]
+        centre = (abs(xx - (nx - 1) / 2) <= nx / 4) & (abs(yy - (ny - 1) / 2) <= ny / 4)
+        self.meter = {"ambient": amb[1] / (e * g / 128.0),   # per line x gain
+                      "weights": np.where(centre, 3.0, 1.0),
+                      "us": METER_START_US, "level": FLASH_PHOTO_LEVEL,
+                      "t0": time.monotonic()}
+        self.flash.on(FLASH_PHOTO_LEVEL, FLASH_PHOTO_TIMEOUT_MS)
+        self.meter_set(METER_START_US)
+        GLib.timeout_add(15, self.meter_tick)
+        return True
+
+    def meter_set(self, us):
+        src = self.preview.get_by_name("src")
+        Gst.util_set_object_arg(src, "exposure-time-mode", "manual")
+        Gst.util_set_object_arg(src, "analogue-gain-mode", "manual")
+        src.set_property("exposure-time", int(us))
+        src.set_property("analogue-gain", 1.0)
+        # libcamera applies it a few requests later: wait for the sensor
+        self.meter.update(us=us, lines=round(us / LINE_US), frame=None)
+
+    def meter_tick(self):
+        """wait for the exposure to reach the sensor, then METER_SETTLE frames
+        (the ones exposed with it), measure; step the exposure while blocks
+        clip or the scene is too dark"""
+        m = self.meter
+        st = self.meter_levels()
+        timed_out = (time.monotonic() - m["t0"]) * 1000 > METER_TIMEOUT_MS
+        if timed_out:
+            if m["frame"] is None or not st:
+                st = None                   # no valid measurement
+        elif not st:
+            return True
+        elif m["frame"] is None:
+            c = CAMERAS[self.cam]
+            e = subdev_ctrl(c["sysdir"], V4L2_CID_EXPOSURE)
+            g = subdev_ctrl(c["sysdir"], V4L2_CID_ANALOGUE_GAIN)
+            if e is not None and abs(e - m["lines"]) <= 1 and g == 128:
+                m["frame"] = st[0]
+            return True
+        elif (st[0] - m["frame"]) & 0xff < METER_SETTLE:
+            return True
+        if st:
+            top = np.percentile(st[1], 97)
+            if not timed_out and top > STAT_CLIP - STAT_BLACK:
+                if m["us"] > METER_MIN_US:
+                    self.meter_set(max(METER_MIN_US, m["us"] / 8))
+                    return True
+                if m["level"] > 0:
+                    # clipping at the shortest exposure (a very close
+                    # subject): pre-flash about 4x dimmer (15 -> 3 -> 0)
+                    m["level"] = max(0, (m["level"] + 1) // 4 - 1)
+                    self.flash.on(m["level"], FLASH_PHOTO_TIMEOUT_MS)
+                    m["frame"] = st[0]      # same exposure: the next frames
+                    return True
+            if not timed_out and top < 4 and m["us"] < METER_MAX_US:
+                self.meter_set(min(METER_MAX_US, m["us"] * 8))
+                return True
+        level, exposure = self.meter_result(st[1] if st else None)
+        # the preview goes back to auto exposure when it restarts
+        src = self.preview.get_by_name("src")
+        Gst.util_set_object_arg(src, "exposure-time-mode", "auto")
+        Gst.util_set_object_arg(src, "analogue-gain-mode", "auto")
+        self.capture(level, exposure)
+        return False
+
+    def meter_result(self, lv):
+        """(flash level, (exposure lines, gain)) for the photo from the
+        pre-flash levels (flash at FLASH_PHOTO_LEVEL, gain 1x)"""
+        m = self.meter
+        if lv is None:
+            return FLASH_PHOTO_LEVEL, None
+        w = m["weights"]
+        lit = lv / (m["us"] / LINE_US)          # per line x gain: flash + ambient
+        amb = np.minimum(m["ambient"], lit)
+        # the flash's share at full power (the pre-flash may have been dimmed;
+        # its current is about 25 mA x (level + 1))
+        flash = (lit - amb) * (FLASH_PHOTO_LEVEL + 1) / (m["level"] + 1)
+
+        def solve(k):
+            """exposure (lines x gain) for the flash at k x full power"""
+            t = amb + k * flash
+            mean = (t * w).sum() / w.sum()
+            top = np.percentile(t, 97)
+            return min(METER_TARGET / mean if mean > 0 else 1e9,
+                       METER_HIGHLIGHT / top if top > 0 else 1e9)
+
+        level = FLASH_PHOTO_LEVEL
+        x = solve(1.0)
+        if x < FLASH_MIN_LINES:
+            # too bright even at the shortest exposure: dim the flash (its
+            # current is about 25 mA x (level + 1))
+            lo, hi = 0.0, 1.0
+            for _ in range(20):
+                k = (lo + hi) / 2
+                if solve(k) < FLASH_MIN_LINES:
+                    hi = k
+                else:
+                    lo = k
+            level = max(0, min(FLASH_PHOTO_LEVEL, int(lo * (FLASH_PHOTO_LEVEL + 1)) - 1))
+            x = max(FLASH_MIN_LINES, solve((level + 1) / (FLASH_PHOTO_LEVEL + 1)))
+        lines = max(FLASH_MIN_LINES, min(FLASH_MAX_LINES, x))
+        gain = max(1.0, min(FLASH_MAX_GAIN, x / lines))
+        self.meter_log = "pre-flash %d us at level %d, top %.0f: flash level %d, %d lines x %.2f" % (
+            m["us"], m["level"], np.percentile(lv, 97), level, lines, gain)
+        return level, (int(lines), gain)
+
+    # ---- capture ----
+
+    def capture(self, flash_level, exposure=None):
+        """the still pipeline; flash_level None = no flash; exposure
+        (lines, gain) = manual exposure from the flash metering"""
         self.set_status("Taking photo…")
         self.stop_preview()
 
         c = CAMERAS[self.cam]
         w, h = c["still"]
-        desc = ("libcamerasrc name=src camera-name=\"%s\" ! "
+        manual = ""
+        if exposure:
+            manual = (" exposure-time-mode=manual analogue-gain-mode=manual "
+                      "exposure-time=%d analogue-gain=%.3f" % (exposure[0] * LINE_US, exposure[1]))
+        self.still_settle = FLASH_SETTLE_FRAMES if exposure else SETTLE_FRAMES
+        desc = ("libcamerasrc name=src camera-name=\"%s\"%s ! "
                 "video/x-raw,format=BGRx,width=%d,height=%d ! "
                 "identity name=gate ! videoflip video-direction=%s ! videoconvert ! "
                 "jpegenc quality=%d ! appsink name=out emit-signals=true sync=false "
                 "max-buffers=1 drop=true"
-                % (c["id"], w, h, video_direction(self.rotation[c["id"]], False),
+                % (c["id"], manual, w, h, video_direction(self.rotation[c["id"]], False),
                    JPEG_QUALITY))
         self.still = Gst.parse_launch(desc)
         self.still_frames = 0
@@ -675,12 +1259,16 @@ class CameraApp(Gtk.Window):
         bus.add_signal_watch()
         bus.connect("message::error", self.on_still_error)
         self.still_timeout = GLib.timeout_add_seconds(10, self.on_still_timeout)
+        if flash_level is not None:
+            # lit for the whole capture (a continuous light, not a strobe);
+            # the hardware timeout switches it off if we die
+            self.flash.on(flash_level, FLASH_PHOTO_TIMEOUT_MS)
         if self.still.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             self.finish_photo(None, "Camera not available")
 
     def on_still_buffer(self, pad, info):
         self.still_frames += 1
-        if self.still_frames <= SETTLE_FRAMES or self.still_done:
+        if self.still_frames <= self.still_settle or self.still_done:
             return Gst.PadProbeReturn.DROP
         self.still_done = True
         return Gst.PadProbeReturn.OK
@@ -732,6 +1320,8 @@ class CameraApp(Gtk.Window):
             self.still.set_state(Gst.State.NULL)
             self.still.get_bus().remove_signal_watch()
             self.still = None
+        if self.flash_mode != "torch":
+            self.flash.off()
         self.busy = False
         self.shutter.set_sensitive(True)
         if path:
@@ -745,6 +1335,126 @@ class CameraApp(Gtk.Window):
         self.start_preview(refocus=False)
         if CAMERAS[self.cam]["focus"] and self.af_before_photo not in ("off", "manual", "hold"):
             self.af.resume()
+
+    # ---- QR codes ----
+
+    def on_qr_sample(self, sink):
+        """the QR branch's streaming thread: scan, hand codes to the main
+        thread (ctypes drops the GIL while zbar runs)"""
+        sample = sink.emit("pull-sample")
+        if self.busy:
+            return Gst.FlowReturn.OK
+        if self.qr_scanner is None:
+            self.qr_scanner = QrScanner()
+        buf = sample.get_buffer()
+        ok, info = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        try:
+            codes = self.qr_scanner.scan(info.data, QR_SIZE[0], QR_SIZE[1])
+        finally:
+            buf.unmap(info)
+        for text in codes:
+            if text:
+                GLib.idle_add(self.qr_found, text)
+        return Gst.FlowReturn.OK
+
+    @staticmethod
+    def qr_describe(text):
+        """(kind, what to show, URL to open or None)"""
+        t = text.strip()
+        if re.match(r"(?i)https?://\S+$", t):
+            u = urlsplit(t)
+            return "LINK", (u.netloc + u.path.rstrip("/") +
+                            ("?" + u.query if u.query else "")), t
+        if t[:5].upper() == "WIFI:":
+            m = re.search(r"(?:^WIFI:|;)S:((?:\\.|[^;])*)", t, re.I)
+            ssid = re.sub(r"\\(.)", r"\1", m.group(1)) if m else "?"
+            return "WI-FI", "Network \u201c%s\u201d" % ssid, None
+        for prefix, kind in (("mailto:", "EMAIL"), ("tel:", "PHONE"), ("geo:", "PLACE"),
+                             ("BEGIN:VCARD", "CONTACT"), ("BEGIN:VEVENT", "EVENT")):
+            if t[:len(prefix)].lower() == prefix.lower():
+                return kind, t[len(prefix):].strip() if ":" in prefix else t, None
+        return "TEXT", " ".join(t.split()), None
+
+    def qr_found(self, text):
+        chip = self.qr_chips.get(text)
+        if chip is None:
+            chip = self.qr_chip(text)
+            self.qr_chips[text] = chip
+            self.qr_box.pack_start(chip, False, False, 0)
+            self.qr_box.reorder_child(chip, 0)              # newest at the top
+            chip.show_all()
+            while len(self.qr_chips) > QR_MAX:
+                self.qr_dismiss(self.qr_box.get_children()[-1])     # the oldest
+            vibrate(QR_BUZZ)
+        ctx = chip.get_style_context()
+        ctx.add_class("fresh")
+        if getattr(chip, "fresh_timer", 0):
+            GLib.source_remove(chip.fresh_timer)
+        chip.fresh_timer = GLib.timeout_add(QR_FRESH_MS, self.qr_unfresh, chip)
+        return False
+
+    def qr_unfresh(self, chip):
+        chip.fresh_timer = 0
+        chip.get_style_context().remove_class("fresh")
+        return False
+
+    def qr_chip(self, text):
+        kind, shown, url = self.qr_describe(text)
+        chip = Gtk.Box(spacing=8)
+        chip.get_style_context().add_class("qr")
+        chip.qr_text = text
+        chip.fresh_timer = 0
+        badge = Gtk.Label(label="QR \u00b7 " + kind)
+        badge.get_style_context().add_class("qrkind")
+        badge.set_valign(Gtk.Align.CENTER)
+        chip.pack_start(badge, False, False, 0)
+        label = Gtk.Label(label=shown, xalign=0)
+        label.get_style_context().add_class("qrtext")
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        label.set_line_wrap(True)
+        label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        label.set_lines(2)
+        label.set_tooltip_text(text)
+        chip.pack_start(label, True, True, 0)
+        if url:
+            b = Gtk.Button(label="Open")
+            b.set_valign(Gtk.Align.CENTER)
+            b.connect("clicked", lambda b: self.qr_open(url))
+            chip.pack_start(b, False, False, 0)
+        b = Gtk.Button(label="Copy")
+        b.set_valign(Gtk.Align.CENTER)
+        b.connect("clicked", lambda b: self.qr_copy(text))
+        chip.pack_start(b, False, False, 0)
+        b = Gtk.Button()
+        b.set_image(Gtk.Image.new_from_icon_name("window-close-symbolic", Gtk.IconSize.BUTTON))
+        b.set_valign(Gtk.Align.CENTER)
+        b.connect("clicked", lambda b: self.qr_dismiss(chip))
+        chip.pack_start(b, False, False, 0)
+        return chip
+
+    def qr_dismiss(self, chip):
+        if chip.fresh_timer:
+            GLib.source_remove(chip.fresh_timer)
+        self.qr_chips.pop(chip.qr_text, None)
+        self.qr_box.remove(chip)
+        chip.destroy()
+
+    def qr_copy(self, text):
+        clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clip.set_text(text, -1)
+        clip.store()
+        self.set_status("Copied", 1000)
+
+    def qr_open(self, url):
+        try:
+            subprocess.Popen([BROWSER, url], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            self.set_status("Opening link…", 1500)
+        except OSError as e:
+            self.set_status("Can't open: %s" % e, 2500)
 
     # ---- last photo ----
 
@@ -795,6 +1505,8 @@ class CameraApp(Gtk.Window):
             self.switch_camera()
         elif name in ("r", "R"):
             self.rotate()
+        elif name in ("t", "T"):
+            self.cycle_flash()
         elif name in ("a", "A"):
             self.autofocus((0.5, 0.5))
         else:
@@ -802,6 +1514,7 @@ class CameraApp(Gtk.Window):
         return True
 
     def on_quit(self, *a):
+        self.flash.off()
         if self.still:
             self.still.set_state(Gst.State.NULL)
         if self.preview:
