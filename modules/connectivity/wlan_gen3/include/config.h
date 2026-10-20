@@ -469,7 +469,11 @@
  * Flags 0: drop multicast packets except white list when device suspend
  *------------------------------------------------------------------------------
  */
-#define CFG_SUPPORT_DROP_ALL_MC_PACKET		0
+/* Titan Pocket: 1. The home router sends IPv6 router advertisements every
+ * ~3 s, and with the white list (all-nodes, for RAs) each one woke the SoC.
+ * Asleep, the phone misses RAs (its addresses outlive a night) and IPv6
+ * neighbour solicitations (IPv4 ARP is still answered by the firmware). */
+#define CFG_SUPPORT_DROP_ALL_MC_PACKET		1
 
 /*------------------------------------------------------------------------------
  * SAR table size.

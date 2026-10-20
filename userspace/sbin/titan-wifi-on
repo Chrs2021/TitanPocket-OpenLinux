@@ -27,6 +27,11 @@ for i in $(seq 75); do
 		# the driver logs INFO and STATE for every module by default (0x27):
 		# hundreds of lines a minute in the journal; keep warnings and errors
 		echo "0xff:0x03" > /proc/net/wlan/dbgLevel 2>/dev/null || true
+		# 802.11 power save: off (cfg80211's default here) keeps the radio,
+		# and so the whole connectivity chip, awake listening; it then holds
+		# its wake line to the SoC and every suspend ends at once (wake up by
+		# R12_CONN2AP, timer_out = 6). cfg80211 keeps it across reconnects.
+		iw dev wlan0 set power_save on 2>/dev/null || true
 		exit 0
 	fi
 	sleep 0.2

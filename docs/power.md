@@ -6,7 +6,10 @@ suspends to RAM (Wi-Fi stays up by default, see below); Weston stops drawing
 while the screen is off. Suspend and power-key wake work, including with
 Weston running. The occasional reset during sleep was a deliberate kernel
 oops, now a refused suspend (kernel #33, [below](#the-suspend-crash)); a
-rarer hang while bringing CPUs back on resume is not understood yet.
+rarer hang while bringing CPUs back on resume is not understood yet. With
+Wi-Fi connected the SoC now sleeps until a real event (2026-10-20: 129 of
+130 s asleep; before, it was woken every ~0.4 s, ~105 mA average
+overnight), see [What wakes it from sleep](#what-wakes-it-from-sleep).
 
 ## CPU frequency
 
@@ -132,8 +135,132 @@ default keeps Wi-Fi up: sleep works and the power key wakes it reliably,
 but the connectivity chip wakes the SoC every ~0.5 s. Next step: unattended
 tests of Wi-Fi down with Bluetooth on, logging each step to a synced file.
 
+**2026-10-20, what the radio hears:** a 60 s capture on `wlan0` (a
+raw-socket counter; no tcpdump on the phone) got 3.4 frames/s, 83 % of them
+broadcast ARP requests: the home router checks each of its ~29 clients
+every ~10 s, and other access points ask for the router. Only
+7/min are for the phone. Then IPv6 router advertisements (13/min), and four
+EAPOL frames a minute, which turned out to be reconnections:
+- **Wi-Fi dropped at every suspend attempt.** cfg80211 disconnects every
+  interface on suspend unless WoWLAN is configured (`iw phy phy0 wowlan
+  show`: disabled), and the reconnect took ~4 s after each wake. With the USB
+  cable in, titan-powerkey retried a refused suspend every 30 s, so the link
+  dropped twice a minute (34 drops in 31 min). Now `wowlan_triggers=any` in
+  `wpa_supplicant-wlan0.conf` (the driver offers "any" and "disconnect"), and
+  titan-powerkey doesn't attempt suspend while USB or AC power is online.
+- **The firmware's suspend mode was never on in normal use.** titan-powerkey
+  now sends `SETSUSPENDMODE 1` at screen-off and `0` at screen-on, as
+  Android does: the driver hands the firmware the IPv4/IPv6 addresses (it
+  answers ARP and NS itself and drops those for other hosts), notifies it
+  (`CMD_ID_SET_SUSPEND_MODE`), and narrows multicast to `33:33:00:00:00:01`.
+- **802.11 power save was off** (`iw dev wlan0 get power_save`);
+  `titan-wifi-on` now turns it on. It didn't change the sleep lengths.
+- **An NTP loop:** every resume counts as a clock change (`hrtimers_resume`
+  → `clock_was_set`), so systemd-timesyncd queried its server after each
+  wake; the phone was asleep again when the reply came, and the reply woke
+  it: 86 cycles in 2 min, one NTP exchange each. titan-powerkey now stops
+  timesyncd at screen-off and starts it at screen-on.
+
+Unattended tests (a script stops titan-powerkey, blanks the panel, sets the
+suspend mode and loops `echo mem` with a 60 s RTC alarm while the cable is
+out; a raw socket logs every frame with the kernel's timestamp; the driver's
+RX thread is frozen in suspend, so a frame that woke the SoC is stamped
+after the resume):
+
+| Setup | Sleeps | Median | Notes |
+|---|---|---|---|
+| suspend mode, BT off | 249 in 3 min | 0.41 s | `wake up by R12_CONN2AP, timer_out = 6` |
+| + power save, BT on/off | 316 in 5 min | 0.40 s | a unicast UDP frame at 315 of 316 wakes |
+| (trace) | 86 in 2 min | | those frames: NTP replies |
+| + timesyncd stopped | 195 in 3 min | 0.4 s | 45 frames (38 RAs) for 195 wakes |
+
+**Found (2026-10-20 morning): the firmware's own log.** A driver build that
+logs every item the chip hands over (`nicRxProcessRFBs`, RX LOUD: type and
+first 32 bytes) showed the first thing after 74 of 76 wakes: a type-7 event,
+ID `0x27`, text `TX_DIAG: 5G Force Short Slot`. The firmware prints that once
+per beacon on 5 GHz (~10/s) and forwards its log to the host as events; each
+woke the SoC (`timer_out` 5 ticks: the event was already pending). The
+driver only sent the firmware a log level when it was above OFF, so the
+firmware kept its own; and a level sent at probe doesn't survive leaving
+suspend mode (the messages start again at `SETSUSPENDMODE 0`). Driver
+changes (`modules/connectivity/wlan_gen3`):
+- `gl_init.c`: the firmware log level (OFF) is sent at probe even when OFF,
+  and again on every switch to suspend mode (`wlanSetSuspendMode`), which
+  titan-powerkey does at screen-off. Awake on the cable: 0 messages in 20 s
+  with suspend mode on, ~7 per 10 s with it off.
+- `config.h`: `CFG_SUPPORT_DROP_ALL_MC_PACKET 1`. The home router sends IPv6
+  router advertisements every ~3 s and the suspend white list let them
+  through (19 wakes in 62 s once the log was quiet). Asleep, the phone now
+  misses RAs (addresses outlive a night) and IPv6 neighbour solicitations
+  (the router may not reach it over IPv6 until it wakes; IPv4 ARP is still
+  answered by the firmware).
+- `debug.c` (earlier): the firmware text log is printed only at RX INFO.
+
+| Setup | Sleeps | Median | Asleep |
+|---|---|---|---|
+| power save + suspend mode, timesyncd stopped | 195 in 3 min | 0.4 s | ~2/3 (incl. resume work) |
+| + firmware log OFF at probe | 22 in 62 s | 2.9 s | 55 of 62 s (when it stuck) |
+| + multicast dropped | 110 in 90 s | 0.4 s | the log came back |
+| + log OFF at each suspend mode | **3 in 130 s** | **60 s** (the test's RTC alarm) | **129 of 130 s** |
+
+`TX_DIAG` strings are readable in `WIFI_RAM_CODE_6759` (plaintext section 3);
+the firmware has a whole family of them (register dumps, queue lengths).
+
 `titan-wlan-cmd [-i wlan0] CMD ...` sends any gen3 driver private command
 (ioctl `SIOCDEVPRIVATE+1`, `struct priv_driver_cmd_s`).
+
+## Charging
+
+Not characterized yet (the limit and LED below work). What's known (2026-10-20):
+- The MT6370 charger runs under MediaTek's charger framework
+  (`/sys/devices/platform/charger`: `ADC_Charger_Voltage` = VBUS in mV,
+  `pe20`, `pe40`, `pdc_max_watt`, `sw_jeita`; `chg1_current` and
+  `input_current` read unset, 4294967295, so the framework chooses).
+- **It plans with the wrong battery data:** it reads MediaTek's own
+  `battery` supply, a gauge this board doesn't use (capacity −1, 2946 mAh,
+  "Charging" while full), not the OZ8806 (`oz8806-battery`: 99 %, 4250 mAh,
+  "Not charging" at the same moment). The same stale value blocked the flash
+  ([camera.md](camera.md)).
+- On a computer's USB port the input is a standard downstream port, 500 mA.
+
+**`titan-charge`** (Rust, `userspace/titan-charge/`, `titan-charge.service`;
+it was `titan-chargelog`) does three things:
+- **Log** to `/var/log/titan-charge/YYYY-MM.csv`: a line when the percentage
+  changes, on plugging in and out, every minute while plugged in, and at
+  `hold`/`resume` (the limit); it polls every 10 s and nothing runs while
+  asleep. Columns: local time, event, plugged, the gauge's status, percent,
+  mV, mA (positive = charging), battery °C, mAh, VBUS mV, USB input limit
+  mA, MediaTek's status and percent, charger and SoC °C, screen.
+- **Charge limit** (`titan-charge limit [50-100]`, kept in
+  `/var/lib/titan-charge/limit`; 100 = none): at the limit charging stops and
+  the phone runs from USB (verified: "Not charging", −10 mA at 96 % with a
+  90 % limit); it resumes 5 % below, or when unplugged. The switch is the
+  charger manager's `cmd_discharging` (`/proc/mtk_battery_cmd/current_cmd`:
+  `0 1` stops, `0 0` charges). MediaTek's own smart-charging limit
+  (`sc_tuisoc`, `enable_sc`) would use its battery percentage, −1 here.
+- **Indicator LED** (below).
+`titan-charge status` prints a reading, the limit and whether charging is
+held.
+
+## Indicator LED
+
+The MT6370's RGB LED (`/sys/class/leds/mt6370_pmu_led1`-`3`: red, green,
+blue, as the stock lights HAL maps them; `led4` is a fourth, "misc"
+channel). Brightness 0-6 (led4 0-3). The trigger selects the chip's mode:
+`cc_mode` (steady), `pwm_mode` (hardware blink: `pwm_dim_freq` from a list,
+0.1 Hz to 1 kHz, written as its index; `pwm_duty` 0-31) and `breath_mode`
+(`tr1`/`tr2`/`ton`/`tf1`/`tf2`/`toff`). Blinking in the chip costs no
+wake-ups. The kernel also offers the gauge's triggers
+(`oz8806-battery-charging`, `-full`, `-charging-blink-full-solid`).
+titan-charge uses: **red** while charging, **green** when full or held at
+the limit, a short **red flash every 2 s** (pwm 0.5 Hz, duty 3/31) below
+15 % on battery, off otherwise; brightness 2.
+
+Plan: charge from ~20 % to full on a wall charger, a computer's port and a
+USB-PD charger; from the logs, the constant-current level, the CV voltage
+(must not pass 4.40 V), termination current, time to 80 % and full, peak
+temperatures, and whether MediaTek's view tracks the gauge. Then point the
+charger framework at the OZ8806.
 
 ## The suspend crash
 
@@ -207,6 +334,30 @@ backlight dips to a fifth for 120 ms, then `titan-brightness apply` puts
 the saved level back. While the red key is held, volume up doesn't change
 the volume; if volume up came first, its step (made under 2 s before) is
 undone.
+
+**Screen off and on** (`panel()`), in order:
+- off: the `/run/titan-screen.off` flag (Weston stops drawing), the panel
+  blanked (fb0 blank 4), the Wi-Fi driver's suspend mode on
+  (`SETSUSPENDMODE 1`), systemd-timesyncd stopped; then suspend;
+- on: the flag removed, the panel unblanked, **the backlight first**, then
+  `SETSUSPENDMODE 0` and timesyncd started in the background. With the
+  Wi-Fi and time-sync steps before the backlight, the panel stayed black for
+  about a second, and a second press in that gap turned the screen off
+  again (2026-10-20, 03:00).
+- **The backlight after an unblank:** the display driver powers the
+  backlight PWM off at blank (`disp_pwm_backlight_status: backlight is off,
+  power:(0)`), and the LED driver skips a write of the value it has cached,
+  so restoring the same level left the panel dark. titan-powerkey steps the
+  LED value one away and then runs `titan-brightness apply`. (titan-brightness
+  reads the PWM register back to catch a lost write, but that register keeps
+  its value while the PWM is unpowered, so its check passed on a dark
+  screen.)
+
+**Test tools** (`tools/power/`, run on the phone): `sleeptest.py` (the
+unattended sleep loop with a frame log, see above), `sleepstats.sh SINCE
+[UNTIL]` (suspend cycles, wake sources, sleep lengths, Wi-Fi drops from the
+journal) and `wlan-rx-count.py` (what arrives on `wlan0`, by kind and
+protocol).
 
 Long presses are ignored; holding the key for ~10 s makes the PMIC reset
 the phone. systemd-logind would otherwise act on the key (the device is

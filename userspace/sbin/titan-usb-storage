@@ -1,0 +1,388 @@
+#!/usr/bin/python3
+"""
+titan-usb-storage: the microSD card as a USB drive, holding Pictures.
+
+The card (/dev/mmcblk0, FAT32) is the phone's Pictures storage: mounted at
+/media/sdcard, its Pictures folder bind-mounted on ~/Pictures. Switched on
+while a computer is plugged in, the phone lets go of the card and the USB
+gadget offers it as a mass-storage drive (f_mass_storage, a removable LUN
+that is always in the gadget, empty while the phone has the card: no
+re-plug needed). When the computer ejects it, the cable comes out, or the
+switch goes off, the phone checks the filesystem (fsck.vfat -a: the computer
+may leave it marked dirty) and mounts it again.
+
+Only one side may have a FAT filesystem mounted at a time, so while it's
+shared ~/Pictures is a plain folder on the phone: Camera and screenshots
+still save there, and those files are moved onto the card when it comes
+back. The same move brings files saved before the card was used (the first
+start) onto it.
+
+Switching off while the computer still has the drive mounted and locked:
+this kernel's mass-storage function has no forced_eject, but any USB reset
+unlocks it, so the gadget is unbound and bound again (serial and network
+over USB drop for a second). Ejecting on the computer first is cleaner.
+
+    titan-usb-storage daemon        the service (titan-usb-storage.service)
+    titan-usb-storage on|off        ask for sharing; waits for the result
+    titan-usb-storage status        the state as JSON
+
+State: /run/titan-usb-storage/state (JSON: state local|shared|nocard|busy,
+detail, host = the UDC's state, card size and free bytes). Request:
+/run/titan-usb-storage/want (on/off). Sharing is always off at boot.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+GADGET = "/sys/kernel/config/usb_gadget/g1"
+FUNC = GADGET + "/functions/mass_storage.usb0"
+LUN = FUNC + "/lun.0"
+CONFIG = GADGET + "/configs/c.1"
+CARD_DISK = "/dev/mmcblk0"
+CARD_PART = "/dev/mmcblk0p1"
+MNT = "/media/sdcard"
+PICS = "/root/Pictures"
+RUN = "/run/titan-usb-storage"
+WANT = RUN + "/want"
+STATE = RUN + "/state"
+INQUIRY = "UnihertzTitan Pocket SD 0001"     # vendor 8, product 16, revision 4
+MOUNT_OPTS = "utf8,flush,shortname=mixed,uid=0,gid=0,fmask=0022,dmask=0022,noatime,errors=remount-ro"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def write(path, value):
+    # an empty write never reaches a sysfs/configfs store: clearing (the
+    # gadget's UDC, the LUN's file) takes a lone newline
+    with open(path, "w") as f:
+        f.write(value or "\n")
+
+
+def udc_name():
+    return read(GADGET + "/UDC")
+
+
+def bind_udc(udc):
+    """Bind the gadget again; the controller refuses (EBUSY) for a moment
+    right after an unbind."""
+    for _ in range(30):
+        try:
+            write(GADGET + "/UDC", udc)
+            return True
+        except OSError:
+            time.sleep(0.1)
+    log("could not bind the gadget to %s" % udc)
+    return False
+
+
+def host_state():
+    """The UDC's state: configured (a host is using us), suspended (it
+    sleeps), not attached (no cable), ..."""
+    udc = udc_name() or (os.listdir("/sys/class/udc") or [""])[0]
+    return read("/sys/class/udc/%s/state" % udc, "unknown") if udc else "unknown"
+
+
+def mounted(path):
+    with open("/proc/self/mounts") as f:
+        return any(line.split()[1] == path for line in f)
+
+
+def run(*cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        log("%s: %s" % (" ".join(cmd), (r.stderr or r.stdout).strip()))
+    return r.returncode
+
+
+# ---- the gadget ----
+
+def setup_gadget():
+    """Put an empty removable LUN into the gadget (once per boot)."""
+    if not os.path.isdir(GADGET):
+        log("no USB gadget")
+        return False
+    if not os.path.isdir(FUNC):
+        os.mkdir(FUNC)
+    if read(LUN + "/file"):
+        write(LUN + "/file", "")
+    write(LUN + "/removable", "1")
+    write(LUN + "/ro", "0")
+    try:
+        write(LUN + "/inquiry_string", INQUIRY)
+    except OSError:
+        pass
+    link = CONFIG + "/mass_storage.usb0"
+    if not os.path.islink(link):
+        udc = udc_name()
+        if udc:
+            write(GADGET + "/UDC", "")
+        os.symlink(FUNC, link)
+        try:
+            write(CONFIG + "/strings/0x409/configuration", "acm+ncm+msc")
+        except OSError:
+            pass
+        if udc:
+            time.sleep(0.3)
+            bind_udc(udc)
+        log("mass storage added to the gadget")
+    if not udc_name():                      # left unbound by an earlier failure
+        udcs = os.listdir("/sys/class/udc")
+        if udcs:
+            bind_udc(udcs[0])
+    return True
+
+
+def lun_release():
+    """Take the card back from the host."""
+    if not read(LUN + "/file"):
+        return
+    try:
+        write(LUN + "/file", "")
+        return
+    except OSError as e:
+        log("eject refused (%s): the host has it locked; resetting the USB link" % e)
+    udc = udc_name()
+    if udc:
+        write(GADGET + "/UDC", "")
+        time.sleep(0.3)
+    write(LUN + "/file", "")
+    if udc:
+        bind_udc(udc)
+
+
+# ---- the card on the phone ----
+
+def card_present():
+    return os.path.exists(CARD_PART)
+
+
+def move_into(src, dst):
+    """Move everything in src into dst (merging folders; a name taken in
+    dst gets " (n)"). FAT keeps no owners or modes, so only the data and
+    the times are copied."""
+    os.makedirs(dst, exist_ok=True)
+    for name in sorted(os.listdir(src)):
+        s = os.path.join(src, name)
+        d = os.path.join(dst, name)
+        try:
+            if os.path.isdir(s) and not os.path.islink(s):
+                if os.path.exists(d) and not os.path.isdir(d):
+                    d = free_name(d)
+                move_into(s, d)
+                os.rmdir(s)
+                continue
+            if os.path.lexists(d):
+                d = free_name(d)
+            st = os.stat(s)
+            tmp = os.path.join(os.path.dirname(d), "." + os.path.basename(d) + ".part")
+            shutil.copyfile(s, tmp)
+            os.utime(tmp, (st.st_atime, st.st_mtime))
+            os.rename(tmp, d)
+            os.unlink(s)
+        except OSError as e:
+            log("could not move %s onto the card: %s" % (s, e))
+
+
+def free_name(path):
+    base, ext = os.path.splitext(path)
+    n = 1
+    while os.path.lexists("%s (%d)%s" % (base, n, ext)):
+        n += 1
+    return "%s (%d)%s" % (base, n, ext)
+
+
+def mount_local():
+    """Card → /media/sdcard, its Pictures → ~/Pictures, with what was saved
+    on the phone meanwhile moved onto it."""
+    if not card_present():
+        return False
+    if not mounted(MNT):
+        os.makedirs(MNT, exist_ok=True)
+        run("fsck.vfat", "-a", "-w", CARD_PART)
+        # FAT keeps local time (as the computer writes it): this zone's offset
+        offset = time.localtime().tm_gmtoff // 60
+        if run("mount", "-t", "vfat", "-o", MOUNT_OPTS + ",time_offset=%d" % offset,
+               CARD_PART, MNT):
+            return False
+    os.makedirs(PICS, exist_ok=True)
+    if not mounted(PICS):
+        move_into(PICS, os.path.join(MNT, "Pictures"))
+        if run("mount", "--bind", os.path.join(MNT, "Pictures"), PICS):
+            return False
+    return True
+
+
+def unmount_local():
+    """Let go of the card; False (and still mounted) when something keeps
+    it busy."""
+    os.sync()
+    for path in (PICS, MNT):
+        if mounted(path) and run("umount", path):
+            mount_local()
+            return False
+    run("blockdev", "--flushbufs", CARD_DISK)
+    return True
+
+
+def card_space():
+    try:
+        st = os.statvfs(MNT if mounted(MNT) else "/")
+        if not mounted(MNT):
+            raise OSError
+        return st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+    except OSError:
+        try:
+            with open("/sys/block/mmcblk0/size") as f:
+                return int(f.read()) * 512, None
+        except (OSError, ValueError):
+            return None, None
+
+
+# ---- the daemon ----
+
+def notify_ready():
+    """Type=notify: the desktop starts once ~/Pictures is in place."""
+    import socket
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+        s.connect(addr)
+        s.send(b"READY=1")
+
+
+class Daemon:
+    def __init__(self):
+        self.state = "local"
+        self.detail = ""
+        self.gone_since = None
+
+    def publish(self):
+        size, free = card_space()
+        data = {"state": self.state, "detail": self.detail, "host": host_state(),
+                "size": size, "free": free, "want": read(WANT, "off")}
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, STATE)
+
+    def share(self):
+        if not unmount_local():
+            self.state, self.detail = "busy", "Pictures is in use on the phone; close the app using it"
+            write(WANT, "off")
+            return
+        try:
+            write(LUN + "/file", CARD_DISK)
+        except OSError as e:
+            log("could not share the card: %s" % e)
+            mount_local()
+            self.state, self.detail = "local", "Could not share the card (%s)" % e.strerror
+            write(WANT, "off")
+            return
+        self.state, self.detail = "shared", ""
+        log("card shared")
+
+    def unshare(self, why):
+        lun_release()
+        write(WANT, "off")
+        if mount_local():
+            self.state, self.detail = "local", why
+        else:
+            self.state, self.detail = "nocard", "The card could not be mounted"
+        log("card back on the phone: %s" % why)
+
+    def tick(self):
+        want = read(WANT, "off") == "on"
+        host = host_state()
+        if not card_present():
+            if self.state == "shared":
+                lun_release()
+            self.state, self.detail = "nocard", "No microSD card"
+            return
+        if self.state in ("nocard", "busy"):
+            self.state = "local" if mount_local() else "nocard"
+            if self.state == "nocard":
+                self.detail = "The card could not be mounted"
+        if self.state == "local":
+            if want and host == "configured":
+                self.share()
+            elif want and host == "not attached":
+                self.detail = "Plug the phone into a computer"
+            elif not want:
+                if self.detail == "Plug the phone into a computer":
+                    self.detail = ""
+        elif self.state == "shared":
+            if host == "not attached":
+                self.gone_since = self.gone_since or time.monotonic()
+                if time.monotonic() - self.gone_since > 1.5:
+                    self.unshare("Unplugged")
+                return
+            self.gone_since = None
+            if not read(LUN + "/file"):
+                self.unshare("Ejected by the computer")
+            elif not want:
+                self.unshare("Switched off")
+
+    def run(self):
+        os.makedirs(RUN, exist_ok=True)
+        write(WANT, "off")
+        setup_gadget()
+        if card_present():
+            if not mount_local():
+                self.state, self.detail = "nocard", "The card could not be mounted"
+        else:
+            self.state, self.detail = "nocard", "No microSD card"
+        notify_ready()
+        last = None
+        while True:
+            try:
+                self.tick()
+            except OSError as e:
+                log("error: %s" % e)
+            now = (self.state, self.detail, host_state(), read(WANT))
+            if now != last or int(time.monotonic()) % 10 == 0:
+                self.publish()
+                last = now
+            time.sleep(0.5)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "daemon":
+        Daemon().run()
+    elif cmd in ("on", "off"):
+        if not os.path.isdir(RUN):
+            sys.exit("titan-usb-storage: the service isn't running")
+        write(WANT, cmd)
+        target = ("shared",) if cmd == "on" else ("local", "nocard")
+        seen_on = False
+        for _ in range(40):
+            time.sleep(0.25)
+            st = json.loads(read(STATE, "{}") or "{}")
+            seen_on = seen_on or st.get("want") == "on"
+            if st.get("state") in target or (cmd == "on" and seen_on and st.get("want") == "off"):
+                break
+        print(read(STATE, "{}"))
+    elif cmd == "status":
+        print(read(STATE, "{}"))
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

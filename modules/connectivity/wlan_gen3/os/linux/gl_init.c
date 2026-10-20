@@ -2243,6 +2243,16 @@ VOID wlanSetSuspendMode(P_GLUE_INFO_T prGlueInfo, BOOLEAN fgEnable)
 	if (!prDev)
 		return;
 
+	/*
+	 * Titan Pocket: the firmware's log level again, OFF, on every switch to
+	 * suspend mode. Its 5 GHz TX diagnostics ("TX_DIAG: 5G Force Short
+	 * Slot", one per beacon, ~10/s) reach the host as events and each wakes
+	 * the SoC; the level sent at probe doesn't always stick.
+	 */
+	if (fgEnable)
+		wlanDbgSetLogLevelImpl(prGlueInfo->prAdapter, ENUM_WIFI_LOG_LEVEL_VERSION_V1,
+				       ENUM_WIFI_LOG_MODULE_FW, ENUM_WIFI_LOG_LEVEL_OFF);
+
 	/* new filter should not include p2p mask */
 	u4PacketFilter = prGlueInfo->prAdapter->u4OsPacketFilter & (~PARAM_PACKET_FILTER_P2P_MASK);
 
@@ -2849,8 +2859,13 @@ static INT_32 wlanProbe(PVOID pvData)
 		prAdapter->u4QmRxBaMissTimeout = DEFAULT_QM_RX_BA_ENTRY_MISS_TIMEOUT_MS;
 		prAdapter->fgEnCfg80211Scan = TRUE;
 		wlanDbgGetGlobalLogLevel(ENUM_WIFI_LOG_MODULE_FW, &u4LogLevel);
-		if (u4LogLevel > ENUM_WIFI_LOG_LEVEL_OFF)
-			wlanDbgSetLogLevelImpl(prAdapter,
+		/*
+		 * Titan Pocket: tell the firmware its log level even when it is
+		 * OFF. Left at its own default it sends diagnostic text to the host
+		 * as events ("TX_DIAG: 5G Force Short Slot" for its power-save
+		 * frames), and each one woke the SoC from suspend: sleeps of 0.4 s.
+		 */
+		wlanDbgSetLogLevelImpl(prAdapter,
 					       ENUM_WIFI_LOG_LEVEL_VERSION_V1,
 					       ENUM_WIFI_LOG_MODULE_FW,
 					       u4LogLevel);

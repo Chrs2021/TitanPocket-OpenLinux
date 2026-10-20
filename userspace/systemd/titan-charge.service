@@ -1,0 +1,12 @@
+[Unit]
+Description=Battery and charging: log (/var/log/titan-charge), charge limit, indicator LED
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/local/bin/titan-charge
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

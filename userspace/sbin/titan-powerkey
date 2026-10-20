@@ -22,7 +22,9 @@ is gone, so a crashed app can't leave the keys dead.
 
   awake      short press → blank the panel, suspend ("mem", deep)
              if the kernel refuses (e.g. USB cable connected): stay
-             "screen off" and retry every RETRY_S seconds
+             "screen off" and retry every RETRY_S seconds; while a
+             charger or computer is plugged in it doesn't try at all,
+             it looks again every RETRY_S seconds
   screen off short press → panel on
   asleep     the power key wakes the SoC; its press is swallowed and the
              panel comes back. Any other wake source (RTC alarm, cable
@@ -92,6 +94,7 @@ WAKE_WINDOW_S = 1.5                  # wait for the waking key press after resum
 FB_BLANK = "/sys/class/graphics/fb0/blank"
 # exists while the screen is off (titan-kbd keeps the keyboard backlight dark)
 SCREEN_OFF_FLAG = "/run/titan-screen.off"
+WLAN_CMD = "/usr/local/bin/titan-wlan-cmd"
 CTL_FIFO = "/run/titan-powerkey.ctl"   # "off" from the compositor (idle)
 WIFI_IF = "wlan0"
 # off by default: taking wlan0 down before suspend (with Bluetooth on) hung
@@ -155,6 +158,44 @@ def write(path, value):
         f.write(value)
 
 
+def background(cmd):
+    """run without waiting (the screen-on path must stay instant)"""
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as e:
+        log("%s: %s" % (cmd[0], e))
+
+
+def wifi_suspend_mode(on):
+    """The Wi-Fi driver's suspend mode, as Android sets it with the screen
+    off: the firmware gets the IP addresses (it answers ARP and neighbour
+    solicitations itself and drops those for other hosts), and multicast
+    narrows to IPv6 router advertisements. Without it every broadcast on the
+    network (a router checking its clients sends a few a second) wakes the
+    SoC while asleep."""
+    if not os.path.exists("/sys/class/net/wlan0"):
+        return
+    try:
+        subprocess.run([WLAN_CMD, "SETSUSPENDMODE", "1" if on else "0"], timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log("wifi suspend mode: %s" % e)
+
+
+def time_sync(on):
+    """systemd-timesyncd off while the screen is off. Every resume counts as a
+    clock change (hrtimers_resume -> clock_was_set), so it sends an NTP query
+    after each wake; the phone is back asleep before the reply arrives, and
+    the reply (unicast, a legitimate WoWLAN wake) wakes it again: a loop of
+    ~0.7 s sleeps. The RTC keeps time meanwhile; it syncs at screen-on."""
+    try:
+        subprocess.run(["systemctl", "start" if on else "stop", "systemd-timesyncd"],
+                       timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log("time sync: %s" % e)
+
+
 def panel(on):
     try:
         if on:
@@ -167,10 +208,31 @@ def panel(on):
         write(FB_BLANK, "0" if on else "4")
     except OSError as e:
         log("panel %s: %s" % ("on" if on else "off", e))
+    if on:
+        # light first: the panel stays black until the backlight is set, and
+        # a second press during that gap turned the screen off again
+        brightness()
+        if os.path.exists("/sys/class/net/wlan0"):
+            background([WLAN_CMD, "SETSUSPENDMODE", "0"])
+        background(["systemctl", "start", "systemd-timesyncd"])
+    else:
+        # these must be done before the SoC sleeps
+        wifi_suspend_mode(True)
+        time_sync(False)
 
 
 def brightness():
-    """re-apply the saved screen brightness (titan-brightness)"""
+    """re-apply the saved screen brightness (titan-brightness). Step the LED
+    one value away first: the display driver powers the backlight PWM off at
+    blank, and a write of the value it has cached is skipped, so restoring
+    the same level left the panel dark (titan-brightness's read-back of the
+    PWM register passes: the register keeps its value while unpowered)."""
+    led = "/sys/class/leds/lcd-backlight/brightness"
+    try:
+        cur = int(open(led).read())
+        write(led, str(cur + 1 if cur < 255 else cur - 1))
+    except (OSError, ValueError):
+        pass
     try:
         subprocess.run(["/usr/local/bin/titan-brightness", "apply"], timeout=5,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -296,6 +358,19 @@ def screenshot():
     except (OSError, ValueError):
         pass
     brightness()
+
+
+def plugged():
+    """A charger or computer on the USB port: the kernel refuses suspend then
+    (the cable-detect interrupt aborts it at the noirq stage)."""
+    for s in ("usb", "ac"):
+        try:
+            with open("/sys/class/power_supply/%s/online" % s) as f:
+                if f.read().strip() == "1":
+                    return True
+        except OSError:
+            pass
+    return False
 
 
 def suspend():
@@ -441,6 +516,7 @@ def main():
     log("power key: %s (%s)" % (path, name))
     volume = Volume()
     brightness()
+    time_sync(True)             # in case a restart left it stopped (screen off)
     others = [p for p, d in key_devices(KEY_VOLUMEUP) if p != path]
     for p in others:
         log("volume keys also from %s" % p)
@@ -455,6 +531,13 @@ def main():
         panel(False)
         wifi(False)
         while True:
+            # plugged in: don't even try (each refused attempt froze every
+            # process, suspended every device and, before WoWLAN was set,
+            # dropped the Wi-Fi connection); look again every RETRY_S
+            if plugged():
+                if key.wait_press(RETRY_S):
+                    break
+                continue
             t0 = time.time()
             if suspend():
                 log("slept %.1f s" % (time.time() - t0))

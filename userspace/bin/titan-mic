@@ -1,0 +1,58 @@
+#!/bin/sh
+# titan-mic: the MT6358 codec's microphone path (stock audio_device.xml).
+#
+#   titan-mic on [main|back|dual] [GAIN]   power the uplink; capture: hw:0,1
+#   titan-mic off
+#   titan-mic status
+#
+# The phone's two microphones are analog (Knowles SPH1642HT5H, -41 dB): the
+# main one at the bottom on preamp input IN_ADC1, the back one on IN_ADC3.
+# The device tree's mic mode is DCC (Audio_MIC_Mode reads 2). The codec
+# powers the uplink (mic bias 1.9 V, PGA, ADC) when Audio_ADC_1_Switch goes
+# Off -> On, in the mode set at that moment, so the mode is set first and the
+# ADCs are always cycled. Capture is ALSA device 1 (MultiMedia1_Capture,
+# 48 kHz stereo S16): left = preamp 1, right = preamp 2. GAIN: the PGA, 0-30
+# dB in 6 dB steps (default 30).
+set -e
+c() { amixer -q -c 0 cset "name=$1" "$2"; }
+
+case "${1:-status}" in
+on)
+	which=${2:-main}
+	gain=${3:-30}
+	case $which in
+	main) l=IN_ADC1; r=IN_ADC1 ;;
+	back) l=IN_ADC3; r=IN_ADC3 ;;
+	dual) l=IN_ADC1; r=IN_ADC3 ;;
+	*) echo "titan-mic: main, back or dual" >&2; exit 2 ;;
+	esac
+	c Audio_Preamp1_Switch OPEN
+	c Audio_Preamp2_Switch OPEN
+	c Audio_ADC_1_Switch Off
+	c Audio_ADC_2_Switch Off
+	for m in 1 2 3 4; do c Audio_MIC${m}_Mode_Select DCCMODE; done
+	c Audio_PGA1_Setting "${gain}Db"
+	c Audio_PGA2_Setting "${gain}Db"
+	c Audio_MicSource1_Setting ADC1
+	c Audio_ADC_1_Switch On
+	c Audio_ADC_2_Switch On
+	c Audio_Preamp1_Switch $l
+	c Audio_Preamp2_Switch $r
+	;;
+off)
+	c Audio_Preamp1_Switch OPEN
+	c Audio_Preamp2_Switch OPEN
+	c Audio_ADC_1_Switch Off
+	c Audio_ADC_2_Switch Off
+	;;
+status)
+	for n in Audio_ADC_1_Switch Audio_Preamp1_Switch Audio_Preamp2_Switch \
+		 Audio_MIC1_Mode_Select Audio_PGA1_Setting; do
+		printf '%-24s %s\n' "$n" "$(amixer -c 0 cget name=$n | sed -n "s/.*: values=//p")"
+	done
+	;;
+*)
+	sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+	exit 2
+	;;
+esac

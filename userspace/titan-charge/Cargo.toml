@@ -1,0 +1,15 @@
+[package]
+name = "titan-charge"
+version = "0.1.0"
+edition = "2021"
+description = "Battery and charging: log, charge limit, indicator LED for the Unihertz Titan Pocket"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

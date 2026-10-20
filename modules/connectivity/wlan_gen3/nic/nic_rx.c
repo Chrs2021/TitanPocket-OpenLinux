@@ -2826,6 +2826,9 @@ VOID nicRxProcessRFBs(IN P_ADAPTER_T prAdapter)
 
 				if (!prSwRfb)
 					break;
+				/* Titan Pocket: what the chip hands over (sleep-wake debugging; RX LOUD) */
+				DBGLOG(RX, LOUD, "RFB type %u: %*ph\n", prSwRfb->ucPacketType,
+				       32, prSwRfb->pucRecvBuff);
 #if CFG_SUPPORT_WAKEUP_REASON_DEBUG
 				if (kalIsWakeupByWlan(prAdapter))
 					nicRxCheckWakeupReason(prSwRfb);

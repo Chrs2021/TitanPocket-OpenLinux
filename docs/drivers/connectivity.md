@@ -159,6 +159,30 @@ section table of `{offset, key index, encrypted, length, destination}`:
   receive-only: its netdev has no `ndo_start_xmit`. See the AirDrop item in
   roadmap.md.
 
+### Power and sleep
+
+How the driver lets the SoC sleep with Wi-Fi connected (WoWLAN, suspend mode
+at screen-off, power save, the firmware log, multicast in suspend) is in
+[../power.md](../power.md#what-wakes-it-from-sleep). Driver changes for it:
+`os/linux/gl_init.c` (firmware log level OFF at probe and at each switch to
+suspend mode), `include/config.h` (`CFG_SUPPORT_DROP_ALL_MC_PACKET 1`),
+`common/debug.c` (firmware text log printed only at RX INFO) and
+`nic/nic_rx.c` (each received item's type and first bytes at RX LOUD, for
+debugging).
+
+**Reloading the driver** (stop `wpa_supplicant@wlan0`, `echo 0 >
+/dev/wmtWifi`, `rmmod wlan_drv_gen3`, `systemctl restart titan-wifi`, start
+`wpa_supplicant@wlan0`) works, with two side effects:
+- `/proc/net/wlan/` (and `dbgLevel` in it) isn't recreated until the next
+  boot, so the log level can't be changed and `titan-wifi-on` can't set it;
+  reboot after installing a new `wlan_drv_gen3.ko` instead.
+- The radio comes back as a new phy (`phy1`, `phy2`, ...), so `iw phy phy0`
+  fails; `iw dev` shows the current one. WoWLAN is re-applied by
+  wpa_supplicant (`wowlan_triggers=any` in its config).
+
+The installed module is stripped (`aarch64-linux-gnu-strip --strip-debug`,
+3 MB; the build's is 52 MB with debug info).
+
 ### NVRAM (per phone)
 
 The factory record `APCFG/APRDEB/WIFI` lives in the Android `nvdata`

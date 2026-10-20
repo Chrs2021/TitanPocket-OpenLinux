@@ -24,7 +24,7 @@ Wayland desktop.
 | `kernel/` | the kernel tree: MediaTek 4.14.186 BSP for the Titan Pocket with changes needed to support this device. |
 | `modules/connectivity/` | out-of-tree MediaTek CONNSYS drivers: WMT core, Wi-Fi, Bluetooth, FM radio, GPS |
 | `modules/camera/` | the camera driver (`v4l2/`: V4L2 + media controller), bring-up tools (`camprobe/`, `camcap/`) and the ISP register map (`isp/`) |
-| `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up), the FM radio, camera and photo gallery apps, the libcamera patch, and the power/volume keys, with their systemd units |
+| `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up), the FM radio, camera and photo gallery apps, the libcamera patch, the power/volume keys, charging (log, limit, LED), the microSD card as a USB drive, and the microphone path, with their systemd units |
 | `docs/` | hardware reference, per-driver notes, and how the vendor drivers were reverse-engineered |
 
 ## Hardware support
@@ -274,12 +274,17 @@ hardware, rewritten for a plain Linux system (systemd, BlueZ, ALSA).
 | `libcamera/` | `build.sh` builds libcamera v0.7.2 on the phone with `0001-titan-pocket.patch`: the `titan-camera` device for the simple pipeline handler, the 4.14 version check, an OV16880 sensor helper, and a `libcamerasrc` crash fix |
 | `spk-hold` (C) | holds an ALSA hostless link open (used by `titan-radio` and `titan-radio-gui` for the FM link) |
 | `titan-powerkey` (Python 3) | power key: screen off + suspend to RAM, wake on the power key only. Volume keys: speaker volume with a safe cap, saved across boots |
-| `titan-wlan-cmd` (C) | sends private commands to the gen3 Wi-Fi driver (e.g. `SETSUSPENDMODE 1`) |
+| `titan-wlan-cmd` (C) | sends private commands to the gen3 Wi-Fi driver (e.g. `SETSUSPENDMODE 1`, which titan-powerkey sends at screen-off) |
+| `titan-charge` (Rust) | battery log (`/var/log/titan-charge/`), a charge limit (stops charging at N % through MediaTek's charger manager, resumes 5 % below) and the RGB indicator LED (charging, full or held, a hardware low-battery blink). `cargo build --release`, then `make install-charge` |
+| `titan-usb-storage` (Python 3) | the microSD card as Pictures storage, lent to a computer as a USB mass-storage drive on request (`titan-usb-storage on/off`) |
+| `titan-mic` (sh) | the MT6358 microphone path (DCC mode, main/back/dual, PGA gain); capture is ALSA device 1 |
+| `python/titan_ui.py` | the apps' look (the water membranes and the header), used by the GTK apps |
+| `tools/power/` | sleep tests run on the phone: `sleeptest.py` (an unattended suspend loop with a log of every Wi-Fi frame), `sleepstats.sh`, `wlan-rx-count.py` ([docs/power.md](docs/power.md)) |
 | `tinymix` | ALSA mixer tool from the bundled tinyalsa, used by `titan-radio` and `titan-powerkey` |
 
 systemd units: `titan-wmt.service` (WMT core), `titan-wifi.service`,
 `titan-bt.service` (both need `titan-wmt`), `titan-powerkey.service`,
-`titan-speaker.service`.
+`titan-speaker.service`, `titan-usb-storage.service`, `titan-charge.service`.
 
 Build and install on the phone (or cross-compile with
 `CC=aarch64-linux-gnu-gcc`; `LDFLAGS=-static` for static binaries):
