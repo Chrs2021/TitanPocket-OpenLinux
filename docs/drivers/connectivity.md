@@ -153,22 +153,37 @@ section table of `{offset, key index, encrypted, length, destination}`:
   test: change one character of a log string in section 3, fix the CRC,
   load it and see whether Wi-Fi comes up. Restore the original file
   afterwards.
-- **Why it matters:** raw 802.11 transmit (frame injection, needed for
-  AWDL/AirDrop through OWL) would mean patching the firmware's TX path. The
-  driver's sniffer interface (`radiotap%d`, `CFG_SUPPORT_SNIFFER`) is
-  receive-only: its netdev has no `ndo_start_xmit`. See the AirDrop item in
-  roadmap.md.
+- **CPU:** the plaintext code is for an Andes N9 core (NDS32 instruction
+  set: 1,132 `ret5 $lp` = `0xdd9e`, almost no ARM, RISC-V or Xtensa
+  return patterns). GNU objdump has an NDS32 target; Ghidra doesn't out of
+  the box.
+- **Frame injection didn't need a firmware patch after all**: it is done in
+  the driver ([monitor mode and frame injection](#monitor-mode-and-frame-injection)).
 
 ### Power and sleep
 
 How the driver lets the SoC sleep with Wi-Fi connected (WoWLAN, suspend mode
 at screen-off, power save, the firmware log, multicast in suspend) is in
-[../power.md](../power.md#what-wakes-it-from-sleep). Driver changes for it:
-`os/linux/gl_init.c` (firmware log level OFF at probe and at each switch to
-suspend mode), `include/config.h` (`CFG_SUPPORT_DROP_ALL_MC_PACKET 1`),
-`common/debug.c` (firmware text log printed only at RX INFO) and
-`nic/nic_rx.c` (each received item's type and first bytes at RX LOUD, for
-debugging).
+[../power.md](../power.md#what-wakes-it-from-sleep) and
+[../power.md](../power.md#the-sleep-floor-2026-10-2526). Driver changes for
+it:
+- `mgmt/rlm.c` (`rlmFillSyncCmdParam`): short slot time always on for 5 GHz.
+  Access points that leave the capability bit clear made the firmware log
+  `TX_DIAG: 5G Force Short Slot` to the host on every beacon in suspend
+  mode, waking the SoC ~10 times a second.
+- `nic/nic.c` (`nicPmIndicateBssConnected`): the power-save profile is sent
+  again on every connection. The firmware starts each connection in CAM and
+  cfg80211 doesn't re-send an unchanged `power_save`, so the radio stayed
+  awake (and held the SoC's 26 MHz clock) while `iw` said power save was on.
+- `os/linux/gl_init.c` (firmware log level OFF at probe and at each switch
+  to suspend mode), `include/config.h` (`CFG_SUPPORT_DROP_ALL_MC_PACKET 1`),
+  `common/debug.c` (firmware text log printed only at RX INFO) and
+  `nic/nic_rx.c` (each received item's type and first bytes at RX LOUD, for
+  debugging).
+
+**Checking it:** `iw dev wlan0 get power_save` only shows what cfg80211
+believes. The SPM register `PCM_REG13` (bit 14, `CONN_SRCCLKENA`) shows
+whether the chip actually sleeps; `tools/power/connlog.py` samples it.
 
 **Reloading the driver** (stop `wpa_supplicant@wlan0`, `echo 0 >
 /dev/wmtWifi`, `rmmod wlan_drv_gen3`, `systemctl restart titan-wifi`, start
@@ -181,7 +196,54 @@ debugging).
   wpa_supplicant (`wowlan_triggers=any` in its config).
 
 The installed module is stripped (`aarch64-linux-gnu-strip --strip-debug`,
-3 MB; the build's is 52 MB with debug info).
+3 MB; the build's is 52 MB with debug info). Check its md5 on the phone
+before replacing the installed one: once, a stripped module read from the
+build container's output too early arrived empty, and the phone booted
+without Wi-Fi (USB SSH still worked, so it was fixed from there).
+
+### Monitor mode and frame injection
+
+The firmware has a sniffer mode, reached with a driver command:
+
+```sh
+systemctl stop wpa_supplicant@wlan0          # leaves the access point
+titan-wlan-cmd MONITOR 1 149 80 0            # enable, channel, width in MHz (20/40/80/160), ext
+ip link set radiotap0 up                     # radiotap headers, every frame on the channel
+titan-wlan-cmd MONITOR 0 149 80 0            # back to normal
+systemctl start wpa_supplicant@wlan0
+```
+
+It receives everything: data, management and control frames (RTS, CTS,
+ACKs). Transmitting needed driver work (2026-10-26):
+- `os/linux/gl_init.c`: `radiotap0` has an `ndo_start_xmit`
+  (`wlanMonHardStartXmit`). It takes a radiotap header plus an 802.11
+  frame without FCS (what libpcap's `pcap_inject` sends), strips the
+  radiotap header and posts the frame to the main thread
+  (`MID_MNY_AIS_MON_TX`). The interface comes up with carrier on (without
+  it the stack drops everything sent) and **wlan0's MAC address**.
+- `mgmt/ais_fsm.c` (`aisFsmRunEventMonTx`): the frame goes out through the
+  management-frame path at 6 Mbit/s OFDM with its own sequence number.
+- `common/wlan_oid.c` (`wlanoidSetMonitor`): the AIS BSS is activated in the
+  firmware while sniffing (and deactivated after). The firmware drops
+  management frames for an inactive BSS: before this, injected frames went
+  to the chip and nothing went on air.
+- **Data frames** go to an LMAC queue instead (best effort, `TC1`). The
+  management path (`TC4`) ends at the MCU port, and the firmware there
+  silently drops data frames; the LMAC queues go straight to the MAC
+  hardware. `nic/nic_tx.c` (`nicTxProcessMngPacket`) now keeps a queue
+  chosen with `MSDU_OPT_MANUAL_TX_QUE` instead of forcing `TC4`.
+
+Checked against our own access point (`tools/wifi/inject-ack-test.py`, 10
+frames each): probe requests, null-data and data frames are all ACKed (the
+data frames also bring a deauthentication, as they should from a station
+that isn't associated). The radio **ACKs unicast frames sent to wlan0's
+address** while sniffing (`tools/wifi/inject-test.py`: 1.1-1.2 copies per
+probe response, i.e. almost no retries), so it works as an "active"
+monitor interface. Only test-inject towards your own equipment.
+
+Known issue: once in a while, after a monitor session in which an AWDL
+peer was active, scans return nothing until the Wi-Fi function is powered
+off and on (`echo 0 > /dev/wmtWifi`, `systemctl restart titan-wifi`).
 
 ### NVRAM (per phone)
 
@@ -253,12 +315,33 @@ Without help the controller reports a MediaTek default of
 address bytes, least significant first.
 
 - The record is 440 bytes. Its first 6 bytes are the address in display
-  order; the rest are radio settings that this controller doesn't need.
+  order. Bytes 18-24 are the controller's sleep parameters (see
+  [Sleep](#sleep)); the rest are radio settings the controller doesn't
+  need.
 - `titan-bt-start` copies the record once to `/var/lib/titan-bt/bt_addr.bin`
   (mode 600, per phone, don't share it) and runs `titan-btbridge -a <addr>`.
 - The bridge sends HCI_Reset and then 0xFC1A before it opens vhci.
 - The address stays set through BlueZ's own HCI_Reset (checked with
   `titan-btbridge -a ... -t`).
+
+### Sleep
+
+Without its sleep parameters the controller never sleeps, and an awake
+Bluetooth function keeps the whole connectivity chip awake: it held the
+SoC's 26 MHz clock and DRAM 100 % of the time, about 30 mA in suspend
+([../power.md](../power.md#the-sleep-floor-2026-10-2526)). MediaTek's HAL
+sends vendor command **0xFC7A** with 7 bytes from the NVRAM record (bytes
+18-24; MediaTek's default is `03 40 1f 40 1f 00 04`).
+- `titan-bt-start` reads them from the record and passes them as
+  `titan-btbridge -s <14 hex digits>`; without them the bridge uses
+  MediaTek's default.
+- **HCI_Reset clears the setting**, and BlueZ resets the controller every
+  time it powers it on (at boot, `btmgmt power on`). The bridge watches for
+  a successful HCI_Reset Command Complete, sends 0xFC7A, waits for its
+  completion and only then passes the Reset's completion to BlueZ, so BlueZ
+  never sees the extra command.
+- Result: clock hold 100 % → 0-3 % with Bluetooth idle; a command wakes the
+  controller for about 2 s.
 
 ### Using it
 
@@ -303,5 +386,8 @@ on the phone.
 
 - Bluetooth audio (A2DP needs PipeWire/PulseAudio; SCO over HCI is untested).
 - GPS. FM is in [fm.md](fm.md).
-- Suspend/resume with Wi-Fi on; Wi-Fi power save tuning.
+- Why scans sometimes find nothing after a monitor session with an AWDL
+  peer (worked around by power-cycling Wi-Fi).
+- Concurrent monitor and station mode (AWDL while connected to an access
+  point).
 - `WMT_STEP.cfg`, coredump/firmware log daemons (`stp_dump`, `wifi_dump`).

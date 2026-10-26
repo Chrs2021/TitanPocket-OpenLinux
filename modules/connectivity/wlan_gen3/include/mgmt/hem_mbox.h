@@ -139,6 +139,7 @@ typedef enum _ENUM_MSG_ID_T {
 	MID_OID_WMM_TSPEC_OPERATE,
 	MID_RLM_RM_SCHEDULE,
 	MID_MNY_P2P_ACS,
+	MID_MNY_AIS_MON_TX,	/* frame injected on the monitor interface */
 	MID_TOTAL_NUM
 } ENUM_MSG_ID_T, *P_ENUM_MSG_ID_T;
 
@@ -222,6 +223,12 @@ typedef struct _MSG_MGMT_TX_REQUEST_T {
 	BOOLEAN fgNoneCckRate;
 	BOOLEAN fgIsWaitRsp;
 } MSG_MGMT_TX_REQUEST_T, *P_MSG_MGMT_TX_REQUEST_T;
+
+typedef struct _MSG_MON_TX_T {
+	MSG_HDR_T rMsgHdr;	/* Must be the first member */
+	P_MSDU_INFO_T prMsduInfo;
+	UINT_8 ucMacHeaderLength;
+} MSG_MON_TX_T, *P_MSG_MON_TX_T;
 
 struct MSG_SAA_FT_CONTINUE {
 	MSG_HDR_T rMsgHdr;

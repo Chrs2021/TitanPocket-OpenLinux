@@ -11411,6 +11411,26 @@ wlanoidSetMonitor(IN P_ADAPTER_T prAdapter, IN PVOID pvSetBuffer, IN UINT_32 u4S
 	rCmdMonitorSetInfo.ucChannelS1 = prMonitorSetInfo->ucChannelS1;
 	rCmdMonitorSetInfo.ucChannelS2 = prMonitorSetInfo->ucChannelS2;
 
+	/*
+	 * Frames injected on the monitor interface go out as AIS management
+	 * frames, and the firmware drops those while the AIS BSS is inactive
+	 * (not connected). Activate it, with wlan0's address, for the sniffer.
+	 */
+	if (prAdapter->prAisBssInfo) {
+		UINT_8 ucBssIndex = prAdapter->prAisBssInfo->ucBssIndex;
+		static BOOLEAN fgMonActivatedAis;
+
+		if (prMonitorSetInfo->ucEnable && !IS_NET_ACTIVE(prAdapter, ucBssIndex)) {
+			SET_NET_ACTIVE(prAdapter, ucBssIndex);
+			nicActivateNetwork(prAdapter, ucBssIndex);
+			fgMonActivatedAis = TRUE;
+		} else if (!prMonitorSetInfo->ucEnable && fgMonActivatedAis) {
+			UNSET_NET_ACTIVE(prAdapter, ucBssIndex);
+			nicDeactivateNetwork(prAdapter, ucBssIndex);
+			fgMonActivatedAis = FALSE;
+		}
+	}
+
 	rWlanStatus = wlanSendSetQueryCmd(prAdapter,
 					  CMD_ID_SET_MONITOR,
 					  TRUE,

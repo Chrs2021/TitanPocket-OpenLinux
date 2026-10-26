@@ -468,6 +468,10 @@ aisFuncTxMgmtFrame(IN P_ADAPTER_T prAdapter,
 
 VOID aisFsmRunEventMgmtFrameTx(IN P_ADAPTER_T prAdapter, IN P_MSG_HDR_T prMsgHdr);
 
+#if CFG_SUPPORT_SNIFFER
+VOID aisFsmRunEventMonTx(IN P_ADAPTER_T prAdapter, IN P_MSG_HDR_T prMsgHdr);
+#endif
+
 VOID aisFuncValidateRxActionFrame(IN P_ADAPTER_T prAdapter, IN P_SW_RFB_T prSwRfb);
 
 enum _ENUM_AIS_STATE_T aisFsmStateSearchAction(IN struct _ADAPTER_T *prAdapter, UINT_8 ucPhase);

@@ -2552,8 +2552,13 @@ BOOLEAN nicTxProcessMngPacket(IN P_ADAPTER_T prAdapter, IN P_MSDU_INFO_T prMsduI
 		return FALSE;
 
 
-	/* MMPDU: force stick to TC4 */
-	prMsduInfo->ucTC = TC4_INDEX;
+	/*
+	 * MMPDU: force stick to TC4 (the firmware sends it), unless a queue was
+	 * chosen: data frames injected on the monitor interface go straight to
+	 * an LMAC queue, as the firmware drops data frames given to it as MMPDUs.
+	 */
+	if (!(prMsduInfo->u4Option & MSDU_OPT_MANUAL_TX_QUE))
+		prMsduInfo->ucTC = TC4_INDEX;
 
 	/* No Tx descriptor template for MMPDU */
 	prMsduInfo->fgIsTXDTemplateValid = FALSE;

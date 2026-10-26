@@ -206,6 +206,68 @@ changes (`modules/connectivity/wlan_gen3`):
 `TX_DIAG` strings are readable in `WIFI_RAM_CODE_6759` (plaintext section 3);
 the firmware has a whole family of them (register dumps, queue lengths).
 
+**Correction (2026-10-25): the log level wasn't the fix.** In real use (18
+minutes unplugged, titan-powerkey in charge) the phone still averaged 142 mA:
+559 suspends with a 0.4 s median, all woken by CONN2AP. With the driver's RX
+module at INFO the reason was plain: `TX_DIAG: 5G Force Short Slot` came
+~98 times per 10 s with suspend mode on and 0 times with it off, and
+re-sending log level OFF didn't change that. On 5 GHz the short slot time is
+mandatory, but the home access point leaves the Short Slot Time bit clear in
+its beacons' capability field. The driver passed that bit on
+(`ucUseShortSlotTime` in the RLM parameters). In suspend mode the firmware
+handles beacons itself, finds the mismatch, forces short slot and logs it,
+once per beacon. Fix (`mgmt/rlm.c`, `rlmFillSyncCmdParam`): on 5 GHz always
+send short slot. Afterwards 0 messages in 30 s in suspend mode, and real use
+went to 24 suspends in 20 minutes (92 % asleep, sleeps up to 5.5 minutes),
+113 mA.
+
+### The sleep floor (2026-10-25/26)
+
+113 mA while asleep 92 % of the time meant the floor itself was high.
+`tools/power/sleepfloor.py` measures it: it waits for the cable to come out,
+stops titan-powerkey, then keeps the phone in forced suspend (300 s RTC
+alarm, re-suspending at once after any other wake) for a set time per phase,
+reading the gauge's coulomb counter (0.5 mAh steps) across each phase.
+
+| Phase (forced sleep, > 99 % asleep) | First run | After the fixes below |
+|---|---|---|
+| Wi-Fi connected + Bluetooth on | 112 mA | **12.4 mA** |
+| Wi-Fi only | | 15.6 mA |
+| Wi-Fi off, Bluetooth on | 42 mA | 11.9 mA |
+| both off | ~15 mA | 11.9 mA |
+
+**Why the radios cost 100 mA asleep.** The SPM's `PCM_REG13` (SPM base
+`0x10006000` + `0x134`) shows which subsystems hold the SoC's resources:
+bit 14 `CONN_SRCCLKENA` (the 26 MHz clock), bit 4 `CONN_DDR_EN`, bit 15
+`CONN_APSRC_REQ`, bit 13 `CONN_STATE`. Sampling it through `/dev/mem` every
+10 ms (read only) showed the connectivity chip holding the 26 MHz clock
+(and with Bluetooth, DRAM) 100 % of the time, so the SoC never reached its
+deep sleep state. The chip only lets go when every function on it sleeps:
+- **Bluetooth never slept.** MediaTek's HAL sends vendor command `0xFC7A`
+  (sleep parameters, 7 bytes) from the factory record
+  `APCFG/APRDEB/BT_Addr` (bytes 18-24; MediaTek's default is
+  `03 40 1f 40 1f 00 04`); `titan-btbridge` only set the address. HCI_Reset
+  clears the setting, and BlueZ resets the controller every time it powers
+  it on, so the bridge now sends it at start and again after every
+  successful HCI_Reset (before passing the Reset's Command Complete on).
+  Clock hold: 100 % → 0-3 %. See
+  [drivers/connectivity.md](drivers/connectivity.md#sleep).
+- **Wi-Fi lost power save at every connection.** The firmware starts each
+  connection in CAM (always awake). Android's framework sends the power
+  mode again after each connect; cfg80211 doesn't (`iw ... power_save` is
+  unchanged, so nothing is sent), and `iw` kept reporting power save "on".
+  Fix (`nic/nic.c`, `nicPmIndicateBssConnected`): re-send the power-save
+  profile held for the BSS when it connects. Clock hold: 100 % → 3-30 %
+  while awake, lower once idle.
+
+**Real use is not there yet.** Overnight (5.3 h unplugged, screen off,
+asleep 98 % of the time) the average was 68 mA, but not evenly: 15-17 mA for
+the first 35 minutes, then 70-83 mA from about 02:10 until morning, with no
+event in the logs at the change (no Wi-Fi reconnect, no gauge resync; the
+voltage fell faster too, so it was real). `tools/power/connlog.py` logs, at
+every wake, the gauge, the clock-hold share, the Wi-Fi link and power-save
+state and Bluetooth, to catch the moment it changes.
+
 `titan-wlan-cmd [-i wlan0] CMD ...` sends any gen3 driver private command
 (ioctl `SIOCDEVPRIVATE+1`, `struct priv_driver_cmd_s`).
 
@@ -234,7 +296,10 @@ it was `titan-chargelog`) does three things:
 - **Charge limit** (`titan-charge limit [50-100]`, kept in
   `/var/lib/titan-charge/limit`; 100 = none): at the limit charging stops and
   the phone runs from USB (verified: "Not charging", −10 mA at 96 % with a
-  90 % limit); it resumes 5 % below, or when unplugged. The switch is the
+  90 % limit); it resumes 5 % below, or when unplugged. **It only holds
+  above 4.0 V** (~75 % on this battery): on 2026-10-25 the gauge booted at
+  "95 %" on an empty cell and the limit kept it from charging for 15 min.
+  (The gauge was fixed in kernel #35, [drivers/oz8806.md](drivers/oz8806.md).) The switch is the
   charger manager's `cmd_discharging` (`/proc/mtk_battery_cmd/current_cmd`:
   `0 1` stops, `0 0` charges). MediaTek's own smart-charging limit
   (`sc_tuisoc`, `enable_sc`) would use its battery percentage, −1 here.
@@ -347,17 +412,30 @@ undone.
 - **The backlight after an unblank:** the display driver powers the
   backlight PWM off at blank (`disp_pwm_backlight_status: backlight is off,
   power:(0)`), and the LED driver skips a write of the value it has cached,
-  so restoring the same level left the panel dark. titan-powerkey steps the
-  LED value one away and then runs `titan-brightness apply`. (titan-brightness
-  reads the PWM register back to catch a lost write, but that register keeps
-  its value while the PWM is unpowered, so its check passed on a dark
-  screen.)
+  so restoring the same level left the panel dark. (titan-brightness reads
+  the PWM register back to catch a lost write, but that register keeps its
+  value while the PWM is unpowered, so its check passed on a dark screen.)
+- **After deep suspend the PWM is off as well (2026-10-26).** Once the SoC
+  reached real deep sleep, the display power domain lost power and the PWM
+  came back with its enable bit clear (`DISP_PWM_EN` at `0x1100e000` = 0)
+  while the level register held the right value. `ddp_pwm.c` keeps the
+  enable state in `g_pwm_en` and skips the register write when the cache
+  already says enabled, so every wake set a level on a disabled PWM and the
+  screen stayed dark. titan-powerkey now writes **0** to the LED first (the
+  driver then clears its enable cache) and then runs `titan-brightness
+  apply`, which enables the PWM in hardware again. A kernel fix would check
+  the register instead of the cache.
 
 **Test tools** (`tools/power/`, run on the phone): `sleeptest.py` (the
 unattended sleep loop with a frame log, see above), `sleepstats.sh SINCE
 [UNTIL]` (suspend cycles, wake sources, sleep lengths, Wi-Fi drops from the
-journal) and `wlan-rx-count.py` (what arrives on `wlan0`, by kind and
-protocol).
+journal), `wlan-rx-count.py` (what arrives on `wlan0`, by kind and
+protocol), `sleepfloor.py` (sleep current per radio setup, see
+[the sleep floor](#the-sleep-floor-2026-10-2526)), `drainlog.sh [SECONDS]`
+(gauge, current, voltage, plug and screen state every 5 s while awake) and
+`connlog.py [SECONDS]` (the same at each wake, plus the connectivity chip's
+26 MHz clock hold and the Wi-Fi/Bluetooth state). Run the long ones with
+`systemd-run --unit=NAME --collect`, so they survive the SSH session.
 
 Long presses are ignored; holding the key for ~10 s makes the PMIC reset
 the phone. systemd-logind would otherwise act on the key (the device is
@@ -366,14 +444,16 @@ tagged `power-switch`, and logind's default is **poweroff**), so
 
 ## Not done
 
-- Connected standby: find which frames still wake the host in Wi-Fi suspend
-  mode (DTIM skipping, ARP offload, multicast filters).
-
+- The overnight drain step: 15-17 mA asleep for the first half hour, then
+  70-83 mA for the rest of the night with nothing in the logs
+  ([the sleep floor](#the-sleep-floor-2026-10-2526)). Next: a night with
+  `connlog.py` running.
+- A kernel fix for the backlight PWM enable cache (`ddp_pwm.c`
+  `disp_pwm_set_enabled`), so the userspace workaround isn't needed.
 - Wake on keyboard/touch (only the power key, RTC and cable wake it now).
 - The resume hang (CPU1 coming online, no pstore record) and which power
   domain refused suspend, once kernel #33 logs it.
 - DPMS in the KMS driver (titan-powerkey blanks through mtkfb; Weston idle
   ([core] idle-time) locks and asks titan-powerkey for the screen off, and
   stays offscreen while it's off).
-- Measured current draw in suspend.
 - cpuidle/hotplug tuning, thermal limits.

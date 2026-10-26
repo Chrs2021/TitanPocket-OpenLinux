@@ -39,8 +39,8 @@ Wayland desktop.
 | Battery fuel gauge (O2Micro OZ8806) | `drivers/power/supply/oz8806_battery.c` (new) | ✅ voltage, current, temperature, capacity |
 | Charging (MT6370) | BSP | ⚠️ works, not characterized |
 | Speaker amplifier (FourSemi FS1860) | `sound/soc/codecs/fs1860.c` (new) | ✅ |
-| Wi-Fi 2.4 + 5 GHz (CONNSYS gen3) | `modules/connectivity/` | ✅ |
-| Bluetooth | `modules/connectivity/bt/` | ✅ BlueZ via raw HCI (`/dev/stpbt`); LE scanning and GATT peripheral connections work (with the supported-commands fix in `titan-btbridge`); classic pairing and audio untested |
+| Wi-Fi 2.4 + 5 GHz (CONNSYS gen3) | `modules/connectivity/` | ✅ sleeps with the SoC (power save, suspend mode); monitor mode with frame injection |
+| Bluetooth | `modules/connectivity/bt/` | ✅ BlueZ via raw HCI (`/dev/stpbt`); LE scanning and GATT peripheral connections work (with the supported-commands fix in `titan-btbridge`); controller sleep enabled, so it no longer keeps the connectivity chip awake; classic pairing and audio untested |
 | FM radio (MT6631) | `modules/connectivity/fm/` | ✅ `/dev/fm`; Radio app (`titan-radio-gui`) with RDS (station name, call letters, programme type, radio text) |
 | Headphone jack (MT6358 accdet) | BSP | ✅ plug detection (`SW_HEADPHONE_INSERT`); sound and FM switch to the headphones with their own volume (`titan-speakerd`, [docs/audio.md](docs/audio.md#headphones)) |
 | IR blaster | BSP `mtk_irtx_pwm` + MT6370 LDO fix | ✅ `/dev/irtx` |
@@ -233,7 +233,7 @@ Some hardware needs files that only exist on the phone itself:
 | Speaker amplifier | `fs16xx_01s_mono.preset` → `/lib/firmware` | stock vendor partition |
 | GPS | MediaTek's `libmnl.so` (positioning engine, carries the GNSS DSP firmware patch) and the 32-bit Android runtime it links against: 8 files in a chroot | stock system image and runtime APEX |
 | Wi-Fi MAC, TX power, 5 GHz | factory NVRAM record `APCFG/APRDEB/WIFI` (first 1024 bytes, handed to `/dev/wmtWifi`) | the phone's `nvdata` partition, unique per unit |
-| Bluetooth address | NVRAM record `APCFG/APRDEB/BT_Addr`, set with HCI vendor command `0xFC1A` | the phone's `nvdata` partition, unique per unit |
+| Bluetooth address, sleep parameters | NVRAM record `APCFG/APRDEB/BT_Addr`: the address (vendor command `0xFC1A`) and bytes 18-24, the controller's sleep parameters (`0xFC7A`, re-sent after every HCI_Reset) | the phone's `nvdata` partition, unique per unit |
 
 These files are not redistributable, and the NVRAM records are specific
 to each phone. Copy them from your own device, and don't publish images
@@ -279,7 +279,7 @@ hardware, rewritten for a plain Linux system (systemd, BlueZ, ALSA).
 | `titan-usb-storage` (Python 3) | the microSD card as Pictures storage, lent to a computer as a USB mass-storage drive on request (`titan-usb-storage on/off`) |
 | `titan-mic` (sh) | the MT6358 microphone path (DCC mode, main/back/dual, PGA gain); capture is ALSA device 1 |
 | `python/titan_ui.py` | the apps' look (the water membranes and the header), used by the GTK apps |
-| `tools/power/` | sleep tests run on the phone: `sleeptest.py` (an unattended suspend loop with a log of every Wi-Fi frame), `sleepstats.sh`, `wlan-rx-count.py` ([docs/power.md](docs/power.md)) |
+| `tools/power/` | sleep tests run on the phone: `sleeptest.py` (an unattended suspend loop with a log of every Wi-Fi frame), `sleepstats.sh`, `wlan-rx-count.py`, `sleepfloor.py` (sleep current per radio setup), `drainlog.sh` and `connlog.py` (battery and connectivity-chip state while in use) ([docs/power.md](docs/power.md)) |
 | `tinymix` | ALSA mixer tool from the bundled tinyalsa, used by `titan-radio` and `titan-powerkey` |
 
 systemd units: `titan-wmt.service` (WMT core), `titan-wifi.service`,
@@ -317,8 +317,9 @@ overwritten. Debian 12 doesn't package tinyalsa.
 - Display scanout copies each frame into the framebuffer: no zero-copy
   yet, no vblank interrupts, no DPMS.
 - GPU runs at a fixed frequency (no devfreq governor).
-- With Wi-Fi associated, the connectivity chip wakes the SoC from deep
-  sleep about every 0.5 s.
+- Sleep current: ~12 mA in forced sleep with Wi-Fi connected and Bluetooth
+  on, but in real use it can step up to ~80 mA after a while, for a reason
+  not found yet (docs/power.md).
 - GPS depends on MediaTek's closed `libmnl.so`, and runs without
   assistance data (no AGPS/EPO yet), so cold starts take minutes.
 - Cameras run on libcamera's software ISP (a patched v0.7.2, see

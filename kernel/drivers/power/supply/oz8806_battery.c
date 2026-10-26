@@ -50,6 +50,15 @@ extern int agold_gpio_get_in(unsigned gpio);
 #define OZ8806_POLL_MS		5000
 #define OZ8806_ANCHOR_POLLS	3	/* consecutive polls before re-anchoring */
 #define OZ8806_IDLE_MA		20
+/*
+ * Cell resistance for a rest-equivalent voltage: V - I * R (I > 0 charging).
+ * ~0.19 ohm from the log (38 mV more drop for 200 mA more load); 170 used.
+ */
+#define OZ8806_RINT_MOHM	170
+#define OZ8806_OCV_STALE_MV	100	/* OCV register vs. the cell: stale beyond */
+#define OZ8806_SEED_DRIFT	30	/* % : retained count vs. voltage at probe */
+#define OZ8806_DRIFT		25	/* % : count vs. voltage while running */
+#define OZ8806_DRIFT_POLLS	12	/* a minute of disagreement before resyncing */
 
 struct oz8806_lut {
 	int x;
@@ -94,6 +103,7 @@ struct oz8806 {
 	int temp_dc;	/* tenths of a degree C */
 	int full_polls;
 	int empty_polls;
+	int drift_polls;
 	bool valid;
 };
 
@@ -139,6 +149,14 @@ static int oz8806_write_car(struct oz8806 *oz, int mah)
 	s16 raw = mah * OZ8806_RSENSE_MOHM / OZ8806_CAR_LSB;
 
 	return i2c_smbus_write_word_data(oz->client, OZ8806_REG_CAR, (u16)raw);
+}
+
+/* state of charge (%) from a cell voltage under current (rest-equivalent) */
+static int oz8806_soc_from_cell(int mv, int ma)
+{
+	int rest = mv - ma * OZ8806_RINT_MOHM / 1000;
+
+	return oz8806_lut_interp(oz8806_ocv, ARRAY_SIZE(oz8806_ocv), rest);
 }
 
 static int oz8806_wake(struct oz8806 *oz)
@@ -209,31 +227,78 @@ static int oz8806_update(struct oz8806 *oz)
 		oz->car_mah = OZ8806_DESIGN_MAH;
 	}
 
+	/*
+	 * Drift: the count can be wrong (2026-10-25: seeded from a stale OCV
+	 * register it read 95 % on an empty cell). When the voltage says
+	 * something else by more than OZ8806_DRIFT for a minute, follow it. The
+	 * voltage curve is flat in the middle, so only a gross error trips this;
+	 * the full/empty anchors stay the precise corrections.
+	 */
+	{
+		int vsoc = oz8806_soc_from_cell(oz->volt_mv, oz->curr_ma);
+		int csoc = clamp(oz->car_mah * 100 / OZ8806_DESIGN_MAH, 0, 100);
+
+		if (abs(vsoc - csoc) > OZ8806_DRIFT)
+			oz->drift_polls++;
+		else
+			oz->drift_polls = 0;
+		if (oz->drift_polls >= OZ8806_DRIFT_POLLS) {
+			int mah = OZ8806_DESIGN_MAH * vsoc / 100;
+
+			dev_info(&oz->client->dev,
+				 "count %d%% disagrees with the cell (%d mV, %d mA: %d%%), resyncing\n",
+				 csoc, oz->volt_mv, oz->curr_ma, vsoc);
+			oz8806_write_car(oz, mah);
+			oz->car_mah = mah;
+			oz->drift_polls = 0;
+		}
+	}
+
 	oz->valid = true;
 	return 0;
 }
 
 static void oz8806_seed_car(struct oz8806 *oz)
 {
-	s16 car, ocv;
-	int mah, soc;
+	s16 car, ocv, v, c;
+	int mah, soc, cell_mv, ocv_mv, rest_mv, ma, vsoc;
 
-	if (oz8806_read_s16(oz, OZ8806_REG_CAR, &car))
+	if (oz8806_read_s16(oz, OZ8806_REG_CAR, &car) ||
+	    oz8806_read_s16(oz, OZ8806_REG_OCV, &ocv) ||
+	    oz8806_read_s16(oz, OZ8806_REG_VOLT, &v) ||
+	    oz8806_read_s16(oz, OZ8806_REG_CURR, &c))
 		return;
 	mah = car * OZ8806_CAR_LSB / OZ8806_RSENSE_MOHM;
-	if (mah > 0 && mah <= OZ8806_DESIGN_MAH + OZ8806_DESIGN_MAH / 20) {
+	ocv_mv = oz8806_raw_to_mv(ocv);
+	cell_mv = oz8806_raw_to_mv(v);
+	ma = c * OZ8806_CURR_LSB / OZ8806_RSENSE_MOHM / 100 / 4;
+	rest_mv = cell_mv - ma * OZ8806_RINT_MOHM / 1000;
+	vsoc = oz8806_soc_from_cell(cell_mv, ma);
+
+	if (mah > 0 && mah <= OZ8806_DESIGN_MAH + OZ8806_DESIGN_MAH / 20 &&
+	    abs(mah * 100 / OZ8806_DESIGN_MAH - vsoc) <= OZ8806_SEED_DRIFT) {
 		dev_info(&oz->client->dev, "using retained capacity %d mAh\n", mah);
 		return;
 	}
 
-	if (oz8806_read_s16(oz, OZ8806_REG_OCV, &ocv))
-		return;
-	soc = oz8806_lut_interp(oz8806_ocv, ARRAY_SIZE(oz8806_ocv),
-				oz8806_raw_to_mv(ocv));
-	mah = OZ8806_DESIGN_MAH * soc / 100;
-	dev_info(&oz->client->dev, "seeding capacity from OCV %d mV: %d%% (%d mAh)\n",
-		 oz8806_raw_to_mv(ocv), soc, mah);
-	oz8806_write_car(oz, mah);
+	/*
+	 * The OCV register holds the chip's last rest sample: after the battery
+	 * ran flat it can be days old (4330 mV on a 3575 mV cell). Use it only
+	 * when it agrees with the cell now; otherwise the cell voltage,
+	 * corrected for the current.
+	 */
+	if (abs(ocv_mv - rest_mv) <= OZ8806_OCV_STALE_MV) {
+		soc = oz8806_lut_interp(oz8806_ocv, ARRAY_SIZE(oz8806_ocv), ocv_mv);
+		dev_info(&oz->client->dev, "seeding capacity from OCV %d mV: %d%%\n",
+			 ocv_mv, soc);
+	} else {
+		soc = vsoc;
+		dev_info(&oz->client->dev,
+			 "OCV register stale (%d mV); seeding from the cell %d mV (%d mA): %d%%%s\n",
+			 ocv_mv, cell_mv, ma, soc,
+			 mah > 0 ? " (retained count disagreed)" : "");
+	}
+	oz8806_write_car(oz, OZ8806_DESIGN_MAH * soc / 100);
 }
 
 static void oz8806_work(struct work_struct *work)

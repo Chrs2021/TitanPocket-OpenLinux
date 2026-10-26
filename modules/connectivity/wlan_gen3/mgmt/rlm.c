@@ -1989,7 +1989,13 @@ VOID rlmFillSyncCmdParam(P_CMD_SET_BSS_RLM_PARAM_T prCmdBody, P_BSS_INFO_T prBss
 	prCmdBody->u2HtOpInfo2 = prBssInfo->u2HtOpInfo2;
 	prCmdBody->ucHtOpInfo1 = prBssInfo->ucHtOpInfo1;
 	prCmdBody->ucUseShortPreamble = prBssInfo->fgUseShortPreamble;
-	prCmdBody->ucUseShortSlotTime = prBssInfo->fgUseShortSlotTime;
+	/*
+	 * 5 GHz always uses short slot (see rlmRecBcnInfoForClient). APs that
+	 * leave the capability bit clear made the firmware "force" it and log
+	 * "TX_DIAG: 5G Force Short Slot" on every beacon while in suspend mode,
+	 * waking the host ~10 times a second.
+	 */
+	prCmdBody->ucUseShortSlotTime = (prBssInfo->eBand == BAND_5G) ? TRUE : prBssInfo->fgUseShortSlotTime;
 	prCmdBody->ucVhtChannelWidth = prBssInfo->ucVhtChannelWidth;
 	prCmdBody->ucVhtChannelFrequencyS1 = prBssInfo->ucVhtChannelFrequencyS1;
 	prCmdBody->ucVhtChannelFrequencyS2 = prBssInfo->ucVhtChannelFrequencyS2;

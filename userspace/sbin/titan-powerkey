@@ -222,16 +222,17 @@ def panel(on):
 
 
 def brightness():
-    """re-apply the saved screen brightness (titan-brightness). Step the LED
-    one value away first: the display driver powers the backlight PWM off at
-    blank, and a write of the value it has cached is skipped, so restoring
-    the same level left the panel dark (titan-brightness's read-back of the
-    PWM register passes: the register keeps its value while unpowered)."""
+    """re-apply the saved screen brightness (titan-brightness). Write 0 to the
+    LED first. The display driver caches both the level and the PWM's enable
+    bit and skips writes that match its cache: restoring the same level left
+    the panel dark, and after deep suspend (the display power domain off) the
+    PWM comes back with EN=0 while the driver still thinks it is enabled, so
+    any level stayed dark. Level 0 clears the enable bit in the driver; the
+    next level sets it again in the hardware."""
     led = "/sys/class/leds/lcd-backlight/brightness"
     try:
-        cur = int(open(led).read())
-        write(led, str(cur + 1 if cur < 255 else cur - 1))
-    except (OSError, ValueError):
+        write(led, "0")
+    except OSError:
         pass
     try:
         subprocess.run(["/usr/local/bin/titan-brightness", "apply"], timeout=5,

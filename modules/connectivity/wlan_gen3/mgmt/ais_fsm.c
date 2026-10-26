@@ -5093,6 +5093,45 @@ VOID aisFsmRunEventMgmtFrameTx(IN P_ADAPTER_T prAdapter, IN P_MSG_HDR_T prMsgHdr
 
 }				/* aisFsmRunEventMgmtFrameTx */
 
+#if CFG_SUPPORT_SNIFFER
+/*----------------------------------------------------------------------------*/
+/*!
+* @brief Send a frame injected on the monitor interface (wlanMonHardStartXmit):
+*        the 802.11 frame as given, on the channel the sniffer is tuned to, at
+*        6 Mb/s OFDM, through the management frame path (no station record).
+*/
+/*----------------------------------------------------------------------------*/
+VOID aisFsmRunEventMonTx(IN P_ADAPTER_T prAdapter, IN P_MSG_HDR_T prMsgHdr)
+{
+	P_MSG_MON_TX_T prMonTxMsg = (P_MSG_MON_TX_T) prMsgHdr;
+	P_MSDU_INFO_T prMsduInfo = prMonTxMsg->prMsduInfo;
+	UINT_8 ucMacHeaderLength = prMonTxMsg->ucMacHeaderLength;
+
+	cnmMemFree(prAdapter, prMsgHdr);
+
+	if (!prAdapter->prAisBssInfo) {
+		cnmMgtPktFree(prAdapter, prMsduInfo);
+		return;
+	}
+
+	TX_SET_MMPDU(prAdapter, prMsduInfo, prAdapter->prAisBssInfo->ucBssIndex, STA_REC_INDEX_NOT_FOUND,
+		     ucMacHeaderLength, prMsduInfo->u2FrameLength, NULL, MSDU_RATE_MODE_MANUAL_DESC);
+	nicTxSetPktFixedRateOption(prMsduInfo, RATE_OFDM_6M, 0, FALSE, FALSE);
+	/* keep the sequence number the frame carries */
+	nicTxConfigPktOption(prMsduInfo, MSDU_OPT_MANUAL_SN, FALSE);
+	/*
+	 * The firmware (TC4, MCU port) drops data frames that come as MMPDUs:
+	 * send those through the best effort LMAC queue, i.e. the hardware.
+	 */
+	if ((((P_WLAN_MAC_HEADER_T) ((ULONG) prMsduInfo->prPacket + MAC_TX_RESERVED_FIELD))->u2FrameCtrl
+	     & MASK_FC_TYPE) == MAC_FRAME_TYPE_DATA)
+		nicTxSetPktMacTxQue(prMsduInfo, MAC_TXQ_AC1_INDEX);
+	nicTxConfigPktControlFlag(prMsduInfo, MSDU_CONTROL_FLAG_FORCE_TX, TRUE);
+
+	nicTxEnqueueMsdu(prAdapter, prMsduInfo);
+}
+#endif
+
 VOID aisFsmRunEventChannelTimeout(IN P_ADAPTER_T prAdapter, ULONG ulParamPtr)
 {
 	P_AIS_FSM_INFO_T prAisFsmInfo;

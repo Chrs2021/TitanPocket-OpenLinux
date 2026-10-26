@@ -241,6 +241,11 @@ static MSG_HNDL_ENTRY_T arMsgMapTable[] = {
 	{MID_OID_WMM_TSPEC_OPERATE, wmmRunEventTSOperate},
 	{MID_RLM_RM_SCHEDULE, rlmRunEventProcessNextRm},
 	{MID_MNY_P2P_ACS, p2pRoleFsmRunEventAcs},
+#if CFG_SUPPORT_SNIFFER
+	{MID_MNY_AIS_MON_TX, aisFsmRunEventMonTx},
+#else
+	{MID_MNY_AIS_MON_TX, mboxDummy},
+#endif
 };
 
 /*******************************************************************************

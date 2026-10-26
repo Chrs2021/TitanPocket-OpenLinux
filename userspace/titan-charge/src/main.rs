@@ -10,7 +10,9 @@
 //! `cmd_discharging` (/proc/mtk_battery_cmd/current_cmd: "0 1" stops, "0 0"
 //! charges). Its own smart-charging limit (sc_tuisoc) would work off
 //! MediaTek's battery percentage, which is -1 here: the gauge is the OZ8806.
-//! Unplugging clears the hold, so the next plug-in starts charging.
+//! Unplugging clears the hold, so the next plug-in starts charging. The hold
+//! also needs the cell above HOLD_MIN_MV, so a wrong percentage can't keep
+//! an empty battery from charging.
 //!
 //! **LED** (MT6370 RGB: led1 red, led2 green, led3 blue, as the stock lights
 //! HAL maps them): red while charging, green when full or held at the limit,
@@ -59,6 +61,11 @@ const TICK: Duration = Duration::from_secs(60);
 const LIMIT_FILE: &str = "/var/lib/titan-charge/limit";
 const CHG_CMD: &str = "/proc/mtk_battery_cmd/current_cmd";
 const RESUME_GAP: i64 = 5;
+/// The limit holds only above this cell voltage (mV): ~75 % on this battery's
+/// own log (80 % ~4.09 V, 90 % ~4.21 V at light load). A gauge that is wrong
+/// (2026-10-25: it booted at "95 %" on an empty cell, seeded from a stale OCV)
+/// must never keep an empty battery from charging.
+const HOLD_MIN_MV: i64 = 4000;
 const LOW: i64 = 15;
 const LED: &str = "/sys/class/leds/mt6370_pmu_led";
 const LED_LEVEL: &str = "2"; // of 6
@@ -144,6 +151,7 @@ struct Reading {
     plugged: bool,
     percent: Option<i64>,
     status: String,
+    mv: Option<i64>,
     fields: Vec<String>, // everything after time,event
 }
 
@@ -185,7 +193,8 @@ fn reading(src: &Sources) -> Reading {
         (if Path::new(SCREEN_OFF).exists() { "off" } else { "on" }).to_string(),
     ];
     let status = ps(GAUGE, "status").unwrap_or_default();
-    Reading { plugged, percent, status, fields }
+    let mv = ps_i64(GAUGE, "voltage_now").map(|v| v / 1000);
+    Reading { plugged, percent, status, mv, fields }
 }
 
 fn append(event: &str, r: &Reading) {
@@ -340,11 +349,13 @@ fn run(cmd: Option<&str>) {
         // the limit
         let lim = limit();
         let pct = r.percent.unwrap_or(0);
-        if r.plugged && lim < 100 && !held && pct >= lim {
+        let high = r.mv.map_or(false, |v| v >= HOLD_MIN_MV);
+        if r.plugged && lim < 100 && !held && pct >= lim && high {
             charging(false);
             held = true;
             append("hold", &r);
-        } else if held && (!r.plugged || lim >= 100 || pct <= lim - RESUME_GAP) {
+        } else if held && (!r.plugged || lim >= 100 || pct <= lim - RESUME_GAP
+                           || r.mv.map_or(false, |v| v < HOLD_MIN_MV - 100)) {
             charging(true);
             held = false;
             append("resume", &r);

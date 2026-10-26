@@ -1549,6 +1549,8 @@ static int wlanMonOpen(struct net_device *prDev)
 {
 	ASSERT(prDev);
 
+	/* without carrier the stack keeps the noop qdisc and drops what we send */
+	netif_carrier_on(prDev);
 	netif_tx_start_all_queues(prDev);
 
 	return 0;		/* success */
@@ -1559,13 +1561,97 @@ static int wlanMonStop(struct net_device *prDev)
 	ASSERT(prDev);
 
 	netif_tx_stop_all_queues(prDev);
+	netif_carrier_off(prDev);
 
 	return 0;		/* success */
+}
+
+/* 802.11 header length of an injected frame, 0 for frames we don't send */
+static UINT_8 wlanMonHeaderLength(const UINT_8 *pucFrame, UINT_32 u4Len)
+{
+	UINT_16 u2Fc;
+	UINT_8 ucLen = 24;
+
+	if (u4Len < 24)
+		return 0;
+	u2Fc = pucFrame[0] | pucFrame[1] << 8;
+
+	switch ((u2Fc >> 2) & 3) {
+	case 0:			/* management */
+		if (u2Fc & BIT(15))	/* +HTC */
+			ucLen += 4;
+		break;
+	case 2:			/* data */
+		if ((u2Fc & BITS(8, 9)) == BITS(8, 9))	/* ToDS and FromDS: address 4 */
+			ucLen += 6;
+		if (u2Fc & BIT(7)) {			/* QoS */
+			ucLen += 2;
+			if (u2Fc & BIT(15))
+				ucLen += 4;
+		}
+		break;
+	default:		/* control frames are left to the hardware */
+		return 0;
+	}
+	return ucLen <= u4Len ? ucLen : 0;
+}
+
+/*
+ * Frame injection (e.g. libpcap): a radiotap header followed by an 802.11
+ * frame without FCS. The radiotap fields are ignored; aisFsmRunEventMonTx
+ * sends the frame from the main thread on the sniffer's channel.
+ */
+static netdev_tx_t wlanMonHardStartXmit(struct sk_buff *prSkb, struct net_device *prDev)
+{
+	P_GLUE_INFO_T prGlueInfo = ((P_NETDEV_PRIVATE_GLUE_INFO) netdev_priv(prDev))->prGlueInfo;
+	P_ADAPTER_T prAdapter;
+	P_MSG_MON_TX_T prMsg;
+	P_MSDU_INFO_T prMsduInfo;
+	UINT_32 u4RtLen, u4Len;
+	UINT_8 ucHdrLen;
+
+	if (!prGlueInfo || !prGlueInfo->prAdapter || !prGlueInfo->fgIsEnableMon || prSkb->len < 8)
+		goto drop;
+	u4RtLen = prSkb->data[2] | prSkb->data[3] << 8;
+	if (prSkb->data[0] != 0 || u4RtLen < 8 || u4RtLen >= prSkb->len)
+		goto drop;
+	u4Len = prSkb->len - u4RtLen;
+	ucHdrLen = wlanMonHeaderLength(prSkb->data + u4RtLen, u4Len);
+	if (!ucHdrLen || u4Len > NIC_TX_MAX_SIZE_PER_FRAME)
+		goto drop;
+
+	prAdapter = prGlueInfo->prAdapter;
+	prMsg = cnmMemAlloc(prAdapter, RAM_TYPE_MSG, sizeof(MSG_MON_TX_T));
+	if (!prMsg)
+		goto drop;
+	prMsduInfo = cnmMgtPktAlloc(prAdapter, u4Len + MAC_TX_RESERVED_FIELD);
+	if (!prMsduInfo) {
+		cnmMemFree(prAdapter, prMsg);
+		goto drop;
+	}
+	kalMemCopy((PUINT_8) ((ULONG) prMsduInfo->prPacket + MAC_TX_RESERVED_FIELD), prSkb->data + u4RtLen, u4Len);
+	prMsduInfo->u2FrameLength = (UINT_16) u4Len;
+
+	prMsg->rMsgHdr.eMsgId = MID_MNY_AIS_MON_TX;
+	prMsg->prMsduInfo = prMsduInfo;
+	prMsg->ucMacHeaderLength = ucHdrLen;
+	mboxSendMsg(prAdapter, MBOX_ID_0, (P_MSG_HDR_T) prMsg, MSG_SEND_METHOD_BUF);
+
+	prDev->stats.tx_packets++;
+	prDev->stats.tx_bytes += u4Len;
+	dev_kfree_skb(prSkb);
+	return NETDEV_TX_OK;
+
+drop:
+	prDev->stats.tx_dropped++;
+	dev_kfree_skb(prSkb);
+	return NETDEV_TX_OK;
 }
 
 static const struct net_device_ops wlan_mon_netdev_ops = {
 	.ndo_open = wlanMonOpen,
 	.ndo_stop = wlanMonStop,
+	.ndo_start_xmit = wlanMonHardStartXmit,
 };
 
 void wlanMonWorkHandler(struct work_struct *work)
@@ -1590,6 +1676,12 @@ void wlanMonWorkHandler(struct work_struct *work)
 		((P_NETDEV_PRIVATE_GLUE_INFO) netdev_priv(prGlueInfo->prMonDevHandler))->prGlueInfo = prGlueInfo;
 		prGlueInfo->prMonDevHandler->type = ARPHRD_IEEE80211_RADIOTAP;
 		prGlueInfo->prMonDevHandler->netdev_ops = &wlan_mon_netdev_ops;
+		/*
+		 * wlan0's address: the hardware ACKs frames sent to it (the AIS BSS
+		 * is active while sniffing), and injectors such as OWL take their
+		 * own address from the interface they inject on.
+		 */
+		ether_addr_copy(prGlueInfo->prMonDevHandler->dev_addr, prGlueInfo->prDevHandler->dev_addr);
 		netif_carrier_off(prGlueInfo->prMonDevHandler);
 		netif_tx_stop_all_queues(prGlueInfo->prMonDevHandler);
 		kalResetStats(prGlueInfo->prMonDevHandler);

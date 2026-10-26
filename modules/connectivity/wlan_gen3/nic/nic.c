@@ -1789,6 +1789,7 @@ WLAN_STATUS nicPmIndicateBssConnected(IN P_ADAPTER_T prAdapter, IN UINT_8 ucBssI
 {
 	P_BSS_INFO_T prBssInfo;
 	CMD_INDICATE_PM_BSS_CONNECTED rCmdIndicatePmBssConnected = {0};
+	WLAN_STATUS rStatus;
 
 	ASSERT(prAdapter);
 	ASSERT(ucBssIndex <= MAX_BSS_INDEX);
@@ -1829,7 +1830,7 @@ WLAN_STATUS nicPmIndicateBssConnected(IN P_ADAPTER_T prAdapter, IN UINT_8 ucBssI
 		rCmdIndicatePmBssConnected.fgIsUapsdConnection = 0;
 	}
 
-	return wlanSendSetQueryCmd(prAdapter,
+	rStatus = wlanSendSetQueryCmd(prAdapter,
 				   CMD_ID_INDICATE_PM_BSS_CONNECTED,
 				   TRUE,
 				   FALSE,
@@ -1838,6 +1839,25 @@ WLAN_STATUS nicPmIndicateBssConnected(IN P_ADAPTER_T prAdapter, IN UINT_8 ucBssI
 				   NULL,
 				   sizeof(CMD_INDICATE_PM_BSS_CONNECTED),
 				   (PUINT_8)&rCmdIndicatePmBssConnected, NULL, 0);
+
+	/*
+	 * The firmware starts every connection in CAM. Android's framework sends
+	 * the power mode again after each connect; cfg80211 does not (power_save
+	 * is unchanged), so the radio stayed awake and the connectivity chip held
+	 * the SoC's 26 MHz clock even in suspend. Re-send the profile held for
+	 * this BSS.
+	 */
+	if (rStatus != WLAN_STATUS_FAILURE && prBssInfo->eNetworkType == NETWORK_TYPE_AIS &&
+	    prAdapter->rWlanInfo.arPowerSaveMode[ucBssIndex].ucPsProfile != Param_PowerModeCAM) {
+		prAdapter->rWlanInfo.arPowerSaveMode[ucBssIndex].ucBssIndex = ucBssIndex;
+		DBGLOG(NIC, INFO, "BSS %u connected: PS profile %u again\n", ucBssIndex,
+		       prAdapter->rWlanInfo.arPowerSaveMode[ucBssIndex].ucPsProfile);
+		wlanSendSetQueryCmd(prAdapter, CMD_ID_POWER_SAVE_MODE, TRUE, FALSE, FALSE, NULL, NULL,
+				    sizeof(CMD_PS_PROFILE_T),
+				    (PUINT_8)&(prAdapter->rWlanInfo.arPowerSaveMode[ucBssIndex]), NULL, 0);
+	}
+
+	return rStatus;
 }
 
 /*----------------------------------------------------------------------------*/

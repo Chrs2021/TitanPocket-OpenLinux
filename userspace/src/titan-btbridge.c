@@ -8,13 +8,20 @@
  * relays packets between /dev/stpbt and /dev/vhci, which makes the
  * controller appear as hci0.
  *
- *   titan-btbridge [-a BD:AD:DR:..]       relay (foreground)
+ *   titan-btbridge [-a BD:AD:DR:..] [-s HEX]  relay (foreground)
  *   titan-btbridge [-a BD:AD:DR:..] -t    test: Reset, Read Local Version,
  *                                         Read BD_ADDR
  *
  * -a sets the public address first (MediaTek vendor command 0xFC1A, as the
  * stock HAL does from the factory NVRAM record APCFG/APRDEB/BT_Addr);
  * otherwise the controller uses its default 00:00:46:xx:xx:xx.
+ *
+ * -s sets the controller's sleep parameters (vendor command 0xFC7A, 7 bytes in
+ * hex, bytes 18-24 of the same NVRAM record; default MediaTek's 03401f401f0004).
+ * Without them the controller never sleeps and holds the whole connectivity
+ * chip, and with it the SoC's 26 MHz clock and DRAM, awake in suspend: about
+ * 30 mA. HCI_Reset clears them, and BlueZ resets the controller each time it
+ * powers it on, so the relay sends them again after every Reset.
  *
  * The controller's Read Local Supported Commands reply leaves out every LE
  * command (octets 25-28 are zero) although it implements them. The kernel
@@ -181,6 +188,38 @@ static int hci_cmd(int stp, uint16_t opcode, const uint8_t *param, uint8_t plen)
 	return -1;
 }
 
+static uint8_t sleep_param[7] = { 0x03, 0x40, 0x1f, 0x40, 0x1f, 0x00, 0x04 };
+
+static int set_sleep(int stp)
+{
+	int st = hci_cmd(stp, 0xfc7a, sleep_param, sizeof(sleep_param));
+
+	if (st != 0)
+		log("set sleep parameters failed (%d)", st);
+	return st;
+}
+
+static int parse_sleep(const char *str)
+{
+	unsigned i, b;
+
+	if (strlen(str) != 2 * sizeof(sleep_param))
+		return -1;
+	for (i = 0; i < sizeof(sleep_param); i++) {
+		if (sscanf(str + 2 * i, "%2x", &b) != 1)
+			return -1;
+		sleep_param[i] = b;
+	}
+	return 0;
+}
+
+/* Command Complete for HCI_Reset, success */
+static int is_reset_done(const uint8_t *p, int n)
+{
+	return n >= 7 && p[0] == H4_EVT && p[1] == 0x0e &&
+	       (p[4] | p[5] << 8) == 0x0c03 && p[6] == 0;
+}
+
 static int set_bdaddr(int stp, const char *str)
 {
 	unsigned a[6];
@@ -244,10 +283,15 @@ int main(int argc, char **argv)
 	const char *addr = NULL;
 	int opt, testmode = 0;
 
-	while ((opt = getopt(argc, argv, "a:t")) != -1) {
+	while ((opt = getopt(argc, argv, "a:s:t")) != -1) {
 		if (opt == 'a')
 			addr = optarg;
-		else if (opt == 't')
+		else if (opt == 's') {
+			if (parse_sleep(optarg)) {
+				log("bad sleep parameters %s", optarg);
+				return 2;
+			}
+		} else if (opt == 't')
 			testmode = 1;
 		else
 			return 2;
@@ -261,6 +305,7 @@ int main(int argc, char **argv)
 	log("BT powered on");
 	if (addr && set_bdaddr(stp, addr))
 		log("continuing with the default address");
+	set_sleep(stp);
 	if (testmode)
 		return test(stp);
 
@@ -299,6 +344,9 @@ int main(int argc, char **argv)
 		if (p[0].revents & POLLIN) {	/* controller -> host */
 			while ((n = stp_next_packet(stp, pkt, -1)) > 0) {
 				fix_supported_commands(pkt, n);
+				/* before BlueZ sees the Reset finish and sends its next command */
+				if (is_reset_done(pkt, n))
+					set_sleep(stp);
 				if (write_all(vhci, pkt, n)) {
 					log("write vhci: %s", strerror(errno));
 					return 1;
