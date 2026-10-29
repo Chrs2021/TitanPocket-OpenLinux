@@ -1,0 +1,21 @@
+# The GNSS engine: titan-mnld (userspace/titan-mnld, ours) hosting
+# MediaTek's closed navigation library, libmnl.so. Both are 32-bit bionic,
+# so they run in a minimal chroot (/opt/android-gps): the stock bionic
+# linker, libc, libc++, libdl, libm, ld-android and libmnl.so, copied from
+# the phone's own system/vendor partitions (tools/gnss/stage-mnld.sh; never
+# redistribute). The kernel side is gps_drv (/dev/stpgps). titan-gnss drives
+# it over mnld's HAL socket protocol and feeds the NMEA to gpsd.
+[Unit]
+Description=GNSS engine (titan-mnld + MediaTek libmnl)
+Requires=titan-gps-driver.service
+After=titan-gps-driver.service
+# Location off (titan-location) stops titan-gnss, and this with it
+PartOf=titan-gnss.service
+
+[Service]
+RootDirectory=/opt/android-gps
+BindPaths=/dev /proc /sys
+Environment=LD_LIBRARY_PATH=/vendor/lib:/system/lib
+ExecStart=/vendor/bin/titan-mnld
+Restart=on-failure
+RestartSec=3

@@ -1,0 +1,13 @@
+# Location on/off: titan-location starts/stops this (not started at boot,
+# the receiver drains the battery). Stopping it stops titan-mnld too (PartOf).
+[Unit]
+Description=GNSS: drive titan-mnld and feed its NMEA to gpsd
+Requires=titan-mnld.service
+After=titan-mnld.service
+Wants=gpsd.service
+
+[Service]
+ExecStart=/usr/local/bin/titan-gnss daemon
+Restart=on-failure
+RestartSec=3
+

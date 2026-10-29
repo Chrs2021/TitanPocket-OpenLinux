@@ -55,6 +55,33 @@ gpsd -n  ──>  cgps, gpspipe, the Location app, any gpsd client
     `/dev/null`. Use the unit, or `systemd-run` with the same
     `RootDirectory` and `BindPaths`.
   - `TITAN_MNLD_DEBUG=1` logs every property read.
+  - `TITAN_MNLD_MEAS=/tmp/meas.log` logs libmnl's raw measurements once a
+    second (`mtk_gnss_get_measurement`, the call behind Android's
+    GnssMeasurement, and `mtk_gnss_get_clock`) as hex, timestamped like
+    strace: the reference for decoding the chip's records ("Replacing
+    libmnl"). Set it with a runtime drop-in for the unit. The call takes 12
+    arguments: six arrays of 0xA4-byte entries (GPS 0x18FC, GLONASS 0xF60,
+    BeiDou 0x285C, Galileo 0x1710 bytes, then 0xC2C and 0x8F8) and six small
+    per-satellite byte arrays. The decompiler showed only the first 4 (the
+    rest go on the stack); called with 4 it crashes. libmnl stores doubles
+    into them with VFP stores, so they must be word-aligned (unaligned:
+    SIGBUS).
+  - More reverse-engineering switches, all off unless set:
+    - `TITAN_MNLD_DBG=/path` (with `TITAN_MNLD_DBG_TYPE`, default `0x11`,
+      stock mnld's "debug to file"): libmnl's debug log, through callback
+      12. Most lines are obscured; `tools/gnss/mnl-dbglog.py` decodes them
+      (each printable byte is ((previous plain byte + byte) mod 0x60) +
+      0x20, from 0x4D at each line). Other lines are binary.
+    - `TITAN_MNLD_MEMDUMP=/dir`: the process's writable memory every 20 s.
+      libmnl keeps no copy of its reported values (it computes them on each
+      call), so this was a dead end.
+    - `TITAN_MNLD_DROP=29,3b` (`TITAN_MNLD_DROP_AFTER=s`,
+      `TITAN_MNLD_DROP_B2=hex`, `TITAN_MNLD_DROP_ID=n`): titan-mnld exports
+      its own `read()`, which libmnl binds to; on `/dev/stpgps` it breaks
+      the chip's frames of those types (only `29` records with that byte 2
+      and satellite field, if given) after that many seconds, so libmnl
+      drops them. Which measurements disappear shows which reports carry
+      them.
 - **No assistance data.** libmnl asks for AGPS (EPO and QEPO orbit
   predictions, NTP time, network location) through
   `mtk_gps_sys_agps_disaptcher_callback`. titan-mnld logs each request
@@ -144,12 +171,16 @@ escapes in the length and the body: DE DF → AA,  DE E0 → DE
   bytes) starts `AA F0 DE E0 04`.
 - Chip→host payloads after `[type] FE` are XORed with **0xCA**.
 - The read side is a byte stream: frames are split across `read()` calls.
-- A little chip output is outside `AA F0` frames: short blocks XORed with
-  0xCA that end in `AA 0F` (99 pieces, 942 bytes in 100 s). Not understood
-  yet.
+- Every byte the chip sends is inside a frame (the pieces that looked
+  unframed were reads the decoder failed to join, below).
 - strace splits a call that another thread interrupts into
-  `<unfinished ...>` and `<... resumed>` lines; the decoder joins them
-  (missing them first made 3 firmware chunks look skipped).
+  `<unfinished ...>` and `<... resumed>` lines; the decoder joins them.
+  Missing them first made 3 firmware chunks look skipped. A split read is
+  written `read(6,  <unfinished ...>` with two spaces, which the decoder
+  also missed until 2026-10-29: a quarter of the chip's output was lost,
+  and with it every record of the satellites in steady tracking, which
+  looked like a separate "tracking report" that doesn't exist (and broke
+  the once-a-second `42` and `28` reports into unframed pieces).
 
 **Host → chip:**
 
@@ -158,13 +189,14 @@ escapes in the length and the body: DE DF → AA,  DE E0 → DE
 | `08` | session start | a 110-byte header (it carries the patch's header, below, and the chunk count, 49), then short download controls |
 | `0C` | session start | **the firmware patch**, `[u16 number from 1][data]` (below) |
 | `04` | after the setup | 30 bytes of FF |
-| `02` | 1 Hz | **satellite search assignments**, 24 bytes each, ~30 a second: `[satellite][constellation: 01 GPS, 10 GLONASS, 20 BeiDou][u16][u16 seconds, +1 a second][u16]` and predicted values (Doppler and code phase, it seems). The GPS satellites are exactly the PRNs gpsd reports: libmnl aids the search from its saved almanac and ephemeris. |
+| `02` | 1 Hz | **satellite search assignments**, 24 bytes each, ~30 a second: `[satellite][constellation: 01 GPS, 10 GLONASS, 20 BeiDou][u16][u16 seconds, +1 a second][u16]` and predicted values (Doppler and code phase, it seems). The satellite is the PRN for GPS and BeiDou, and the frequency channel k + 8 for GLONASS (libmnl's slot 11 at k = 0 is 8). libmnl aids the search from its saved almanac and ephemeris. |
 | `07`, `0A` | occasional | short controls |
 | `05` | setup, then periodic | register-style settings `[u16 id][value]` |
-| `00` | 1 Hz | a millisecond counter rising by 1000 each second |
+| `00` | 1 Hz | a millisecond counter rising by 1000 each second (the low 16 bits of `01`'s, a second later) |
 | `10` | 1 Hz | clock and frequency values that drift slowly |
-| `01` | 1 Hz | constant fields (contains 10000 = `0x2710`) plus a counter |
-| `03`, `1C` | 1 Hz | 174-byte channel and search configuration plus short control frames |
+| `01` | 1 Hz | constant fields (contains 10000 = `0x2710`) plus the chip's millisecond tick (u32 at byte 8, +1000 a second) |
+| `03` | 1 Hz | the satellite list: `00 [count]` then `[satellite][constellation]` pairs, numbered as in `02`, roughly strongest first (33 or 34); plus a short `03 0100` |
+| `1C` | 1 Hz | an empty control frame |
 
 **The firmware patch.** 61440 bytes (0xF000), in libmnl.so at file offset
 0x3E0106 after an 8-byte header: `[u16 0x7800, its size in 16-bit words]
@@ -259,10 +291,53 @@ the repository.
    chunk sent on top of the last stalls the link) and batching writes.
    The session frames are still libmnl's, replayed from a capture
    (including its satellite search assignments, an hour stale).
-2. **Decoding the measurements** (next): the `29` records against libmnl's
-   view of the same moments (gpsd's SKY: satellite, elevation, azimuth,
-   signal), then the 1 Hz host frames (`00`, `10`, `01`, `03`, `1C`) and
-   `02`'s fields, so the probe can make its own instead of replaying.
+2. **Decoding the measurements** (in progress). The reference is libmnl's
+   own measurements (titan-mnld's `TITAN_MNLD_MEAS` log) beside an strace
+   capture of the same session: each record is matched to the satellite
+   and second it describes, and bit fields are searched for ones that
+   follow libmnl's values. Fields are bit-packed, little-endian (bit n is
+   bit n % 8 of byte n / 8, after the 0xCA XOR). The `29` record so far
+   (57-byte payload):
+
+   | Bits | Field |
+   |---|---|
+   | 0-2 | flags |
+   | 3-7 | channel, 0-31 (the chip assigns them; a channel moves between satellites) |
+   | 11-15 (-16) | satellite: GPS PRN; GLONASS k + 8; BeiDou PRN modulo 32, + 32 (6 bits: C1 and C33 alike; the search assignments tell them apart) |
+   | byte 2 | constellation: `08` GPS, `80` GLONASS, `01` BeiDou (bit 16 doubles as the BeiDou id's top bit), `10` rarely (Galileo?) |
+   | 24, 27-31 | C/N0: ((byte 3 >> 3) \| (byte 3 & 1) << 5) − 3 = libmnl's dB-Hz (GLONASS and BeiDou agree every time) |
+   | 40-47 | `A0` in most records; `50` marks another layout (GLONASS searches, it seems) |
+   | 160-191 | the time the record was latched: 2^-27 s units, modulo 32 s (bit 187 is 1 s). Records come in groups sharing one time |
+   | 240-263 | Doppler, signed, 2^-11 Hz, without the receiver clock's drift (about 38.5 kHz here, which libmnl adds to every satellite); r = 0.999 against libmnl's, the rest in libmnl's 16 Hz steps |
+
+   Every satellite libmnl measures has its `29` records: with the decoder
+   fixed (above), each of libmnl's measurements in three captures pairs
+   with a record of its satellite from the second before. Dropping frames
+   (`TITAN_MNLD_DROP`) agrees: without the `29` records of one constellation
+   (byte 2), or of one satellite (its id), exactly those measurements stop;
+   without `3A`, `3B` or `2B` nothing changes. Satellites in steady
+   tracking get about two records a second, of two kinds, and only one
+   kind's C/N0 agrees with libmnl's.
+
+   The other reports, so far:
+   - `2B` (46 bytes): GPS navigation subframes, 300 bits, about every 6 s
+     per satellite; its "channel" byte (byte 2 >> 3) is the PRN. The
+     ephemeris for our own solution can come from here.
+   - `3B` (14 bytes, every 2 s per channel): the navigation bit stream,
+     nearly the same bytes on every GPS channel at once (the satellites
+     send their subframes in step). `3A` (5 bytes, every 2 s) goes with
+     it.
+   - `30`, `37`, `2C`, `4E` (once a second): counters and status, no
+     per-satellite values.
+
+   Still open:
+   - The code phase (the pseudorange). It isn't a fixed field compared
+     across satellites at libmnl's epochs: the records are latched at
+     their own times, so it needs the per-record time above and the
+     Doppler to bring them to one instant.
+   - The two record kinds of steady tracking.
+   - Then the 1 Hz host frames (`10`, `01`'s constant part) and `02`'s
+     predicted values, so the probe can make its own instead of replaying.
 3. **Aiding and the solution**: search assignments from ephemeris (first
    from broadcast ephemeris downloaded over the network, later decoded from
    the satellites), pseudoranges from the measurements, and a PVT solver

@@ -1,0 +1,11 @@
+#!/bin/sh
+# titan-location on|off|toggle|status: the GPS receiver (titan-gnss and
+# MediaTek's mnld). Off by default: it drains the battery while on.
+# Positions come from gpsd (cgps, gpspipe, any gpsd client).
+case "${1:-status}" in
+on)	systemctl start titan-gnss ;;
+off)	systemctl stop titan-gnss titan-mnld ;;
+toggle)	if systemctl -q is-active titan-gnss; then "$0" off; else "$0" on; fi ;;
+status)	if systemctl -q is-active titan-gnss; then echo on; else echo off; fi ;;
+*)	echo "usage: titan-location on|off|toggle|status" >&2; exit 1 ;;
+esac

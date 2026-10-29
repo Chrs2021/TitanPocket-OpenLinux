@@ -1,0 +1,15 @@
+[package]
+name = "titan-gps"
+version = "0.1.0"
+edition = "2021"
+description = "An open driver for the Titan Pocket's MT6631 GNSS receiver (/dev/stpgps), in place of MediaTek's libmnl"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -218,7 +218,7 @@ index 8ccfacb46..22105b5ce 100644
  
  	struct {
 diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
-index e26f438d9..b67b1f795 100644
+index e26f438d9..12f8a7c21 100644
 --- a/src/libcamera/pipeline/simple/simple.cpp
 +++ b/src/libcamera/pipeline/simple/simple.cpp
 @@ -265,6 +265,7 @@ static const SimplePipelineInfo supportedDevices[] = {
@@ -229,6 +229,21 @@ index e26f438d9..b67b1f795 100644
  };
  
  bool isRaw(const StreamConfiguration &cfg)
+@@ -390,7 +391,13 @@ public:
+ 	const Transform &combinedTransform() const { return combinedTransform_; }
+ 
+ private:
+-	static constexpr unsigned int kNumBuffersDefault = 4;
++	/*
++	 * Titan Pocket: 8, not 4. A GStreamer preview that tees the stream to a
++	 * display and to analysis appsinks (autofocus, QR codes) through leaky
++	 * queues can hold every one of 4 buffers at start-up and stall the
++	 * camera for good.
++	 */
++	static constexpr unsigned int kNumBuffersDefault = 8;
+ 	static constexpr unsigned int kNumBuffersMax = 32;
+ 
+ 	/*
 diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
 index 28043150e..e6571651e 100644
 --- a/src/libcamera/sensor/camera_sensor_properties.cpp

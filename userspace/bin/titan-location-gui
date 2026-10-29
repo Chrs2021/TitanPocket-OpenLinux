@@ -1,0 +1,197 @@
+#!/usr/bin/python3
+"""
+titan-location-gui: Location for the Titan Pocket (GTK 4, titan_ui4).
+
+A switch for the GPS receiver (titan-location: titan-gnss + MediaTek's
+mnld; off by default because it drains the battery) and its live status from
+gpsd: fix, satellites, position, altitude, speed, accuracy.
+"""
+import json
+import socket
+import subprocess
+import sys
+
+import titan_ui4 as ui
+import titan_water4 as water
+from gi.repository import GLib, Gtk
+
+TITAN_LOCATION = "/usr/local/bin/titan-location"
+GPSD = ("127.0.0.1", 2947)
+FIX = {0: "unknown", 1: "no fix yet", 2: "2D fix", 3: "3D fix"}
+
+CSS = """
+.big { font-size: 26px; font-weight: bold; }
+.ok { color: #7BE07B; }
+.wait { color: #FFD24A; }
+.off { color: rgba(255, 255, 255, 0.78); }
+.key { font-size: 18px; color: rgba(255, 255, 255, 0.78); }
+.val { font-family: monospace; font-size: 20px; }
+.hint { font-size: 17px; color: rgba(255, 255, 255, 0.78); }
+"""
+
+
+def location_on():
+    return subprocess.run([TITAN_LOCATION, "status"], capture_output=True,
+                          text=True).stdout.strip() == "on"
+
+
+def fmt_coord(v, pos, neg):
+    if v is None:
+        return "—"
+    return "%.6f° %s" % (abs(v), pos if v >= 0 else neg)
+
+
+class LocationApp(ui.AppWindow):
+    def __init__(self, app):
+        super().__init__(app, "Location", "GPS and position")
+        ui.add_css(self.get_display(), CSS)
+        self.connect("close-request", self.on_quit)
+        self.sock = None
+        self.buf = b""
+        self.watch_id = 0
+        self.busy = False
+
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.set_margin_bottom(18)
+        p = water.panel((4, 18, 4, 18))
+        self.switch = water.WaterCheck("Use GPS", "Off by default: it drains the battery")
+        self.switch.connect("toggled", self.on_switch)
+        p.inner.append(self.switch)
+        page.append(p)
+
+        p = water.panel((14, 18, 14, 18), spacing=8)
+        self.state = ui.label("", "big")
+        p.inner.append(self.state)
+        grid = Gtk.Grid(column_spacing=16, row_spacing=6)
+        self.vals = {}
+        for i, (key, name) in enumerate((("sats", "Satellites"), ("lat", "Latitude"),
+                                         ("lon", "Longitude"), ("alt", "Altitude"),
+                                         ("speed", "Speed"), ("acc", "Accuracy"),
+                                         ("time", "Time (UTC)"))):
+            grid.attach(ui.label(name, "key"), 0, i, 1, 1)
+            v = ui.label("—", "val")
+            v.set_selectable(True)
+            grid.attach(v, 1, i, 1, 1)
+            self.vals[key] = v
+        p.inner.append(grid)
+        page.append(p)
+
+        page.append(ui.label("The first fix needs open sky and can take several minutes. "
+                             "Any gpsd client (cgps, gpspipe) sees the same data.",
+                             "hint", wrap=True))
+        self.body.append(ui.scroll(page))
+
+        self.refresh_switch()
+        GLib.timeout_add_seconds(3, self.refresh_switch)
+        GLib.timeout_add_seconds(2, self.ensure_gpsd)
+
+    # ---- the switch ----
+
+    def refresh_switch(self):
+        if not self.busy:
+            on = location_on()
+            self.switch.set_active(on)
+            if not on:
+                self.show_off()
+        return True
+
+    def on_switch(self, sw, on):
+        if self.busy:
+            return
+        self.busy = True
+        self.state.set_text("Starting…" if on else "Stopping…")
+        proc = subprocess.Popen([TITAN_LOCATION, "on" if on else "off"])
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, proc.pid, self.switch_done)
+
+    def switch_done(self, pid, status):
+        self.busy = False
+        self.refresh_switch()
+        if self.switch.get_active():
+            self.set_state("Searching for satellites…", "wait")
+
+    # ---- gpsd ----
+
+    def ensure_gpsd(self):
+        if self.sock is None and self.switch.get_active():
+            try:
+                s = socket.create_connection(GPSD, timeout=2)
+                s.sendall(b'?WATCH={"enable":true,"json":true}\n')
+                s.setblocking(False)
+                self.sock = s
+                self.watch_id = GLib.io_add_watch(s.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+                                                  self.on_gpsd)
+            except OSError:
+                self.sock = None
+        return True
+
+    def on_gpsd(self, fd, cond):
+        try:
+            data = self.sock.recv(65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            data = b""
+        if not data:
+            self.sock.close()
+            self.sock = None
+            return False
+        self.buf += data
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("class") == "TPV":
+                self.show_tpv(msg)
+            elif msg.get("class") == "SKY":
+                self.show_sky(msg)
+        return True
+
+    # ---- display ----
+
+    def set_state(self, text, css):
+        self.state.set_text(text)
+        for c in ("ok", "wait", "off"):
+            self.state.remove_css_class(c)
+        self.state.add_css_class(css)
+
+    def show_off(self):
+        self.set_state("Location is off", "off")
+        for v in self.vals.values():
+            v.set_text("—")
+
+    def show_tpv(self, t):
+        if not self.switch.get_active():
+            return
+        mode = t.get("mode", 0)
+        self.set_state(FIX.get(mode, "?").capitalize() if mode >= 2 else
+                       "Searching for satellites…", "ok" if mode >= 2 else "wait")
+        self.vals["lat"].set_text(fmt_coord(t.get("lat"), "N", "S"))
+        self.vals["lon"].set_text(fmt_coord(t.get("lon"), "E", "W"))
+        # above sea level (altHAE is above the WGS84 ellipsoid, ~30 m off here)
+        alt = t.get("altMSL", t.get("alt", t.get("altHAE")))
+        self.vals["alt"].set_text("—" if alt is None else "%.0f m" % alt)
+        spd = t.get("speed")
+        self.vals["speed"].set_text("—" if spd is None else "%.1f km/h" % (spd * 3.6))
+        eph = t.get("eph") or (max(t.get("epx", 0), t.get("epy", 0)) or None)
+        self.vals["acc"].set_text("—" if eph is None else "±%.0f m" % eph)
+        tm = t.get("time")
+        self.vals["time"].set_text(tm[11:19] if tm else "—")
+
+    def show_sky(self, s):
+        sats = s.get("satellites")
+        if sats is not None:
+            used = sum(1 for x in sats if x.get("used"))
+            self.vals["sats"].set_text("%d used / %d seen" % (used, len(sats)))
+        elif "uSat" in s or "nSat" in s:
+            self.vals["sats"].set_text("%d used / %d seen" % (s.get("uSat", 0), s.get("nSat", 0)))
+
+    def on_quit(self, *a):
+        if self.sock:
+            self.sock.close()
+        return False
+
+
+if __name__ == "__main__":
+    sys.exit(ui.run("org.titanpocket.location", LocationApp, lock="titan-location"))
