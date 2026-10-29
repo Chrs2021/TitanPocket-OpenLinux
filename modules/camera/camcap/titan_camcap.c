@@ -87,6 +87,30 @@ static int p1afm1 = 1;		/* AFO sizes minus one, as for every DMA. The HAL's
 				 * as is, AFO reports error 0x8280 and ignores the
 				 * stride */
 module_param(p1afm1, int, 0444);
+static int p1proc;		/* processed path: IMGO after the raw blocks (OBC ...), not pure raw */
+module_param(p1proc, int, 0444);
+static int p1rrz;		/* resizer branch: RMX -> RPG -> RRZ (1:1) -> RRZO */
+module_param(p1rrz, int, 0444);
+static int p1rrzdma = 2;	/* CTL_DMA_EN bit of RRZO (unconfirmed) */
+module_param(p1rrzdma, int, 0444);
+static int p1aa;		/* AE/AWB statistics (AA) through AAO */
+module_param(p1aa, int, 0444);
+static int p1aanx = 32, p1aany = 24;	/* AA blocks (max 120 x 90) */
+module_param(p1aanx, int, 0444);
+module_param(p1aany, int, 0444);
+static int p1aaen2;		/* experiments: CTL_EN2 bits for AA (HAL function 0x15: bit 23) */
+module_param(p1aaen2, int, 0444);
+static int p1img = -1;		/* CTL_SEL IMG_SEL (25:24), the IMGO tap: 2 pure raw from the TG,
+				 * 0 before LSC, 3 after LSC (HAL CAM_RAW_PIPE::setIMG_SEL) */
+module_param(p1img, int, 0444);
+static uint p1regs[32];		/* experiments: offset,value pairs written to CAM A before go */
+static int p1regs_n;
+module_param_array(p1regs, uint, &p1regs_n, 0444);
+static int p1obc;		/* OBC: subtract the sensor's black level (HAL ISP_MGR_OBC) */
+module_param(p1obc, int, 0444);
+static int p1wb[3];		/* RPG white-balance gains R, G, B; 512 = 1x, 0 = RPG off */
+static int p1wb_n;
+module_param_array(p1wb, int, &p1wb_n, 0444);
 MODULE_PARM_DESC(focus, "rear lens position 0..1023 (0 = far)");
 
 #define SENINF_BASE	0x1a040000
@@ -116,16 +140,17 @@ struct cam_desc {
 	int ninit;
 	struct cam_mode modes[2];
 	bool needs_stream_on;	/* mode tables don't start streaming */
+	int black;		/* RAW10 black level (stock OBC tuning: 4x this, 12 bit) */
 };
 
 #define TBL(t) t, ARRAY_SIZE(t)
 static const struct cam_desc cams[2] = {
 	{ "OV16880", 2, 0x36, TOP_MUX_CAMTG, NULL, 1, TBL(ov16880_init),
 	  { { TBL(ov16880_preview), 2336, 1752, 3824 },
-	    { TBL(ov16880_capture), 4672, 3504, 3824 } }, true },
+	    { TBL(ov16880_capture), 4672, 3504, 3824 } }, true, 64 },
 	{ "OV8865", 4, 0x10, TOP_MUX_CAMTG2, "vcama1", 5, TBL(ov8865_init),
 	  { { TBL(ov8865_preview), 1632, 1224, 1280 },
-	    { TBL(ov8865_capture), 3264, 2448, 2550 } }, false },
+	    { TBL(ov8865_capture), 3264, 2448, 2550 } }, false, 17 },
 };
 
 static const struct cam_desc *c;
@@ -139,7 +164,7 @@ static struct i2c_adapter *adap;
 static struct regulator *dovdd, *avdd, *dvdd, *afvdd;
 static struct clk *mclk, *mclk_parent;
 static bool mclk_on;
-static void __iomem *seninf, *mipi_rx, *camsv, *cama;
+static void __iomem *seninf, *mipi_rx, *camsv, *cama, *uni;
 static struct dentry *dbg, *dbg_frame;
 static struct debugfs_blob_wrapper frame_blob;
 static bool smi_on;
@@ -523,6 +548,8 @@ static void seninf_setup(void)
 /* BSP m4u 2.4 API (not exported to modules: found through kallsyms) */
 #define M4U_PORT_CAM_SOCO	72	/* larb6 port 11: CAMSV output */
 #define M4U_PORT_CAM_IMGO	61	/* larb6 port 0: CAM IMGO */
+#define M4U_PORT_CAM_RRZO	62	/* larb6 port 1: CAM RRZO */
+#define M4U_PORT_CAM_AAO	63	/* larb6 port 2: CAM AAO */
 #define M4U_PORT_CAM_AFO	64	/* larb6 port 3: CAM AFO */
 #define buf_port()		(p1 ? M4U_PORT_CAM_IMGO : M4U_PORT_CAM_SOCO)
 
@@ -541,9 +568,21 @@ static struct {
 	size_t size;
 	struct sg_table sgt;
 	unsigned int mva;	/* the device address */
-} frame, header, afo;
+} frame, header, afo, rrzo, aao;
 static struct dentry *dbg_afo, *dbg_focus;
-static struct debugfs_blob_wrapper afo_blob;
+static struct debugfs_blob_wrapper afo_blob, rrzo_blob, aao_blob;
+static struct dentry *dbg_rrzo, *dbg_aao;
+/* AAO with only the AWB window set up (AE registers 0): per block row, nx x
+ * {R, G, B, 0x0f} (8-bit block averages) then nx AE bytes (8-bit luma). The
+ * HAL's AE configuration adds more per block (22 bytes) and histograms */
+#define AAO_BLOCK	5
+#define AAO_BYTES	(p1aanx * p1aany * AAO_BLOCK)
+
+static int buf_m4u_port(void *b)
+{
+	return b == &afo ? M4U_PORT_CAM_AFO : b == &rrzo ? M4U_PORT_CAM_RRZO :
+	       b == &aao ? M4U_PORT_CAM_AAO : buf_port();
+}
 static void *m4u_client;
 
 static void *m4u_fn(const char *name)
@@ -582,7 +621,7 @@ static int buf_alloc(typeof(frame) *b, size_t size)
 	ret = sg_alloc_table_from_pages(&b->sgt, b->pages, b->npages, 0, b->size, GFP_KERNEL);
 	if (ret)
 		return ret;
-	ret = alloc_mva(m4u_client, b == &afo ? M4U_PORT_CAM_AFO : buf_port(), 0, &b->sgt, b->size,
+	ret = alloc_mva(m4u_client, buf_m4u_port(b), 0, &b->sgt, b->size,
 			M4U_PROT_READ | M4U_PROT_WRITE, 0, &b->mva);
 	if (ret)
 		pr_err("titan_camcap: m4u_alloc_mva: %d\n", ret);
@@ -596,7 +635,7 @@ static void buf_free(typeof(frame) *b)
 	int i;
 
 	if (b->mva && dealloc_mva)
-		dealloc_mva(m4u_client, b == &afo ? M4U_PORT_CAM_AFO : buf_port(), b->mva);
+		dealloc_mva(m4u_client, buf_m4u_port(b), b->mva);
 	b->mva = 0;
 	if (b->sgt.sgl)
 		sg_free_table(&b->sgt);
@@ -630,6 +669,10 @@ static int buffers_alloc(void)
 		ret = buf_alloc(&header, PAGE_SIZE);
 	if (!ret && p1af)
 		ret = buf_alloc(&afo, AFO_STRIDE * AF_NY);
+	if (!ret && p1rrz)
+		ret = buf_alloc(&rrzo, stride * m->height);
+	if (!ret && p1aa)
+		ret = buf_alloc(&aao, AAO_BYTES);
 	if (ret)
 		return ret;
 	frame_blob.data = frame.vaddr;
@@ -645,6 +688,8 @@ static void buffers_free(void)
 	buf_free(&frame);
 	buf_free(&header);
 	buf_free(&afo);
+	buf_free(&rrzo);
+	buf_free(&aao);
 	if (m4u_client && destroy_client)
 		destroy_client(m4u_client);
 	m4u_client = NULL;
@@ -759,6 +804,9 @@ static void camsv_stop(void)
  * CAMSV's with the blocks moved: control at 0x000 (CAMSV 0x500), TG at
  * 0x230 (same), DMA at 0x1000 (CAMSV 0x000).
  */
+#define UNI_BASE	0x1a003000	/* CAM_UNI, shared by CAM A/B/C */
+#define UNI_TOP_MOD_EN	0x010
+#define UNI_EN_RLB	BIT(29)		/* RRZ line buffer (HAL UNI_TOP_CTRL::_config) */
 #define P1_BASE		0x1a004000	/* CAM A */
 #define P1_SIZE		0x2000
 #define P1_CTL_EN	0x004
@@ -800,6 +848,64 @@ static void camsv_stop(void)
 #define P1_AFO_CON2	0x10d0
 #define P1_AFO_CON3	0x10d4
 #define P1_AFO_ERR	0x136c		/* ChromeOS REG_AFO_ERR_STAT */
+#define P1_OBC_OFFST(i)	(0x3f0 + 4 * (i))	/* 13-bit two's complement, 12-bit scale */
+#define P1_OBC_GAIN(i)	(0x400 + 4 * (i))	/* 13 bit, 512 = 1x */
+#define P1_RPG_SATU_1	0x4c0		/* clip B | Gb << 16, 12 bit */
+#define P1_RPG_SATU_2	0x4c4		/* clip Gr | R << 16 */
+#define P1_RPG_GAIN_1	0x4c8		/* B | Gb << 16, 13 bit, 512 = 1x */
+#define P1_RPG_GAIN_2	0x4cc		/* Gr | R << 16 */
+#define P1_RPG_OFST_1	0x4d0
+#define P1_RPG_OFST_2	0x4d4
+#define P1_EN_PAK	BIT(15)		/* IMGO packer: without it the processed path writes nothing */
+#define P1_EN_OBC	BIT(5)
+#define P1_EN_RRZ	BIT(10)
+#define P1_EN_AA	BIT(19)		/* tuning function 13 */
+#define P1_DMA_AAO	BIT(5)
+#define P1_AWB_WIN_ORG	0x830		/* x | y << 16 */
+#define P1_AWB_WIN_SIZE	0x834		/* block w | h << 16 */
+#define P1_AWB_WIN_PIT	0x838
+#define P1_AWB_WIN_NUM	0x83c
+#define P1_AWB_GAIN1_0	0x840		/* pre-gain R | G << 16, 512 = 1x */
+#define P1_AWB_GAIN1_1	0x844		/* B */
+#define P1_AWB_LMT1_0	0x848		/* 12-bit limits after the pre-gain */
+#define P1_AWB_LMT1_1	0x84c
+#define P1_AWB_LOW_THR	0x850		/* 8-bit R | G << 8 | B << 16 */
+#define P1_AWB_HI_THR	0x854
+#define P1_AWB_PIXEL_CNT0 0x858		/* R, 24 bit */
+#define P1_AWB_PIXEL_CNT1 0x85c		/* G */
+#define P1_AWB_PIXEL_CNT2 0x860		/* B */
+#define P1_AAO_BASE	0x1080
+#define P1_AAO_OFST	0x1088
+#define P1_AAO_XSIZE	0x1090
+#define P1_AAO_YSIZE	0x1094
+#define P1_AAO_STRIDE	0x1098
+#define P1_AAO_CON	0x109c
+#define P1_AAO_CON2	0x10a0
+#define P1_AAO_CON3	0x10a4
+#define P1_AAO_ERR	0x1368
+#define P1_EN_RMX	BIT(11)
+#define P1_RRZ_CTL	0x4e0
+#define P1_RRZ_IN_IMG	0x4e4
+#define P1_RRZ_OUT_IMG	0x4e8
+#define P1_RRZ_HORI_STEP 0x4ec
+#define P1_RRZ_VERT_STEP 0x4f0
+#define P1_RRZ_MODE_TH	0x504
+#define P1_RRZ_MODE_CTL	0x508
+#define P1_RRZ_NNIR	0x514
+#define P1_RMX_CTL	0x540
+#define P1_RMX_CROP	0x544
+#define P1_RMX_VSIZE	0x548
+#define P1_RRZO_BASE	0x1050
+#define P1_RRZO_OFST	0x1058
+#define P1_RRZO_XSIZE	0x1060
+#define P1_RRZO_YSIZE	0x1064
+#define P1_RRZO_STRIDE	0x1068
+#define P1_RRZO_CON	0x106c
+#define P1_RRZO_CON2	0x1070
+#define P1_RRZO_CON3	0x1074
+#define P1_RRZO_CROP	0x1078
+#define P1_RRZO_ERR	0x1364		/* assumed: next to IMGO's */		/* tuning function 2 */
+#define P1_EN_RPG	BIT(9)		/* function 9 */
 #define P1_EN_AF	BIT(17)		/* tuning function 15 (TuningMgrImp::enableEngine) */
 #define P1_EN_SGG1	BIT(18)		/* function 14: the AF input gamma */
 #define P1_EN2_SGG5	BIT(31)		/* function 22 */
@@ -825,12 +931,18 @@ static void p1_start(void)
 	/* format: TG RAW10 (bits 14:12), IMGO format (8:4), RRZO 10 bit (3:2),
 	 * one pixel per clock (21:20) */
 	writel(1 << 12 | (p1fmt & 0x1f) << 4 | 1 << 2, cama + P1_CTL_FMT_SEL);
-	writel((p1sel ? 0x060a5010 : 0x07025010) | p1selor, cama + P1_CTL_SEL);
-	writel(p1en, cama + P1_CTL_EN);
+	/* CTL_SEL (HAL Cam_path_sel::Path_sel_RAW): 0x060a5010 = pure raw (IMG_SEL 2,
+	 * bit 19 bypasses the raw blocks), 0x07025010 = IMGO after LSC (IMG_SEL 3) */
+	writel((p1sel && !p1proc ? 0x060a5010 : 0x07025010) | p1selor, cama + P1_CTL_SEL);
+	if (p1img >= 0)
+		p1_rmw(P1_CTL_SEL, ~0x03000000U, (p1img & 3) << 24);
+	writel(p1en | (p1proc ? P1_EN_PAK : 0), cama + P1_CTL_EN);
 	writel(p1en2, cama + P1_CTL_EN2);
 	/* DMX (HAL CAM_DMX_CTRL): bits 19:16 set, bit 31 clear; the whole width
 	 * and height */
-	p1_rmw(P1_DMX_CTL, 0x7ff00000, 0xf0000 | (p1dmx & 0xffff));
+	/* DMX: bits 15:0 are its SRAM size (HAL capibility::GetXMXSramSize, 0x1b0).
+	 * Left 0, the processed path drops the last 640 of every 4096 pixels */
+	p1_rmw(P1_DMX_CTL, 0x7ff00000, 0xf0000 | ((p1dmx ?: 0x1b0) & 0xffff));
 	writel((m->width - 1) << 16, cama + P1_DMX_CROP);
 	writel(m->height, cama + P1_DMX_VSIZE);
 	writel(0, cama + P1_INT_EN);		/* the BSP driver owns the IRQ */
@@ -859,6 +971,30 @@ static void p1_start(void)
 	writel(0, cama + P1_FBC_IMGO);
 	writel(1, cama + P1_DB_EN);
 
+	if (p1obc) {
+		/* black level: offset -4 * black on the 12-bit scale, then a gain
+		 * that stretches the rest back to full range (as the stock
+		 * tuning tables do: OV16880 0x1f00 / 0x222, OV8865 0x1fbc / 0x209) */
+		int b = 4 * c->black;
+
+		for (i = 0; i < 4; i++) {
+			writel(-b & 0x1fff, cama + P1_OBC_OFFST(i));
+			writel(512 * 4095 / (4095 - b), cama + P1_OBC_GAIN(i));
+		}
+		p1_rmw(P1_CTL_EN, ~0U, P1_EN_OBC);
+	}
+
+	if (p1wb_n == 3) {
+		/* white balance (HAL ISP_MGR_RPG::setIspPregain) */
+		writel(0x0fff0fff, cama + P1_RPG_SATU_1);
+		writel(0x0fff0fff, cama + P1_RPG_SATU_2);
+		writel((p1wb[2] & 0x1fff) | (p1wb[1] & 0x1fff) << 16, cama + P1_RPG_GAIN_1);
+		writel((p1wb[1] & 0x1fff) | (p1wb[0] & 0x1fff) << 16, cama + P1_RPG_GAIN_2);
+		writel(0, cama + P1_RPG_OFST_1);
+		writel(0, cama + P1_RPG_OFST_2);
+		p1_rmw(P1_CTL_EN, ~0U, P1_EN_RPG);
+	}
+
 	if (p1af) {
 		/* AF statistics (HAL ISP_MGR_AF_STAT_CONFIG with the stock default
 		 * AF config) and their DMA, AFO */
@@ -882,6 +1018,85 @@ static void p1_start(void)
 		writel(afo.mva, cama + P1_AFO_BASE);
 		p1_rmw(P1_CTL_DMA_EN, ~0U, P1_DMA_AFO);
 	}
+
+	if (p1aa) {
+		/* AE/AWB statistics (HAL ISP_MGR_AWB_STAT_CONFIG::config): equal
+		 * blocks over the frame, unity pre-gain, thresholds wide open; the
+		 * AE registers (0x900...) stay 0: no histograms */
+		int bw = (m->width / p1aanx) & ~1, bh = (m->height / p1aany) & ~1;
+
+		writel(0, cama + P1_AWB_WIN_ORG);
+		writel(bw | bh << 16, cama + P1_AWB_WIN_SIZE);
+		writel(bw | bh << 16, cama + P1_AWB_WIN_PIT);
+		writel(p1aanx | p1aany << 16, cama + P1_AWB_WIN_NUM);
+		writel(0x200 | 0x200 << 16, cama + P1_AWB_GAIN1_0);
+		writel(0x200, cama + P1_AWB_GAIN1_1);
+		writel(0xfff | 0xfff << 16, cama + P1_AWB_LMT1_0);
+		writel(0xfff, cama + P1_AWB_LMT1_1);
+		writel(0, cama + P1_AWB_LOW_THR);
+		writel(0xffffff, cama + P1_AWB_HI_THR);
+		/* averages = sums * PIXEL_CNT >> 24: 1 / pixels of that colour per block */
+		writel((1 << 24) / (bw * bh / 4), cama + P1_AWB_PIXEL_CNT0);
+		writel((1 << 24) / (bw * bh / 2), cama + P1_AWB_PIXEL_CNT1);
+		writel((1 << 24) / (bw * bh / 4), cama + P1_AWB_PIXEL_CNT2);
+		/* the HAL's fixed values for 0x8c4..0x8d4 */
+		writel(0x200, cama + 0x8c4);
+		writel(0x200, cama + 0x8cc);
+		writel(0x90200, cama + 0x8d4);
+		/* the copy at 0xbd0 */
+		writel(0, cama + 0xbd0);
+		writel(bw | bh << 16, cama + 0xbd4);
+		writel(bw | bh << 16, cama + 0xbd8);
+		writel(p1aanx | p1aany << 16, cama + 0xbdc);
+		for (i = 0; i < 4; i++)
+			writel((1 << 24) / (bw * bh / 4), cama + 0xbe0 + 4 * i);
+		p1_rmw(P1_CTL_EN, ~0U, P1_EN_AA);
+		p1_rmw(P1_CTL_EN2, ~0U, p1aaen2);
+		writel(AAO_BYTES - 1, cama + P1_AAO_XSIZE);
+		writel(0, cama + P1_AAO_YSIZE);
+		writel(AAO_BYTES, cama + P1_AAO_STRIDE);
+		writel(0x80000080, cama + P1_AAO_CON);
+		writel(0x00200020, cama + P1_AAO_CON2);
+		writel(0x00100010, cama + P1_AAO_CON3);
+		writel(0, cama + P1_AAO_OFST);
+		writel(aao.mva, cama + P1_AAO_BASE);
+		p1_rmw(P1_CTL_DMA_EN, ~0U, P1_DMA_AAO);
+	}
+
+	if (p1rrz) {
+		/* resizer at 1:1 (HAL CAM_RRZ_CTRL::setDefault/_config): coefficient
+		 * table 0x1f for both directions, step (in - 1) * 32768 / (out - 1),
+		 * and its mux RMX (SRAM size as DMX's) cropped to the output */
+		/* the resizer's line buffer lives in CAM_UNI: without it RRZ stalls
+		 * the whole pipe (PIPE_CHECK::RRZ_CHECK "can't enable rrz without RLB") */
+		writel(readl(uni + UNI_TOP_MOD_EN) | UNI_EN_RLB, uni + UNI_TOP_MOD_EN);
+		writel(readl(uni + 0x20) | 1, uni + 0x20);	/* HAL UNI_TOP_CTRL: 0x20 |= 1 */
+		writel(0x1f << 24 | 0x1f << 16 | 0x80 | 3, cama + P1_RRZ_CTL);
+		writel(m->width | m->height << 16, cama + P1_RRZ_IN_IMG);
+		writel(m->width | m->height << 16, cama + P1_RRZ_OUT_IMG);
+		writel(0x8000, cama + P1_RRZ_HORI_STEP);
+		writel(0x8000, cama + P1_RRZ_VERT_STEP);
+		writel(0x00502850, cama + P1_RRZ_MODE_TH);
+		p1_rmw(P1_RRZ_MODE_CTL, ~0x1ffffU, 0x10000 | 0x10 << 11);
+		writel(0x1f1f, cama + P1_RRZ_NNIR);
+		writel(0x1f0000 | 0x1b0, cama + P1_RMX_CTL);
+		writel((m->width - 1) << 16, cama + P1_RMX_CROP);
+		writel(m->height, cama + P1_RMX_VSIZE);
+		p1_rmw(P1_CTL_EN, ~0U, P1_EN_RRZ | P1_EN_RMX);
+		writel(line_bytes - 1, cama + P1_RRZO_XSIZE);
+		writel(m->height - 1, cama + P1_RRZO_YSIZE);
+		writel(stride, cama + P1_RRZO_STRIDE);
+		writel(0, cama + P1_RRZO_CROP);
+		writel(0x80000180, cama + P1_RRZO_CON);
+		writel(0x00800080, cama + P1_RRZO_CON2);
+		writel(0x00400040, cama + P1_RRZO_CON3);
+		writel(0, cama + P1_RRZO_OFST);
+		writel(rrzo.mva, cama + P1_RRZO_BASE);
+		p1_rmw(P1_CTL_DMA_EN, ~0U, BIT(p1rrzdma));
+	}
+
+	for (i = 0; i + 1 < p1regs_n; i += 2)
+		writel(p1regs[i + 1], cama + (p1regs[i] & 0x1ffc));
 
 	/* go */
 	p1_rmw(P1_CTL_DMA_EN, ~0U, 1);		/* IMGO */
@@ -933,6 +1148,15 @@ static int status_show(struct seq_file *s, void *v)
 				   readl(cama + P1_AFO_ERR), w[0], w[1], w[2], w[3], w[4], w[5],
 				   w[6], w[7], w[8], w[9]);
 		}
+		if (aao.vaddr) {
+			const u8 *b = aao.vaddr;
+
+			seq_printf(s, "  aao err %08x  block 0: %*ph  ae %02x\n",
+				   readl(cama + P1_AAO_ERR), 4, b, b[4 * p1aanx]);
+		}
+		if (rrzo.vaddr)
+			seq_printf(s, "  rrzo err? %08x  rrz ctl %08x\n", readl(cama + P1_RRZO_ERR),
+				   readl(cama + P1_RRZ_CTL));
 		seq_printf(s, "  dmx %08x %08x %08x  en2 %08x\n", readl(cama + P1_DMX_CTL),
 			   readl(cama + P1_DMX_CROP), readl(cama + P1_DMX_VSIZE),
 			   readl(cama + P1_CTL_EN2));
@@ -983,6 +1207,9 @@ static void teardown(void)
 	debugfs_remove(dbg);
 	debugfs_remove(dbg_frame);
 	debugfs_remove(dbg_afo);
+	debugfs_remove(dbg_rrzo);
+	debugfs_remove(dbg_aao);
+	dbg_rrzo = dbg_aao = NULL;
 	debugfs_remove(dbg_focus);
 	dbg = dbg_frame = dbg_afo = dbg_focus = NULL;
 	camsv_stop();
@@ -991,7 +1218,9 @@ static void teardown(void)
 		iounmap(camsv);
 	if (cama)
 		iounmap(cama);
-	camsv = cama = NULL;
+	if (uni)
+		iounmap(uni);
+	camsv = cama = uni = NULL;
 	if (adap) {
 		sensor_write(0x0100, 0);	/* stream off */
 		i2c_put_adapter(adap);
@@ -1028,7 +1257,9 @@ static int __init camcap_init(void)
 	c = &cams[cam];
 	m = &c->modes[mode];
 	if (p1)
-		line_bytes = p1fmt == 8 ? m->width : p1fmt == 9 ? m->width * 10 / 8 : m->width * 2;
+		/* IMGO formats: 8/9/10/11 packed RAW8/10/12/14, 0 16-bit */
+		line_bytes = p1fmt >= 8 && p1fmt <= 11 ? m->width * (8 + 2 * (p1fmt - 8)) / 8
+						      : m->width * 2;
 	else
 		line_bytes = unpak ? m->width * 2 : m->width * 10 / 8;	/* 16-bit or packed RAW10 */
 	stride = ALIGN(line_bytes, 16);
@@ -1059,8 +1290,10 @@ static int __init camcap_init(void)
 		smi_on = true;
 	seninf = ioremap(SENINF_BASE, SENINF_SIZE);
 	mipi_rx = ioremap(MIPI_RX_BASE, MIPI_RX_SIZE);
-	if (p1)
+	if (p1) {
 		cama = ioremap(P1_BASE, P1_SIZE);
+		uni = ioremap(UNI_BASE, 0x1000);
+	}
 	else
 		camsv = ioremap(CAMSV_BASE + sv * 0x1000, 0x1000);
 	if (!seninf || !mipi_rx || !(camsv || cama)) {
@@ -1130,6 +1363,16 @@ static int __init camcap_init(void)
 	dbg_frame = debugfs_create_blob("titan_camcap_frame", 0444, NULL, &frame_blob);
 	if (cam == 0)
 		dbg_focus = debugfs_create_file("titan_camcap_focus", 0644, NULL, NULL, &focus_fops);
+	if (aao.vaddr) {
+		aao_blob.data = aao.vaddr;
+		aao_blob.size = AAO_BYTES;
+		dbg_aao = debugfs_create_blob("titan_camcap_aao", 0444, NULL, &aao_blob);
+	}
+	if (rrzo.vaddr) {
+		rrzo_blob.data = rrzo.vaddr;
+		rrzo_blob.size = stride * m->height;
+		dbg_rrzo = debugfs_create_blob("titan_camcap_rrzo", 0444, NULL, &rrzo_blob);
+	}
 	if (afo.vaddr) {
 		afo_blob.data = afo.vaddr;
 		afo_blob.size = AFO_STRIDE * AF_NY;

@@ -1,13 +1,20 @@
 # GNSS (MT6631 CONNSYS GPS)
 
-Status (2026-10-13): the receiver runs on MediaTek's closed navigation
+Status (2026-10-29): the receiver runs on MediaTek's closed navigation
 library, **libmnl.so**, hosted by **titan-mnld**, our own replacement for
-the stock daemon (mnld). **3D fix verified outdoors** with stock mnld: 12 of
-20 satellites used (GPS, GLONASS, BeiDou, SBAS), HDOP 0.74, about ±14 m,
-after a few minutes from cold with no assistance data. titan-mnld tracks the
-same satellites indoors; **its outdoor fix is not verified yet**. The
-**Location** app (app drawer) and `titan-location on|off` switch it. It is
-off by default because it drains the battery.
+the stock daemon (mnld). **3D fix verified** with stock mnld outdoors (12 of
+20 satellites used: GPS, GLONASS, BeiDou, SBAS; HDOP 0.74, about ±14 m,
+after a few minutes from cold with no assistance data) and **with
+titan-mnld indoors** (2026-10-29: 32 satellites seen across GPS, GLONASS,
+BeiDou and Galileo, 5 used). The **Location** app (app drawer) and
+`titan-location on|off` switch it. It is off by default because it drains
+the battery.
+
+**Replacing libmnl, stage 1 (2026-10-29): GO.** Our own code
+(`userspace/titan-gps`, Rust) brings the receiver up with no libmnl: it
+loads the firmware patch (from the phone's own libmnl.so), runs a session
+and gets every report type the chip sends libmnl. See "Replacing libmnl"
+below.
 
 ## Stack
 
@@ -113,43 +120,75 @@ reads only `ro.build.type`, and titan-mnld returns the default.
 
 ## The /dev/stpgps protocol (libmnl ↔ chip)
 
-This is the result of a feasibility probe into replacing libmnl with open
-code. The data is an strace capture of 2 minutes of mnld traffic: 540
-transfers, 210 KB written and 16 KB read. The decoder,
-`tools/gnss/stpgps-decode.py`, holds the capture command in its header.
+From strace captures of libmnl's sessions (`tools/gnss/gps-capture.sh` on
+the phone, attached before titan-mnld opens the device; 2026-10-13 and
+2026-10-29, the second with satellites tracked and a fix). The decoder,
+`tools/gnss/stpgps-decode.py`, reads them.
 
 **Framing (both directions):**
 
 ```
-AA F0 | u16 len | body (len bytes after unescaping) | AA 0F
+AA F0 | len (2 bytes) | body (len bytes) | AA 0F
 body  = [type] FE [fields...] [u16 checksum]
-checksum = 16-bit sum of the body bytes before it, plus len
-escapes in the body: DE DF → AA,  DE E0 → DE
+len   = 12 bits; the chip puts a sequence number in the top 4 bits
+checksum = 16-bit sum of the two length bytes as sent and the body bytes
+           before it
+escapes in the length and the body: DE DF → AA,  DE E0 → DE
 ```
 
-- The checksum holds for every command and status frame.
+- The checksum holds for every frame, both ways (3987 written, 1264 read
+  in the 2026-10-29 capture). It was first noted as "the body's sum plus
+  len"; that only agrees for lengths under 256, and the firmware chunks
+  (1406 bytes) looked like they had their own trailer.
+- The length is escaped like the body: the last firmware chunk (0x4DE
+  bytes) starts `AA F0 DE E0 04`.
 - Chip→host payloads after `[type] FE` are XORed with **0xCA**.
 - The read side is a byte stream: frames are split across `read()` calls.
-- Some chip output is not in `AA F0` frames: blocks XORed with 0xCA that end
-  in `AA 0F`. The decoder folds them into the preceding type-0x2C frame.
-  They are not understood yet.
+- A little chip output is outside `AA F0` frames: short blocks XORed with
+  0xCA that end in `AA 0F` (99 pieces, 942 bytes in 100 s). Not understood
+  yet.
+- strace splits a call that another thread interrupts into
+  `<unfinished ...>` and `<... resumed>` lines; the decoder joins them
+  (missing them first made 3 firmware chunks look skipped).
 
 **Host → chip:**
 
 | Type | When | What it looks like |
 |---|---|---|
-| `08` | session start | a 110-byte header, then download control |
-| `0C` | session start | **the firmware patch**: about 48 chunks of 1400 bytes, numbered from 1. Each chunk is the next 1400 bytes of a ~66 KB image stored **inside libmnl.so at file offset 0x3E0106**, plus a 2-byte trailer (not the frame checksum). |
-| `04` | end of the download | the last partial chunk |
+| `08` | session start | a 110-byte header (it carries the patch's header, below, and the chunk count, 49), then short download controls |
+| `0C` | session start | **the firmware patch**, `[u16 number from 1][data]` (below) |
+| `04` | after the setup | 30 bytes of FF |
+| `02` | 1 Hz | **satellite search assignments**, 24 bytes each, ~30 a second: `[satellite][constellation: 01 GPS, 10 GLONASS, 20 BeiDou][u16][u16 seconds, +1 a second][u16]` and predicted values (Doppler and code phase, it seems). The GPS satellites are exactly the PRNs gpsd reports: libmnl aids the search from its saved almanac and ephemeris. |
+| `07`, `0A` | occasional | short controls |
 | `05` | setup, then periodic | register-style settings `[u16 id][value]` |
 | `00` | 1 Hz | a millisecond counter rising by 1000 each second |
 | `10` | 1 Hz | clock and frequency values that drift slowly |
 | `01` | 1 Hz | constant fields (contains 10000 = `0x2710`) plus a counter |
 | `03`, `1C` | 1 Hz | 174-byte channel and search configuration plus short control frames |
 
+**The firmware patch.** 61440 bytes (0xF000), in libmnl.so at file offset
+0x3E0106 after an 8-byte header: `[u16 0x7800, its size in 16-bit words]
+[u16 0x8000] [u16 0x8004] [u16 0x007B]`. libmnl holds other images with the
+same header (another follows at 0x3EF106); the MT6631's is recognised by
+its CRC-32, 0x5A7874A9. It goes in 1400-byte blocks, a block whose escaped
+data would pass 1412 bytes as two halves (10 frames of 700), 49 frames in
+all. **Flow control:** the chip answers the header with `31`
+(`0000 4615 ...`) and each chunk with a `32` carrying its number; libmnl
+sends the next chunk only then (about 10 ms each).
+
+**Writes are batched.** libmnl writes each moment's frames in one
+`write()` of at most 1424 bytes: the 12 setup frames together, the ~30
+search assignments together, the 1 Hz frames together. One frame per
+write fills the STP link's window (the driver then answers ENOSPC: "native
+process should not call GPS_write with no delay at all").
+
 **Chip → host:**
 
-- `32`: 6-byte acknowledgements.
+- `31`: the answer to the session header.
+- `32`: 6-byte acknowledgements, one per firmware chunk.
+- `29` (61 B): about 7-11 a second, with satellites in view: per-channel
+  measurement records (structured, varying with the sky).
+- `3A`, `3B`, `4A`, `4B`, `14`: seen with satellites tracked.
 - `4E` (20 B), `37` (65 B), `2C`, `30` and `29` (61 B): about one per second.
   These are the measurement and status reports, with mostly zeros indoors.
 - `42`, `28`, `2A`, `2B`: occasional.
@@ -161,7 +200,7 @@ recovery while it has no signal; the NMEA output carries on through it.
 ### Verdict: replacing libmnl with open code
 
 1. **The chip cannot run without a closed blob.**
-   - Every session starts by loading a ~66 KB DSP firmware patch that exists
+   - Every session starts by loading a 60 KB DSP firmware patch that exists
      only inside libmnl.so.
    - The best possible outcome keeps it, extracted from the phone's own
      vendor image into a firmware file at build time (as the Wi-Fi and BT
@@ -193,3 +232,39 @@ recovery while it has no signal; the NMEA output carries on through it.
      - It would also let our own code handle EPO assistance over Debian's
        network stack.
    - The engine would stay closed.
+
+## Replacing libmnl
+
+The plan agreed on 2026-10-13: open code step by step, with a go/no-go at
+each stage. The DSP firmware patch stays MediaTek's: it is read from the
+phone's own libmnl.so at run time (`titan_gps::patch`) and never stored in
+the repository.
+
+1. **Chip bring-up (2026-10-29): GO.** `userspace/titan-gps` (Rust, no
+   dependencies; `build.sh` cross-builds for the phone and runs the tests):
+   - `frame`: the framing above (encode, a streaming decoder for the chip's
+     side); the tests check a frame byte for byte against libmnl's;
+   - `patch`: finds the image in libmnl.so by its CRC and cuts it into
+     chunks as libmnl does (all 49 frames byte-identical to libmnl's);
+   - `titan-gps-probe SCRIPT`: opens `/dev/stpgps` (Location off: one owner
+     at a time), runs a script from `tools/gnss/stpgps-script.py` (libmnl's
+     session frames from a capture, with timing and write batching; the
+     patch as one `PATCH` line), waits for `31` and each `32` during the
+     download, retries ENOSPC, and logs and counts the chip's frames.
+
+   Result: a 40 s session driven entirely by our code, every report type
+   libmnl gets (`42`, `4E`, `37`, `30`, `2C`, `28` once a second; `29`
+   about 11 a second; `3A`, `3B`, `2A`, `2B`, `4A`, `4B`), no ENOSPC, no bad
+   sums. Two things it took: waiting for each chunk's acknowledgement (a
+   chunk sent on top of the last stalls the link) and batching writes.
+   The session frames are still libmnl's, replayed from a capture
+   (including its satellite search assignments, an hour stale).
+2. **Decoding the measurements** (next): the `29` records against libmnl's
+   view of the same moments (gpsd's SKY: satellite, elevation, azimuth,
+   signal), then the 1 Hz host frames (`00`, `10`, `01`, `03`, `1C`) and
+   `02`'s fields, so the probe can make its own instead of replaying.
+3. **Aiding and the solution**: search assignments from ephemeris (first
+   from broadcast ephemeris downloaded over the network, later decoded from
+   the satellites), pseudoranges from the measurements, and a PVT solver
+   (RTKLIB's is the obvious start).
+

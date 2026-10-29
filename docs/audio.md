@@ -111,9 +111,20 @@ app (Chromium via PulseAudio API, pw-play, ...)
 
 ### Volume
 
-One master level: the FS1860 amp gain (`Speaker Amp Volume`, 0-224, 224
-shown as 100 %), stored in `/var/lib/titan-audio/volume`. Level 0 is muted.
-Everything that touches loudness goes through it:
+One master level, 0-224 (224 shown as 100 %), stored in
+`/var/lib/titan-audio/volume`. Level 0 is muted. Everything that touches
+loudness goes through it.
+
+**The level is on a dB curve (2026-10-28).** The FS1860's volume
+(`Speaker Amp Volume`, 0-255) is 0.5 dB a step (`fs1860.c`'s TLV), and the
+level used to be written to it one to one: 100 % was -15.5 dB, 40 % was
+-82.5 dB (near silent, as reported), so the useful range was squeezed into
+the top third. Now the level spreads 42 dB below 100 %, like the
+headphones: amp = 224 - 84 x (1 - level / 224), 1.5 dB per volume-key step;
+40 % is 25 dB below full. `amp_value()` in `titan-powerkey` and
+`titan-mixer`, the same in `titan-speakerd` (`SPK_RANGE_DB`). The level
+file keeps its meaning; only what reaches the amp changed, so a saved level
+now plays louder below the top.
 
 | Who | Reads | Writes |
 |---|---|---|
@@ -147,6 +158,33 @@ stream volumes; WirePlumber remembers them.
 
 `titan-mixer` uses `pactl` (`pulseaudio-utils`): `pactl subscribe` for live
 updates, JSON listings, `set-sink-input-*`.
+
+### UI sounds (2026-10-28)
+
+`userspace/debian/sounds/gen-sounds.py` synthesizes them at build time into
+`/usr/local/share/titan/sounds` (48 kHz mono, peaks about -10 dBFS, so the
+speaker level sets their loudness):
+
+- `vol-up.wav`: a quick, glassy major arpeggio rising to the octave
+  (C5 E5 G5 C6, 55 ms apart). `titan-powerkey` plays it on a volume step up,
+  at the level just set.
+- `vol-down.wav`: a slower, rounder minor arpeggio falling (G5 Eb5 C5, 85 ms
+  apart). The two first differed only in major vs minor and sounded alike;
+  direction, register, timbre and pace now tell them apart.
+- `pop.wav`: the lock screen's bubble popping (a chirp from 380 Hz up toward
+  1.9 kHz, a 3 ms click), played by the shell as the bubble bursts.
+
+No tone at the ends of the range, when muted or with the screen off; a
+held key's step cuts the previous tone short. They play with `pw-play` in
+PipeWire's session (`XDG_RUNTIME_DIR=/run/user/0`).
+
+**A sleeping speaker.** `titan-speakerd` notices the PCM open within its
+200 ms poll and needs ~50 ms more to start the amp, so a short sound played
+to a sleeping speaker was lost. Each sound also comes as `NAME-cold.wav`,
+with 0.3 s of silence first, played when
+`/proc/asound/card0/pcm7p/sub0/status` reads `closed`. The lock screen also
+plays `wake.wav` (0.6 s of silence) when the bubble is pressed, so the
+speaker is usually on by the time it pops.
 
 ## Headphones
 

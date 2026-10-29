@@ -1,19 +1,25 @@
 #!/usr/bin/python3
 """
-titan-camera-gui: camera app for the Titan Pocket (GTK 3 + GStreamer).
+titan-camera-gui: camera app for the Titan Pocket (GTK 4 + GStreamer, titan_ui4).
 
 Live preview, photos, a front/rear switch and autofocus, on libcamera
 (docs/camera.md): the libcamerasrc element runs the titan_camera driver
 through libcamera's simple pipeline handler and software ISP (debayer on the
 GPU, auto exposure, auto white balance).
 
-- Preview: 960x720 from the ISP, rotated (and mirrored for the front camera)
-  on the GPU by glvideoflip, shown by gtkglsink.
+- Preview: YUYV straight from MediaTek's pass-2 hardware ISP (the driver's
+  YUYV node; rear 2336x1752, front 1632x1224), so the GPU only converts
+  YUYV->RGB (glcolorconvert), never debayers. Rotated (and mirrored for the
+  front camera) and scaled to about the screen's size on the GPU
+  (glvideoflip, glcolorscale), then downloaded and shown as a texture. Set
+  TITAN_CAMERA_HWISP=0 to fall back to the GPU software ISP (960x720 BGRx).
 - Photo: the camera allows one stream at a time, so the shutter stops the
-  preview, runs the camera at its largest size (rear 4668x3504, 16 MP, from
-  the sensor's full-resolution mode; front 3260x2448), skips the frames
-  auto exposure needs to settle, saves one as
-  JPEG under ~/Pictures/Camera and restarts the preview.
+  preview, runs the camera at its full-resolution mode (rear 4672x3504,
+  16 MP; front 3264x2448), skips the frames auto exposure needs to settle,
+  saves one as JPEG under ~/Pictures/Camera and restarts the preview. With
+  the hardware ISP the still is finished YUYV straight from the DIP (fast);
+  with TITAN_CAMERA_HWISP=0 it is BGRx from the GPU software ISP (rear
+  4668x3504, front 3260x2448, ~4 s).
 - Rotation: the driver reports each sensor's mounting rotation
   (V4L2_CID_CAMERA_SENSOR_ROTATION); the rotate button overrides it per
   camera (~/.config/titan-camera/state.json), for photos too.
@@ -27,11 +33,15 @@ GPU, auto exposure, auto white balance).
   measured. Focused, the app watches sharpness and refocuses when it stays
   well below the focused level. Tap the preview to focus there; dragging the
   focus slider switches to manual focus until the next tap.
-  With the titan_camera driver's hardware statistics (/sys/.../rear/af_stats:
-  MediaTek's ISP AF block, run beside the capture path), sharpness comes from
-  them instead: the H0 filter energy of the focus region's blocks over their
-  pixel sum, times the SGG1 gain the driver sets from the scene brightness, from frames at least AF_HW_SETTLE frames after the lens moved
-  (the ISP's own frame counter). No CPU spent on frames then.
+  On the software-ISP path (TITAN_CAMERA_HWISP=0) with the titan_camera
+  driver's hardware statistics (/sys/.../rear/af_stats: MediaTek's ISP AF
+  block, run beside the capture path), sharpness comes from them instead: the
+  H0 filter energy of the focus region's blocks over their pixel sum, times
+  the SGG1 gain the driver sets from the scene brightness, from frames at
+  least AF_HW_SETTLE frames after the lens moved (the ISP's own frame
+  counter). With the hardware ISP the preview frames themselves are measured:
+  the statistics' filters see raw sensor noise and lose the focus peak in
+  dim light. Flash metering uses the statistics either way.
 
 - Flash (rear camera): a dual-tone pair on the MT6370 PMIC's two flash
   channels, channel 1 white (cool), channel 2 yellowish (warm), driven
@@ -89,10 +99,11 @@ import os
 import re
 import struct
 import subprocess
+import sys
+import threading
 import time
 from urllib.parse import urlsplit
 
-os.environ.setdefault("NO_AT_BRIDGE", "1")
 # libcamera's GStreamer element lives in /usr/local (userspace/libcamera/build.sh)
 _gst_path = "/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0"
 if _gst_path not in os.environ.get("GST_PLUGIN_PATH", ""):
@@ -101,28 +112,39 @@ if _gst_path not in os.environ.get("GST_PLUGIN_PATH", ""):
 os.environ.setdefault("LIBCAMERA_LOG_LEVELS", "*:ERROR")
 
 import numpy as np  # noqa: E402
+import titan_ui4 as ui  # noqa: E402
+import titan_water4 as water  # noqa: E402
 import gi  # noqa: E402
 
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Gst", "1.0")
-from gi.repository import Gdk, GdkPixbuf, GLib, Gst, Gtk, Pango  # noqa: E402
-import titan_ui  # noqa: E402  (the TitanWater look: header, membrane)
+gi.require_version("GstVideo", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gst, GstVideo, Gtk  # noqa: E402
 
 SYSDEV = "/sys/devices/platform/1a050000.camsv1/"
 CAMERAS = [
-    # libcamera id, label, mirrored preview, still size, sensor device,
-    # focus motor, fallback rotation (clockwise)
+    # libcamera id, label, mirrored preview, still size, sensor device, focus
+    # motor, fallback rotation (clockwise), hardware-ISP preview size, hardware-
+    # ISP still size. "still" is the GPU software-ISP size (cropped Bayer
+    # margins); "hwstill" is the exact sensor-mode size the DIP delivers (the
+    # driver only has a tile list for the mode's own size).
     {"id": "platform/1a050000.camsv1/rear ov16880", "label": "Rear",
      "mirror": False, "still": (4668, 3504), "sysdir": SYSDEV + "rear",
-     "focus": True, "rotation": 90},
+     "focus": True, "rotation": 90, "hwisp": (2336, 1752), "hwstill": (4672, 3504)},
     {"id": "platform/1a050000.camsv1/front ov8865", "label": "Front",
      "mirror": True, "still": (3260, 2448), "sysdir": SYSDEV + "front",
-     "focus": False, "rotation": 270},
+     "focus": False, "rotation": 270, "hwisp": (1632, 1224), "hwstill": (3264, 2448)},
 ]
+
+# Hardware ISP preview: request YUYV from the driver, so MediaTek's pass-2 ISP
+# does demosaic/colour/gamma and the GPU only converts YUYV->RGB for display
+# (no debayer). The YUYV node streams at the sensor-mode size; the display
+# scales it. Off falls back to the GPU software ISP at PREVIEW (BGRx).
+HW_ISP = os.environ.get("TITAN_CAMERA_HWISP", "1") != "0"
 PREVIEW = (960, 720)
 SETTLE_FRAMES = 15          # auto exposure settles in ~8 frames
+HW_SETTLE_FRAMES = 8        # hardware ISP: the still starts at the preview's
+                            # exposure and white balance (the driver carries them)
 QR_RATE = 5                 # preview frames a second the QR decoder looks at
 QR_SIZE = (640, 480)        # ...scaled to this, grayscale
 QR_DENSITY = 2              # zbar reads every 2nd line and column
@@ -176,8 +198,14 @@ METER_SETTLE = 3            # frames after the sensor has the new exposure
 METER_TIMEOUT_MS = 2500
 LINE_US = 2512 / 288.0      # line time of both rear modes (HTS / pixel rate)
 FLASH_MIN_LINES = 4         # the sensor's shortest exposure
-FLASH_MAX_LINES = 3800      # longest flash exposure (~1/30 s), then gain
-FLASH_MAX_GAIN = 8.0
+# Shake: an unsteady hand or a tremor blurs anything much longer than ~1/100 s,
+# and the flash is a continuous LED, so it freezes nothing. Photo exposures
+# stop there and gain takes over (the driver's auto exposure has the same cap,
+# its ae_max_us); then the sharpest frame of a short burst is kept.
+PHOTO_MAX_US = 10000
+FLASH_MAX_LINES = int(PHOTO_MAX_US / LINE_US)   # then gain
+FLASH_MAX_GAIN = 15.5       # the sensor's maximum analogue gain
+STILL_BURST = 6             # frames scored for sharpness, the sharpest kept
 FLASH_SETTLE_FRAMES = 6     # still frames skipped with a metered exposure
 AF_ASSIST_GAIN = FLASH_AUTO_GAIN    # dark: auto exposure is at 4x or more
 AF_ASSIST_WAIT_MS = 500             # auto exposure settles on the lit scene
@@ -400,17 +428,19 @@ def subdev_ctrl(sysdir, cid, value=None):
 
 
 def sharpness(data, w, h, region):
-    """gradient energy of the focus region of a BGRx frame: its green
-    channel, binned 2x2 against noise, normalised by brightness so auto
-    exposure changes don't look like focus changes. Only the region is
-    touched, straight in the buffer."""
+    """gradient energy of the focus region: its luma, binned 2x2 against
+    noise, normalised by brightness so auto exposure changes don't look like
+    focus changes. BGRx (green at byte 4x+1) or YUYV (Y at byte 2x). Only the
+    region is touched, straight in the buffer."""
     stride = len(data) // h
+    bpp = max(stride // w, 1)		# 4 BGRx, 2 YUYV
     a = np.frombuffer(data, np.uint8).reshape(h, stride)
     cx, cy = region
     rw, rh = int(w * AF_REGION) & ~1, int(h * AF_REGION) & ~1
     x0 = min(max(int(cx * w) - rw // 2, 0), w - rw) & ~1
     y0 = min(max(int(cy * h) - rh // 2, 0), h - rh) & ~1
-    g = a[y0:y0 + rh, 4 * x0 + 1:4 * (x0 + rw):4].astype(np.int32)
+    chan = 1 if bpp >= 4 else 0		# green in BGRx, Y in YUYV
+    g = a[y0:y0 + rh, bpp * x0 + chan:bpp * (x0 + rw):bpp].astype(np.int32)
     g = g[0::2, 0::2] + g[1::2, 0::2] + g[0::2, 1::2] + g[1::2, 1::2]
     gx = g[:, 1:] - g[:, :-1]
     gy = g[1:, :] - g[:-1, :]
@@ -539,59 +569,77 @@ class AutoFocus:
             self.low = 0
 
 
-CSS = b"""
-* { font-size: 20px; }
+CSS = """
 .bar { background: #0B0D12; padding: 8px 12px; }
-.round { min-width: 64px; min-height: 64px; border-radius: 32px; padding: 0; }
-/* the shutter: a big bead of lit water */
-.shutter { min-width: 92px; min-height: 92px; border-radius: 46px; padding: 0;
-           background-color: rgba(255, 255, 255, 0.90);
-           background-image: radial-gradient(ellipse 30% 30% at 32% 28%, #FFFFFF, rgba(255,255,255,0)),
-                             radial-gradient(ellipse closest-side at 50% 50%, rgba(255,255,255,0) 70%,
-                                             rgba(160,170,190,0.55) 86%, rgba(255,255,255,0));
-           border: 2px solid #FFFFFF;
-           box-shadow: inset 0 0 14px rgba(150,160,180,0.55), 0 0 0 4px rgba(255,255,255,0.35),
-                       0 8px 16px rgba(0,0,0,0.45); }
-.shutter:disabled { background-color: rgba(255, 255, 255, 0.35); }
-.thumb { min-width: 64px; min-height: 64px; padding: 0; border-radius: 16px; }
+.thumb { min-width: 60px; min-height: 60px; padding: 0; border-radius: 16px; }
 /* glass over the preview */
-.status, .camback { color: white; background-color: rgba(18, 24, 48, 0.55);
-          border: 1px solid rgba(255,255,255,0.40);
+.status { color: white; background-color: rgba(18, 24, 48, 0.55);
+          border: 1px solid rgba(255,255,255,0.40); border-radius: 20px; padding: 6px 16px;
+          font-size: 20px;
           box-shadow: inset 0 1px 0 rgba(255,255,255,0.5), 0 6px 18px rgba(0,0,0,0.35); }
-.status { border-radius: 20px; padding: 6px 16px; font-size: 20px; }
-.camback { min-width: 46px; min-height: 46px; border-radius: 23px; padding: 0;
-           background-image: none; }
 .viewer { background: black; }
-.focuslbl { color: @titan_dim; font-size: 16px; }
-.flash { min-width: 96px; font-size: 16px; padding: 0 8px; }
-.flash.lit { background-color: rgba(255, 210, 74, 0.92); color: #141821; text-shadow: none; }
-.afmode { color: #141821; background: @titan_accent; border-radius: 7px;
+.afmode { color: #141821; background: #FFD24A; border-radius: 7px;
           padding: 1px 7px; font-size: 14px; font-weight: bold; text-shadow: none; }
 .afmode.manual { background: rgba(255, 255, 255, 0.80); }
-.qr { background-color: rgba(18, 24, 48, 0.72); border-radius: 22px; padding: 4px 6px 4px 12px;
+.qr { background-color: rgba(18, 24, 48, 0.72); border-radius: 24px; padding: 5px 6px 5px 12px;
       border: 1px solid rgba(255,255,255,0.40);
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.45), 0 6px 18px rgba(0,0,0,0.35); }
-.qr.fresh { border-color: @titan_accent; }
-.qrkind { color: #141821; background: @titan_accent; border-radius: 6px; padding: 0 6px;
+.qr.fresh { border-color: #FFD24A; }
+.qrkind { color: #141821; background: #FFD24A; border-radius: 6px; padding: 0 6px;
           font-size: 13px; font-weight: bold; text-shadow: none; }
 .qrtext { color: white; font-size: 16px; }
-.qr button { min-height: 40px; min-width: 40px; padding: 0 10px; border-radius: 20px;
-             font-size: 15px; }
-scale trough { min-height: 8px; }
-scale slider { min-width: 34px; min-height: 34px; border-radius: 17px; }
 """
 
+ROTATE = "M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4.5H15"
+FLASH = "M13 3L6 13.5h5L10 21l8-11h-5z"
+SWITCH = "M4 8h3.5L9 5.5h6L16.5 8H20v11H4zM9 13.5a3 3 0 0 1 5.6-1.5M15 13.5a3 3 0 0 1-5.6 1.5"
+VIEW_BOX = (720, 540)       # the preview is scaled on the GPU to fit about this
 
-class CameraApp(Gtk.Window):
+
+class VideoView(Gtk.Widget):
+    """the live preview: the newest frame (RGBA, already converted, turned
+    and scaled to about this size on the GPU) as a texture, fitted and
+    centred on black"""
+
     def __init__(self):
-        super().__init__(title="Camera")
-        self.set_default_size(720, 680)
-        self.connect("destroy", self.on_quit)
-        self.connect("key-press-event", self.on_key)
-        provider = Gtk.CssProvider()
-        provider.load_from_data(CSS)
-        Gtk.StyleContext.add_provider_for_screen(
-            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        super().__init__()
+        self.tex = None
+        self.frame = (4, 3)
+        self.add_css_class("viewer")
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+
+    def set_frame(self, w, h, stride, data):
+        self.tex = Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8A8,
+                                         GLib.Bytes.new(data), stride)
+        self.frame = (w, h)
+        self.queue_draw()
+
+    def clear(self):
+        self.tex = None
+        self.queue_draw()
+
+    def placed(self):
+        """where the frame is drawn: x, y, w, h"""
+        W, H = self.get_width(), self.get_height()
+        fw, fh = self.frame
+        k = min(W / fw, H / fh)
+        return (W - fw * k) / 2, (H - fh * k) / 2, fw * k, fh * k
+
+    def do_snapshot(self, s):
+        if self.tex is not None:
+            x, y, w, h = self.placed()
+            s.append_texture(self.tex, Graphene.Rect().init(x, y, w, h))
+
+
+class CameraApp(ui.AppWindow):
+    def __init__(self, app):
+        super().__init__(app, "Camera", on_back=self.go_back)
+        ui.add_css(self.get_display(), CSS)
+        self.connect("close-request", self.on_quit)
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
 
         st = self.load_state()
         self.cam = st.get("camera", 0) % len(CAMERAS)
@@ -607,14 +655,15 @@ class CameraApp(Gtk.Window):
         self.preview = None         # Gst.Pipeline
         self.still = None
         self.busy = False
-        self.syncing = False        # moving the focus slider from code
-        self.hw_af = False          # the driver's ISP AF statistics in use
+        self.hw_stats = False       # the driver's ISP AF statistics exist (flash metering)
+        self.hw_af = False          # ...and autofocus uses them
         self.hw_timer = 0
         self.hw_last = -1
         self.af = AutoFocus(self)
         self.assist = False         # the AF assist light is on
         self.assist_timer = 0
         self.assist_off_at = 0.0    # monotonic time the assist light went off
+        self.frame_pending = False  # a preview frame waits for the main loop
 
         self.build()
         self.build_preview()
@@ -630,24 +679,29 @@ class CameraApp(Gtk.Window):
 
     def build(self):
         self.stack = Gtk.Stack()
-        self.add(self.stack)
+        # the camera fills the screen; the header gives way to a droplet
+        # back button floating over the preview
+        self.float_over(self.stack)
+        self.show_header(False)
 
         # camera page: preview with a status overlay, focus row, button bar
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        page.add_css_class("viewer")
         self.stack.add_named(page, "camera")
         overlay = Gtk.Overlay()
-        overlay.get_style_context().add_class("viewer")
-        page.pack_start(overlay, True, True, 0)
-        self.view_box = Gtk.EventBox()
-        self.view_box.get_style_context().add_class("viewer")
-        self.view_box.connect("button-release-event", self.on_tap)
-        overlay.add(self.view_box)
-        self.status = Gtk.Label()
-        self.status.get_style_context().add_class("status")
+        overlay.add_css_class("viewer")
+        overlay.set_vexpand(True)
+        page.append(overlay)
+        self.view = VideoView()
+        tap = Gtk.GestureClick()
+        tap.connect("released", lambda g, n, x, y: self.on_tap(x, y))
+        self.view.add_controller(tap)
+        overlay.set_child(self.view)
+        self.status = ui.label("", "status", xalign=0.5)
         self.status.set_halign(Gtk.Align.CENTER)
         self.status.set_valign(Gtk.Align.START)
         self.status.set_margin_top(12)
-        self.status.set_no_show_all(True)
+        self.status.set_visible(False)
         overlay.add_overlay(self.status)
         self.qr_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.qr_box.set_valign(Gtk.Align.END)
@@ -657,105 +711,95 @@ class CameraApp(Gtk.Window):
         self.qr_box.set_margin_bottom(10)
         overlay.add_overlay(self.qr_box)    # only as tall as its chips
         self.qr_chips = {}          # code text -> chip
-        # the design's back button, floating over the preview
-        back = Gtk.Button.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.BUTTON)
-        back.get_style_context().add_class("camback")
+        # the design's back button, a droplet floating over the preview
+        back = ui.RoundButton("back", tooltip="Back (Esc)")
         back.set_halign(Gtk.Align.START)
         back.set_valign(Gtk.Align.START)
         back.set_margin_top(12)
         back.set_margin_start(12)
-        back.set_tooltip_text("Back (Esc)")
-        back.connect("clicked", lambda b: self.destroy())
+        back.connect("clicked", lambda b: self.close())
         overlay.add_overlay(back)
 
-        self.focus_row = Gtk.Box(spacing=10)
-        self.focus_row.get_style_context().add_class("bar")
-        page.pack_start(self.focus_row, False, False, 0)
-        self.af_label = Gtk.Label(label="AF")
-        self.af_label.get_style_context().add_class("afmode")
-        self.focus_row.pack_start(self.af_label, False, False, 0)
-        lbl = Gtk.Label(label="Far")
-        lbl.get_style_context().add_class("focuslbl")
-        self.focus_row.pack_start(lbl, False, False, 0)
-        self.focus_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, FOCUS_MAX, 1)
-        self.focus_scale.set_draw_value(False)
-        self.focus_scale.set_value(self.focus)
-        self.focus_scale.connect("value-changed", self.on_focus)
-        self.focus_row.pack_start(self.focus_scale, True, True, 0)
-        lbl = Gtk.Label(label="Near")
-        lbl.get_style_context().add_class("focuslbl")
-        self.focus_row.pack_start(lbl, False, False, 0)
+        # the focus: a water slider, far to near (moving it is manual focus
+        # until the next tap)
+        self.focus_row = Gtk.Box(spacing=12)
+        self.focus_row.add_css_class("bar")
+        self.af_label = ui.label("AF", "afmode")
+        self.af_label.set_valign(Gtk.Align.CENTER)
+        self.focus_row.append(self.af_label)
+        self.focus_slider = water.WaterSlider("Far → Near", self.focus, lo=0, hi=FOCUS_MAX,
+                                              fmt=lambda v: "%d" % v)
+        self.focus_slider.set_hexpand(True)
+        self.focus_slider.connect("value-changed", self.on_focus)
+        self.focus_row.append(self.focus_slider)
+        page.append(self.focus_row)
 
-        bar = Gtk.Box(spacing=12)
-        bar.get_style_context().add_class("bar")
-        page.pack_start(bar, False, False, 0)
-
+        bar = Gtk.CenterBox()
+        bar.add_css_class("bar")
+        page.append(bar)
+        left = Gtk.Box(spacing=12)
         self.thumb = Gtk.Button()
-        self.thumb.get_style_context().add_class("thumb")
+        self.thumb.add_css_class("thumb")
         self.thumb.set_valign(Gtk.Align.CENTER)
         self.thumb.connect("clicked", self.on_thumb)
-        bar.pack_start(self.thumb, False, False, 0)
-
-        self.rotate_btn = self.icon_button("object-rotate-right-symbolic", "round")
+        left.append(self.thumb)
+        self.rotate_btn = ui.GlassButton(icon=ROTATE, height=60)
+        self.rotate_btn.set_valign(Gtk.Align.CENTER)
         self.rotate_btn.connect("clicked", lambda b: self.rotate())
-        bar.pack_start(self.rotate_btn, False, False, 0)
-
-        self.flash_btn = Gtk.Button()
-        self.flash_btn.get_style_context().add_class("round")
-        self.flash_btn.get_style_context().add_class("flash")
+        left.append(self.rotate_btn)
+        self.flash_btn = ui.GlassButton("Off", icon=FLASH, height=60, size=16)
         self.flash_btn.set_valign(Gtk.Align.CENTER)
         self.flash_btn.connect("clicked", lambda b: self.cycle_flash())
-        bar.pack_start(self.flash_btn, False, False, 0)
-
-        self.shutter = Gtk.Button()
-        self.shutter.get_style_context().add_class("shutter")
-        self.shutter.set_halign(Gtk.Align.CENTER)
+        left.append(self.flash_btn)
+        bar.set_start_widget(left)
+        # the shutter: a big bead of lit water
+        self.shutter = water.Droplet("", size=100, radius=42, tint=0.9)
         self.shutter.set_valign(Gtk.Align.CENTER)
         self.shutter.connect("clicked", lambda b: self.take_photo())
+        self.shutter.connect("notify::sensitive",
+                             lambda w, p: w.set_opacity(1.0 if w.get_sensitive() else 0.45))
         bar.set_center_widget(self.shutter)
-
-        self.switch_btn = self.icon_button("camera-switch-symbolic", "round")
+        self.switch_btn = ui.GlassButton(icon=SWITCH, height=60)
+        self.switch_btn.set_valign(Gtk.Align.CENTER)
         self.switch_btn.connect("clicked", lambda b: self.switch_camera())
-        bar.pack_end(self.switch_btn, False, False, 0)
+        bar.set_end_widget(self.switch_btn)
 
         # photo page: the last photo, tap to go back
-        photo = Gtk.EventBox()
-        photo.get_style_context().add_class("viewer")
-        photo.connect("button-release-event", lambda *a: self.show_camera())
-        self.photo_img = Gtk.Image()
-        photo.add(self.photo_img)
-        self.stack.add_named(photo, "photo")
+        self.photo_img = Gtk.Picture()
+        self.photo_img.add_css_class("viewer")
+        self.photo_img.set_can_shrink(True)
+        back_tap = Gtk.GestureClick()
+        back_tap.connect("released", lambda *a: self.show_camera())
+        self.photo_img.add_controller(back_tap)
+        self.stack.add_named(self.photo_img, "photo")
 
         self.update_thumb()
-
-    def icon_button(self, icon, cls):
-        b = Gtk.Button()
-        img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
-        img.set_pixel_size(30)
-        b.set_image(img)
-        b.get_style_context().add_class(cls)
-        b.set_valign(Gtk.Align.CENTER)
-        return b
 
     def set_status(self, text, timeout_ms=0):
         if text:
             self.status.set_text(text)
-            self.status.show()
+            self.status.set_visible(True)
         else:
-            self.status.hide()
+            self.status.set_visible(False)
         if timeout_ms:
             GLib.timeout_add(timeout_ms, self.clear_status, text)
 
     def clear_status(self, text):
         if self.status.get_text() == text:
-            self.status.hide()
+            self.status.set_visible(False)
         return False
 
     def show_af_mode(self):
         manual = self.af.state == "manual"
         self.af_label.set_text("MF" if manual else "AF")
-        ctx = self.af_label.get_style_context()
-        (ctx.add_class if manual else ctx.remove_class)("manual")
+        (self.af_label.add_css_class if manual else self.af_label.remove_css_class)("manual")
+
+    def go_back(self):
+        """Esc, Back: from the photo to the camera, or close"""
+        if self.stack.get_visible_child_name() == "photo":
+            self.show_camera()
+        else:
+            self.close()
 
     # ---- state ----
 
@@ -786,12 +830,15 @@ class CameraApp(Gtk.Window):
     # ---- preview ----
 
     def build_preview(self):
-        """libcamerasrc -> tee: (1) glupload -> glvideoflip -> gtkglsink (all GPU
-        after the upload; videoflip + gtksink without GL), (2) the frames ->
-        appsink for autofocus (the same BGRx buffers, no copy)"""
-        w, h = PREVIEW
-        src = ("libcamerasrc name=src ! video/x-raw,format=BGRx,width=%d,height=%d ! "
-               "tee name=t ! queue max-size-buffers=2 leaky=downstream ! " % (w, h))
+        """libcamerasrc -> tee: (1) glupload -> glcolorconvert -> glvideoflip
+        -> glcolorscale to about the screen's size, all on the GPU, then
+        down to an appsink and into the preview as a texture (GTK 4 has no
+        GStreamer GL sink in Debian 12); (2) the frames -> appsink for
+        autofocus (the same preview buffers, no copy); (3) QR codes"""
+        # the source caps (format + size) are set per camera in
+        # configure_preview: YUYV from the hardware ISP, or BGRx from the GPU
+        src = ("libcamerasrc name=src ! capsfilter name=srccaps ! "
+               "tee name=t ! queue max-size-buffers=2 leaky=downstream ! ")
         af = (" t. ! queue max-size-buffers=1 leaky=downstream ! "
               "appsink name=af emit-signals=true max-buffers=1 drop=true sync=false")
         if QrScanner.load():
@@ -801,37 +848,65 @@ class CameraApp(Gtk.Window):
                    "video/x-raw,width=%d,height=%d ! videoconvert ! "
                    "video/x-raw,format=GRAY8 ! appsink name=qr emit-signals=true "
                    "max-buffers=1 drop=true sync=false" % ((QR_RATE,) + QR_SIZE))
-        sink = Gst.ElementFactory.make("gtkglsink", "view")
-        if sink:
-            self.preview = Gst.parse_launch(
-                src + "glupload ! glcolorconvert ! glvideoflip name=flip ! glsinkbin name=out" + af)
-            self.preview.get_by_name("out").set_property("sink", sink)
-        else:
-            sink = Gst.ElementFactory.make("gtksink", "view")
-            self.preview = Gst.parse_launch(
-                src + "videoflip name=flip ! videoconvert name=conv" + af)
-            self.preview.add(sink)
-            self.preview.get_by_name("conv").link(sink)
+        self.preview = Gst.parse_launch(
+            src + "glupload ! glcolorconvert ! glvideoflip name=flip ! glcolorscale ! "
+            "capsfilter name=viewcaps ! gldownload ! video/x-raw,format=RGBA ! "
+            "appsink name=view emit-signals=true max-buffers=1 drop=true sync=false" + af)
+        self.preview.get_by_name("view").connect("new-sample", self.on_view_sample)
         self.preview.get_by_name("af").connect("new-sample", self.on_af_sample)
         qr = self.preview.get_by_name("qr")
         if qr:
             self.qr_scanner = None      # made in the decoding thread
             qr.connect("new-sample", self.on_qr_sample)
-        widget = sink.get_property("widget")
-        widget.set_hexpand(True)
-        widget.set_vexpand(True)
-        self.view_box.add(widget)
-        widget.show()
 
         bus = self.preview.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", self.on_preview_error)
 
+    def on_view_sample(self, sink):
+        """a preview frame (the appsink's thread): copied out and shown from
+        the main loop, one at a time (frames that come meanwhile are dropped)"""
+        sample = sink.emit("pull-sample")
+        if sample is None or self.frame_pending:
+            return Gst.FlowReturn.OK
+        info = GstVideo.VideoInfo.new_from_caps(sample.get_caps())
+        buf = sample.get_buffer()
+        ok, m = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        data = bytes(m.data)
+        buf.unmap(m)
+        self.frame_pending = True
+        GLib.idle_add(self.show_view_frame, info.width, info.height, info.stride[0], data)
+        return Gst.FlowReturn.OK
+
+    def show_view_frame(self, w, h, stride, data):
+        self.frame_pending = False
+        if self.stack.get_visible_child_name() == "camera":
+            self.view.set_frame(w, h, stride, data)
+        return False
+
     def configure_preview(self):
         c = CAMERAS[self.cam]
         self.preview.get_by_name("src").set_property("camera-name", c["id"])
+        if HW_ISP:
+            w, h = c["hwisp"]
+            fmt = "YUY2"		# V4L2 YUYV: the driver's hardware-ISP output
+        else:
+            w, h = PREVIEW
+            fmt = "BGRx"		# the GPU software ISP debayers to this
+        caps = Gst.Caps.from_string(
+            "video/x-raw,format=%s,width=%d,height=%d" % (fmt, w, h))
+        self.preview.get_by_name("srccaps").set_property("caps", caps)
         Gst.util_set_object_arg(self.preview.get_by_name("flip"), "video-direction",
                                 video_direction(self.rotation[c["id"]], c["mirror"]))
+        # the preview at about the screen's size: turned, its sides swap
+        if self.rotation[c["id"]] in (90, 270):
+            w, h = h, w
+        k = min(VIEW_BOX[0] / w, VIEW_BOX[1] / h)
+        vw, vh = int(w * k) // 2 * 2, int(h * k) // 2 * 2
+        self.preview.get_by_name("viewcaps").set_property("caps", Gst.Caps.from_string(
+            "video/x-raw(memory:GLMemory),format=RGBA,width=%d,height=%d" % (vw, vh)))
 
     def start_preview(self, refocus=True):
         self.configure_preview()
@@ -845,7 +920,14 @@ class CameraApp(Gtk.Window):
         self.show_flash()
         self.apply_torch()
         path = self.af_stats_path()
-        self.hw_af = bool(path and os.path.exists(path))
+        self.hw_stats = bool(path and os.path.exists(path))
+        # Focus from the hardware statistics only on the software-ISP path.
+        # Their filters see the raw sensor noise: in dim light, at high gain,
+        # a focus peak the image shows at 2.6x is a 15% bump on a noise floor
+        # there (measured, lens swept on a still scene), too weak to find.
+        # The hardware-ISP preview is full-size demosaiced YUYV, so the
+        # image's own gradient (sharpness()) is the better signal.
+        self.hw_af = self.hw_stats and not HW_ISP
         if self.hw_af and not self.hw_timer:
             self.hw_last = -1
             self.hw_timer = GLib.timeout_add(AF_HW_POLL_MS, self.poll_hw_af)
@@ -862,10 +944,9 @@ class CameraApp(Gtk.Window):
     def show_flash(self):
         rear = CAMERAS[self.cam]["focus"]
         self.flash_btn.set_visible(rear)
-        self.flash_btn.set_label({"off": "⚡ Off", "auto": "⚡ Auto", "on": "⚡ On",
+        self.flash_btn.set_label({"off": "Off", "auto": "Auto", "on": "On",
                                   "torch": "Torch"}[self.flash_mode])
-        ctx = self.flash_btn.get_style_context()
-        (ctx.add_class if self.flash_mode != "off" else ctx.remove_class)("lit")
+        self.flash_btn.set_kind("suggested" if self.flash_mode != "off" else "")
 
     def cycle_flash(self):
         if self.busy:
@@ -975,15 +1056,19 @@ class CameraApp(Gtk.Window):
         if self.af.state == "track" and self.af_count % AF_TRACK_EVERY:
             return Gst.FlowReturn.OK
         buf = sample.get_buffer()
+        s = sample.get_caps().get_structure(0)
+        fw, fh = s.get_value("width"), s.get_value("height")
         ok, info = buf.map(Gst.MapFlags.READ)
         if not ok:
             return Gst.FlowReturn.OK
         try:
-            value = sharpness(info.data, PREVIEW[0], PREVIEW[1], self.af.region)
+            value = sharpness(info.data, fw, fh, self.af.region)
         finally:
             buf.unmap(info)
         pts = buf.pts if buf.pts != Gst.CLOCK_TIME_NONE else None
-        GLib.idle_add(self.af_sample, pts, value)
+        # default priority, not idle: a playing video widget keeps a redraw
+        # (priority 120) pending, and idle sources (200) would never run
+        GLib.idle_add(self.af_sample, pts, value, priority=GLib.PRIORITY_DEFAULT)
         return Gst.FlowReturn.OK
 
     def af_sample(self, pts, value):
@@ -1036,9 +1121,7 @@ class CameraApp(Gtk.Window):
         else:
             self.set_status("Focused", 800)
         self.focus = pos
-        self.syncing = True
-        self.focus_scale.set_value(pos)
-        self.syncing = False
+        self.focus_slider.set_value(pos, notify=False)
         self.save_state()
         if self.assist:
             # focused in the dark: hold, tracking would keep re-lighting
@@ -1050,36 +1133,25 @@ class CameraApp(Gtk.Window):
         if c["focus"]:
             subdev_ctrl(c["sysdir"], V4L2_CID_FOCUS_ABSOLUTE, int(pos))
         if self.af.state in ("sweep", "fine", "settle", "hold"):
-            self.syncing = True
-            self.focus_scale.set_value(pos)
-            self.syncing = False
+            self.focus_slider.set_value(pos, notify=False)
 
-    def on_focus(self, scale):
-        if self.syncing:
-            return
+    def on_focus(self, slider, value):
         self.af.stop(manual=True)
         self.assist_off()
         self.show_af_mode()
-        self.focus = int(scale.get_value())
+        self.focus = int(value)
         self.set_lens(self.focus)
         self.save_state()
 
-    def on_tap(self, widget, ev):
+    def on_tap(self, tx, ty):
         """tap to focus: map the tap to the unrotated frame"""
         c = CAMERAS[self.cam]
         if not c["focus"] or self.busy:
             return False
-        alloc = widget.get_allocation()
         rot = self.rotation[c["id"]]
-        aspect = PREVIEW[0] / PREVIEW[1]
-        if rot in (90, 270):
-            aspect = 1 / aspect
-        if alloc.width / alloc.height > aspect:
-            dh, dw = alloc.height, alloc.height * aspect
-        else:
-            dw, dh = alloc.width, alloc.width / aspect
-        u = (ev.x - (alloc.width - dw) / 2) / dw
-        v = (ev.y - (alloc.height - dh) / 2) / dh
+        x0, y0, dw, dh = self.view.placed()
+        u = (tx - x0) / dw
+        v = (ty - y0) / dh
         if not (0 <= u <= 1 and 0 <= v <= 1):
             return False
         if c["mirror"]:
@@ -1117,7 +1189,7 @@ class CameraApp(Gtk.Window):
         self.af_before_photo = "hold" if self.assist else self.af.state
         self.busy = True
         self.shutter.set_sensitive(False)
-        if flash and self.hw_af and self.meter_start():
+        if flash and self.hw_stats and self.meter_start():
             return                          # capture() follows the metering
         self.capture(FLASH_PHOTO_LEVEL if flash else None)
 
@@ -1139,6 +1211,7 @@ class CameraApp(Gtk.Window):
         if not amb or not e or not g:
             return False
         self.set_status("Metering…")
+        self.meter_log = "no measurement"
         self.assist_off()
         ny, nx = amb[1].shape
         yy, xx = np.mgrid[0:ny, 0:nx]
@@ -1158,8 +1231,16 @@ class CameraApp(Gtk.Window):
         Gst.util_set_object_arg(src, "analogue-gain-mode", "manual")
         src.set_property("exposure-time", int(us))
         src.set_property("analogue-gain", 1.0)
+        lines = round(us / LINE_US)
+        if HW_ISP:
+            # YUYV passthrough runs no software ISP, so libcamera's manual
+            # exposure goes nowhere: set the sensor directly. The driver's
+            # AE loop sees the manual write and backs off for this stream.
+            c = CAMERAS[self.cam]
+            subdev_ctrl(c["sysdir"], V4L2_CID_EXPOSURE, lines)
+            subdev_ctrl(c["sysdir"], V4L2_CID_ANALOGUE_GAIN, 128)
         # libcamera applies it a few requests later: wait for the sensor
-        self.meter.update(us=us, lines=round(us / LINE_US), frame=None)
+        self.meter.update(us=us, lines=lines, frame=None)
 
     def meter_tick(self):
         """wait for the exposure to reach the sensor, then METER_SETTLE frames
@@ -1199,6 +1280,7 @@ class CameraApp(Gtk.Window):
                 self.meter_set(min(METER_MAX_US, m["us"] * 8))
                 return True
         level, exposure = self.meter_result(st[1] if st else None)
+        print("meter: %s" % getattr(self, "meter_log", "no measurement"), file=sys.stderr, flush=True)
         # the preview goes back to auto exposure when it restarts
         src = self.preview.get_by_name("src")
         Gst.util_set_object_arg(src, "exposure-time-mode", "auto")
@@ -1256,22 +1338,46 @@ class CameraApp(Gtk.Window):
         self.stop_preview()
 
         c = CAMERAS[self.cam]
-        w, h = c["still"]
+        # Hardware ISP: the DIP delivers finished YUYV at the sensor-mode size,
+        # so the still skips the slow GPU software debayer (~4 s -> tens of ms).
+        # The size must be the mode's own size (the driver only has a DIP tile
+        # list for that); the software-ISP path keeps its cropped "still" size.
+        # A manual exposure (flash) makes the driver's in-kernel AE loop back
+        # off for this stream, so it does not fight the metered value.
+        if HW_ISP:
+            w, h = c["hwstill"]
+            still_fmt = "YUY2"
+        else:
+            w, h = c["still"]
+            still_fmt = "BGRx"
         manual = ""
         if exposure:
             manual = (" exposure-time-mode=manual analogue-gain-mode=manual "
                       "exposure-time=%d analogue-gain=%.3f" % (exposure[0] * LINE_US, exposure[1]))
-        self.still_settle = FLASH_SETTLE_FRAMES if exposure else SETTLE_FRAMES
+            if HW_ISP:
+                # set before the still stream starts (the preview has
+                # stopped): the driver applies it at stream on and keeps its
+                # AE loop off until this stream stops
+                subdev_ctrl(c["sysdir"], V4L2_CID_EXPOSURE, int(exposure[0]))
+                subdev_ctrl(c["sysdir"], V4L2_CID_ANALOGUE_GAIN, round(exposure[1] * 128))
+        if exposure:
+            self.still_settle = FLASH_SETTLE_FRAMES
+        else:
+            self.still_settle = HW_SETTLE_FRAMES if HW_ISP else SETTLE_FRAMES
+        # raw frames to an appsink: the burst is scored for sharpness there
+        # and only the sharpest is rotated and encoded (encode_still)
         desc = ("libcamerasrc name=src camera-name=\"%s\"%s ! "
-                "video/x-raw,format=BGRx,width=%d,height=%d ! "
-                "identity name=gate ! videoflip video-direction=%s ! videoconvert ! "
-                "jpegenc quality=%d ! appsink name=out emit-signals=true sync=false "
-                "max-buffers=1 drop=true"
-                % (c["id"], manual, w, h, video_direction(self.rotation[c["id"]], False),
-                   JPEG_QUALITY))
+                "video/x-raw,format=%s,width=%d,height=%d ! "
+                "identity name=gate ! appsink name=out emit-signals=true sync=false "
+                "max-buffers=2 drop=false"
+                % (c["id"], manual, still_fmt, w, h))
         self.still = Gst.parse_launch(desc)
         self.still_frames = 0
         self.still_done = False
+        self.still_scores = []
+        self.still_best = (-1.0, None, None)
+        self.still_region = self.af.region if c["focus"] else (0.5, 0.5)
+        self.still_direction = video_direction(self.rotation[c["id"]], False)
         # skip the frames auto exposure needs to settle
         self.still.get_by_name("gate").get_static_pad("src").add_probe(
             Gst.PadProbeType.BUFFER, self.on_still_buffer)
@@ -1288,24 +1394,90 @@ class CameraApp(Gtk.Window):
             self.finish_photo(None, "Camera not available")
 
     def on_still_buffer(self, pad, info):
+        """let through the STILL_BURST frames after the settle frames"""
         self.still_frames += 1
-        if self.still_frames <= self.still_settle or self.still_done:
+        if (self.still_frames <= self.still_settle or
+                self.still_frames > self.still_settle + STILL_BURST):
             return Gst.PadProbeReturn.DROP
-        self.still_done = True
         return Gst.PadProbeReturn.OK
 
     def on_still_sample(self, sink):
+        """the still's streaming thread: score each burst frame for
+        sharpness (shake blurs the whole frame; the focus region is where it
+        matters), keep a copy of the best, and when the burst is in, stop the
+        camera and encode that one"""
         sample = sink.emit("pull-sample")
+        if self.still_done:
+            return Gst.FlowReturn.OK
+        st = sample.get_caps().get_structure(0)
         buf = sample.get_buffer()
         ok, info = buf.map(Gst.MapFlags.READ)
-        data = bytes(info.data) if ok else None
         if ok:
-            buf.unmap(info)
-        GLib.idle_add(self.save_photo, data)
+            try:
+                score = sharpness(info.data, st.get_value("width"), st.get_value("height"),
+                                  self.still_region)
+                self.still_scores.append(score)
+                if score > self.still_best[0]:
+                    self.still_best = (score, bytes(info.data), sample.get_caps())
+            finally:
+                buf.unmap(info)
+        if len(self.still_scores) >= STILL_BURST:
+            self.still_done = True
+            GLib.idle_add(self.still_collected, priority=GLib.PRIORITY_DEFAULT)
         return Gst.FlowReturn.OK
+
+    def still_collected(self):
+        """main thread: the burst is in; free the camera and the flash now,
+        encode the sharpest frame off the main thread"""
+        if not self.busy:
+            return False
+        if self.still:
+            self.still.set_state(Gst.State.NULL)
+            self.still.get_bus().remove_signal_watch()
+            self.still = None
+        if self.flash_mode != "torch":
+            self.flash.off()
+        sc = self.still_scores
+        print("still: sharpness %s, kept %d (%.0f%% of the burst's worst)" % (
+            " ".join("%.3f" % x for x in sc), sc.index(max(sc)),
+            100.0 * max(sc) / max(min(sc), 1e-9)), file=sys.stderr, flush=True)
+        _, data, caps = self.still_best
+        self.still_best = (-1.0, None, None)
+        self.set_status("Saving…")
+        threading.Thread(target=self.encode_still, args=(data, caps, self.still_direction),
+                         daemon=True).start()
+        return False
+
+    def encode_still(self, data, caps, direction):
+        """worker thread: rotate and JPEG-encode one raw frame"""
+        jpeg = None
+        try:
+            p = Gst.parse_launch(
+                "appsrc name=src ! videoflip video-direction=%s ! videoconvert ! "
+                "jpegenc quality=%d ! appsink name=out sync=false" % (direction, JPEG_QUALITY))
+            src = p.get_by_name("src")
+            src.set_property("caps", caps)
+            src.set_property("format", Gst.Format.TIME)
+            p.set_state(Gst.State.PLAYING)
+            src.emit("push-buffer", Gst.Buffer.new_wrapped(data))
+            src.emit("end-of-stream")
+            sample = p.get_by_name("out").emit("try-pull-sample", 15 * Gst.SECOND)
+            if sample:
+                buf = sample.get_buffer()
+                ok, info = buf.map(Gst.MapFlags.READ)
+                if ok:
+                    jpeg = bytes(info.data)
+                    buf.unmap(info)
+            p.set_state(Gst.State.NULL)
+        except GLib.Error as e:
+            print("still: encode failed: %s" % e, file=sys.stderr, flush=True)
+        GLib.idle_add(self.save_photo, jpeg, priority=GLib.PRIORITY_DEFAULT)
 
     def save_photo(self, data):
         if not self.busy:
+            return False
+        if data is None:
+            self.finish_photo(None, "Photo failed")
             return False
         path, err = None, None
         try:
@@ -1377,7 +1549,7 @@ class CameraApp(Gtk.Window):
             buf.unmap(info)
         for text in codes:
             if text:
-                GLib.idle_add(self.qr_found, text)
+                GLib.idle_add(self.qr_found, text, priority=GLib.PRIORITY_DEFAULT)
         return Gst.FlowReturn.OK
 
     @staticmethod
@@ -1403,14 +1575,11 @@ class CameraApp(Gtk.Window):
         if chip is None:
             chip = self.qr_chip(text)
             self.qr_chips[text] = chip
-            self.qr_box.pack_start(chip, False, False, 0)
-            self.qr_box.reorder_child(chip, 0)              # newest at the top
-            chip.show_all()
+            self.qr_box.prepend(chip)                       # newest at the top
             while len(self.qr_chips) > QR_MAX:
-                self.qr_dismiss(self.qr_box.get_children()[-1])     # the oldest
+                self.qr_dismiss(self.qr_box.get_last_child())       # the oldest
             vibrate(QR_BUZZ)
-        ctx = chip.get_style_context()
-        ctx.add_class("fresh")
+        chip.add_css_class("fresh")
         if getattr(chip, "fresh_timer", 0):
             GLib.source_remove(chip.fresh_timer)
         chip.fresh_timer = GLib.timeout_add(QR_FRESH_MS, self.qr_unfresh, chip)
@@ -1418,41 +1587,36 @@ class CameraApp(Gtk.Window):
 
     def qr_unfresh(self, chip):
         chip.fresh_timer = 0
-        chip.get_style_context().remove_class("fresh")
+        chip.remove_css_class("fresh")
         return False
 
     def qr_chip(self, text):
         kind, shown, url = self.qr_describe(text)
         chip = Gtk.Box(spacing=8)
-        chip.get_style_context().add_class("qr")
+        chip.add_css_class("qr")
         chip.qr_text = text
         chip.fresh_timer = 0
-        badge = Gtk.Label(label="QR \u00b7 " + kind)
-        badge.get_style_context().add_class("qrkind")
+        badge = ui.label("QR \u00b7 " + kind, "qrkind")
         badge.set_valign(Gtk.Align.CENTER)
-        chip.pack_start(badge, False, False, 0)
-        label = Gtk.Label(label=shown, xalign=0)
-        label.get_style_context().add_class("qrtext")
-        label.set_ellipsize(Pango.EllipsizeMode.END)
-        label.set_line_wrap(True)
-        label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        label.set_lines(2)
-        label.set_tooltip_text(text)
-        chip.pack_start(label, True, True, 0)
+        chip.append(badge)
+        lab = ui.label(shown, "qrtext", wrap=True, ellipsize=True)
+        lab.set_lines(2)
+        lab.set_tooltip_text(text)
+        lab.set_hexpand(True)
+        chip.append(lab)
         if url:
-            b = Gtk.Button(label="Open")
+            b = ui.GlassButton("Open", height=42, size=15, kind="suggested")
             b.set_valign(Gtk.Align.CENTER)
             b.connect("clicked", lambda b: self.qr_open(url))
-            chip.pack_start(b, False, False, 0)
-        b = Gtk.Button(label="Copy")
+            chip.append(b)
+        b = ui.GlassButton("Copy", height=42, size=15)
         b.set_valign(Gtk.Align.CENTER)
         b.connect("clicked", lambda b: self.qr_copy(text))
-        chip.pack_start(b, False, False, 0)
-        b = Gtk.Button()
-        b.set_image(Gtk.Image.new_from_icon_name("window-close-symbolic", Gtk.IconSize.BUTTON))
+        chip.append(b)
+        b = ui.GlassButton(icon=ui.ICONS["close"], height=42)
         b.set_valign(Gtk.Align.CENTER)
         b.connect("clicked", lambda b: self.qr_dismiss(chip))
-        chip.pack_start(b, False, False, 0)
+        chip.append(b)
         return chip
 
     def qr_dismiss(self, chip):
@@ -1460,12 +1624,10 @@ class CameraApp(Gtk.Window):
             GLib.source_remove(chip.fresh_timer)
         self.qr_chips.pop(chip.qr_text, None)
         self.qr_box.remove(chip)
-        chip.destroy()
 
     def qr_copy(self, text):
-        clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        clip.set_text(text, -1)
-        clip.store()
+        self.get_clipboard().set_content(Gdk.ContentProvider.new_for_bytes(
+            "text/plain;charset=utf-8", GLib.Bytes.new(text.encode())))
         self.set_status("Copied", 1000)
 
     def qr_open(self, url):
@@ -1483,29 +1645,31 @@ class CameraApp(Gtk.Window):
         pix = None
         if self.last_photo and os.path.exists(self.last_photo):
             try:
-                pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(self.last_photo, 64, 64, True)
+                pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(self.last_photo, 60, 60, True)
             except GLib.Error:
                 pix = None
         if pix:
-            self.thumb.set_image(Gtk.Image.new_from_pixbuf(pix))
+            pic = Gtk.Picture.new_for_paintable(Gdk.Texture.new_for_pixbuf(pix))
+            pic.set_content_fit(Gtk.ContentFit.COVER)
+            pic.set_size_request(60, 60)
+            pic.set_overflow(Gtk.Overflow.HIDDEN)
+            self.thumb.set_child(pic)
             self.thumb.set_sensitive(True)
         else:
-            img = Gtk.Image.new_from_icon_name("image-x-generic-symbolic", Gtk.IconSize.BUTTON)
-            img.set_pixel_size(30)
-            self.thumb.set_image(img)
+            self.thumb.set_child(Gtk.Image.new_from_icon_name("image-x-generic-symbolic"))
             self.thumb.set_sensitive(False)
 
     def on_thumb(self, btn):
         if self.busy or not self.last_photo:
             return
-        alloc = self.get_allocation()
         try:
             pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                self.last_photo, alloc.width, alloc.height, True)
+                self.last_photo, self.get_width(), self.get_height(), True)
         except GLib.Error:
             return
-        self.photo_img.set_from_pixbuf(pix)
+        self.photo_img.set_paintable(Gdk.Texture.new_for_pixbuf(pix))
         self.stop_preview()
+        self.view.clear()
         self.stack.set_visible_child_name("photo")
 
     def show_camera(self):
@@ -1515,15 +1679,13 @@ class CameraApp(Gtk.Window):
 
     # ---- keys, quit ----
 
-    def on_key(self, win, ev):
-        name = Gdk.keyval_name(ev.keyval) or ""
+    def on_key(self, ctl, keyval, code, state):
+        name = Gdk.keyval_name(keyval) or ""
         if self.stack.get_visible_child_name() == "photo":
             self.show_camera()
             return True
         if name in ("space", "Return", "KP_Enter"):
             self.take_photo()
-        elif name in ("Escape", "XF86Back"):     # the back button's key
-            self.destroy()
         elif name in ("f", "F"):
             self.switch_camera()
         elif name in ("r", "R"):
@@ -1542,27 +1704,16 @@ class CameraApp(Gtk.Window):
             self.still.set_state(Gst.State.NULL)
         if self.preview:
             self.preview.set_state(Gst.State.NULL)
-        Gtk.main_quit()
+        return False
 
 
-def main():
-    Gst.init(None)
-    lock = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
-                             "titan-camera-gui.lock"), "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return
-    win = CameraApp()
+def build(app):
+    win = CameraApp(app)
     for sig in (2, 15, 1):      # SIGINT, SIGTERM, SIGHUP: release the camera
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda w=win: w.destroy() or False)
-    titan_ui.install(win)
-    win.show_all()
-    win.status.hide()
-    win.focus_row.set_visible(CAMERAS[win.cam]["focus"])
-    win.maximize()
-    Gtk.main()
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda w=win: w.close() or False)
+    return win
 
 
 if __name__ == "__main__":
-    main()
+    Gst.init(None)
+    sys.exit(ui.run("org.titanpocket.camera", build, lock="titan-camera-gui"))

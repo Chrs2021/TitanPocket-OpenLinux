@@ -443,12 +443,14 @@ On 2026-10-18 the flash and the torch stopped. The kernel logged
 
 ## The Camera app (titan-camera-gui)
 
-`userspace/debian/overlay/usr/local/bin/titan-camera-gui` (Python, GTK 3,
-GStreamer), **Camera** in the app drawer.
+`userspace/debian/overlay/usr/local/bin/titan-camera-gui` (Python, GTK 4 and
+`titan_ui4` since 2026-10-28, GStreamer), **Camera** in the app drawer.
 
-- **Preview:** `libcamerasrc` at 960×720, rotated (mirrored for the front
-  camera) by `glvideoflip` and shown by `gtkglsink`, so after the ISP
-  everything stays on the GPU.
+- **Preview:** `libcamerasrc`, converted, rotated (mirrored for the front
+  camera) by `glvideoflip` and scaled to about the screen by `glcolorscale`
+  on the GPU. GTK 3 showed it with `gtkglsink`; GTK 4 has no GStreamer GL
+  sink in Debian 12, so the small frame is downloaded by an appsink and
+  drawn as a texture (~30 fps, see desktop.md).
 - **Photo:** one stream at a time, so the shutter stops the preview, runs
   the camera at its largest RGB size (rear 4668×3504 from the sensor's
   full-resolution mode, front 3260×2448: the OV8865's full mode), drops
@@ -766,7 +768,511 @@ a lit scene.
    CAMSV, ✅ used by the Camera app (see "AF statistics in the driver").
    ✅ SGG1's gain follows the scene brightness (below). Open: checking
    the focus curve on a lit scene under libcamera's auto exposure.
-3. OBC, LSC (tables from `libCamera_ov16880mipiraw_*.so`), RPG, and the AA
-   statistics for exposure and white balance; the rear 4672×3504 mode.
-4. Pass 2 (DIP) with the stock tuning.
+3. ✅ The processed path and ✅ OBC, ✅ AA statistics (see "Pass 1
+   processing" below). Open: LSC (tables from
+   `libCamera_ov16880mipiraw_*.so`), BNR, RPG (needs RRZO, parked), the
+   rear 4672×3504 mode.
+4. Pass 2 (DIP) with the stock tuning: frame mode (no tiles) first.
 
+### Pass 1 processing (2026-10-26)
+
+`titan_camcap` options, all on top of `p1=1`:
+
+| option | what |
+|---|---|
+| `p1proc=1` | IMGO after the raw blocks instead of pure raw |
+| `p1obc=1` | black level (OBC) |
+| `p1aa=1` (`p1aanx`, `p1aany`) | AE/AWB block statistics through AAO, `/sys/kernel/debug/titan_camcap_aao` |
+| `p1wb=R,G,B` | RPG white-balance gains (512 = 1×) |
+| `p1rrz=1` | resizer branch RRZ → RRZO (not producing output yet) |
+| `p1img=N` | IMGO tap (CTL_SEL IMG_SEL) |
+| `p1regs=off,val,...` | raw CAM A writes before start, for experiments |
+
+The enables come from the HAL: each `ISP_MGR_*::apply` in
+`libcam.hal3a.v3.so` (Ghidra: `out/camera/re/ispmgr.c`) passes a tuning
+function to `TuningMgrImp::enableEngine` and sets the same bit in
+`ISP_MGR_CTL_EN_P1`, which mirrors `CTL_EN`
+(`tools/re/ispmgr_engines.sh`):
+
+| CTL_EN bit | block | | CTL_EN bit | block |
+|---|---|---|---|---|
+| 0 | TG | | 11 | RMX (resizer mux) |
+| 1 | DMX | | 13 | BMX |
+| 3 | RMG | | 15 | PAK (IMGO packer) |
+| 4 | RMM | | 17 | AF |
+| 5 | OBC | | 18 | SGG1 |
+| 6 | BNR (+ BPCI) | | 19 | AA (+ AAO) |
+| 7 | LSC (+ LSCI) | | 21 | LCS |
+| 9 | RPG | | 23 | RCP |
+| 10 | RRZ | | 26, 28 | SL2F, DBS |
+
+DMA enables (`CTL_DMA_EN`, HAL `DMAO_B::_enable`): IMGO 0, UFEO 1, RRZO 2,
+AFO 3, AAO 5. The DMA ports sit 0x30 apart: IMGO 0x1020, RRZO 0x1050,
+AAO 0x1080, AFO 0x10b0; error status from 0x1360, one word each.
+
+- **Processed path:** `CTL_SEL` = 0x07025010 (HAL `Path_sel_RAW`; bits
+  25:24 are IMG_SEL: 2 pure raw from the TG, 0 before LSC, 3 after LSC;
+  bit 19 forces pure raw) and the packer (`CTL_EN` bit 15). Without the
+  packer IMGO reports error 0x8280 and writes nothing. BMX and RCP aren't
+  needed for IMGO.
+- **DMX SRAM size:** `DMX_CTL` bits 15:0 must hold the DMX SRAM size
+  (0x1b0, `capibility::GetXMXSramSize` in `libimageio_plat_drv.so`). Left
+  at 0, the processed path drops the last 640 of every 4096 pixels (a
+  fixed pattern lands there) — in packed RAW10 that looked like diagonal
+  stripes. Packed RAW10/12 then decode as MediaTek's little-endian bit
+  stream.
+- **OBC:** `OFFST0..3` (0x3f0) are 13-bit two's complement on a 12-bit
+  scale, `GAIN0..3` (0x400) 13 bit with 512 = 1×. The stock tables
+  (`libCamera_<sensor>_Scene_Preview.so`, symbols `..._OBC_0020..0039`
+  per ISO) give OV16880 0x1f00/0x222 (black 64 in RAW10) and OV8865
+  0x1fbc/0x209 (black 17): gain = 512·4095/(4095 − 4·black). The HAL also
+  folds the ISP digital gain into GAIN. Measured: the black floor goes to
+  0 on both cameras.
+- **RPG** (0x4c0: `SATU` 0x0fff0fff, `GAIN_1` = B | Gb << 16, `GAIN_2` =
+  Gr | R << 16, `OFST` 0) has no effect on IMGO at any tap: it feeds the
+  resizer branch only.
+- **RRZ/RRZO:** enabling RRZ (`CTL_EN` bit 10) stalls the whole pipe
+  unless `CAM_UNI_TOP_MOD_EN` (0x1a003010) bit 29, the resizer's line
+  buffer, is set (HAL `PIPE_CHECK::RRZ_CHECK`: "can't enable rrz without
+  RLB"). CAM_UNI reads 0 and ignores writes while CAM is powered off.
+  With RLB on, frames run but RRZO (port 62, DMA bit 2) still writes
+  nothing.
+- **AA statistics:** AWB window registers 0x830 (origin, block size,
+  pitch, count), pre-gain 0x840/0x844 (512 = 1×), limits, low/high
+  thresholds, and **`PIXEL_CNT` 0x858–0x860 = 2²⁴ / pixels of that colour
+  per block** (left 0, every average is 0); the HAL's fixed 0x8c4/0x8cc =
+  0x200, 0x8d4 = 0x90200; a copy at 0xbd0. AAO: port 63, FIFO
+  0x80000080/0x00200020/0x00100010. With the AE registers (0x900–0x970)
+  left 0, each block row is nx × {R, G, B, 0x0f} 8-bit averages followed
+  by nx 8-bit luma values. Against block means of the same IMGO frame:
+  correlation 0.96 for R, G, B and Y. (The HAL's AE setup makes it 22
+  bytes per block, plus histograms.)
+
+**Pass 2 (DIP)** is at 0x15022000 (0x6000, IRQ 268, imgsys power domain,
+larb5). `libdip_postproc.so`'s `DIP_ISP_PIPE::configTpipeData` writes the
+tile registers 0x50–0x5c/0xe0 only when the tile engine
+(`tpipe_main_platform` in `libdpframework.so`) is used; otherwise it
+writes `TDR_CTL` 0x50 = 0, frame mode. The pass-2 tuning managers
+(`ISP_MGR_CCM`, `GGM`, `UDM`, `G2C`, `PGN` ...) write offset/value lists
+into the DIP register file, which gives its layout.
+
+DIP map so far (all offsets from 0x15022000; the named control bits are
+in `out/camera/re/dip_ctl_bits.txt`, derived from
+`DIP_ISP_PIPE::configTpipeData`, which copies register bits into the tile
+config struct, and `dumpIspTPipeInfo`, which prints that struct's field
+names):
+
+| reg | contents |
+|---|---|
+| 0x000 `CTL_START` | bit *n* starts command-queue thread *n* (base at 0x208 + n·stride) |
+| 0x004 `YUV_EN` | C24 2, G2C (RGB→YUV) 3, C42 4, NBC 5, NBC2 6, PCA 7, SEEE 8, NR3D 10, CRZ 17 |
+| 0x00c `RGB_EN` | UNP 0, PGN (WB gain) 2, SL2 3, UDM (demosaic) 4, LCE 5, G2G (CCM) 6, GGM (gamma) 7, OBC2 11, BNR2 13, LSC2 15, RNR 18 |
+| 0x010 `DMA_EN` | IMGI 0, IMGBI 1, IMGCI 2, UFDI 3, VIPI 4, LCEI 7, DMGI 9, IMG2O 11, IMG3O 13, FEO 16 |
+| 0x014 `FMT_SEL` | input format 3:0, VIPI 12:8, IMG3O 21:20, IMG2O 24, Bayer order 29:28 |
+| 0x018 `PATH_SEL` | G2G 1:0, PGN 2, G2C 4, CRZ 13:12, MDP 15, GGM 21, IMGI 22 |
+| 0x050–0x05c, 0x0e0 | tiles (TDR); 0x050 = 0 is frame mode |
+
+DMA ports (base, +8 offset, +0x10 xsize, +0x14 ysize, +0x18 stride):
+inputs IMGI 0x500, IMGBI 0x530, IMGCI 0x560, VIPI 0x590, VIP2I 0x5c0,
+VIP3I 0x5f0, DMGI 0x620, DEPI 0x650, LCEI 0x680, UFDI 0x6b0; outputs
+IMG2O 0x330, IMG2BO 0x360, IMG3O 0x390, IMG3BO 0x3c0, IMG3CO 0x3f0,
+FEO 0x420, PAK2O 0x450 (names from the `DIP_DMA` id table). Processing
+blocks (from the managers' register lists): OBC2 0x11c0, BNR2 0x1240,
+PGN ~0x1440, UDM 0x1544, CCM 0x2080, LCE 0x2100, GGM 0x2184–0x2480, G2C
+0x3244, SEEE 0x46c4, NBC2 0x4800.
+
+**`titan_dip` (`modules/camera/dip/`, 2026-10-26)** powers the imgsys
+domain (`SCP_SYS_ISP`, `img_sel`, `IMG_LARB5`, `IMG_DIP`, larb5), maps
+IMGI/IMG3O through the IOMMU (ports 36/38) and runs one frame from
+debugfs (`titan_dip_in` → `titan_dip_run` → `titan_dip_out`, plus
+`titan_dip_tdr` for a tile list and `titan_dip_poke`). Status:
+
+- Writing `CTL_START` bit 0 with the command-queue thread disabled runs a
+  frame from the directly written registers; IMGI fetches (an unmapped
+  base faults on port CAM_IMGI), IMG3O writes, G2C runs. A YUV passthrough
+  (`PATH_SEL` bit 10) carries real input bytes to IMG3O.
+- The DIP line buffer is about 900 bytes of RAW10, so a 1632-wide frame
+  needs tiles. `tools/re/emu_tile.py` runs the stock tile engine
+  (`tile_main_platform` in `libdpframework.so`) in Unicorn from a config
+  written by field name (`out/camera/re/tile_cfg_fields.txt`) and prints
+  its tile list (TDR) with the engine's own decoder: 3 tiles of 16 words
+  for 1632×1224 (edges, per-tile module enables, IMGI/IMG3O offsets and
+  sizes, `UNP_OFST`, UDM/C42 tile edges, G2C shading).
+
+### First light through the DIP (2026-10-26)
+
+`titan_dip` turns a pass-1 frame (`titan_camcap p1proc=1 p1obc=1`) into
+YUYV on the hardware: **UNP → PGN (white balance) → UDM (demosaic) → G2G
+(colour matrix) → GGM (gamma) → G2C (RGB→YUV) → C42 → IMG3O**, the full
+1632×1224 frame in 3 tiles, a few milliseconds per frame:
+
+```sh
+insmod titan_dip.ko wb=610,512,1347              # PGN gains R, G, B (512 = 1x)
+cat f.raw > /sys/kernel/debug/titan_dip_in        # processed RAW10, stride 2048
+echo 1 > /sys/kernel/debug/titan_dip_run
+cat /sys/kernel/debug/titan_dip_out > f.yuyv
+```
+
+The register values came from running the **stock HAL in an emulator**:
+`tools/re/emu_hal.py` loads several Android libraries into one Unicorn
+address space (APS2-packed and RELR relocations, cross-library linking,
+static constructors, shims for libc/logging/properties/ION and a fake
+`/dev/camera-dip`), and `tools/re/emu_dip_config.py` drives
+`libdip_postproc.so`'s `PostProcPipe` through `createInstance`, `init`,
+`queryCQ` (takes a DIP working buffer), `configPipe` and `start` with a
+fake `FrameParams` (input/output `android::Vector`s of 0x20-byte port
+entries), fake `IImageBuffer` objects (vtable: 0x28 format, 0x30 size,
+0x48 plane count, 0xe0 PA, 0xe8 VA, 0xf0 size, 0xf8 stride) and a p2
+tuning register image at `PipePackageInfo` + 0x28 (the HAL takes every
+module enable and parameter from it). The register image it leaves in the
+working buffer is what the hardware needs:
+
+| register | value | |
+|---|---|---|
+| `PATH_SEL` 0x18 | 0x16040 | srz1_sel 1, crz_sel 2, nr3d_sel 1, fe_sel 1 |
+| `MISC_SEL` 0x1c | 0x249010 | |
+| `TDR_CTL` 0x50, 0x54 | 0xb, 0 | tiles |
+| TCM 0x58, 0x5c, 0xe0 | 0x08182002, 0x100, 0 | which registers the tile words go to; wrong values make the tile loader overwrite the control registers |
+| `IMGI_STRIDE` 0x518 | stride \| 0x40010000 | |
+| `IMG3O_STRIDE` 0x3a8 | stride \| 0x01910000 | format_en, YUY2, bus size |
+| 0x3040 | 0xf0 | always |
+| `FMT_SEL` 0x14 | 9 | packed RAW10; the reset value's bit 31 makes IMGI fetch a second plane from 0 |
+
+Two findings decided it:
+
+- **GGM is not optional.** With gamma disabled the RGB path outputs zeros
+  (that was every earlier black frame). Its table: 192 words at 0x2180,
+  each B | G << 10 | R << 20 (10 bit), control 0x2480 = 0x100307fe; the
+  stock curve is `ov8865mipiraw_GMA_0001`.
+- The G2C offsets are 0: the output already centres U/V at 128 (offsets
+  of 128 come out as +32, a magenta cast).
+
+`CTL_START` bit 0 with command-queue thread 0 disabled runs the frame
+from the directly written registers (the HAL loads them through the
+command queue; not needed here). Defaults in `titan_dip` are the HAL's;
+the 1632×1224 tile list is built in, other sizes take one through
+`titan_dip_tdr`.
+
+### Rear camera through the DIP (2026-10-26)
+
+Both rear modes run, with the OV16880's own tuning:
+
+| mode | input | tiles | DIP time |
+|---|---|---|---|
+| 2336×1752 | pass 1 processed + OBC (`titan_camcap cam=0 p1=1 p1fmt=9 p1proc=1 p1obc=1`), stride 2928 | 4 | ~5 ms |
+| 4672×3504 | CAMSV raw in 2-pixel mode (`titan_camcap cam=0 mode=1`), stride 5840; black level in the DIP | 7 | ~16-30 ms |
+
+```sh
+insmod titan_dip.ko width=2336 height=1752 stride=2928 sensor=0 wb=602,512,1102
+insmod titan_dip.ko width=4672 height=3504 stride=5840 sensor=0 black=64 wb=678,512,879
+```
+
+- **Per-sensor tuning** (`sensor=0` rear, `1` front) is in
+  `modules/camera/dip/dip_tuning.h`, generated from the stock tables:
+  UDM (`ov16880mipiraw_UDM_0040`, `ov8865mipiraw_UDM_0080`), the first
+  CCM of `..._CCM_0000`/`..._CCM_0001` (capture library), and
+  `..._GMA_0001`; noise reduction (NBC) from the stock `ISP_MGR_NBC::apply`
+  run in emulation. Generated values stay local like the other
+  vendor-derived tables: the repository's `dip_tuning.h` is a placeholder
+  with neutral values (identity colour matrix, straight gamma, no noise
+  reduction), so the drivers build and run untuned. **Generate the real
+  one from your own phone's libraries** (2026-10-29):
+
+  ```sh
+  modules/camera/tools/gen-dip-tuning.py --vendor VENDOR/lib64 --system SYSTEM/lib64
+  ```
+
+  `VENDOR/lib64` and `SYSTEM/lib64` are the vendor and system partitions'
+  library folders from your phone's firmware. The demosaic, colour and
+  gamma tables are read straight from the libraries' symbols; noise
+  reduction needs Unicorn (`pip install unicorn`), or `--no-nbc` leaves it
+  out (the driver keeps it off by default). Checked: it reproduces every
+  table the driver was tuned with.
+- **OBC2** (`black=`): pass 2's black level, laid out like pass 1's OBC
+  (offsets 0x11c0, gains 0x11d0, `RGB_EN` bit 11). It lets raw CAMSV
+  frames in, which matters for 4672×3504: CAM A's pass 1 can't take it yet
+  (it needs 2-pixel mode), CAMSV already does.
+- **Tile lists** for each mode are built in (`dip_tdr.h`, generated by
+  `tools/camera/dip_tdr.py WIDTH HEIGHT STRIDE [--obc2]`, which runs the
+  stock tile engine). Running the HAL emulation with OBC2 and PGN enabled
+  showed the TCM words don't change for them.
+- No visible seams: at each tile boundary the column-to-column luma step
+  equals its neighbourhood's.
+
+### Streaming hardware ISP in the driver (2026-10-26)
+
+`titan_camera` now offers a **`YUYV`** format beside the raw Bayer ones:
+the whole pass-2 pipeline runs live, per frame, in the kernel, so the
+video node delivers finished YUV and the GPU software ISP is not needed.
+Both cameras stream at **30 fps**:
+
+```sh
+v4l2-ctl -d /dev/video0 --set-fmt-video=width=2336,height=1752,pixelformat=YUYV
+v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=60     # 29.98 fps
+# libcamera picks it up directly (GPU debayer bypassed):
+cam -c 1 --capture=30 --stream pixelformat=YUYV,width=2336,height=1752
+```
+
+How it fits together (`module param `hwisp`, on by default; `modules/
+camera/dip/dip_core.h` is the shared register programming):
+
+- **CAMSV captures packed RAW10** (as `titan_camcap p1fmt=9`) into an
+  internal 3-buffer **raw ring**, not the vb2 buffer — the output buffers
+  are YUYV. The raw buffers are M4U-mapped twice: on the CAMSV port
+  (larb6, write) and the DIP IMGI port (larb5, read) of the same pages.
+- **A workqueue runs the DIP per frame.** On each CAMSV frame-done the
+  IRQ hands the finished raw buffer to a worker, which programs the DIP
+  (`dip_program()`), waits (~5 ms for preview), and completes the YUYV
+  vb2 buffer. At 30 fps the ~5 ms leaves plenty of headroom; a frame is
+  dropped only if the worker is still busy (it isn't, in practice).
+- **imgsys is powered** (`SCP_SYS_ISP`, `IMG_DIP`/`IMG_LARB5`, smi larb5)
+  only while a `YUYV` stream runs, alongside camsys for CAMSV.
+- **White balance** is grey-world from a subsample of the raw (into the PGN
+  gains); since 2026-10-27 it runs every 100 ms off the per-frame path and
+  decodes the raw correctly (see "Full-resolution live DIP streaming"). The
+  rear sensor's black level is removed by the DIP's own OBC2 (the pass-1
+  CAM A path isn't used here).
+- **libcamera** needs no change: its simple pipeline sees `YUYV`, finds
+  the GPU debayer "can't" process it (it's already processed), and passes
+  it straight through. The old raw→GPU path still works for `BGR888`.
+
+So the camera path is complete end to end on the hardware ISP: sensor →
+seninf → CAMSV (raw) → DIP (pass 2) → app, at 30 fps, with the GPU free.
+
+**Still open (quality, not plumbing):** noise reduction (NBC/NBC2) and
+sharpening (SEEE), and the 4272×2404 video mode. Full-resolution live DIP
+streaming is wired in the driver as of 2026-10-27 (see below). Auto white
+balance and exposure from the AA statistics are below.
+
+### Camera app preview on the hardware ISP (2026-10-27)
+
+`titan-camera-gui`'s preview now requests the driver's `YUYV` node, so the
+live preview runs through MediaTek's pass-2 hardware ISP and the GPU only
+converts `YUYV`→RGB for display (no software debayer). Per camera it asks
+for the sensor-mode size the DIP delivers — rear 2336×1752, front
+1632×1224 — and the GL sink scales to the window. `TITAN_CAMERA_HWISP=0`
+falls back to the old 960×720 `BGRx` GPU software-ISP path.
+
+The app change is just the source caps: a named `capsfilter` after
+`libcamerasrc` is set to `video/x-raw,format=YUY2,width=…,height=…` at
+configure time (GStreamer spells the format `YUY2`, libcamera `YUYV`). The
+autofocus `appsink` reads the same buffers, so `sharpness()` was made
+format-aware (2 bytes/px YUYV, luma at byte `2x`; 4 bytes/px BGRx, green at
+`4x+1`) and `on_af_sample` now takes the frame size from the sample caps
+instead of the fixed preview size. Stills still stop the preview and run
+the GPU software ISP at full sensor resolution (the DIP full-res path isn't
+wired into the live node). Verified on device: both cameras negotiate
+exactly `YUY2` at their hardware-ISP sizes at 30 fps and the pipeline
+reaches `PLAYING`.
+
+### Auto white balance and exposure from the AA statistics (2026-10-27)
+
+The hardware ISP path now drives white balance and exposure from the CAM A
+**AA statistics** (AAO) instead of the grey-world raw subsample and the
+fixed sensor default. CAM A already ran in pure-raw mode for the rear AF
+statistics; that bring-up (`af_start`) is generalised into `cama_start`,
+which runs AF (rear 2336 mode only, its filter table) and the AA block
+(either camera) off the same demuxed stream. The AA block is configured as
+in `camcap`'s `p1aa` — equal `AA_NX`×`AA_NY` blocks over the frame, unity
+pre-gain, thresholds wide open, the AE histogram registers left zero — and
+its AAO DMA (M4U port 63, larb6) writes, per block row, `AA_NX`×{R,G,B,flag}
+8-bit averages then `AA_NX` luma bytes. CAM A for the *front* is new here
+(the seninf top mux already feeds every CAM/CAMSV input from the active
+sensor); it was not needed before because the front is fixed-focus.
+
+A 100 ms work item (the old `af_work`, now shared) reads the AAO each tick:
+
+- **White balance:** grey world over the per-block R/G/B averages, black
+  removed, into the DIP PGN gains (`tc->wb[]`) — only when `aa_wb` is on
+  (default **off**). By default the CPU raw subsample owns WB (see "Full-
+  resolution live DIP streaming" below for how it works and why). The AA path
+  averages every block, near-black ones included, so it has the same
+  dark-scene bias the CPU path now avoids with its thresholds; the AWB
+  low/high thresholds (0x850/0x854, left wide open) are the hardware's way to
+  do the same, untested.
+- **Exposure/gain:** the mean luma, derived from the same R/G/B averages
+  (`Y = (R + 2G + B) / 4`, above black — more reliable than the block's
+  separate AE-luma byte, and consistent with the white balance) drives a
+  damped closed loop on the sensor. Light ∝ exposure × gain; it raises
+  exposure up to the frame-length limit first (keeps gain and noise low)
+  then gain, with a ±6 % deadband so the preview does not hunt. The
+  exposure/gain registers are written directly as one group-hold update
+  (`ae_apply`), as `af_pgn` is — libcamera does not run its own AGC in the
+  YUYV passthrough path, so nothing fights it.
+
+Module params: `aa` (run the AA stats block, default on), `aa_wb` (WB from AA,
+default **off**), `ae` (exposure loop, default on), `ae_target` (target mean
+luma above black, 0–255). Per-sensor debug: `/sys/.../{rear,front}/ae` prints
+`running luma exp gain wbR wbB target src` (`src`: `aa`, `cpu` or `manual`)
+and `/sys/.../{rear,front}/dip` prints `frames busy nobuf rawerr us us_max`
+for the current stream (frames the DIP did; frames lost because the worker
+was busy, because no YUYV buffer was queued, or to a CAMSV error; last and
+worst per-frame worker time in µs).
+
+Verified on device: AA runs on both cameras (the new front CAM A path
+included), the AAO produces live stats, the white-balance gains track the
+scene, and the exposure loop drives the sensor — register writes confirmed
+over I²C, and a forced high/low target swings the captured frame from
+`meanY` ≈ 20 down to ≈ 1. Midtone regulation and the final `ae_target` still
+need a normally-lit scene to tune: both test scenes were near-black (rear
+face-down, front dim), so the signal sat close to the sensor pedestal and
+the loop correctly railed at its limits without a mid-range to settle in.
+
+
+### Full-resolution live DIP streaming (2026-10-27)
+
+The driver can now run the pass-2 DIP at the sensors' full-resolution modes,
+so a still can come from the hardware ISP (~tens of ms) instead of stopping
+the preview and debayering on the GPU (~4 s). The DIP streaming path was
+already resolution-independent (`set_format` sizes the raw ring and strides
+from the mode, `start_streaming` carries `pix2` for the rear's 2-pixel mode,
+`cama_start` runs AA at any size and skips AF off the 2336 mode); the only
+missing piece was a **built-in tile list** for each full-res mode.
+
+- Rear 4672×3504 (stride 5840, OBC2, 7 tiles): `tdr_4672x3504_obc2`, already
+  present.
+- Front 3264×2448 (stride 4080, OBC2, 5 tiles): `tdr_3264x2448_obc2`, added
+  now — `tools/camera/dip_tdr.py 3264 2448 4080 --obc2`. The generator is
+  deterministic (it reproduces the committed rear list bit-for-bit).
+
+Both are registered in `dip_tdrs[]` (`dip_core.h`), so `dip_find_tdr` matches
+the full-res YUYV stream on either camera.
+
+**App still path.** `titan-camera-gui`'s `capture()` requests `YUY2` at the
+exact sensor-mode size (`hwstill`: 4672×3504 / 3264×2448) when the hardware
+ISP is on, so stills come finished from the DIP; `TITAN_CAMERA_HWISP=0` keeps
+the old `BGRx` GPU software-ISP path at its cropped size (4668 / 3260). The
+same caps through `gst-launch` give a 4672×3504 JPEG.
+
+Measured on device (`dip` sysfs, `cam` with no file writing):
+
+| Mode | fps | DIP worker per frame | drops |
+|---|---|---|---|
+| rear 4672×3504 (2-pixel) | 20.6 (the sensor's rate) | 32 ms | 0 |
+| front 3264×2448 | 29.5 | 16 ms | 0 |
+
+Getting there took four fixes, all in the CPU raw statistics:
+
+- **Off the per-frame path.** The raw ring is mapped write-combine, so the
+  CPU subsample went to DRAM for every load: 24 ms a full-res frame, which on
+  top of the DIP's 32 ms dropped every other frame (10 fps). It now runs in
+  the 100 ms AE/AWB work on the frame the DIP last took (`raw_last`), and only
+  per frame (every 8th) when `aa` is off and there is no such work.
+- **Decoding.** CAMSV's packed RAW10 is a little-endian bitstream (pixel *i*
+  at bits 10*i*…10*i*+9), not CSI-2 packing — the sampler had been reading
+  byte 0 as pixel 0's top bits since the streaming path was written, which
+  made every white-balance result close to meaningless. One aligned `u32`
+  holds pixels 0 and 1. Checked against an unpacked 8-bit `BA81` frame at the
+  same exposure: driver wbR/wbB/luma 1003/627/29, reference 995/618/30.
+- **Black level** on the right scale: the 10-bit pedestal >> 2 against the
+  8-bit samples (it had subtracted the full 10-bit value, ~4× too much; in a
+  dim scene that clamped the red gain at 8×).
+- **Lit samples only for WB.** In a mostly dark scene the near-black samples
+  carry the per-channel pedestal and noise rather than the light, and pull
+  grey-world toward 1×; since raw green is the strongest channel, gains stuck
+  near 1× look green. WB averages only quads with green ≥ 8 levels above black
+  and nothing clipped (falling back to every sample if too few); on a test
+  frame the gains then settle (R 2.05×, B 1.15–1.19× from +8 up) where the
+  full average gave 1.81×/1.21×. The luma for AE still averages everything.
+
+The green tint in photos taken before this change did *not* come from the AA
+white balance: stills then went through libcamera's GPU software ISP, whose
+white balance has its own green cast (noted above). Not checked: the AA
+white balance with these lessons applied.
+
+**AE at the rear's full resolution.** The 4672×3504 mode is 2-pixel; CAMSV
+handles it, but CAM A's TG is set up for one pixel a clock, so the AA block
+sees nothing and the AAO stays empty. The AE then takes its luma from the CPU
+raw subsample (`src` = `cpu`). The AAO buffer is cleared at each stream start,
+so a dead AA block reads empty instead of returning the previous stream's
+statistics (which briefly steered the AE in testing).
+
+**Exposure and white balance carry over between streams.** The AE loop writes
+what it applies back into the exposure/gain controls' cached values (not
+through `s_ctrl`, so it is not a manual set): the readback is truthful and the
+next stream starts from it (`sensor_apply_ctrls`), so a still taken right
+after the preview starts at the preview's settled exposure — both rear modes
+have the same line time (`LINE_US` in the app), so lines carry over. The PGN
+gains are saved per sensor at stream stop and restored at the next start, so
+the first frames are not unity-balanced (green).
+
+**AE vs. manual exposure.** The in-kernel AE loop would fight the app's flash
+metering and metered still. And libcamera's manual exposure doesn't reach the
+sensor in the YUYV path at all: the earlier libcamera patch implements it in
+the software ISP's AGC, which passthrough doesn't run (`gst-launch` with
+`exposure-time-mode=manual` left the sensor untouched). So:
+
+- With the hardware ISP the app writes the metered exposure/gain straight to
+  the sensor subdev — on the preview during metering, and after the preview
+  stops but before the still starts for the photo.
+- The driver treats any userspace `EXPOSURE`/`ANALOGUE_GAIN` write — while
+  streaming or not — as manual: `sensor_s_ctrl` sets a per-sensor `ae_manual`
+  and `ae_step` backs off until that stream stops (`sensor_stop` clears it).
+  The driver's own range updates (`sensor_update_limits`, the VBLANK handler)
+  may clamp the exposure and call `s_ctrl`; they set `ctrl_internal` so they
+  don't count. The AE's own writes never go through `s_ctrl`.
+
+Tested on device: auto preview → `aa`, AE running; auto full res → `cpu`, AE
+running; exposure pre-set to 500 lines / 2× then a full-res stream → `manual`,
+sensor held at 500/256 throughout; the next stream → auto again. libcamera
+does not write exposure/gain at stream start, so auto streams don't latch.
+
+Flash photos through the real app were then tested end to end (Space
+injected through `/dev/uinput`): metering on the preview with the AE paused
+(`manual`), the full-res still at the metered exposure with the flash lit,
+the preview back on auto afterwards. Colour came out neutral.
+
+### Shake tolerance, image autofocus, and a preview stall (2026-10-27)
+
+The flash photos were soft. Taking that apart:
+
+- **Exposure is capped for handheld use.** The driver's AE stops at
+  `ae_max_us` (default 10 000 = 1/100 s; 0 = the frame length) and raises gain
+  after that; the cap applies before the deadband, so an exposure already
+  above it comes down. The app's flash meter stops at `PHOTO_MAX_US` (also
+  1/100 s; it was 1/30 s), with `FLASH_MAX_GAIN` raised to the sensor's 15.5×.
+  The flash is the torch LED lit continuously, so it freezes nothing.
+- **Stills are the sharpest of a burst.** The still pipeline now ends in a
+  raw `appsink`: after the settle frames, `STILL_BURST` (6) frames are scored
+  with `sharpness()` on the focus region, the best one is kept, the camera
+  and flash are released, and a worker thread rotates and JPEG-encodes that
+  frame alone (`appsrc ! videoflip ! videoconvert ! jpegenc`). Handheld, the
+  scores in a burst spread 2× (shake); resting, 5%. With the hardware ISP the
+  still skips `HW_SETTLE_FRAMES` (8), not 15: exposure and white balance carry
+  over from the preview. The meter logs its decision to stderr
+  (`meter: pre-flash … N lines x G`).
+- **Focus was the main cause, not shake.** A metered flash still was 0.9 ms
+  and still soft. With the phone resting, image sharpness over the lens range
+  peaked clearly (2.6× at 512 against either end), and the AK7371 position
+  registers followed every command — but the hardware AF statistics the
+  rear autofocus used barely moved: `w1`/`w2`/`w4` peak at the same place by
+  only ~15% over a noise floor, at high gain in a dim scene. So with the
+  hardware ISP the app now focuses on the preview frames themselves
+  (`hw_af` = statistics exist *and* not `HW_ISP`; `hw_stats` keeps flash
+  metering on the statistics). On the resting scene it sweeps 0 → 704,
+  refines 464–560 and settles at 528; the photo is sharp at 100%.
+- **Two bugs that path exposed:**
+  - *Idle starvation.* Streaming threads handed results to the main thread
+    with `GLib.idle_add`; a playing video widget keeps a GTK redraw (priority
+    120) pending, so idle sources (200) never ran and the AF sweep waited
+    forever ("Focusing…"). The hand-offs (AF samples, QR codes, burst done,
+    photo encoded) now use `priority=GLib.PRIORITY_DEFAULT`.
+  - *Preview stall at start-up.* libcamera's simple pipeline gave the stream
+    4 buffers; the preview tees to the display, the AF appsink and the QR
+    branch through leaky queues (which keep the *newest* buffers) and a
+    videorate, and at start-up they could hold all 4 — libcamera then had
+    nothing to queue and the preview froze after ~5 frames, about one launch
+    in four. `kNumBuffersDefault` is now 8 in the libcamera patch (64 MB at
+    preview size); 6 of 6 launches then streamed. It predates this work; the
+    hardware-statistics AF just didn't need frames, so it went unnoticed.
+
+**Still open:** low light — at 1/100 s and full gain a dim indoor scene gives
+a photo of mean 7/255 and heavy chroma noise without the flash (noise
+reduction, NBC, is still blocked on SMX); the AA luma read 21 whether the
+exposure was 1147 or 3816 lines in a very dark scene, so its black level may
+be off, which would make the AE under-expose — check on a lit scene with
+`ae_target`; the app should keep the screen awake while it's open (Weston's
+`idle-time` is 60 s); if a pre-set exposure's stream never starts,
+`ae_manual` stays set until the next stream stops; `ae_step`'s `exp_max` is
+the mode's nominal VTS, so it can't use the longer frames libcamera's default
+frame duration gives the rear full-res mode (20.6 fps).

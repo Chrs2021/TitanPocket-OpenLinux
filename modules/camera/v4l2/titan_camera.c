@@ -71,6 +71,40 @@
 #include "../camcap/ov8865_regs.h"
 #include "../camcap/ov16880_regs.h"
 #include "../camcap/af_regs_rear.h"
+#include "dip_core.h"			/* pass-2 ISP (DIP) register programming */
+
+static bool hwisp = true;
+module_param(hwisp, bool, 0644);
+MODULE_PARM_DESC(hwisp, "offer the YUYV format (hardware ISP, pass 2) as well as raw Bayer");
+
+static bool nr;	/* noise reduction (NBC): needs SMX stripe buffers, WIP */
+module_param(nr, bool, 0644);
+MODULE_PARM_DESC(nr, "noise reduction (NBC) in the hardware ISP YUYV path");
+
+/* auto white balance / exposure from the CAM A hardware statistics (AAO).
+ * aa drives the DIP white balance from the per-block R/G/B averages (instead
+ * of the grey-world subsample); ae closes the exposure/gain loop on the sensor
+ * from the per-block luma. Both only run with the hardware ISP (YUYV) path. */
+static bool aa = true;
+module_param(aa, bool, 0644);
+MODULE_PARM_DESC(aa, "run the CAM A AA statistics block (feeds auto exposure and, with aa_wb, white balance)");
+
+static bool aa_wb;	/* white balance from AA stats; default is the CPU grey-world */
+module_param(aa_wb, bool, 0644);
+MODULE_PARM_DESC(aa_wb, "white balance from the AA statistics (default: CPU grey-world over the raw frame)");
+
+static bool ae = true;
+module_param(ae, bool, 0644);
+MODULE_PARM_DESC(ae, "auto exposure/gain from the CAM A AA statistics");
+
+static unsigned int ae_target = 46;	/* 8-bit AA luma (~1/4 of the 10-bit raw) */
+module_param(ae_target, uint, 0644);
+MODULE_PARM_DESC(ae_target, "target mean scene luma for auto exposure (0-255)");
+
+/* past this the loop raises gain instead: a shaky hand blurs longer exposures */
+static unsigned int ae_max_us = 10000;
+module_param(ae_max_us, uint, 0644);
+MODULE_PARM_DESC(ae_max_us, "longest auto exposure in microseconds, then gain (0: the frame length)");
 
 /* 5.8's camera location control; libcamera reads it for front/back */
 #ifndef V4L2_CID_CAMERA_ORIENTATION
@@ -103,11 +137,13 @@
 /* output formats of the video node */
 struct titan_fmt {
 	u32 fourcc;
-	u32 bytes;		/* per pixel */
+	u32 bytes;		/* output bytes per pixel */
 	const char *desc;
+	bool dip;		/* through the hardware ISP: packed RAW10 in, this out */
 };
 
 static const struct titan_fmt formats[] = {
+	{ V4L2_PIX_FMT_YUYV, 2, "YUYV 4:2:2 (hardware ISP)", true },
 	{ V4L2_PIX_FMT_SBGGR8, 1, "8-bit Bayer BGGR" },
 	{ V4L2_PIX_FMT_SBGGR14, 2, "14-bit Bayer BGGR (10-bit << 4)" },
 };
@@ -117,7 +153,7 @@ static const struct titan_fmt *find_format(u32 fourcc)
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(formats); i++)
-		if (formats[i].fourcc == fourcc)
+		if (formats[i].fourcc == fourcc && (hwisp || !formats[i].dip))
 			return &formats[i];
 	return NULL;
 }
@@ -189,6 +225,9 @@ struct titan_sensor {
 	struct regulator *dovdd, *avdd, *dvdd, *afvdd;
 	struct clk *mclk;
 	bool powered, streaming;
+	bool ae_manual;		/* app set exposure/gain by hand: the AE loop backs off */
+	bool ctrl_internal;	/* the driver itself is re-ranging the exposure control */
+	u32 wb[3];		/* PGN gains at the end of the last YUYV stream, 0: none */
 	struct device dev;	/* "rear" / "front": parent of the subdev node */
 	bool dev_added;
 };
@@ -206,6 +245,7 @@ struct titan_buf {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
 	unsigned int mva;
+	int port;		/* M4U port it is mapped on */
 };
 
 struct titan_cam {
@@ -246,6 +286,15 @@ struct titan_cam {
 	bool af_pgn_auto;
 	unsigned long af_pgn_changed;	/* jiffies */
 	struct delayed_work af_work;
+	/* AE/AWB statistics (CAM A AAO): per-block R/G/B + luma averages */
+	struct page *aao_pages[2];
+	struct sg_table aao_sgt;
+	unsigned int aao_mva;
+	void *aao_vaddr;		/* uncached */
+	bool aa_running;
+	u32 ae_exp, ae_gain;		/* last applied: exposure lines, gain (128 = 1x) */
+	u32 ae_luma;			/* last luma the loop saw */
+	bool ae_cpu;			/* ... from the CPU raw subsample, not the AAO */
 	struct sg_table scratch_sgt;
 	struct page **scratch_pages;
 	int scratch_npages;
@@ -254,6 +303,36 @@ struct titan_cam {
 	/* format */
 	const struct titan_fmt *fmt;
 	u32 width, height, stride;
+
+	/* hardware ISP (DIP, pass 2): CAMSV captures packed RAW10 into a raw
+	 * ring; a worker runs the DIP per frame into the YUYV vb2 buffer */
+	bool imgsys_on;
+	void __iomem *dip;
+	u32 raw_stride, raw_bytes;	/* packed RAW10 line pitch / used bytes */
+	int black;			/* OBC2 black level, -1 for front (OBC in pass 1) */
+	struct {
+		struct page **pages;
+		int npages;
+		struct sg_table sgt;
+		u32 mva_sv, mva_imgi;	/* CAMSV write / DIP read */
+		void *vaddr;
+	} raw[3];
+	int rc, rn;			/* raw ring: index being filled / programmed next */
+	struct {			/* DIP tile list + CQ descriptor */
+		struct page **pages;
+		int npages;
+		struct sg_table sgt;
+		u32 mva;
+		void *vaddr;
+	} tdr, desc;
+	struct work_struct dip_work;
+	int dip_ready;			/* raw ring index ready for the DIP, -1 none */
+	bool dip_busy;
+	int raw_last;			/* raw ring index the DIP last took, -1 none */
+	u32 wb[3];			/* current PGN gains R, G, B */
+	u64 dip_frames, dip_drops;
+	u64 dip_nobuf, dip_rawerr;	/* frames lost: no YUYV buffer queued, CAMSV error */
+	u32 dip_us, dip_us_max;		/* last / worst DIP time per frame */
 };
 
 
@@ -265,6 +344,9 @@ extern s32 smi_bus_prepare_enable(const u32 id, const char *user);
 extern s32 smi_bus_disable_unprepare(const u32 id, const char *user);
 
 #define M4U_PORT_CAM_SOCO	72	/* larb6 port 11: CAMSV output */
+#define M4U_PORT_CAM_IMGI	36	/* larb5: DIP input */
+#define M4U_PORT_CAM_IMG2O	37	/* larb5: DIP tile list / CQ descriptor */
+#define M4U_PORT_CAM_IMG3O	38	/* larb5: DIP YUV output */
 #define M4U_PROT_RW		3
 
 static struct {
@@ -357,6 +439,56 @@ static void camsys_off(struct titan_cam *tc)
 	for (i = ARRAY_SIZE(clks) - 1; i >= 0; i--)
 		clk_disable_unprepare(clks[i].clk);
 	tc->clocks_on = false;
+}
+
+/* imgsys power for the DIP (pass 2), enabled only while a hwisp stream runs */
+#define SMI_LARB5	5
+static struct {
+	const char *provider;
+	int id;
+	struct clk *clk;
+} imgclks[] = {
+	{ "mediatek,scpsys",   SCP_SYS_ISP },
+	{ "mediatek,topckgen", TOP_MUX_IMG },
+	{ "mediatek,imgsys",   IMG_LARB5 },
+	{ "mediatek,imgsys",   IMG_DIP },
+};
+
+static struct clk *provider_clk(const char *compat, int idx);
+
+static int imgsys_on(struct titan_cam *tc)
+{
+	int i, ret;
+
+	if (tc->imgsys_on)
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(imgclks); i++) {
+		if (!imgclks[i].clk)
+			imgclks[i].clk = provider_clk(imgclks[i].provider, imgclks[i].id);
+		if (IS_ERR(imgclks[i].clk))
+			return PTR_ERR(imgclks[i].clk);
+		ret = clk_prepare_enable(imgclks[i].clk);
+		if (ret) {
+			while (--i >= 0)
+				clk_disable_unprepare(imgclks[i].clk);
+			return ret;
+		}
+	}
+	smi_bus_prepare_enable(SMI_LARB5, DRV);
+	tc->imgsys_on = true;
+	return 0;
+}
+
+static void imgsys_off(struct titan_cam *tc)
+{
+	int i;
+
+	if (!tc->imgsys_on)
+		return;
+	smi_bus_disable_unprepare(SMI_LARB5, DRV);
+	for (i = ARRAY_SIZE(imgclks) - 1; i >= 0; i--)
+		clk_disable_unprepare(imgclks[i].clk);
+	tc->imgsys_on = false;
 }
 
 static void *ksym(const char *name)
@@ -571,7 +703,9 @@ static void sensor_update_limits(struct titan_sensor *s)
 	__v4l2_ctrl_modify_range(s->hblank, m->hts - m->width, m->hts - m->width, 1,
 				 m->hts - m->width);
 	__v4l2_ctrl_modify_range(s->vblank, vblank_def, 0x7fff - m->height, 1, vblank_def);
+	s->ctrl_internal = true;	/* may clamp the value and call s_ctrl */
 	__v4l2_ctrl_modify_range(s->exposure, 4, m->vts - 8, 1, m->vts - 64);
+	s->ctrl_internal = false;
 }
 
 static int sensor_s_ctrl(struct v4l2_ctrl *ctrl)
@@ -581,9 +715,21 @@ static int sensor_s_ctrl(struct v4l2_ctrl *ctrl)
 	if (ctrl->id == V4L2_CID_VBLANK) {	/* frame length bounds exposure */
 		u32 vts = s->mode->height + ctrl->val;
 
+		s->ctrl_internal = true;
 		__v4l2_ctrl_modify_range(s->exposure, 4, vts - 8, 1,
 					 min_t(s32, s->exposure->default_value, vts - 8));
+		s->ctrl_internal = false;
 	}
+	/*
+	 * Exposure/gain set by the app (e.g. flash metering, or a metered still
+	 * set just before its stream starts): the in-kernel AE loop backs off
+	 * until this stream stops. Our own AE writes go straight to the sensor
+	 * (ae_apply), not through the control framework, and the driver's own
+	 * range updates are flagged, so neither lands here.
+	 */
+	if ((ctrl->id == V4L2_CID_EXPOSURE || ctrl->id == V4L2_CID_ANALOGUE_GAIN) &&
+	    !s->ctrl_internal)
+		s->ae_manual = true;
 	if (!s->streaming)
 		return 0;	/* applied at stream on */
 	switch (ctrl->id) {
@@ -749,6 +895,7 @@ static void sensor_stop(struct titan_sensor *s)
 	if (s->powered)
 		s_write(s, 0x0100, 0);
 	s->streaming = false;
+	s->ae_manual = false;	/* the next stream starts under the AE loop */
 	sensor_power_off(s);
 }
 
@@ -995,7 +1142,13 @@ static void camsv_start(struct titan_cam *tc, unsigned int first, bool pix2)
 	 * TG format RAW10, packer off and MODULE_EN bit 3 (what the HAL uses for
 	 * its non-Bayer formats) stores the bus as is, samples << 4.
 	 */
-	if (tc->fmt->bytes == 1) {
+	if (tc->fmt->dip) {
+		/* packed RAW10 for the DIP (as titan_camcap p1fmt=9): TG RAW10,
+		 * packer on (MODULE_EN bit 2), PAK 10-bit */
+		sv_rmw(tc, SV_MODULE_EN, ~0x3f2cU, 0x40000005);
+		writel(1, tc->camsv + SV_FMT_SEL);
+		sv_rmw(tc, SV_PAK, ~0x37U, 0x1);
+	} else if (tc->fmt->bytes == 1) {
 		sv_rmw(tc, SV_MODULE_EN, ~0x3f2cU, 0x40000005);
 		writel(0, tc->camsv + SV_FMT_SEL);
 		sv_rmw(tc, SV_PAK, ~0x37U, 0x0);
@@ -1026,9 +1179,11 @@ static void camsv_start(struct titan_cam *tc, unsigned int first, bool pix2)
 	writel(tc->height << 16, tc->camsv + SV_TG_GRAB_LIN);
 
 	/* IMGO DMA; the buffer address is switched at every start of frame */
-	writel(tc->width * tc->fmt->bytes - 1, tc->camsv + SV_IMGO_XSIZE);
+	writel((tc->fmt->dip ? tc->raw_bytes : tc->width * tc->fmt->bytes) - 1,
+	       tc->camsv + SV_IMGO_XSIZE);
 	writel(tc->height - 1, tc->camsv + SV_IMGO_YSIZE);
-	writel(tc->stride | 0x1000000 | (pix2 ? 3 : 1) << 16, tc->camsv + SV_IMGO_STRIDE);
+	writel((tc->fmt->dip ? tc->raw_stride : tc->stride) | 0x1000000 |
+	       (pix2 ? 3 : 1) << 16, tc->camsv + SV_IMGO_STRIDE);
 	writel(0, tc->camsv + SV_IMGO_CROP);
 	writel(0x80000080, tc->camsv + SV_IMGO_CON);
 	writel(0x20002, tc->camsv + SV_IMGO_CON2);
@@ -1077,6 +1232,32 @@ static irqreturn_t camsv_irq(int irq, void *data)
 	if (!st)
 		return IRQ_NONE;
 	spin_lock_irqsave(&tc->qlock, flags);
+	if (tc->fmt->dip) {
+		/* CAMSV fills the raw ring; hand each finished frame to the DIP worker */
+		if (st & SV_INT_DONE) {
+			if (!(st & (SV_INT_IMGO_ERR | SV_INT_OVERRUN))) {
+				if (tc->dip_busy) {
+					tc->dip_drops++;	/* worker still on the last frame */
+				} else {
+					tc->dip_ready = tc->rc;
+					tc->dip_busy = true;
+					queue_work(system_highpri_wq, &tc->dip_work);
+				}
+			} else {
+				tc->dip_rawerr++;
+			}
+			tc->sequence++;
+		}
+		if (st & SV_INT_SOF) {
+			tc->rc = tc->rn;
+			tc->rn = (tc->rn + 1) % ARRAY_SIZE(tc->raw);
+			if (tc->rn == tc->rc)	/* keep one frame behind the reader */
+				tc->rn = (tc->rn + 1) % ARRAY_SIZE(tc->raw);
+			writel(tc->raw[tc->rn].mva_sv, tc->camsv + SV_IMGO_BASE);
+		}
+		spin_unlock_irqrestore(&tc->qlock, flags);
+		return IRQ_HANDLED;
+	}
 	if (st & SV_INT_DONE) {
 		b = tc->cur;
 		if (b && b != tc->next) {	/* not being refilled */
@@ -1159,6 +1340,41 @@ static irqreturn_t camsv_irq(int irq, void *data)
 #define AFO_SIZE	(AFO_STRIDE * AF_NY)
 #define AF_HDR_WORDS	8
 
+/* AE/AWB statistics (AA block, same CAM A): equal blocks over the frame, unity
+ * pre-gain, thresholds wide open, AE histogram registers left zero. The AAO
+ * data is, per block row, AA_NX x {R, G, B, 0x0f} 8-bit averages then AA_NX
+ * luma bytes (AAO_BLOCK bytes per block). See camcap's p1aa and docs. */
+#define CA_EN_AA	BIT(19)		/* tuning function 16 */
+#define CA_DMA_AAO	BIT(5)
+#define M4U_PORT_CAM_AAO	63	/* larb6 port 2 */
+#define CA_AWB_WIN_ORG	0x830		/* x | y << 16 */
+#define CA_AWB_WIN_SIZE	0x834		/* block w | h << 16 */
+#define CA_AWB_WIN_PIT	0x838
+#define CA_AWB_WIN_NUM	0x83c
+#define CA_AWB_GAIN1_0	0x840		/* pre-gain R | G << 16, 512 = 1x */
+#define CA_AWB_GAIN1_1	0x844		/* pre-gain B */
+#define CA_AWB_LMT1_0	0x848
+#define CA_AWB_LMT1_1	0x84c
+#define CA_AWB_LOW_THR	0x850
+#define CA_AWB_HI_THR	0x854
+#define CA_AWB_PIXEL_CNT0 0x858		/* 1 << 24 / pixels of that colour per block */
+#define CA_AWB_PIXEL_CNT1 0x85c
+#define CA_AWB_PIXEL_CNT2 0x860
+#define CA_AAO_BASE	0x1080
+#define CA_AAO_OFST	0x1088
+#define CA_AAO_XSIZE	0x1090
+#define CA_AAO_YSIZE	0x1094
+#define CA_AAO_STRIDE	0x1098
+#define CA_AAO_CON	0x109c
+#define CA_AAO_CON2	0x10a0
+#define CA_AAO_CON3	0x10a4
+#define CA_AAO_ERR	0x1368
+#define AA_NX		24
+#define AA_NY		18
+#define AAO_BLOCK	5
+#define AAO_BYTES	(AA_NX * AA_NY * AAO_BLOCK)
+#define AAO_ROW		(AA_NX * AAO_BLOCK)	/* AA_NX*4 AWB + AA_NX luma */
+
 static unsigned int af_pgn_default = 0x80;
 module_param_named(af_pgn, af_pgn_default, uint, 0444);
 MODULE_PARM_DESC(af_pgn, "SGG1 gain in front of the AF filters at start (stock 0x10 saturates)");
@@ -1221,13 +1437,99 @@ static void af_free(struct titan_cam *tc)
 			__free_page(tc->afo_pages[i]);
 }
 
-/* camsys is on (streaming) */
-static void af_start(struct titan_cam *tc, const struct sensor_mode *m)
+static int aa_alloc(struct titan_cam *tc)
+{
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(tc->aao_pages); i++) {
+		tc->aao_pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!tc->aao_pages[i])
+			return -ENOMEM;
+	}
+	tc->aao_vaddr = vmap(tc->aao_pages, ARRAY_SIZE(tc->aao_pages), VM_MAP,
+			     pgprot_writecombine(PAGE_KERNEL));
+	if (!tc->aao_vaddr)
+		return -ENOMEM;
+	ret = sg_alloc_table_from_pages(&tc->aao_sgt, tc->aao_pages, ARRAY_SIZE(tc->aao_pages),
+					0, ARRAY_SIZE(tc->aao_pages) * PAGE_SIZE, GFP_KERNEL);
+	if (ret)
+		return ret;
+	return m4u_alloc_mva(tc->m4u_client, M4U_PORT_CAM_AAO, 0, &tc->aao_sgt,
+			     ARRAY_SIZE(tc->aao_pages) * PAGE_SIZE, M4U_PROT_RW, 0, &tc->aao_mva);
+}
+
+static void aa_free(struct titan_cam *tc)
 {
 	int i;
 
-	if (!tc->cama || !tc->afo_mva || m->width != 2336)
-		return;		/* the AF table is for the rear camera's mode */
+	if (tc->aao_mva && camsys_get(tc) == 0) {
+		m4u_dealloc_mva(tc->m4u_client, M4U_PORT_CAM_AAO, tc->aao_mva);
+		camsys_put(tc);
+	}
+	if (tc->aao_sgt.sgl)
+		sg_free_table(&tc->aao_sgt);
+	if (tc->aao_vaddr)
+		vunmap(tc->aao_vaddr);
+	for (i = 0; i < ARRAY_SIZE(tc->aao_pages); i++)
+		if (tc->aao_pages[i])
+			__free_page(tc->aao_pages[i]);
+}
+
+/* program the AA statistics block in CAM A (m = the active sensor's mode);
+ * the CAM A common setup and DMA/CTL enables are done by the caller */
+static void aa_program(struct titan_cam *tc, const struct sensor_mode *m)
+{
+	int bw = (m->width / AA_NX) & ~1, bh = (m->height / AA_NY) & ~1, i;
+
+	writel(0, tc->cama + CA_AWB_WIN_ORG);
+	writel(bw | bh << 16, tc->cama + CA_AWB_WIN_SIZE);
+	writel(bw | bh << 16, tc->cama + CA_AWB_WIN_PIT);
+	writel(AA_NX | AA_NY << 16, tc->cama + CA_AWB_WIN_NUM);
+	writel(0x200 | 0x200 << 16, tc->cama + CA_AWB_GAIN1_0);
+	writel(0x200, tc->cama + CA_AWB_GAIN1_1);
+	writel(0xfff | 0xfff << 16, tc->cama + CA_AWB_LMT1_0);
+	writel(0xfff, tc->cama + CA_AWB_LMT1_1);
+	writel(0, tc->cama + CA_AWB_LOW_THR);
+	writel(0xffffff, tc->cama + CA_AWB_HI_THR);
+	/* averages = sums * PIXEL_CNT >> 24: 1 / pixels of that colour per block */
+	writel((1 << 24) / (bw * bh / 4), tc->cama + CA_AWB_PIXEL_CNT0);
+	writel((1 << 24) / (bw * bh / 2), tc->cama + CA_AWB_PIXEL_CNT1);
+	writel((1 << 24) / (bw * bh / 4), tc->cama + CA_AWB_PIXEL_CNT2);
+	writel(0x200, tc->cama + 0x8c4);	/* the HAL's fixed values */
+	writel(0x200, tc->cama + 0x8cc);
+	writel(0x90200, tc->cama + 0x8d4);
+	writel(0, tc->cama + 0xbd0);		/* the copy at 0xbd0 */
+	writel(bw | bh << 16, tc->cama + 0xbd4);
+	writel(bw | bh << 16, tc->cama + 0xbd8);
+	writel(AA_NX | AA_NY << 16, tc->cama + 0xbdc);
+	for (i = 0; i < 4; i++)
+		writel((1 << 24) / (bw * bh / 4), tc->cama + 0xbe0 + 4 * i);
+
+	writel(AAO_BYTES - 1, tc->cama + CA_AAO_XSIZE);
+	writel(0, tc->cama + CA_AAO_YSIZE);
+	writel(AAO_BYTES, tc->cama + CA_AAO_STRIDE);
+	writel(0x80000080, tc->cama + CA_AAO_CON);
+	writel(0x00200020, tc->cama + CA_AAO_CON2);
+	writel(0x00100010, tc->cama + CA_AAO_CON3);
+	writel(0, tc->cama + CA_AAO_OFST);
+	writel(tc->aao_mva, tc->cama + CA_AAO_BASE);
+}
+
+/*
+ * Bring up CAM A in pure-raw mode (TG -> DMX -> ...) to collect hardware
+ * statistics on the active sensor while CAMSV captures the raw frames. Two
+ * blocks run off the same demuxed stream: AF (rear only; its filter table is
+ * for the 2336-wide mode) and AA (AE/AWB, either camera). camsys is on.
+ */
+static void cama_start(struct titan_cam *tc, const struct sensor_mode *m)
+{
+	bool want_af = tc->afo_mva && m->width == 2336;
+	bool want_aa = aa && tc->aao_mva;
+	u32 ctl_en = CA_EN_TG | CA_EN_DMX, dma_en = 0;
+	int i;
+
+	if (!tc->cama || (!want_af && !want_aa))
+		return;
 	mutex_lock(&tc->af_lock);
 	writel(1, tc->cama + CA_SW_CTL);	/* reset: 1, wait for 2, 4, 0 */
 	for (i = 0; i < 10000 && readl(tc->cama + CA_SW_CTL) != 2; i++)
@@ -1235,10 +1537,14 @@ static void af_start(struct titan_cam *tc, const struct sensor_mode *m)
 	writel(4, tc->cama + CA_SW_CTL);
 	writel(0, tc->cama + CA_SW_CTL);
 
+	if (want_af)
+		ctl_en |= CA_EN_AF | CA_EN_SGG1;
+	if (want_aa)
+		ctl_en |= CA_EN_AA;
 	writel(1 << 12 | 1 << 2, tc->cama + CA_CTL_FMT_SEL);	/* TG RAW10 */
 	writel(0x060a5010, tc->cama + CA_CTL_SEL);	/* Path_sel_RAW, 2nd variant */
-	writel(CA_EN_TG | CA_EN_DMX | CA_EN_AF | CA_EN_SGG1, tc->cama + CA_CTL_EN);
-	writel(CA_EN2_SGG5, tc->cama + CA_CTL_EN2);
+	writel(ctl_en, tc->cama + CA_CTL_EN);
+	writel(want_af ? CA_EN2_SGG5 : 0, tc->cama + CA_CTL_EN2);
 	writel(0, tc->cama + CA_INT_EN);	/* MediaTek's camera-isp owns the IRQ */
 	ca_rmw(tc, 0x13b0, 0x7fffffff, 0);
 	writel(0xffffffff, tc->cama + 0x13c4);
@@ -1255,24 +1561,33 @@ static void af_start(struct titan_cam *tc, const struct sensor_mode *m)
 	ca_rmw(tc, 0x25c, ~0U, 0x20);
 	ca_rmw(tc, 0x240, ~0U, 0x8000);
 
-	for (i = 0; i < ARRAY_SIZE(af_regs_2336x1752); i++)
-		writel(af_regs_2336x1752[i].val, tc->cama + af_regs_2336x1752[i].off);
-	writel(tc->af_pgn, tc->cama + CA_SGG1_PGN);
+	if (want_af) {
+		for (i = 0; i < ARRAY_SIZE(af_regs_2336x1752); i++)
+			writel(af_regs_2336x1752[i].val, tc->cama + af_regs_2336x1752[i].off);
+		writel(tc->af_pgn, tc->cama + CA_SGG1_PGN);
 
-	writel(AFO_LINE - 1, tc->cama + CA_AFO_XSIZE);
-	writel(AF_NY - 1, tc->cama + CA_AFO_YSIZE);
-	writel(AFO_STRIDE, tc->cama + CA_AFO_STRIDE);
-	writel(0x80000100, tc->cama + CA_AFO_CON);
-	writel(0x00800080, tc->cama + CA_AFO_CON2);
-	writel(0x00550055, tc->cama + CA_AFO_CON3);
-	writel(0, tc->cama + CA_AFO_OFST);
-	writel(tc->afo_mva, tc->cama + CA_AFO_BASE);
+		writel(AFO_LINE - 1, tc->cama + CA_AFO_XSIZE);
+		writel(AF_NY - 1, tc->cama + CA_AFO_YSIZE);
+		writel(AFO_STRIDE, tc->cama + CA_AFO_STRIDE);
+		writel(0x80000100, tc->cama + CA_AFO_CON);
+		writel(0x00800080, tc->cama + CA_AFO_CON2);
+		writel(0x00550055, tc->cama + CA_AFO_CON3);
+		writel(0, tc->cama + CA_AFO_OFST);
+		writel(tc->afo_mva, tc->cama + CA_AFO_BASE);
+		dma_en |= CA_DMA_AFO;
+	}
+	if (want_aa) {
+		memset(tc->aao_vaddr, 0, AAO_BYTES);	/* a dead AA block reads empty */
+		aa_program(tc, m);
+		dma_en |= CA_DMA_AAO;
+	}
 	writel(1, tc->cama + CA_DB_EN);
 
-	writel(CA_DMA_AFO, tc->cama + CA_CTL_DMA_EN);
+	writel(dma_en, tc->cama + CA_CTL_DMA_EN);
 	ca_rmw(tc, CA_TG_SEN_MODE, ~0U, 1);	/* CMOS_EN */
 	ca_rmw(tc, CA_TG_VF_CON, ~0U, 1);	/* VFDATA_EN */
-	tc->af_running = true;
+	tc->af_running = want_af;
+	tc->aa_running = want_aa;
 	tc->af_pgn_changed = jiffies;
 	mutex_unlock(&tc->af_lock);
 	schedule_delayed_work(&tc->af_work, msecs_to_jiffies(AF_PGN_HOLD_MS));
@@ -1291,17 +1606,204 @@ static u32 af_auto_pgn(struct titan_cam *tc)
 	return clamp_t(u64, sum, AF_PGN_MIN, AF_PGN_MAX);
 }
 
+/* grey-world white balance from black-removed R/G/B means into the PGN gains */
+static void wb_set(struct titan_cam *tc, const u32 rgb[3])
+{
+	tc->wb[0] = clamp_t(u32, 512 * rgb[1] / rgb[0], 128, 4095);
+	tc->wb[1] = 512;
+	tc->wb[2] = clamp_t(u32, 512 * rgb[1] / rgb[2], 128, 4095);
+}
+
+/*
+ * R/G/B means above black (8-bit, the same scale as the AA averages) from a
+ * subsample of a packed RAW10 frame in the raw ring: one 2x2 Bayer quad every
+ * 32 px of every 16th row pair. lum[] averages every sample (scene brightness
+ * for AE). wb[] averages only quads whose green is WB_MIN above black and
+ * none clipped: in a mostly dark scene the near-black samples carry the
+ * per-channel pedestal and noise rather than the light, and pull grey-world
+ * toward 1x (the green cast). Too few such quads (a black frame): wb = lum.
+ *
+ * The ring is mapped write-combine, so every load goes to DRAM (~24 ms a
+ * frame at 4672x3504 with byte loads): run it from the 100 ms work, not per
+ * frame, and read each pixel pair with one u32 load. Returns 0, or -ENODATA.
+ */
+#define WB_MIN	8		/* 8-bit levels above black for a WB sample */
+#define WB_CLIP	250
+
+static int raw_stats(struct titan_cam *tc, const u8 *raw, u32 lum[3], u32 wb[3])
+{
+	u32 bl = tc->black >= 0 ? tc->black >> 2 : 0;	/* 10-bit -> 8-bit */
+	u64 all[4] = {}, lit[4] = {};
+	u32 n = 0, nl = 0, y, x, i;
+
+	for (y = 0; y + 1 < tc->height; y += 16) {
+		const u8 *p0 = raw + y * tc->raw_stride;
+		const u8 *p1 = p0 + tc->raw_stride;
+
+		for (x = 0; x + 4 < tc->raw_bytes; x += 40) {
+			/*
+			 * CAMSV packed RAW10 is a little-endian bitstream (4 px in
+			 * 5 bytes, pixel i at bits 10i..10i+9), not CSI-2 packing:
+			 * one aligned u32 holds pixels 0 and 1. Keep the top 8 bits.
+			 */
+			u32 bg = *(const u32 *)(p0 + x);	/* B, Gb */
+			u32 gr = *(const u32 *)(p1 + x);	/* Gr, R */
+			u32 q[4] = { (bg & 0x3ff) >> 2, (bg >> 12) & 0xff,
+				     (gr & 0x3ff) >> 2, (gr >> 12) & 0xff };
+
+			for (i = 0; i < 4; i++)
+				all[i] += q[i];
+			n++;
+			if (q[1] + q[2] > 2 * (bl + WB_MIN) &&
+			    max(max(q[0], q[1]), max(q[2], q[3])) < WB_CLIP) {
+				for (i = 0; i < 4; i++)
+					lit[i] += q[i];
+				nl++;
+			}
+		}
+	}
+	if (!n)
+		return -ENODATA;
+#define ABOVE(v) ((v) > bl ? (v) - bl : 1)
+	lum[0] = ABOVE((u32)(all[3] / n));			/* R */
+	lum[1] = ABOVE((u32)((all[1] + all[2]) / (2 * n)));	/* G */
+	lum[2] = ABOVE((u32)(all[0] / n));			/* B */
+	if (nl < n / 256 + 16) {
+		memcpy(wb, lum, 3 * sizeof(*wb));
+	} else {
+		wb[0] = ABOVE((u32)(lit[3] / nl));
+		wb[1] = ABOVE((u32)((lit[1] + lit[2]) / (2 * nl)));
+		wb[2] = ABOVE((u32)(lit[0] / nl));
+	}
+#undef ABOVE
+	return 0;
+}
+
+/*
+ * Read the AA statistics (af_lock held). With aa_wb, set the DIP white-balance
+ * gains from the per-block R/G/B averages (grey world over the frame, black
+ * removed); otherwise the CPU grey-world in dip_work_fn owns the gains. Return
+ * the mean luma above black (0-255, AA scale ~1/4 of the 10-bit raw) for the
+ * exposure loop; 0 if the statistics look empty (AAO not producing).
+ *
+ * Luma is derived from the same R/G/B averages (Y = (R + 2G + B) / 4) rather
+ * than the block's separate AE-luma byte: the R/G/B averages are the validated
+ * quantities, this tracks the white balance, and subtracting black makes it
+ * independent of the sensor pedestal, so ae_target is "signal above black".
+ */
+static u32 aa_read(struct titan_cam *tc)
+{
+	const u8 *aao = tc->aao_vaddr;
+	u64 sr = 0, sg = 0, sb = 0;
+	u32 blk = (u32)AA_NX * AA_NY;
+	int black = tc->black >= 0 ? tc->black >> 2 : 0;
+	int r, g, b, x, y;
+
+	for (y = 0; y < AA_NY; y++) {
+		const u8 *row = aao + y * AAO_ROW;
+
+		for (x = 0; x < AA_NX; x++) {
+			sr += row[x * 4];
+			sg += row[x * 4 + 1];
+			sb += row[x * 4 + 2];
+		}
+	}
+	if (!sg)
+		return 0;
+	r = max(1, (int)(sr / blk) - black);
+	g = max(1, (int)(sg / blk) - black);
+	b = max(1, (int)(sb / blk) - black);
+	if (aa_wb) {			/* else the CPU raw subsample sets wb */
+		u32 rgb[3] = { r, g, b };
+
+		wb_set(tc, rgb);
+	}
+	return (r + 2 * g + b) / 4;	/* luma above black */
+}
+
+/*
+ * Apply exposure (whole lines) and analogue gain (128 = 1x) to the sensor as
+ * one group-hold update. The AE loop owns these registers in the YUYV path
+ * (libcamera does not run its own AGC there); both OmniVision sensors match.
+ */
+static void ae_apply(struct titan_sensor *s, u32 exp, u32 gain)
+{
+	u32 e = exp << 4;	/* registers are in 1/16-line units */
+
+	s_write(s, 0x3208, 0x00);
+	s_write(s, 0x3500, e >> 16);
+	s_write(s, 0x3501, (e >> 8) & 0xff);
+	s_write(s, 0x3502, e & 0xff);
+	s_write(s, 0x3508, gain >> 8);
+	s_write(s, 0x3509, gain & 0xff);
+	s_write(s, 0x3208, 0x10);
+	s_write(s, 0x3208, 0xa0);
+}
+
+/*
+ * One step of the exposure/gain loop toward ae_target from the mean luma
+ * (af_lock held). Light is proportional to exposure x gain; raise exposure up
+ * to the frame-length limit first (keeps gain, and so noise, low), then gain.
+ * Each step is damped and there is a deadband, so the preview does not hunt.
+ */
+static void ae_step(struct titan_cam *tc, u32 luma)
+{
+	struct titan_sensor *s = tc->active;
+	u32 exp_max, q, qd, exp, gain;
+
+	if (!s || s->ae_manual)	/* app drives exposure by hand: do not fight it */
+		return;
+	if (!tc->ae_exp) {	/* seed from the current sensor settings */
+		tc->ae_exp = s->exposure->val;
+		tc->ae_gain = s->gain->val;
+	}
+	exp_max = s->mode->vts - 8;
+	if (ae_max_us)		/* line time = 1 / (vts * fps) */
+		exp_max = clamp_t(u32, div_u64((u64)ae_max_us * s->mode->vts * s->mode->fps,
+					       1000000), 4, exp_max);
+	if (abs((int)luma - (int)ae_target) * 16 <= (int)ae_target && tc->ae_exp <= exp_max)
+		return;		/* within ~6% (and under the shutter cap): hold */
+	q = tc->ae_exp * tc->ae_gain;			/* light ~ exp * gain */
+	qd = (u32)div_u64((u64)q * ae_target, luma);	/* desired */
+	qd = clamp(qd, q - q / 2, q + q * 3 / 4);	/* damp per step */
+	if (qd / 128 <= exp_max) {
+		exp = qd / 128;				/* 1x gain is enough */
+		gain = 128;
+	} else {
+		exp = exp_max;				/* then raise gain */
+		gain = qd / exp_max;
+	}
+	exp = clamp_t(u32, exp, 4, exp_max);
+	gain = clamp_t(u32, gain, 128, 1984);
+	if (exp == tc->ae_exp && gain == tc->ae_gain)
+		return;
+	tc->ae_exp = exp;
+	tc->ae_gain = gain;
+	ae_apply(s, exp, gain);			/* latched at the next frame */
+	/*
+	 * Keep the controls truthful, without going through s_ctrl (so not a
+	 * manual set): a readback sees what the loop applied, and the next
+	 * stream starts from it (sensor_apply_ctrls) - a still taken right after
+	 * the preview starts at the preview's settled exposure. Both rear modes
+	 * have the same line time, so the lines carry over.
+	 */
+	v4l2_ctrl_lock(s->exposure);
+	s->exposure->val = s->exposure->cur.val = exp;
+	s->gain->val = s->gain->cur.val = gain;
+	v4l2_ctrl_unlock(s->exposure);
+}
+
 static void af_work_fn(struct work_struct *work)
 {
 	struct titan_cam *tc = container_of(to_delayed_work(work), struct titan_cam, af_work);
 	u32 target;
 
 	mutex_lock(&tc->af_lock);
-	if (!tc->af_running) {
+	if (!tc->af_running && !tc->aa_running) {
 		mutex_unlock(&tc->af_lock);
 		return;
 	}
-	if (tc->af_pgn_auto &&
+	if (tc->af_running && tc->af_pgn_auto &&
 	    time_after(jiffies, tc->af_pgn_changed + msecs_to_jiffies(AF_PGN_HOLD_MS))) {
 		target = af_auto_pgn(tc);
 		if (abs((int)target - (int)tc->af_pgn) * 8 > tc->af_pgn) {
@@ -1310,20 +1812,48 @@ static void af_work_fn(struct work_struct *work)
 			writel(target, tc->cama + CA_SGG1_PGN);	/* latched at the next frame */
 		}
 	}
+	if (tc->aa_running) {
+		u32 luma = aa_read(tc);		/* with aa_wb, also sets tc->wb */
+		int idx = READ_ONCE(tc->raw_last);
+		u32 rgb[3], wbr[3];
+
+		/*
+		 * The CPU raw subsample owns the white balance unless aa_wb, and
+		 * stands in for the AE luma when the AAO is empty: in the rear's
+		 * 2-pixel mode (4672x3504) CAM A's TG is set up for one pixel a
+		 * clock and the AA block sees nothing. Only the YUYV path has a
+		 * raw ring (raw_last stays -1 otherwise).
+		 */
+		tc->ae_cpu = false;
+		if ((!aa_wb || !luma) && idx >= 0 &&
+		    !raw_stats(tc, tc->raw[idx].vaddr, rgb, wbr)) {
+			wb_set(tc, wbr);
+			if (!luma) {
+				luma = (rgb[0] + 2 * rgb[1] + rgb[2]) / 4;
+				tc->ae_cpu = true;
+			}
+		}
+		tc->ae_luma = luma;
+		if (ae && luma)
+			ae_step(tc, luma);
+	}
 	mutex_unlock(&tc->af_lock);
 	schedule_delayed_work(&tc->af_work, msecs_to_jiffies(AF_WORK_MS));
 }
 
-static void af_stop(struct titan_cam *tc)
+static void cama_stop(struct titan_cam *tc)
 {
 	cancel_delayed_work_sync(&tc->af_work);
 	mutex_lock(&tc->af_lock);
-	if (tc->af_running) {
+	if (tc->af_running || tc->aa_running) {
 		ca_rmw(tc, CA_TG_VF_CON, ~1U, 0);
 		ca_rmw(tc, CA_TG_SEN_MODE, ~1U, 0);
 		writel(0, tc->cama + CA_CTL_DMA_EN);
 		tc->af_running = false;
+		tc->aa_running = false;
 	}
+	tc->ae_exp = tc->ae_gain = tc->ae_luma = 0;
+	tc->ae_cpu = false;
 	mutex_unlock(&tc->af_lock);
 }
 
@@ -1401,6 +1931,224 @@ static ssize_t af_pgn_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RW(af_pgn);
 
+/*
+ * AE/AWB state for tuning: "running luma exp gain wbR wbB target src", src =
+ * where the luma came from: aa (the AAO), cpu (the raw subsample, when the
+ * AAO is empty) or manual (the app set exposure by hand; the loop is idle).
+ */
+static ssize_t ae_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct titan_sensor *s = container_of(dev, struct titan_sensor, dev);
+	struct titan_cam *tc = s->tc;
+	int n;
+
+	mutex_lock(&tc->af_lock);
+	n = sprintf(buf, "%d %u %u %u %u %u %u %s\n", tc->aa_running, tc->ae_luma,
+		    tc->ae_exp, tc->ae_gain, tc->wb[0], tc->wb[2], ae_target,
+		    s->ae_manual ? "manual" : tc->ae_cpu ? "cpu" : "aa");
+	mutex_unlock(&tc->af_lock);
+	return n;
+}
+static DEVICE_ATTR_RO(ae);
+
+/* DIP worker stats for this stream: "frames busy nobuf rawerr us us_max" */
+static ssize_t dip_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct titan_cam *tc = container_of(dev, struct titan_sensor, dev)->tc;
+
+	return sprintf(buf, "%llu %llu %llu %llu %u %u\n", tc->dip_frames, tc->dip_drops,
+		       tc->dip_nobuf, tc->dip_rawerr, tc->dip_us, tc->dip_us_max);
+}
+static DEVICE_ATTR_RO(dip);
+
+/* ------------------------------------------------------------------ */
+/* hardware ISP (DIP, pass 2): per-frame packed RAW10 -> YUYV           */
+
+/* a page-backed, write-combined, M4U-mapped buffer; pages[] + sgt reused */
+static int dipbuf_alloc(struct titan_cam *tc, struct page ***ppages, int *pnpages,
+			struct sg_table *sgt, void **vaddr, size_t size, int port, u32 *mva)
+{
+	int i, npages = PAGE_ALIGN(size) >> PAGE_SHIFT;
+	struct page **pages;
+
+	if (!*ppages) {
+		pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL | __GFP_ZERO);
+		if (!pages)
+			return -ENOMEM;
+		for (i = 0; i < npages; i++) {
+			pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+			if (!pages[i]) {
+				while (--i >= 0)
+					__free_page(pages[i]);
+				kvfree(pages);
+				return -ENOMEM;
+			}
+		}
+		*ppages = pages;
+		*pnpages = npages;
+		*vaddr = vmap(pages, npages, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
+		if (!*vaddr)
+			return -ENOMEM;
+		if (sg_alloc_table_from_pages(sgt, pages, npages, 0, npages << PAGE_SHIFT,
+					      GFP_KERNEL))
+			return -ENOMEM;
+	}
+	return m4u_alloc_mva(tc->m4u_client, port, 0, sgt, npages << PAGE_SHIFT,
+			     M4U_PROT_RW, 0, mva);
+}
+
+static void dipbuf_free(struct titan_cam *tc, struct page ***ppages, int *pnpages,
+			struct sg_table *sgt, void **vaddr)
+{
+	int i;
+
+	if (sgt->sgl)
+		sg_free_table(sgt);
+	sgt->sgl = NULL;
+	if (*vaddr)
+		vunmap(*vaddr);
+	*vaddr = NULL;
+	if (*ppages) {
+		for (i = 0; i < *pnpages; i++)
+			if ((*ppages)[i])
+				__free_page((*ppages)[i]);
+		kvfree(*ppages);
+	}
+	*ppages = NULL;
+}
+
+static void dip_teardown(struct titan_cam *tc)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(tc->raw); i++) {
+		if (tc->raw[i].mva_sv)
+			m4u_dealloc_mva(tc->m4u_client, M4U_PORT_CAM_SOCO, tc->raw[i].mva_sv);
+		if (tc->raw[i].mva_imgi)
+			m4u_dealloc_mva(tc->m4u_client, M4U_PORT_CAM_IMGI, tc->raw[i].mva_imgi);
+		tc->raw[i].mva_sv = tc->raw[i].mva_imgi = 0;
+		dipbuf_free(tc, &tc->raw[i].pages, &tc->raw[i].npages, &tc->raw[i].sgt,
+			    &tc->raw[i].vaddr);
+	}
+	if (tc->tdr.mva)
+		m4u_dealloc_mva(tc->m4u_client, M4U_PORT_CAM_IMG2O, tc->tdr.mva);
+	tc->tdr.mva = 0;
+	dipbuf_free(tc, &tc->tdr.pages, &tc->tdr.npages, &tc->tdr.sgt, &tc->tdr.vaddr);
+	if (tc->desc.mva)
+		m4u_dealloc_mva(tc->m4u_client, M4U_PORT_CAM_IMG2O, tc->desc.mva);
+	tc->desc.mva = 0;
+	dipbuf_free(tc, &tc->desc.pages, &tc->desc.npages, &tc->desc.sgt, &tc->desc.vaddr);
+}
+
+/* raw ring + tile list + CQ descriptor; the DIP registers are mapped once */
+static int dip_setup(struct titan_cam *tc)
+{
+	size_t rawsz = tc->raw_stride * tc->height;
+	int i, ret;
+
+	if (!tc->dip) {
+		tc->dip = ioremap(DIP_BASE, DIP_SIZE);
+		if (!tc->dip)
+			return -ENOMEM;
+	}
+	for (i = 0; i < ARRAY_SIZE(tc->raw); i++) {
+		ret = dipbuf_alloc(tc, &tc->raw[i].pages, &tc->raw[i].npages, &tc->raw[i].sgt,
+				   &tc->raw[i].vaddr, rawsz, M4U_PORT_CAM_SOCO, &tc->raw[i].mva_sv);
+		if (ret)
+			goto err;
+		/* a second mapping of the same pages, for the DIP's IMGI read */
+		ret = m4u_alloc_mva(tc->m4u_client, M4U_PORT_CAM_IMGI, 0, &tc->raw[i].sgt,
+				    tc->raw[i].npages << PAGE_SHIFT, M4U_PROT_RW, 0,
+				    &tc->raw[i].mva_imgi);
+		if (ret)
+			goto err;
+	}
+	ret = dipbuf_alloc(tc, &tc->tdr.pages, &tc->tdr.npages, &tc->tdr.sgt, &tc->tdr.vaddr,
+			   0x10000, M4U_PORT_CAM_IMG2O, &tc->tdr.mva);
+	if (ret)
+		goto err;
+	ret = dipbuf_alloc(tc, &tc->desc.pages, &tc->desc.npages, &tc->desc.sgt, &tc->desc.vaddr,
+			   CQ_SLOTS * 8, M4U_PORT_CAM_IMG2O, &tc->desc.mva);
+	if (ret)
+		goto err;
+	if (!dip_find_tdr(tc->width, tc->height, tc->raw_stride, tc->black >= 0, nr)) {
+		dev_err(&tc->pdev->dev, "no DIP tile list for %ux%u stride %u%s\n",
+			tc->width, tc->height, tc->raw_stride, tc->black >= 0 ? " +OBC2" : "");
+		ret = -EINVAL;
+		goto err;
+	}
+	tc->rc = tc->rn = 0;
+	tc->dip_ready = -1;
+	tc->dip_busy = false;
+	tc->wb[0] = tc->wb[1] = tc->wb[2] = 512;
+	return 0;
+err:
+	dip_teardown(tc);
+	return ret;
+}
+
+/* grey-world white balance from a subsample of the packed RAW10 frame */
+
+static void dip_work_fn(struct work_struct *w)
+{
+	struct titan_cam *tc = container_of(w, struct titan_cam, dip_work);
+	struct titan_buf *out;
+	unsigned long flags;
+	struct dip_job job;
+	ktime_t t0;
+	int idx, ret;
+
+	for (;;) {
+		spin_lock_irqsave(&tc->qlock, flags);
+		idx = tc->dip_ready;
+		tc->dip_ready = -1;
+		if (idx < 0) {
+			tc->dip_busy = false;
+			spin_unlock_irqrestore(&tc->qlock, flags);
+			return;
+		}
+		out = list_first_entry_or_null(&tc->queued, struct titan_buf, list);
+		if (out)
+			list_del(&out->list);
+		spin_unlock_irqrestore(&tc->qlock, flags);
+
+		if (!out) {		/* no output buffer queued: drop this frame */
+			tc->dip_nobuf++;
+			continue;
+		}
+		t0 = ktime_get();
+		WRITE_ONCE(tc->raw_last, idx);	/* for the 100 ms AE/AWB work */
+		if (!tc->aa_running && !(tc->dip_frames & 7)) {
+			u32 rgb[3], wbr[3];	/* no AA work: WB here, every 8th frame */
+
+			if (!raw_stats(tc, tc->raw[idx].vaddr, rgb, wbr))
+				wb_set(tc, wbr);
+		}
+		job = (struct dip_job){
+			.width = tc->width, .height = tc->height, .stride = tc->raw_stride,
+			.sensor = tc->active && tc->active->d->has_focus ? 0 : 1,
+			.black = tc->black,
+			.nbc = nr,
+			.wb = { tc->wb[0], tc->wb[1], tc->wb[2] },
+			.in_mva = tc->raw[idx].mva_imgi, .out_mva = out->mva,
+			.tdr_mva = tc->tdr.mva, .tdr_vaddr = tc->tdr.vaddr,
+			.desc_mva = tc->desc.mva, .desc_vaddr = tc->desc.vaddr,
+		};
+		ret = dip_program(tc->dip, &job);
+		if (!ret)
+			ret = dip_wait(tc->dip, 50000);
+		tc->dip_us = ktime_us_delta(ktime_get(), t0);
+		tc->dip_us_max = max(tc->dip_us_max, tc->dip_us);
+		out->vb.sequence = tc->sequence;
+		out->vb.field = V4L2_FIELD_NONE;
+		out->vb.vb2_buf.timestamp = ktime_get_ns();
+		vb2_set_plane_payload(&out->vb.vb2_buf, 0, tc->stride * tc->height);
+		vb2_buffer_done(&out->vb.vb2_buf,
+				ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
+		tc->dip_frames++;
+	}
+}
+
 /* ------------------------------------------------------------------ */
 /* the video node                                                      */
 
@@ -1410,6 +2158,11 @@ static void set_format(struct titan_cam *tc, const struct titan_fmt *fmt, u32 w,
 	tc->width = w;
 	tc->height = h;
 	tc->stride = ALIGN(w * fmt->bytes, 16);
+	if (fmt->dip) {
+		/* CAMSV captures packed RAW10 for the DIP; the node outputs YUYV */
+		tc->raw_bytes = w * 10 / 8;
+		tc->raw_stride = ALIGN(tc->raw_bytes, 16);
+	}
 }
 
 static int queue_setup(struct vb2_queue *q, unsigned int *nbuf, unsigned int *nplanes,
@@ -1434,10 +2187,13 @@ static int buf_init(struct vb2_buffer *vb)
 	struct sg_table *sgt = vb2_dma_sg_plane_desc(vb, 0);
 	int ret;
 
+	/* raw mode: CAMSV writes the buffer (SOCO). DIP mode: the DIP writes
+	 * the YUYV output (IMG3O); CAMSV writes a separate raw ring */
+	b->port = tc->fmt->dip ? M4U_PORT_CAM_IMG3O : M4U_PORT_CAM_SOCO;
 	ret = camsys_get(tc);	/* held while the buffer exists */
 	if (ret)
 		return ret;
-	ret = m4u_alloc_mva(tc->m4u_client, M4U_PORT_CAM_SOCO, 0, sgt,
+	ret = m4u_alloc_mva(tc->m4u_client, b->port, 0, sgt,
 			    PAGE_ALIGN(vb2_plane_size(vb, 0)), M4U_PROT_RW, 0, &b->mva);
 	if (ret) {
 		b->mva = 0;
@@ -1452,7 +2208,7 @@ static void buf_cleanup(struct vb2_buffer *vb)
 	struct titan_buf *b = container_of(to_vb2_v4l2_buffer(vb), struct titan_buf, vb);
 
 	if (b->mva) {
-		m4u_dealloc_mva(tc->m4u_client, M4U_PORT_CAM_SOCO, b->mva);
+		m4u_dealloc_mva(tc->m4u_client, b->port, b->mva);
 		camsys_put(tc);
 	}
 	b->mva = 0;
@@ -1490,10 +2246,12 @@ static void return_all(struct titan_cam *tc, enum vb2_buffer_state state)
 		list_del(&b->list);
 		vb2_buffer_done(&b->vb.vb2_buf, state);
 	}
-	if (tc->cur && tc->cur != tc->next)
-		vb2_buffer_done(&tc->cur->vb.vb2_buf, state);
-	if (tc->next)
-		vb2_buffer_done(&tc->next->vb.vb2_buf, state);
+	if (!tc->fmt->dip) {	/* DIP mode: cur/next are the raw ring, not vb2 */
+		if (tc->cur && tc->cur != tc->next)
+			vb2_buffer_done(&tc->cur->vb.vb2_buf, state);
+		if (tc->next)
+			vb2_buffer_done(&tc->next->vb.vb2_buf, state);
+	}
 	tc->cur = tc->next = NULL;
 	spin_unlock_irqrestore(&tc->qlock, flags);
 }
@@ -1529,12 +2287,32 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
 		goto err_pipe;
 
 	tc->sequence = 0;
-	spin_lock_irqsave(&tc->qlock, flags);
-	first = list_first_entry(&tc->queued, struct titan_buf, list);	/* min_buffers_needed */
-	list_del(&first->list);
-	tc->cur = NULL;
-	tc->next = first;	/* latched at the first start of frame */
-	spin_unlock_irqrestore(&tc->qlock, flags);
+	tc->dip_frames = tc->dip_drops = tc->dip_nobuf = tc->dip_rawerr = 0;
+	tc->dip_us = tc->dip_us_max = 0;
+	tc->raw_last = -1;
+	if (tc->fmt->dip) {
+		/* hardware ISP: CAMSV fills the raw ring, the DIP worker fills the
+		 * YUYV vb2 buffers (left queued). imgsys powers the DIP */
+		tc->black = s->d->black;
+		ret = imgsys_on(tc);
+		if (!ret)
+			ret = dip_setup(tc);
+		if (ret) {
+			camsys_put(tc);
+			goto err_pipe;
+		}
+		if (s->wb[1])	/* start from this camera's last gains, not unity */
+			memcpy(tc->wb, s->wb, sizeof(tc->wb));
+		tc->rc = tc->rn = 0;	/* camsv_start programs raw[0]; SOF(1) sets rc=0 */
+		first = NULL;		/* first CAMSV base is a raw buffer */
+	} else {
+		spin_lock_irqsave(&tc->qlock, flags);
+		first = list_first_entry(&tc->queued, struct titan_buf, list);
+		list_del(&first->list);
+		tc->cur = NULL;
+		tc->next = first;	/* latched at the first start of frame */
+		spin_unlock_irqrestore(&tc->qlock, flags);
+	}
 
 	seninf_start(tc, s->d->csi_port, s->mode->pix2);
 	ret = sensor_start(s);
@@ -1542,10 +2320,9 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
 		dev_err(&tc->pdev->dev, "%s: start failed: %d\n", s->d->name, ret);
 		goto err_sensor;
 	}
-	camsv_start(tc, first->mva, s->mode->pix2);
-	if (s->d->has_focus)
-		af_start(tc, s->mode);
+	camsv_start(tc, first ? first->mva : tc->raw[0].mva_sv, s->mode->pix2);
 	tc->active = s;
+	cama_start(tc, s->mode);	/* AF (rear) + AE/AWB statistics */
 	ret = request_irq(tc->irq, camsv_irq, 0, DRV, tc);
 	if (ret) {
 		dev_err(&tc->pdev->dev, "irq %d: %d\n", tc->irq, ret);
@@ -1572,10 +2349,16 @@ static void stop_streaming(struct vb2_queue *q)
 
 	/* vb2 calls this with the queue lock (tc->lock) held */
 	if (tc->active) {
-		af_stop(tc);
+		cama_stop(tc);
 		camsv_stop(tc);
 		free_irq(tc->irq, tc);
 		msleep(40);	/* let a frame in flight finish */
+		if (tc->fmt->dip) {
+			cancel_work_sync(&tc->dip_work);
+			memcpy(tc->active->wb, tc->wb, sizeof(tc->wb));
+			dip_teardown(tc);	/* imgsys + camsys still on for M4U */
+			imgsys_off(tc);
+		}
 		sensor_stop(tc->active);
 		seninf_stop(tc, tc->active->d->csi_port);
 		camsys_put(tc);
@@ -1839,6 +2622,7 @@ static void titan_cleanup(struct titan_cam *tc)
 	media_device_cleanup(&tc->mdev);
 	scratch_free(tc);
 	af_free(tc);
+	aa_free(tc);
 	if (tc->m4u_client)
 		m4u_destroy_client(tc->m4u_client);
 	for (i = 0; i < ARRAY_SIZE(clks); i++)
@@ -1856,6 +2640,8 @@ static void titan_cleanup(struct titan_cam *tc)
 		iounmap(tc->camsv);
 	if (tc->cama)
 		iounmap(tc->cama);
+	if (tc->dip)
+		iounmap(tc->dip);
 	kfree(tc);
 }
 
@@ -1894,6 +2680,11 @@ static int sensor_add_device(struct titan_cam *tc, struct titan_sensor *s)
 		if (ret)
 			return ret;
 	}
+	ret = device_create_file(&s->dev, &dev_attr_ae);	/* AE/AWB on both */
+	if (!ret)
+		ret = device_create_file(&s->dev, &dev_attr_dip);
+	if (ret)
+		return ret;
 	return s->sd.devnode ? device_move(&s->sd.devnode->dev, &s->dev, DPM_ORDER_NONE) : 0;
 }
 
@@ -1925,6 +2716,7 @@ static int titan_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&tc->af_work, af_work_fn);
 	spin_lock_init(&tc->qlock);
 	INIT_LIST_HEAD(&tc->queued);
+	INIT_WORK(&tc->dip_work, dip_work_fn);
 
 	tc->pdev = pdev;	/* CAMSV1, 0x1a050000 */
 	res = platform_get_resource(tc->pdev, IORESOURCE_MEM, 0);
@@ -1983,6 +2775,8 @@ static int titan_probe(struct platform_device *pdev)
 	ret = scratch_alloc(tc);
 	if (!ret)
 		ret = af_alloc(tc);
+	if (!ret)
+		ret = aa_alloc(tc);
 	camsys_put(tc);
 	if (ret)
 		goto err;
