@@ -36,8 +36,8 @@ From the stock dtbo. "Driver" is the driver that binds in our kernel.
 |---|---|---|---|---|
 | i2c0 | 0x5d | `mediatek,cap_touch` | Goodix GT1151QM touchscreen | `drivers/input/touchscreen/mediatek/GT1151` |
 | i2c1 | 0x0c | `mediatek,msensor` | magnetometer | BSP |
-| i2c1 | 0x51 | `mediatek,alsps` | ambient light / proximity | BSP |
-| i2c1 | 0x77 | `mediatek,barometer` | barometer | BSP |
+| i2c1 | 0x51 | `mediatek,alsps` | ambient light / proximity: nothing answers here; the sensor hub drives them ([below](#light-and-proximity-sensors)) | none |
+| i2c1 | 0x77 | `mediatek,barometer` | **not fitted**: nothing answers at 0x77 or 0x76 (2026-10-29), the stock kernel builds no barometer driver, the hub has no barometer | none |
 | i2c2 | 0x1a/0x72/0x50 | `mediatek,camera_main*` | OV16880 rear camera, AF, EEPROM | none (see roadmap) |
 | i2c2 | 0x28 | `mediatek,camera_sub_two` | | none |
 | i2c3 | 0x08 | `mediatek,nfc` | ST21NFC | BSP |
@@ -172,6 +172,30 @@ it off), `GyroBias` (learns the offset whenever the phone lies still) and
 only when tight, and used only when it explains the field better than the
 raw readings). Both are saved in `~/.local/share/titan-sensors/`.
 **Maze** and **Compass** use it (desktop.md).
+
+## Light and proximity sensors
+
+Both are read by the SCP's sensor hub (`alspshub`, MediaTek's alsps
+framework), like the motion sensors: `/dev/m_als_misc` and
+`/dev/m_ps_misc` carry the same `struct sensor_event` records, with
+`/sys/class/sensor/m_als_misc/als{batch,active}` and `m_ps_misc/ps{...}`.
+The device tree's `alsps` entry at i2c1 0x51 doesn't answer: the chip is
+on the hub's own bus. Two differences from the motion sensors (2026-10-29):
+
+- The batch line needs the real handle: `ID_LIGHT` 4, `ID_PROXIMITY` 7
+  (`"4,0,200000000,0"`); with 0 nothing reports.
+- `alsactive` takes `handle,enable` (`"4,1"`), `psactive` a bare `1`/`0`.
+  A bare `1` to `alsactive` is accepted and does nothing.
+
+Both report only on change. **Light** is word[0] in lux: about 440 in a
+room in daylight, 11-58 in a hand's shadow, 0-8 covered by a finger, and
+flat at 20 000 under a lamp (saturated). The divisor `alsactive` reads back
+(100) is never set by the hub driver and doesn't apply. Right after
+enabling, the framework sends value + 1 once to force a first update.
+**Proximity** is word[0] = state + 1: 1 near, 2 far (so 0/1 after the
+framework's +1); every pass of a hand ~2-3 cm over the top edge gave a
+near/far pair. `titan_sensors.py` handles all of this: `Sensor("als")`
+gives lux, `Sensor("ps")` 0 near / 1 far.
 
 ## microSD card
 

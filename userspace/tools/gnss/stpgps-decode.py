@@ -6,6 +6,7 @@ Capture on the phone with tools/gnss/gps-capture.sh (strace -f -ttt
 -s 65535 -xx, attached before titan-mnld opens the device), then:
     tools/gnss/stpgps-decode.py gps.trace            # summary by frame type
     tools/gnss/stpgps-decode.py gps.trace --dump     # every frame, in order
+    tools/gnss/stpgps-decode.py gps.trace --fd 6     # strace attached after the open
 
 Frame format (see docs/gnss.md):
     AA F0 | len | body (len bytes) | AA 0F       (len and body escaped)
@@ -27,12 +28,12 @@ RESUMED = re.compile(r'^(?:\d+\s+)?\S+ <\.\.\. (read|write) resumed>(?:"((?:[^"\
 ESC = {0xDF: 0xAA, 0xE0: 0xDE}
 
 
-def messages(path):
-    """(time, 'read'|'write', bytes) for each transfer on /dev/stpgps.
+def messages(path, fd=None):
+    """(time, 'read'|'write', bytes) for each transfer on /dev/stpgps (or on
+    fd, for a trace that starts after the device was opened).
     Calls that strace splits across threads ("<unfinished ...>" then
     "<... read resumed>") are joined: a write's data is on the first line,
     a read's on the second, the result on the second."""
-    fd = None
     pending = {}            # pid -> (time, op, fd, data) of an unfinished call
     for line in open(path, errors="replace"):
         pid = line.split(None, 1)[0] if line[:1].isdigit() else ""
@@ -132,7 +133,8 @@ def checksum_ok(head, body):
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
-    msgs = list(messages(sys.argv[1]))
+    fd = int(sys.argv[sys.argv.index("--fd") + 1]) if "--fd" in sys.argv else None
+    msgs = list(messages(sys.argv[1], fd))
     if not msgs:
         sys.exit("no /dev/stpgps traffic found (was the openat captured?)")
     dump = "--dump" in sys.argv

@@ -38,6 +38,32 @@ def bits(p, start, width, signed=False):
     return v - (1 << width) if signed and v >> (width - 1) else v
 
 
+# the code phase's two 10-bit counts, bit i of each (docs/gnss.md)
+CODE_A = (219, 220, 221, 222, 223, 216, 217, 218, 227, 228)
+CODE_B = (229, 230, 231, 224, 225, 226, 213, 214, 215)
+
+
+# chips in one code period (1 ms) of each constellation's signal
+CHIPS = {"G": 1023, "R": 511, "C": 2046}
+
+
+def code_phase(p, con="G"):
+    """whole chips of the constellation's code (GPS C/A 0-1022, GLONASS
+    0-510, BeiDou B1I 0-2045), from the two counts A and B. GPS from bit
+    flips against libmnl; GLONASS and BeiDou against geometry (2026-10-30,
+    a probe session at a window, the receiver's position known): GPS A + B,
+    GLONASS A + 2B, BeiDou A + B + 1023 * bit 229 (B's lowest bit doubles
+    as A's eleventh, 1024-chip bit). Whole chips only: the record has no
+    fraction (libmnl carries it, integrating Doppler)"""
+    a = sum(bits(p, b, 1) << i for i, b in enumerate(CODE_A))
+    b = sum(bits(p, bb, 1) << i for i, bb in enumerate(CODE_B))
+    if con == "R":
+        return (a + 2 * b) % 511
+    if con == "C":
+        return (a + b + 1023 * bits(p, 229, 1)) % 2046
+    return (a + b) % 1023
+
+
 def record(p):
     """the 0x29 fields decoded so far (docs/gnss.md)"""
     con = {0x08: "G", 0x80: "R", 0x01: "C"}.get(p[2])
@@ -51,7 +77,9 @@ def record(p):
         "sat": (con, sv - 32 if con == "C" else sv),
         "cn0": ((p[3] >> 3) | (p[3] & 1) << 5) - 3,     # dB-Hz
         "layout": p[5],
-        "time": bits(p, 160, 32) / 2 ** 27,             # seconds, modulo 32
+        "batch": p[20:27],                              # same for one constellation's batch
+        "codephase": code_phase(p, con),                # integer chips, + a per-batch offset
+        "chips": CHIPS[con],                            # chips in 1 ms
         "doppler": bits(p, 240, 24, True) / 2 ** 11,    # Hz, receiver drift excluded
     }
 

@@ -10,11 +10,13 @@ BeiDou and Galileo, 5 used). The **Location** app (app drawer) and
 `titan-location on|off` switch it. It is off by default because it drains
 the battery.
 
-**Replacing libmnl, stage 1 (2026-10-29): GO.** Our own code
-(`userspace/titan-gps`, Rust) brings the receiver up with no libmnl: it
-loads the firmware patch (from the phone's own libmnl.so), runs a session
-and gets every report type the chip sends libmnl. See "Replacing libmnl"
-below.
+**Replacing libmnl (2026-10-30): GPS fixes without it.** Our own code
+brings the receiver up, gives it search assignments from broadcast
+ephemeris and makes ~100 m position fixes from its measurements, fed to
+gpsd by `titan-gnss-open`, which the Location switch starts by default since 2026-10-30 (`titan-location engine libmnl` for MediaTek's engine). **[gnss-open.md](gnss-open.md) is the
+current summary and handoff for that work**; this page is the full record
+behind it (see "Replacing libmnl" below), and some of its early sections
+are history now.
 
 ## Stack
 
@@ -82,6 +84,37 @@ gpsd -n  ──>  cgps, gpspipe, the Location app, any gpsd client
       and satellite field, if given) after that many seconds, so libmnl
       drops them. Which measurements disappear shows which reports carry
       them.
+    - `TITAN_MNLD_FLIP=byte:mask` (`TITAN_MNLD_FLIP_B2=hex`,
+      `TITAN_MNLD_FLIP_ID=n`, `TITAN_MNLD_FLIP_PERIOD=s`, default 10): in
+      the same `read()`, XORs payload byte `byte` of the chosen `29`
+      records with `mask` during alternate windows of that many seconds,
+      and fixes the checksum. Each change is logged to the measurement log
+      as `F <ms> <byte 1> <byte 2> <old> <new>`, so the step in libmnl's
+      measurement gives that bit's meaning. On the phone,
+      `/root/flip-run.sh byte:mask seconds [b2] [id]` runs one experiment
+      with Location on and leaves `/tmp/flip-byte:mask.log`.
+    - `TITAN_MNLD_NAV=/path`: libmnl's navigation events
+      (`mtk_gnss_get_navigation_event(event, svid, 1)` for GPS PRNs 1-32,
+      once a second) as `N <ms> <svid> <return> <0x60 bytes hex>`; the data
+      (offset 0x14) are ten words `[6 parity bits][24 data bits]`: plain,
+      decoded GPS subframes, the reference for `2B`.
+    - `TITAN_MNLD_FLIP2B=prn=byte[-byte]:mask,...`: the flip experiment
+      for `2B` navigation subframes, by the PRN in their header (byte 2 >>
+      3), during alternate `TITAN_MNLD_FLIP_PERIOD` windows (use 30, the
+      subframe cycle); logged as `F <ms> 2b <prn> <old> <new> <byte>`.
+      Pair with `TITAN_MNLD_NAV`.
+    - `TITAN_MNLD_WFLIP=type:offset:width:delta` (`TITAN_MNLD_WFLIP_SV`,
+      `_CON` hex, `_PERIOD` s, default 10, 0 = always): the host side.
+      libmnl imports `write()` as well, and writes whole frames, so
+      titan-mnld rebuilds each write: in host frames of that type it adds
+      `delta` to the little-endian field of `width` bytes at that payload
+      offset, during alternate windows, and fixes the sum and the escaping
+      (frames it doesn't change come out byte for byte the same). Each
+      change is logged as `W <ms> <type> <byte 0> <byte 1> <old> <new>`.
+      `/root/wflip-run.sh type:offset:width:delta seconds [sv] [con]`
+      (tools/gnss/wflip-run.sh) also records the traffic with strace,
+      which can attach after `/dev/stpgps` is opened:
+      `stpgps-decode.py --fd 6` reads such a trace.
 - **No assistance data.** libmnl asks for AGPS (EPO and QEPO orbit
   predictions, NTP time, network location) through
   `mtk_gps_sys_agps_disaptcher_callback`. titan-mnld logs each request
@@ -189,12 +222,12 @@ escapes in the length and the body: DE DF → AA,  DE E0 → DE
 | `08` | session start | a 110-byte header (it carries the patch's header, below, and the chunk count, 49), then short download controls |
 | `0C` | session start | **the firmware patch**, `[u16 number from 1][data]` (below) |
 | `04` | after the setup | 30 bytes of FF |
-| `02` | 1 Hz | **satellite search assignments**, 24 bytes each, ~30 a second: `[satellite][constellation: 01 GPS, 10 GLONASS, 20 BeiDou][u16][u16 seconds, +1 a second][u16]` and predicted values (Doppler and code phase, it seems). The satellite is the PRN for GPS and BeiDou, and the frequency channel k + 8 for GLONASS (libmnl's slot 11 at k = 0 is 8). libmnl aids the search from its saved almanac and ephemeris. |
+| `02` | 3 a second | **per-satellite channel assignments**, 20-byte payload, ~30 a second: `[satellite][constellation: 01 GPS, 10 GLONASS, 20 BeiDou][0400][u16 seconds, as in 01][u16 sub-step, 1/24 s: three a second, 8 apart][i32 Doppler, 2^-16 Hz][u8, nearly always a multiple of 3][u8][u16 small while tracked (4, 15, 46), large while searching (156-475): a Doppler window in Hz, it seems][u16 mode: 0100 search, 0301 track][u16 41/43/01/03]`. The Doppler excludes the receiver clock's drift: against libmnl's measured Doppler minus a per-epoch common value (~38.4 kHz, the drift), it agrees to 1.3 Hz (median, three captures). While a satellite is searched it is libmnl's prediction (almanac/ephemeris); once tracked, libmnl's own estimate, updated three times a second. There is no code-phase prediction: the chip searches code phase itself. **The Doppler is the acquisition search centre and is ignored while tracking** (`TITAN_MNLD_WFLIP`): +200 Hz on a tracked satellite changed neither the chip's record Doppler nor libmnl's; +3 kHz on every GPS satellite from the start, and no GPS satellite was acquired in 90 s (750 measurements normally; GLONASS and BeiDou dropped too, from 338/408 to 2/75, libmnl's clock estimate relying on GPS, it seems). The satellite is the PRN for GPS and BeiDou, and the frequency channel k + 8 for GLONASS (libmnl's slot 11 at k = 0 is 8). |
 | `07`, `0A` | occasional | short controls |
 | `05` | setup, then periodic | register-style settings `[u16 id][value]` |
-| `00` | 1 Hz | a millisecond counter rising by 1000 each second (the low 16 bits of `01`'s, a second later) |
-| `10` | 1 Hz | clock and frequency values that drift slowly |
-| `01` | 1 Hz | constant fields (contains 10000 = `0x2710`) plus the chip's millisecond tick (u32 at byte 8, +1000 a second) |
+| `00` | 2 a second | `00 00 [u16 milliseconds]`, +500 each frame |
+| `10` | 2 a second | `01` then three groups `[u16 a][0000][ffff][u16 b]` (one per constellation, it seems; a steps by 800 and b by 448 from group to group). a and b fall slowly in step in all three groups and follow the receiver clock's drift (r 0.89-0.98), but at 0.56-0.76 Hz per unit, different in each capture: a clock or temperature compensation setting rather than the drift itself. Adding 20 to the GPS group's a (`TITAN_MNLD_WFLIP=10:1:2:20`) changed nothing in tracking: neither the records' Doppler (0 ± 6 Hz) nor libmnl's clock drift. The stage 1 probe tracked with an hour-old replay of these |
+| `01` | 2 a second | `[u32, ~0x60][u32, ~0x0f93, rising slowly][u16 milliseconds: 00's value from the frame before][u16 0x0420][00][u16 seconds, as in 02][00 00 00]` |
 | `03` | 1 Hz | the satellite list: `00 [count]` then `[satellite][constellation]` pairs, numbered as in `02`, roughly strongest first (33 or 34); plus a short `03 0100` |
 | `1C` | 1 Hz | an empty control frame |
 
@@ -307,7 +340,8 @@ the repository.
    | byte 2 | constellation: `08` GPS, `80` GLONASS, `01` BeiDou (bit 16 doubles as the BeiDou id's top bit), `10` rarely (Galileo?) |
    | 24, 27-31 | C/N0: ((byte 3 >> 3) \| (byte 3 & 1) << 5) − 3 = libmnl's dB-Hz (GLONASS and BeiDou agree every time) |
    | 40-47 | `A0` in most records; `50` marks another layout (GLONASS searches, it seems) |
-   | 160-191 | the time the record was latched: 2^-27 s units, modulo 32 s (bit 187 is 1 s). Records come in groups sharing one time |
+   | 160-215 | a batch value, identical in every record of one constellation in one batch (GPS `…dbf930`, GLONASS `…b21a38`, BeiDou `…51fae0`). It is not a latch time: byte 23 steps +8, +8, 0 and byte 25's top bits cycle with period 3 (about three batches a second) |
+   | 213-231 | integer code phase in C/A chips: the sum of two 10-bit counts with their bits shuffled (see below) |
    | 240-263 | Doppler, signed, 2^-11 Hz, without the receiver clock's drift (about 38.5 kHz here, which libmnl adds to every satellite); r = 0.999 against libmnl's, the rest in libmnl's 16 Hz steps |
 
    Every satellite libmnl measures has its `29` records: with the decoder
@@ -330,16 +364,184 @@ the repository.
    - `30`, `37`, `2C`, `4E` (once a second): counters and status, no
      per-satellite values.
 
+   **Code phase (2026-10-29).** Mapped bit by bit with `TITAN_MNLD_FLIP`
+   (above): flipping a bit of the `29` records moves libmnl's
+   `received_sv_time` for that satellite by exactly that bit's weight
+   (repeatable to about 10 ns), so `tools/gnss/flip-steps.py` reads each
+   bit's meaning straight off the measurement log. Weights in C/A chips
+   (1 ms = 1023 chips; libmnl takes the sum modulo 1023):
+
+   | chips | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 |
+   |---|---|---|---|---|---|---|---|---|---|---|
+   | count A, bit | 219 | 220 | 221 | 222 | 223 | 216 | 217 | 218 | 227 | 228 |
+   | count B, bit | 229 | 230 | 231 | 224 | 225 | 226 | 213 | 214 | 215 | ? |
+
+   Count A is byte 27 rotated right by 3, plus byte 28's bits 3-4; count B
+   is byte 28 rotated right by 5 plus byte 26's top bits (always 0 in the
+   captures so far; bits 208-212 together are worth 464 chips, so byte 26
+   holds more of the counts, unmapped bit by bit).
+
+   Checked against libmnl in three captures, in pairs of satellites from
+   one batch: A + B matches the difference of libmnl's times to a median of
+   1.2 chips, 0.6 once each pair's Doppler difference × the time between
+   the record and libmnl's epoch is allowed for (it was 80 chips with the
+   older reading). For one satellite over time, A + B steps exactly as
+   libmnl's does (72 chips per 3 s); what is left:
+   - an offset that depends on the batch value (bytes 20-26) and is the
+     same for every satellite of the batch. A position solution absorbs it
+     into the receiver clock bias;
+   - the fraction of a chip, which the record doesn't carry. XORing whole
+     bytes (one byte per satellite, `TITAN_MNLD_FLIP_SATS`) showed that no
+     byte of 4-54 other than 26-28 moves libmnl's time, nor a 2048 Hz bit
+     of the Doppler. Instead, libmnl's time for a satellite advances from
+     one second to the next by exactly what its own pseudorange rate
+     predicts (median 2.3 ns; the rest are whole-second rollovers and the
+     jump when the time of week is decoded), with no whole-chip
+     corrections. So libmnl carries each satellite's phase itself,
+     integrating Doppler, and the chip's whole-chip count anchors it (which
+     is why a flipped bit moves the time by exact whole chips). The
+     fraction's starting point is host state from setting up the channel
+     (`02` and the 1 Hz frames). An open receiver keeps it the same way:
+     it issues those commands itself, or rebuilds the fraction from the
+     whole-chip count and the integrated Doppler.
+
    Still open:
-   - The code phase (the pseudorange). It isn't a fixed field compared
-     across satellites at libmnl's epochs: the records are latched at
-     their own times, so it needs the per-record time above and the
-     Doppler to bring them to one instant.
+   - The batch offset (above), and how the `02` and 1 Hz host frames set a
+     channel's code phase (the fraction's starting point).
    - The two record kinds of steady tracking.
-   - Then the 1 Hz host frames (`10`, `01`'s constant part) and `02`'s
-     predicted values, so the probe can make its own instead of replaying.
+   - The host frames, so the probe can make its own instead of replaying
+     (table above): `02`'s Doppler (the search centre) and timing are
+     decoded; left are its window/level/mode fields, which only matter to
+     search, and what `10` is for (not tracking). `TITAN_MNLD_WFLIP` tests
+     them.
 3. **Aiding and the solution**: search assignments from ephemeris (first
    from broadcast ephemeris downloaded over the network, later decoded from
    the satellites), pseudoranges from the measurements, and a PVT solver
    (RTKLIB's is the obvious start).
 
+   **Our own GPS search assignments work (2026-10-29).** The chip acquires
+   GPS satellites from `02` frames computed with no libmnl:
+   - `tools/gnss/gpseph.py`: GPS orbits from a RINEX 3 broadcast
+     navigation file (IS-GPS-200), and the Doppler seen from a position,
+     without the receiver's drift. Against libmnl's own `02` frames it
+     agrees for every satellite to within a common offset of -145 to -152
+     Hz (about 2 Hz scatter) in four captures: libmnl folds that much of
+     the drift into `02`. The file came from IGS's merged broadcast
+     ephemeris (BKG: `root_ftp/IGS/BRDC/<year>/<day>/BRDC00WRD_S_...MN.rnx.gz`,
+     updated every 15 min).
+   - `tools/gnss/own02.py`: rewrites every GPS `02` frame of a replay
+     script with that Doppler (minus 150 Hz) for the moment the probe will
+     send it, holding the other fields at the satellite's first
+     (search-mode) frame; `tools/gnss/own02-run.sh` does this on the phone
+     seconds before starting titan-gps-probe;
+     `tools/gnss/probe-sats.py` says what the chip tracked.
+   - Result, indoors, 90 s each from the same base capture (records at
+     C/N0 >= 20 dB-Hz): our `02`, GPS 522 and 492 in two runs, 13 and 8
+     satellites; libmnl's own values ten minutes stale, GPS 3; ours offset
+     by 3 kHz, GPS 3 (brief threshold crossings). GLONASS and BeiDou,
+     replayed the same in every run, varied between 20 and 100 at random.
+     libmnl in its own session tracked 10 GPS satellites.
+
+   Still replayed from libmnl: the setup, the clock frames (`00`, `01`,
+   `10`), the satellite list (`03`) and GLONASS/BeiDou's `02`. The probe's
+   firmware download used to stall in about half of back-to-back
+   sessions; fixed, see "The probe's firmware download" below.
+   `titan-gps-probe --quiet` writes no log at all.
+
+   **First position fix without libmnl (2026-10-30).**
+   `tools/gnss/snapfix.py` makes a GPS fix from titan-gps-probe's log
+   alone: the chip's whole-chip code phases (`29`), broadcast ephemeris,
+   the probe's start time (the phone's NTP clock) and a rough position.
+   It is a snapshot ("coarse-time") fix, as AGPS receivers make: each
+   batch of records (bytes 20-26 alike) gives each satellite's transmit
+   time modulo 1 ms; whole milliseconds are resolved against one
+   satellite from the rough position and time, and least squares finds
+   position, clock bias and the error of the time stamp. All batches are
+   then solved together (one position, a bias and time error per batch).
+   - Live: rough position 20 km off (the true one rounded to 0.5°, height
+     0), fresh ephemeris, our own `02` for GPS, the probe for 60 s (the
+     first try was the one session in ten that never measures; the second
+     tracked 10 GPS satellites): joint fix **67 m** from libmnl's own
+     indoor fix of the same spot. Two earlier probe runs: 45 m and 78 m,
+     the same from starting guesses 0 to 67 km off.
+   - Residuals (~65 m rms) are what whole chips predict (±146 m, 85 m rms
+     per satellite). Better needs the sub-chip phase, which the record
+     doesn't carry: carry it in software from the integrated Doppler, as
+     libmnl does.
+
+   **titan-gnss-open: open fixes into gpsd (2026-10-30).**
+   `userspace/titan-gnss-open`: a Python daemon (and an unenabled unit
+   that conflicts with titan-gnss and titan-mnld) that feeds gpsd with no
+   libmnl. Each session it refreshes the GPS broadcast ephemeris (about
+   hourly; an older file is used offline, up to 4 h), rewrites the GPS
+   `02` assignments of a replay script for that moment from the last
+   position, runs titan-gps-probe for 10 minutes (the receiver keeps
+   tracking after the script's ~90 s), reads the chip's records as they
+   come and, every 2 s, solves a joint snapshot fix over the last 30 s,
+   sending NMEA GGA and RMC to gpsd's UDP input (127.0.0.1:10110, as
+   titan-gnss does). Install: `userspace/titan-gnss-open/install.sh`;
+   then, on the phone, in `/var/lib/titan-gnss-open` (root only, never in
+   the repository): `base.script` (a libmnl session captured on the phone:
+   gps-capture.sh, stpgps-script.py) and, before the first fix,
+   `position` ("lat lon" within some tens of km; later the last fix).
+   With Location off: `systemctl start titan-gnss-open`.
+   - First run, indoors: the first fix about 100 s into the session, then
+     one every 2 s; gpsd reported 3D fixes 45-136 m from libmnl's own fix
+     of the spot (height ~+200 m); 31 fixes in four minutes on 5-6
+     satellites; the daemon used 5 s of CPU in that time.
+   - Still from libmnl: the replayed setup and clock frames, the
+     satellite list and GLONASS/BeiDou's assignments (from base.script),
+     and the firmware patch (read from the phone's libmnl.so). GPS only.
+
+   **The probe's firmware download (2026-10-29).** `32 [u16 n]` (raw, not
+   XORed) acknowledges chunk n, about 10 ms after it (in strace it can look
+   like a request for the next chunk: a blocking `read()` is stamped when
+   it starts). Two things made sessions fail:
+   - now and then an acknowledgement doesn't come; libmnl then sends the
+     chunk again (its captures show one chunk sent twice), and the probe
+     used to give up. It now sends a chunk up to 3 times, then gives up
+     on the session.
+   - now and then (about one session in ten, at 10-20 s gaps) the session
+     header isn't answered at all, though the driver powers GPS on fine
+     (when it is answered, it's within 2 ms). The probe now stops such a
+     session (exit 1) instead of sending the patch; the next one, after
+     a short wait, works. About as often, a session completes the patch
+     (with a resend) but the receiver never starts measuring: a caller
+     should check for `29` records and start again.
+   **Never push the patch into a receiver that isn't answering**: sending
+   chunks over and over with no acknowledgements (about 150-190 writes)
+   hung the whole connectivity chip three times (STP `tx_timeout`,
+   `consys_hang_debug`, then a kernel "whole chip reset"; Wi-Fi and
+   Bluetooth recovered by themselves after a minute or so). With the
+   checks above, ten back-to-back sessions at 10 s gaps caused no chip
+   reset (8 measured, 1 stopped at the header, 1 never measured).
+
+
+   **The Doppler field, the fraction and the reference (2026-10-30).**
+   - The plan was to carry the sub-chip code phase by integrating each
+     satellite's Doppler between records, as libmnl does. It doesn't
+     work with the records' Doppler: against the Doppler predicted from
+     broadcast ephemeris at libmnl's fix, it is off by a per-satellite
+     amount that holds through a session (probe session: +57 Hz for G8,
+     −306 Hz for G1, −231 Hz for G17; libmnl session: −24 to −355 Hz). The
+     whole chips follow the geometry instead: their drift between two
+     satellites matched the ephemeris Doppler difference (G1−G8 2.575
+     chip/s measured, 2.580 predicted; G17−G8 3.359 and 3.363; G7−G8 0.305
+     and 0.31), not the records' (2.344, 3.176, 0.19).
+   - No field of the record holds a fraction: adding any bit field (3-16
+     bits, outside the known ones) to the whole chips leaves two
+     satellites' difference as rough as before over a minute (0.41 chip
+     rms, best 0.40; rounding alone gives 0.41).
+   - Against libmnl's measured time in run6, the whole chips differ by a
+     per-satellite amount (G31 −2.9 chips, G16 −2.1, G8 +1.2, the rest
+     within ±0.3) that wanders by about a chip during the session. libmnl's
+     fixes at the same indoor spot also disagree between sessions: run3
+     and run5 are 169 m and 106 m from run6 horizontally (run3 253 m
+     lower), each with a claimed 30 m. Measured against run3's fix instead
+     of run6's, snapfix's joint fix of the live run is 7 m off
+     horizontally, the own02 run's 32 m.
+   - `snapfix.py` gained `solve_joint_t` (one time error for all batches,
+     so four satellites a batch are enough) and `solve_robust` (leaves out
+     a satellite whose mean residual stays over 120 m). Replaying the
+     daemon's loop over the live run: first fix after 20 s (24 s before),
+     median 68 m in 3D from run3's fix (94 m). The daemon uses it.

@@ -5,6 +5,7 @@ replay script for titan-gps-probe (userspace/titan-gps).
 
     tools/gnss/stpgps-script.py gps2.trace > session.script
     tools/gnss/stpgps-script.py gps2.trace --seconds 30 > session.script
+    tools/gnss/stpgps-script.py gps2.trace --fd 5 > session.script   # strace attached late
 
 Capture as in stpgps-decode.py (strace -f -ttt -s 65535 -xx ...), attached
 before titan-mnld opens the device (/root/gps-capture.sh on the phone does
@@ -47,10 +48,11 @@ def main():
     seconds = None
     if "--seconds" in sys.argv:
         seconds = float(sys.argv[sys.argv.index("--seconds") + 1])
+    fd = int(sys.argv[sys.argv.index("--fd") + 1]) if "--fd" in sys.argv else None
     dec = load_decoder()
     t0 = None
     patching = False
-    for t, op, data in dec.messages(sys.argv[1]):
+    for t, op, data in dec.messages(sys.argv[1], fd):
         if op != "write":
             continue
         t = float(t)
