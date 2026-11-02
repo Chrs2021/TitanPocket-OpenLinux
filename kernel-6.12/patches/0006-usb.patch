@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 06/15] usb: mtu3, phy: mediatek: VBUS session follows the role switch; set the IP up after a reset in suspend
+
+phy-mtk-tphy: a port with mediatek,force-vbus forces the VBUS-valid and
+session signals the PHY's comparator cannot see on this board, and ends
+the forced session on phy_set_mode(PHY_MODE_INVALID). mtu3 sets that mode
+on role "none", so the Type-C port controller's cable detection decides
+and the IP can sleep when nothing is plugged in.
+
+The SPM's deep sleep leaves the SSUSB IP in software reset; mtu3's resume
+now releases it and sets the device side up again
+(ssusb_gadget_restore()).
+---
+ drivers/phy/mediatek/phy-mtk-tphy.c | 41 +++++++++++++++++++++++++++--
+ drivers/usb/mtu3/mtu3_core.c        | 21 +++++++++++++++
+ drivers/usb/mtu3/mtu3_dr.c          | 34 +++++++++++++++++++++++-
+ drivers/usb/mtu3/mtu3_dr.h          |  6 +++++
+ drivers/usb/mtu3/mtu3_plat.c        | 13 ++++++++-
+ 5 files changed, 111 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/phy/mediatek/phy-mtk-tphy.c b/drivers/phy/mediatek/phy-mtk-tphy.c
+index 3f7095ec5978e3c80836db98a65cabd55061a36e..aa9403de0f8d79a72b666a5d2a141e18fceed212 100644
+--- a/drivers/phy/mediatek/phy-mtk-tphy.c
++++ b/drivers/phy/mediatek/phy-mtk-tphy.c
+@@ -111,6 +111,9 @@
+ 
+ #define U3P_U2PHYDTM1		0x06C
+ #define P2C_RG_UART_EN			BIT(16)
++#define P2C_FORCE_VBUSVALID		BIT(13)
++#define P2C_FORCE_SESSEND		BIT(12)
++#define P2C_FORCE_AVALID		BIT(10)
+ #define P2C_FORCE_IDDIG		BIT(9)
+ #define P2C_RG_VBUSVALID		BIT(5)
+ #define P2C_RG_SESSEND			BIT(4)
+@@ -331,6 +334,8 @@ struct mtk_phy_instance {
+ 	int discth;
+ 	int pre_emphasis;
+ 	bool bc12_en;
++	bool force_vbus;
++	bool vbus_off;		/* forced session ended: no cable (phy_set_mode) */
+ 	bool type_force_mode;
+ };
+ 
+@@ -890,9 +895,23 @@ static void u2_phy_instance_power_on(struct mtk_tphy *tphy,
+ 	/* OTG Enable */
+ 	mtk_phy_set_bits(com + U3P_USBPHYACR6, PA6_RG_U2_OTG_VBUSCMP_EN);
+ 
+-	mtk_phy_set_bits(com + U3P_U2PHYDTM1, P2C_RG_VBUSVALID | P2C_RG_AVALID);
++	if (instance->force_vbus && instance->vbus_off) {
++		mtk_phy_clear_bits(com + U3P_U2PHYDTM1, P2C_RG_VBUSVALID | P2C_RG_AVALID);
++		mtk_phy_set_bits(com + U3P_U2PHYDTM1, P2C_RG_SESSEND);
++	} else {
++		mtk_phy_set_bits(com + U3P_U2PHYDTM1, P2C_RG_VBUSVALID | P2C_RG_AVALID);
++		mtk_phy_clear_bits(com + U3P_U2PHYDTM1, P2C_RG_SESSEND);
++	}
+ 
+-	mtk_phy_clear_bits(com + U3P_U2PHYDTM1, P2C_RG_SESSEND);
++	/*
++	 * Where the VBUS comparator doesn't see the cable (another chip
++	 * senses VBUS), the session values above only count when forced.
++	 * They then follow phy_set_mode(): PHY_MODE_INVALID (no cable) ends
++	 * the session, PHY_MODE_USB_DEVICE starts it again.
++	 */
++	if (instance->force_vbus)
++		mtk_phy_set_bits(com + U3P_U2PHYDTM1, P2C_FORCE_VBUSVALID |
++				 P2C_FORCE_SESSEND | P2C_FORCE_AVALID);
+ 
+ 	if (tphy->pdata->avoid_rx_sen_degradation && index) {
+ 		mtk_phy_set_bits(com + U3D_U2PHYDCR0, P2C_RG_SIF_U2PLL_FORCE_ON);
+@@ -916,6 +935,10 @@ static void u2_phy_instance_power_off(struct mtk_tphy *tphy,
+ 
+ 	mtk_phy_set_bits(com + U3P_U2PHYDTM1, P2C_RG_SESSEND);
+ 
++	if (instance->force_vbus)
++		mtk_phy_clear_bits(com + U3P_U2PHYDTM1, P2C_FORCE_VBUSVALID |
++				   P2C_FORCE_SESSEND | P2C_FORCE_AVALID);
++
+ 	if (tphy->pdata->avoid_rx_sen_degradation && index) {
+ 		mtk_phy_clear_bits(com + U3P_U2PHYDTM0, P2C_RG_SUSPENDM | P2C_FORCE_SUSPENDM);
+ 
+@@ -950,6 +973,19 @@ static void u2_phy_instance_set_mode(struct mtk_tphy *tphy,
+ 	switch (mode) {
+ 	case PHY_MODE_USB_DEVICE:
+ 		tmp |= P2C_FORCE_IDDIG | P2C_RG_IDDIG;
++		if (instance->force_vbus) {
++			instance->vbus_off = false;
++			tmp |= P2C_RG_VBUSVALID | P2C_RG_AVALID;
++			tmp &= ~P2C_RG_SESSEND;
++		}
++		break;
++	case PHY_MODE_INVALID:
++		/* no cable: end the forced session, so the controller can sleep */
++		if (!instance->force_vbus)
++			return;
++		instance->vbus_off = true;
++		tmp &= ~(P2C_RG_VBUSVALID | P2C_RG_AVALID);
++		tmp |= P2C_RG_SESSEND;
+ 		break;
+ 	case PHY_MODE_USB_HOST:
+ 		tmp |= P2C_FORCE_IDDIG;
+@@ -1149,6 +1185,7 @@ static void phy_parse_property(struct mtk_tphy *tphy,
+ 		return;
+ 
+ 	instance->bc12_en = device_property_read_bool(dev, "mediatek,bc12");
++	instance->force_vbus = device_property_read_bool(dev, "mediatek,force-vbus");
+ 	device_property_read_u32(dev, "mediatek,eye-src",
+ 				 &instance->eye_src);
+ 	device_property_read_u32(dev, "mediatek,eye-vrt",
+diff --git a/drivers/usb/mtu3/mtu3_core.c b/drivers/usb/mtu3/mtu3_core.c
+index ca8cb6c3a01bf93bc5fa1a885d8ec90b653dc1b0..910a11cb5a4df503316bdf3c5ba68028d219c0a1 100644
+--- a/drivers/usb/mtu3/mtu3_core.c
++++ b/drivers/usb/mtu3/mtu3_core.c
+@@ -1051,6 +1051,27 @@ int ssusb_gadget_suspend(struct ssusb_mtk *ssusb, pm_message_t msg)
+ 	return 0;
+ }
+ 
++/*
++ * The IP lost its state in system suspend (MT6771: the SPM's deep sleep
++ * leaves it in software reset): set the device part up again as at probe.
++ * The memory and FIFO layout are software state and survive.
++ */
++int ssusb_gadget_restore(struct ssusb_mtk *ssusb)
++{
++	struct mtu3 *mtu = ssusb->u3d;
++	int ret;
++
++	if (!mtu)
++		return 0;
++
++	mtu3_device_reset(mtu);
++	ret = mtu3_device_enable(mtu);
++	if (ret)
++		return ret;
++	mtu3_regs_init(mtu);
++	return 0;
++}
++
+ int ssusb_gadget_resume(struct ssusb_mtk *ssusb, pm_message_t msg)
+ {
+ 	struct mtu3 *mtu = ssusb->u3d;
+diff --git a/drivers/usb/mtu3/mtu3_dr.c b/drivers/usb/mtu3/mtu3_dr.c
+index 8191b7ed3852107a4ddd55b39fc53987eb56fef6..3337954a20113579bcff3ccf6c6cd26d6c292d64 100644
+--- a/drivers/usb/mtu3/mtu3_dr.c
++++ b/drivers/usb/mtu3/mtu3_dr.c
+@@ -124,6 +124,30 @@ int ssusb_set_vbus(struct otg_switch_mtk *otg_sx, int is_on)
+ 	return 0;
+ }
+ 
++/*
++ * A role switch reporting no partner (USB_ROLE_NONE) on a port whose
++ * default role is device: the controller stays a device, and its PHYs end
++ * the VBUS session where they force it (a PHY whose VBUS comparator
++ * doesn't see the cable), so the IP can sleep; USB_ROLE_DEVICE starts the
++ * session again.
++ */
++static bool vbus_follows_role = true;
++module_param(vbus_follows_role, bool, 0644);
++MODULE_PARM_DESC(vbus_follows_role,
++		 "end the PHY's forced VBUS session on role \"none\" (0 keeps it, for debugging)");
++
++static void ssusb_phy_vbus(struct ssusb_mtk *ssusb, bool on)
++{
++	int i;
++
++	if (!vbus_follows_role)
++		on = true;
++
++	for (i = 0; i < ssusb->num_phys; i++)
++		phy_set_mode(ssusb->phys[i],
++			     on ? PHY_MODE_USB_DEVICE : PHY_MODE_INVALID);
++}
++
+ static void ssusb_mode_sw_work(struct work_struct *work)
+ {
+ 	struct otg_switch_mtk *otg_sx =
+@@ -131,6 +155,7 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 	struct ssusb_mtk *ssusb = otg_sx_to_ssusb(otg_sx);
+ 	struct mtu3 *mtu = ssusb->u3d;
+ 	enum usb_role desired_role = otg_sx->desired_role;
++	bool partner = desired_role != USB_ROLE_NONE;
+ 	enum usb_role current_role;
+ 
+ 	current_role = ssusb->is_host ? USB_ROLE_HOST : USB_ROLE_DEVICE;
+@@ -142,8 +167,14 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 			desired_role = USB_ROLE_DEVICE;
+ 	}
+ 
+-	if (current_role == desired_role)
++	if (current_role == desired_role) {
++		if (desired_role == USB_ROLE_DEVICE) {
++			pm_runtime_get_sync(ssusb->dev);
++			ssusb_phy_vbus(ssusb, partner);
++			pm_runtime_put(ssusb->dev);
++		}
+ 		return;
++	}
+ 
+ 	dev_dbg(ssusb->dev, "set role : %s\n", usb_role_string(desired_role));
+ 	mtu3_dbg_trace(ssusb->dev, "set role : %s", usb_role_string(desired_role));
+@@ -162,6 +193,7 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 		ssusb->is_host = false;
+ 		ssusb_set_vbus(otg_sx, 0);
+ 		switch_port_to_device(ssusb);
++		ssusb_phy_vbus(ssusb, partner);
+ 		mtu3_start(mtu);
+ 		break;
+ 	case USB_ROLE_NONE:
+diff --git a/drivers/usb/mtu3/mtu3_dr.h b/drivers/usb/mtu3/mtu3_dr.h
+index e325508bddf4614dc1890a5b99a9c07c4b93e416..92d486a80b1e1e62884c542ba8175e928fa0bd4c 100644
+--- a/drivers/usb/mtu3/mtu3_dr.h
++++ b/drivers/usb/mtu3/mtu3_dr.h
+@@ -59,6 +59,7 @@ int ssusb_gadget_init(struct ssusb_mtk *ssusb);
+ void ssusb_gadget_exit(struct ssusb_mtk *ssusb);
+ int ssusb_gadget_suspend(struct ssusb_mtk *ssusb, pm_message_t msg);
+ int ssusb_gadget_resume(struct ssusb_mtk *ssusb, pm_message_t msg);
++int ssusb_gadget_restore(struct ssusb_mtk *ssusb);
+ bool ssusb_gadget_ip_sleep_check(struct ssusb_mtk *ssusb);
+ 
+ #else
+@@ -82,6 +83,11 @@ ssusb_gadget_resume(struct ssusb_mtk *ssusb, pm_message_t msg)
+ 	return 0;
+ }
+ 
++static inline int ssusb_gadget_restore(struct ssusb_mtk *ssusb)
++{
++	return 0;
++}
++
+ static inline bool ssusb_gadget_ip_sleep_check(struct ssusb_mtk *ssusb)
+ {
+ 	return true;
+diff --git a/drivers/usb/mtu3/mtu3_plat.c b/drivers/usb/mtu3/mtu3_plat.c
+index 6858ed9fc3b2f1276161a60554dee3491063bb3d..0220bf0d8328403ab0aec40d5066bcde2379f013 100644
+--- a/drivers/usb/mtu3/mtu3_plat.c
++++ b/drivers/usb/mtu3/mtu3_plat.c
+@@ -32,7 +32,8 @@ int ssusb_check_clocks(struct ssusb_mtk *ssusb, u32 ex_clks)
+ 	ret = readl_poll_timeout(ibase + U3D_SSUSB_IP_PW_STS1, value,
+ 			(check_val == (value & check_val)), 100, 20000);
+ 	if (ret) {
+-		dev_err(ssusb->dev, "clks of sts1 are not stable!\n");
++		dev_err(ssusb->dev, "clks of sts1 are not stable! (0x%x, want 0x%x)\n",
++			value, check_val);
+ 		return ret;
+ 	}
+ 
+@@ -570,6 +571,16 @@ static int mtu3_resume_common(struct device *dev, pm_message_t msg)
+ 	if (ret)
+ 		goto phy_err;
+ 
++	/* reset in suspend (MT6771's deep sleep): set it up again */
++	if (mtu3_readl(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL0) & SSUSB_IP_SW_RST) {
++		dev_info(dev, "IP was reset in suspend, setting it up again\n");
++		ssusb_ip_sw_reset(ssusb);
++		if (!ssusb->is_host)
++			ssusb_gadget_restore(ssusb);
++		else
++			dev_warn(dev, "host mode is not set up again\n");
++	}
++
+ 	return resume_ip_and_ports(ssusb, msg);
+ 
+ phy_err:

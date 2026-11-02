@@ -1028,6 +1028,13 @@ static INT32 wmt_parser_data(PUINT8 buffer, UINT32 length, UINT8 type)
 				osal_buffer_dump(buffer, "coex_packet_print", length, 128);
 #else
 			STP_WARN_FUNC("BT/WIFI & LTE coex in non-LTE projects,drop it...\n");
+			/*
+			 * Dropped, but received: report success so that the packet
+			 * is acknowledged. Otherwise CONNSYS resends it until its
+			 * window stalls, and later events (FM's, the wake-up
+			 * event) time out.
+			 */
+			fgRxOk = 0;
 #endif
 		} else {
 			fgRxOk = stp_add_to_rx_queue(buffer + parser_length, packet_length + 4, type);
@@ -2153,8 +2160,15 @@ static INT32 stp_parser_data_in_full_mode(UINT32 length, UINT8 *p_data)
 			break;
 
 		case MTKSTP_CHECKSUM:
+			/*
+			 * The firmware's assert and coredump messages (type 5,
+			 * seq 0, ack 0) carry a zero header checksum; accept them
+			 * so the coredump flow starts.
+			 */
 			if (((stp_core_ctx.rx_buf[0] +
-					stp_core_ctx.rx_buf[1] + stp_core_ctx.rx_buf[2]) & 0xff) == *p_data) {
+					stp_core_ctx.rx_buf[1] + stp_core_ctx.rx_buf[2]) & 0xff) == *p_data ||
+			    (stp_core_ctx.parser.type == STP_TASK_INDX &&
+			     stp_core_ctx.rx_buf[0] == 0x80 && *p_data == 0)) {
 				if ((stp_core_ctx.parser.type == STP_TASK_INDX) || mtk_wcn_stp_is_info_task()) {
 					stp_change_rx_state(MTKSTP_FW_MSG);
 					stp_core_ctx.rx_counter = 0;

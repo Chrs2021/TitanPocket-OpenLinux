@@ -32,7 +32,13 @@
 */
 
 #include "osal.h"
+#ifndef TITAN_LINUX612	/* the vendor kernel's adapter; mainline has none */
 #include "connectivity_build_in_adapter.h"
+#else
+#include <linux/sched/clock.h>
+#include <linux/sched/debug.h>
+#include <linux/sched/signal.h>
+#endif
 
 /*******************************************************************************
 *                              C O N S T A N T S
@@ -352,13 +358,26 @@ VOID osal_dump_thread_state(const PUINT8 name)
 {
 #if defined(KERNEL_dump_thread_state)
 	return KERNEL_dump_thread_state(name);
+#elif defined(TITAN_LINUX612)
+	struct task_struct *p;
+
+	rcu_read_lock();
+	for_each_process(p) {
+		if (!strncmp(p->comm, name, TASK_COMM_LEN))
+			sched_show_task(p);
+	}
+	rcu_read_unlock();
 #endif
 }
 
 VOID osal_thread_show_stack(P_OSAL_THREAD pThread)
 {
 	if ((pThread) && (pThread->pThread))
+#ifdef TITAN_LINUX612
+		sched_show_task(pThread->pThread);
+#else
 		KERNEL_show_stack(pThread->pThread, NULL);
+#endif
 }
 
 /*
@@ -1402,7 +1421,7 @@ INT32 osal_usleep_range(ULONG min, ULONG max)
 INT32 osal_gettimeofday(PINT32 sec, PINT32 usec)
 {
 	INT32 ret = 0;
-	struct timeval now;
+	struct timespec64 now;
 
 	osal_do_gettimeofday(&now);
 
@@ -1412,20 +1431,17 @@ INT32 osal_gettimeofday(PINT32 sec, PINT32 usec)
 		ret = -1;
 
 	if (usec != NULL)
-		*usec = now.tv_usec;
+		*usec = (now.tv_nsec / NSEC_PER_USEC);
 	else
 		ret = -1;
 
 	return ret;
 }
 
-void osal_do_gettimeofday(struct timeval *tv)
+/* struct timespec64 is gone from the kernel (y2038): wall-clock time as timespec64 */
+void osal_do_gettimeofday(struct timespec64 *tv)
 {
-	struct timespec64 now;
-
-	ktime_get_real_ts64(&now);
-	tv->tv_sec = now.tv_sec;
-	tv->tv_usec = now.tv_nsec / NSEC_PER_USEC;
+	ktime_get_real_ts64(tv);
 }
 
 INT32 osal_printtimeofday(const PUINT8 prefix)

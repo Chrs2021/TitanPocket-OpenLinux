@@ -49,7 +49,7 @@ void gps_dl_reserved_mem_init(void)
 		return;
 	}
 
-	host_virt_addr = ioremap_nocache(gGpsRsvMemPhyBase, gGpsRsvMemSize);
+	host_virt_addr = ioremap(gGpsRsvMemPhyBase, gGpsRsvMemSize);
 	if (host_virt_addr == NULL) {
 		GDL_LOGE_INI("res_mem: base = 0x%llx, size = 0x%llx, ioremap fail",
 			(unsigned long long)gGpsRsvMemPhyBase, (unsigned long long)gGpsRsvMemSize);

@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 08/15] i2c: mt65xx: restore a multi-channel controller's mode through ATF
+
+The MT6771's i2c at 0x11008000 is shared between channels; the AP's
+channel needs the controller's multi-channel DMA mode, a secure register
+only ATF writes. The SPM's deep sleep resets it and the channel then runs
+no transfer. With mediatek,secure-channel-id the driver asks ATF for it
+at every init, as MediaTek's driver does at resume.
+---
+ drivers/i2c/busses/i2c-mt65xx.c | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/drivers/i2c/busses/i2c-mt65xx.c b/drivers/i2c/busses/i2c-mt65xx.c
+index adcc43a24b5d15f7651be41e5b2a6f914d43df22..f961d7fa2ce6ee6039d4ba86b62cb473cda82159 100644
+--- a/drivers/i2c/busses/i2c-mt65xx.c
++++ b/drivers/i2c/busses/i2c-mt65xx.c
+@@ -4,6 +4,7 @@
+  * Author: Xudong Chen <xudong.chen@mediatek.com>
+  */
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/clk.h>
+ #include <linux/completion.h>
+ #include <linux/delay.h>
+@@ -24,6 +25,7 @@
+ #include <linux/scatterlist.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
++#include <linux/soc/mediatek/mtk_sip_svc.h>
+ 
+ #define I2C_RS_TRANSFER			(1 << 4)
+ #define I2C_ARB_LOST			(1 << 3)
+@@ -292,6 +294,7 @@ struct mtk_i2c {
+ 	/* set in i2c probe */
+ 	void __iomem *base;		/* i2c base addr */
+ 	void __iomem *pdmabase;		/* dma base address*/
++	int sec_channel_id;		/* multi-channel: ATF's id, else -1 */
+ 	struct clk_bulk_data clocks[I2C_MT65XX_CLK_MAX]; /* clocks for i2c */
+ 	bool have_pmic;			/* can use i2c pins from PMIC */
+ 	bool use_push_pull;		/* IO config push-pull mode */
+@@ -549,6 +552,28 @@ static void mtk_i2c_writew(struct mtk_i2c *i2c, u16 val,
+ 	writew(val, i2c->base + i2c->dev_comp->regs[reg]);
+ }
+ 
++/*
++ * A multi-channel controller (the MT6771's i2c at 0x11008000, the AP on the
++ * channel at +0x100) needs its multi-channel DMA mode, a secure register
++ * (MULTI_DMA, 0xf8c) that only ATF writes. LK has it set, and the SPM's deep
++ * sleep resets it: the channel then never runs a transfer (no interrupt,
++ * every transfer timed out; measured). MediaTek's driver asks ATF for it at
++ * each resume (MTK_SIP_KERNEL_I2C_SEC_WRITE, I2C_SHADOW_REG_MODE).
++ */
++#define MTK_SIP_I2C_SEC_WRITE		MTK_SIP_SMC_CMD(0x2a0)
++#define I2C_SEC_OFFSET_MULTI_DMA	0xf8c
++#define I2C_SHADOW_REG_MODE		0x2
++
++static void mtk_i2c_init_multi_channel(struct mtk_i2c *i2c)
++{
++	struct arm_smccc_res res;
++
++	if (i2c->sec_channel_id < 0)
++		return;
++	arm_smccc_smc(MTK_SIP_I2C_SEC_WRITE, i2c->sec_channel_id,
++		      I2C_SEC_OFFSET_MULTI_DMA, I2C_SHADOW_REG_MODE, 0, 0, 0, 0, &res);
++}
++
+ static void mtk_i2c_init_hw(struct mtk_i2c *i2c)
+ {
+ 	u16 control_reg;
+@@ -636,6 +661,8 @@ static void mtk_i2c_init_hw(struct mtk_i2c *i2c)
+ 
+ 	mtk_i2c_writew(i2c, control_reg, OFFSET_CONTROL);
+ 	mtk_i2c_writew(i2c, I2C_DELAY_LEN, OFFSET_DELAY_LEN);
++
++	mtk_i2c_init_multi_channel(i2c);
+ }
+ 
+ static const struct i2c_spec_values *mtk_i2c_get_spec(unsigned int speed)
+@@ -1391,6 +1418,10 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+ 	if (IS_ERR(i2c->pdmabase))
+ 		return PTR_ERR(i2c->pdmabase);
+ 
++	if (of_property_read_s32(pdev->dev.of_node, "mediatek,secure-channel-id",
++				 &i2c->sec_channel_id))
++		i2c->sec_channel_id = -1;
++
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq < 0)
+ 		return irq;

@@ -76,11 +76,18 @@ static const struct file_operations fm_ops = {
 static ssize_t fm_proc_read(struct file *file, char __user *buf, size_t count, loff_t *ppos);
 static ssize_t fm_proc_write(struct file *file, const char *buffer, size_t count, loff_t *ppos);
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0))
+static const struct proc_ops fm_proc_ops = {
+	.proc_read = fm_proc_read,
+	.proc_write = fm_proc_write,
+};
+#else
 static const struct file_operations fm_proc_ops = {
 	.owner = THIS_MODULE,
 	.read = fm_proc_read,
 	.write = fm_proc_write,
 };
+#endif
 
 #ifdef CONFIG_COMPAT
 static long fm_ops_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
@@ -1424,7 +1431,11 @@ static signed int fm_cdev_setup(struct fm *fm)
 		return ret;
 	}
 #ifndef FM_DEV_STATIC_ALLOC
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	plat->cls = class_create(FM_NAME);
+#else
 	plat->cls = class_create(THIS_MODULE, FM_NAME);
+#endif
 
 	if (IS_ERR(plat->cls)) {
 		ret = PTR_ERR(plat->cls);
@@ -1599,9 +1610,21 @@ static struct platform_device mt_fm_device = {
 */
 
 /* platform driver entry */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0))
+/* .remove returns void since 6.11 */
+static void mt_fm_remove_void(struct platform_device *pdev)
+{
+	mt_fm_remove(pdev);
+}
+#endif
+
 static struct platform_driver mt_fm_dev_drv = {
 	.probe = mt_fm_probe,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0))
+	.remove = mt_fm_remove_void,
+#else
 	.remove = mt_fm_remove,
+#endif
 	.driver = {
 		   .name = FM_NAME,
 		   .owner = THIS_MODULE,

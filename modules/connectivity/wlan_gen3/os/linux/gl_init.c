@@ -47,7 +47,12 @@
 #include "fwcfg.h"
 #endif
 #ifndef MTK_WCN_BUILT_IN_DRIVER
+#ifndef TITAN_LINUX612	/* the vendor kernel's adapter; mainline has none */
 #include "connectivity_build_in_adapter.h"
+#endif
+#ifdef TITAN_LINUX612
+#include <linux/sched/debug.h>
+#endif
 #endif
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0))
 #include "linux/sched/types.h"
@@ -3085,7 +3090,11 @@ static VOID wlanRemove(VOID)
 	if (!wait_for_completion_timeout(&prGlueInfo->rHifHaltComp, MSEC_TO_JIFFIES(KAL_WLAN_REMOVE_TIMEOUT_MSEC))) {
 		DBGLOG(INIT, ERROR, "wait hif_thread exit timeout, longer than 3s, show backtrace of hif_thread\n");
 #ifndef MTK_WCN_BUILT_IN_DRIVER
+#ifdef TITAN_LINUX612
+		sched_show_task(prGlueInfo->hif_thread);
+#else
 		KERNEL_show_stack(prGlueInfo->hif_thread, NULL);
+#endif
 #else
 		show_stack(prGlueInfo->hif_thread, NULL);
 #endif
@@ -3094,7 +3103,11 @@ static VOID wlanRemove(VOID)
 	if (!wait_for_completion_timeout(&prGlueInfo->rRxHaltComp, MSEC_TO_JIFFIES(KAL_WLAN_REMOVE_TIMEOUT_MSEC))) {
 		DBGLOG(INIT, ERROR, "wait rx_thread exit timeout, longer than 3s, show backtrace of rx_thread\n");
 #ifndef MTK_WCN_BUILT_IN_DRIVER
+#ifdef TITAN_LINUX612
+		sched_show_task(prGlueInfo->rx_thread);
+#else
 		KERNEL_show_stack(prGlueInfo->rx_thread, NULL);
+#endif
 #else
 		show_stack(prGlueInfo->rx_thread, NULL);
 #endif
@@ -3107,7 +3120,11 @@ static VOID wlanRemove(VOID)
 	if (!wait_for_completion_timeout(&prGlueInfo->rHaltComp, MSEC_TO_JIFFIES(KAL_WLAN_REMOVE_TIMEOUT_MSEC))) {
 		DBGLOG(INIT, ERROR, "wait tx_thread exit timeout, longer than 3s, show backtrace of tx_thread\n");
 #ifndef MTK_WCN_BUILT_IN_DRIVER
+#ifdef TITAN_LINUX612
+		sched_show_task(prGlueInfo->main_thread);
+#else
 		KERNEL_show_stack(prGlueInfo->main_thread, NULL);
+#endif
 #else
 		show_stack(prGlueInfo->main_thread, NULL);
 #endif

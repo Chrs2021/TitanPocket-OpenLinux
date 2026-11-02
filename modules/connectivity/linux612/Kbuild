@@ -1,0 +1,5 @@
+# The BTIF driver for Linux 6.12 (btif.c): the vendor kernel's BTIF, which
+# the WMT core sends STP through, has no 6.12 counterpart.
+obj-m += mtk_btif.o
+mtk_btif-y := btif.o
+ccflags-y += -I$(src)/include

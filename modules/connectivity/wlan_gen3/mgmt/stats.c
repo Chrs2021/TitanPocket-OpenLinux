@@ -171,7 +171,7 @@ VOID StatsEnvRxTime2Host(IN P_ADAPTER_T prAdapter, struct sk_buff *prSkb)
 	rtc_time64_to_tm(tval.tv_sec, &tm);
 #else
 	do_gettimeofday(&tval);
-	rtc_time_to_tm(tval.tv_sec, &tm);
+	rtc_time64_to_tm(tval.tv_sec, &tm);
 #endif
 
 	switch (ucIpProto) {

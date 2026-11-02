@@ -14,6 +14,7 @@
 
 #ifdef CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH
 
+#include <linux/version.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -235,7 +236,11 @@ int fw_log_wifi_init(void)
 	if (result < 0)
 		return result;
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	fw_log_wifi_dev->driver_class = class_create(FW_LOG_WIFI_DRIVER_NAME);
+#else
 	fw_log_wifi_dev->driver_class = class_create(THIS_MODULE, FW_LOG_WIFI_DRIVER_NAME);
+#endif
 
 	if (IS_ERR(fw_log_wifi_dev->driver_class)) {
 		result = -ENOMEM;

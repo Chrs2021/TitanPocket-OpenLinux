@@ -135,7 +135,7 @@ static size_t bt_report_hw_error(char *buf, size_t count, loff_t *f_pos)
 static uint32_t inline bt_read_cr(unsigned char *cr_name, uint32_t addr)
 {
 	uint32_t value = 0;
-	uint8_t *base = ioremap_nocache(addr, 0x10);
+	uint8_t *base = ioremap(addr, 0x10);
 
 	if (base == NULL) {
 		BT_LOG_PRT_WARN("remapping 0x%08x fail\n", addr);
@@ -793,7 +793,11 @@ static int BT_init(void)
 		goto error;
 
 #if CREATE_NODE_DYNAMIC /* mknod replace */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	stpbt_class = class_create("stpbt");
+#else
 	stpbt_class = class_create(THIS_MODULE, "stpbt");
+#endif
 	if (IS_ERR(stpbt_class))
 		goto error;
 	stpbt_dev = device_create(stpbt_class, NULL, dev, NULL, "stpbt");

@@ -46,7 +46,12 @@
 #endif
 
 #ifndef MTK_WCN_BUILT_IN_DRIVER
+#ifndef TITAN_LINUX612	/* the vendor kernel's adapter; mainline has none */
 #include "connectivity_build_in_adapter.h"
+#endif
+#ifdef TITAN_LINUX612
+#include <linux/sched/debug.h>
+#endif
 #endif
 
 #if defined(CONFIG_MTK_QOS_SUPPORT)
@@ -1628,7 +1633,10 @@ kalIndicateStatusAndComplete(IN P_GLUE_INFO_T prGlueInfo, IN WLAN_STATUS eStatus
 			cfg80211_chandef_create(&chan, prChannel, NL80211_CHAN_HT20);
 
 			/* CFG80211 indication */
-#if KERNEL_VERSION(5, 15, 0) <= LINUX_VERSION_CODE
+#if KERNEL_VERSION(6, 9, 0) <= LINUX_VERSION_CODE
+			/* the puncturing bitmap is gone again: link id only */
+			cfg80211_ch_switch_notify(prGlueInfo->prDevHandler, &chan, 0);
+#elif KERNEL_VERSION(5, 15, 0) <= LINUX_VERSION_CODE
 			cfg80211_ch_switch_notify(prGlueInfo->prDevHandler, &chan, 0, 0);
 #else
 			cfg80211_ch_switch_notify(prGlueInfo->prDevHandler, &chan);
@@ -5585,7 +5593,11 @@ INT_32 kalHaltLock(UINT_32 waitMs)
 				kalGetTimeTick() - rHaltCtrl.u4HoldStart);
 			if (prGlueInfo)
 #ifndef MTK_WCN_BUILT_IN_DRIVER
+#ifdef TITAN_LINUX612
+				sched_show_task(prGlueInfo->main_thread);
+#else
 				KERNEL_show_stack(prGlueInfo->main_thread, NULL);
+#endif
 #else
 				show_stack(prGlueInfo->main_thread, NULL);
 #endif
@@ -5594,7 +5606,11 @@ INT_32 kalHaltLock(UINT_32 waitMs)
 				rHaltCtrl.owner->comm, rHaltCtrl.owner->pid,
 				kalGetTimeTick() - rHaltCtrl.u4HoldStart);
 #ifndef MTK_WCN_BUILT_IN_DRIVER
+#ifdef TITAN_LINUX612
+			sched_show_task(rHaltCtrl.owner);
+#else
 			KERNEL_show_stack(rHaltCtrl.owner, NULL);
+#endif
 #else
 			show_stack(rHaltCtrl.owner, NULL);
 #endif

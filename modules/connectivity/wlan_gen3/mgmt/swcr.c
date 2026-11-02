@@ -476,7 +476,7 @@ VOID swCtrlCmdCategory0(P_ADAPTER_T prAdapter, UINT_8 ucCate, UINT_8 ucAction, U
 				}
 
 #if 0
-#ifdef CONFIG_IPV6
+#if IS_ENABLED(CONFIG_IPV6)
 				if (!wlanGetIPV6Address(prAdapter->prGlueInfo, pucIp, &u4NumIPv6)
 				    || (u4NumIPv6 + u4NumIPv4) > 3) {
 					goto bailout;

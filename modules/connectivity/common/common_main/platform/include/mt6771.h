@@ -90,6 +90,12 @@
 
 /*control app2cnn_osc_en*/
 #define CONSYS_AP2CONN_WAKEUP_BIT	(0x1 << 9)
+/*
+ * The BT CVSD interrupt mask (mtk-btcvsd's mediatek,offset 0xf00 0x800),
+ * set by that driver at probe. While it is clear, CONNSYS stalls ~190 ms
+ * on its own clock switches (measured on 6.12).
+ */
+#define CONSYS_BT_CVSD_IRQ_MASK_BIT	(0x1 << 11)
 
 /* EMI part mapping & ctrl */
 #define CONSYS_EMI_FW_PHY_BASE		(0xf0080000)

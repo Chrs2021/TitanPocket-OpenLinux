@@ -996,7 +996,7 @@ wlanImageDividDownload(IN P_ADAPTER_T prAdapter, IN PVOID pvFwImageMapFile)
 #if (KERNEL_VERSION(5, 6, 0) <= LINUX_VERSION_CODE)
 	prWifiEmiBaseAddr = ioremap(gConEmiPhyBase, WIFI_EMI_AVAILABLE_MEM_SIZE);
 #else
-	prWifiEmiBaseAddr = ioremap_nocache(gConEmiPhyBase, WIFI_EMI_AVAILABLE_MEM_SIZE);
+	prWifiEmiBaseAddr = ioremap(gConEmiPhyBase, WIFI_EMI_AVAILABLE_MEM_SIZE);
 #endif
 
 	/* IEMI + DEMI */

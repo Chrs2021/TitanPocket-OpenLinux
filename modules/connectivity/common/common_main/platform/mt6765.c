@@ -463,7 +463,7 @@ static VOID consys_set_if_pinmux(MTK_WCN_BOOL enable)
 	UINT8 *consys_if_pinmux_reg_base = NULL;
 
 	/* Switch D die pinmux for connecting A die */
-	consys_if_pinmux_reg_base = ioremap_nocache(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
+	consys_if_pinmux_reg_base = ioremap(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
 	if (!consys_if_pinmux_reg_base) {
 		WMT_PLAT_PR_ERR("consys_if_pinmux_reg_base(%x) ioremap fail\n", CONSYS_IF_PINMUX_REG_BASE);
 		return;
@@ -739,7 +739,7 @@ static INT32 polling_consys_chipid(VOID)
 	CONSYS_REG_WRITE(conn_reg.mcu_base + CONSYS_MCU_ROM_DELSEL_OFFSET, consys_ver_id);
 
 	if (wmt_plat_soc_co_clock_flag_get()) {
-		consys_reg_base = ioremap_nocache(CONSYS_COCLOCK_STABLE_TIME_BASE, 0x100);
+		consys_reg_base = ioremap(CONSYS_COCLOCK_STABLE_TIME_BASE, 0x100);
 		if (consys_reg_base) {
 #if 0
 			/* disable XO stable time setting */
@@ -772,7 +772,7 @@ static VOID consys_afe_reg_setting(VOID)
 	UINT8 *consys_afe_reg_base = NULL;
 
 	/*15.default no need,update ANA_WBG(AFE) CR if needed, CONSYS_AFE_REG */
-	consys_afe_reg_base = ioremap_nocache(CONSYS_AFE_REG_BASE, 0x100);
+	consys_afe_reg_base = ioremap(CONSYS_AFE_REG_BASE, 0x100);
 	if (consys_afe_reg_base) {
 		CONSYS_REG_WRITE(consys_afe_reg_base + CONSYS_AFE_RG_WBG_PLL_03_OFFSET,
 				CONSYS_AFE_RG_WBG_PLL_03_VALUE);
@@ -1240,7 +1240,7 @@ static INT32 consys_check_reg_readable(VOID)
 static INT32 consys_emi_coredump_remapping(UINT8 __iomem **addr, UINT32 enable)
 {
 	if (enable) {
-		*addr = ioremap_nocache(gConEmiPhyBase + CONSYS_EMI_COREDUMP_OFFSET, CONSYS_EMI_MEM_SIZE);
+		*addr = ioremap(gConEmiPhyBase + CONSYS_EMI_COREDUMP_OFFSET, CONSYS_EMI_MEM_SIZE);
 		if (*addr) {
 			WMT_PLAT_PR_INFO("COREDUMP EMI mapping OK virtual(0x%p) physical(0x%x)\n",
 					   *addr, (UINT32) gConEmiPhyBase + CONSYS_EMI_COREDUMP_OFFSET);
@@ -1322,7 +1322,7 @@ static INT32 consys_dump_osc_state(P_CONSYS_STATE state)
 	CONSYS_REG_WRITE(CONN_CFG_ON_CONN_ON_HOST_MAILBOX_MCU_ADDR, 0x0);
 
 #if 0
-	addr = ioremap_nocache(gConEmiPhyBase + 0x66500, sizeof(struct consys_sw_state));
+	addr = ioremap(gConEmiPhyBase + 0x66500, sizeof(struct consys_sw_state));
 	if (addr) {
 		memcpy_fromio(&state->sw_state, addr, sizeof(struct consys_sw_state));
 		WMT_PLAT_PR_INFO("[%s] [%x][%x] [%x][%x] [%x] [%x][%x]", __func__,

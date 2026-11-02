@@ -43,7 +43,9 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/of_gpio.h>
+#ifndef TITAN_LINUX612	/* the vendor kernel's adapter; mainline has none */
 #include <connectivity_build_in_adapter.h>
+#endif
 #include "wmt_lib.h"
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0))
@@ -138,6 +140,14 @@ const struct of_device_id apwmt_of_ids[] = {
 struct CONSYS_BASE_ADDRESS conn_reg;
 #endif
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0))
+/* .remove returns void since 6.11 */
+static void mtk_wmt_remove_void(struct platform_device *pdev)
+{
+	mtk_wmt_remove(pdev);
+}
+#endif
+
 static const struct dev_pm_ops wmt_drv_pm_ops = {
 	.suspend_noirq = mtk_wmt_suspend,
 	.resume_noirq = mtk_wmt_resume,
@@ -145,7 +155,11 @@ static const struct dev_pm_ops wmt_drv_pm_ops = {
 
 static struct platform_driver mtk_wmt_dev_drv = {
 	.probe = mtk_wmt_probe,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0))
+	.remove = mtk_wmt_remove_void,
+#else
 	.remove = mtk_wmt_remove,
+#endif
 	.driver = {
 		   .name = "mtk_wmt",
 		   .owner = THIS_MODULE,
@@ -166,10 +180,18 @@ static void plat_resume_handler(struct work_struct *work);
 struct regmap *g_regmap;
 #endif
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
+/* 6.1 replaced the OF sensor ops with the zone's own ops */
+static int wmt_thermal_get_temp_cb(struct thermal_zone_device *tz, int *temp);
+static const struct thermal_zone_device_ops tz_wmt_thermal_ops = {
+	.get_temp = wmt_thermal_get_temp_cb,
+};
+#else
 static int wmt_thermal_get_temp_cb(void *data, int *temp);
 static const struct thermal_zone_of_device_ops tz_wmt_thermal_ops = {
 	.get_temp = wmt_thermal_get_temp_cb,
 };
+#endif
 
 /*******************************************************************************
 *                           P R I V A T E   D A T A
@@ -267,7 +289,11 @@ static INT32 wmt_allocate_connsys_emi(struct platform_device *pdev)
 	return 0;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
+static int wmt_thermal_get_temp_cb(struct thermal_zone_device *tz, int *temp)
+#else
 static int wmt_thermal_get_temp_cb(void *data, int *temp)
+#endif
 {
 	if (temp) {
 		*temp = wmt_lib_tm_temp_query() * 1000;
@@ -282,8 +308,12 @@ static INT32 wmt_thermal_register(struct platform_device *pdev)
 	int ret;
 
 	/* register thermal zone */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
+	tz = devm_thermal_of_zone_register(&pdev->dev, 0, NULL, &tz_wmt_thermal_ops);
+#else
 	tz = devm_thermal_zone_of_sensor_register(
 		&pdev->dev, 0, NULL, &tz_wmt_thermal_ops);
+#endif
 
 	if (IS_ERR(tz)) {
 		ret = PTR_ERR(tz);
@@ -338,7 +368,7 @@ static INT32 mtk_wmt_probe(struct platform_device *pdev)
 		return iRet;
 
 	if (gConEmiPhyBase) {
-		pConnsysEmiStart = ioremap_nocache(gConEmiPhyBase, gConEmiSize);
+		pConnsysEmiStart = ioremap(gConEmiPhyBase, gConEmiSize);
 		WMT_PLAT_PR_INFO("Clearing Connsys EMI (virtual(0x%p) physical(0x%pa)) %llu bytes\n",
 				   pConnsysEmiStart, &gConEmiPhyBase, gConEmiSize);
 		memset_io(pConnsysEmiStart, 0, gConEmiSize);
@@ -442,6 +472,14 @@ static INT32 mtk_wmt_suspend(struct device *dev)
 {
 	WMT_PLAT_PR_INFO(" mtk_wmt_suspend !!");
 	WMT_STEP_DO_ACTIONS_FUNC(STEP_TRIGGER_POINT_WHEN_AP_SUSPEND);
+#ifdef TITAN_LINUX612
+	/*
+	 * CONNSYS keeps running while the AP sleeps (its firmware, the Wi-Fi
+	 * association). genpd would power the CONN domain off here, losing
+	 * all of it; in the wakeup path of an ACTIVE_WAKEUP domain it stays on.
+	 */
+	device_set_wakeup_path(dev);
+#endif
 
 	mtk_wcn_consys_sleep_info_clear();
 	return 0;

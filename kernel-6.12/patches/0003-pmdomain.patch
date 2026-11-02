@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 03/15] pmdomain: mediatek: mt8183: keep CONN on through system suspend
+
+The connectivity subsystem keeps running while the AP sleeps (its
+firmware, the Wi-Fi association). With MTK_SCPD_ACTIVE_WAKEUP the CONN
+domain stays on for a device in the wakeup path; the MT6771's consys
+driver marks itself so. Without it genpd switched CONN off in
+suspend_noirq and Wi-Fi was dead after resume.
+---
+ drivers/pmdomain/mediatek/mt8183-pm-domains.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/pmdomain/mediatek/mt8183-pm-domains.h b/drivers/pmdomain/mediatek/mt8183-pm-domains.h
+index c4c1b63d85b1943aafdb295d21026835ddc74ff3..0c16b4f2c7062b133c423015123902f55e7d6170 100644
+--- a/drivers/pmdomain/mediatek/mt8183-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt8183-pm-domains.h
+@@ -28,6 +28,8 @@ static const struct scpsys_domain_data scpsys_domain_data_mt8183[] = {
+ 		.pwr_sta2nd_offs = 0x0184,
+ 		.sram_pdn_bits = 0,
+ 		.sram_pdn_ack_bits = 0,
++		/* CONNSYS runs on through system suspend (MT6771's consys driver) */
++		.caps = MTK_SCPD_ACTIVE_WAKEUP,
+ 		.bp_cfg = {
+ 			BUS_PROT_WR(INFRA,
+ 				    MT8183_TOP_AXI_PROT_EN_CONN,

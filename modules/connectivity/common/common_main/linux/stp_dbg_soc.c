@@ -19,6 +19,8 @@
 #include "wmt_step.h"
 #include "wmt_lib.h"
 #include <linux/ratelimit.h>
+#include <linux/debugfs.h>
+#include <linux/vmalloc.h>
 
 #define STP_DBG_PAGED_TRACE_SIZE (2048*sizeof(char))
 #define SUB_PKT_SIZE 1024
@@ -90,6 +92,55 @@ INT32 const soc_gen_three_task_id_adapter[STP_DBG_TASK_ID_MAX] = {
 static _osal_inline_ INT32 stp_dbg_soc_paged_dump(INT32 dump_sink);
 static _osal_inline_ INT32 stp_dbg_soc_paged_trace(VOID);
 static _osal_inline_ INT32 stp_dbg_soc_put_emi_dump_to_nl(PUINT8 data_buf, INT32 dump_len);
+/*
+ * Log the text in a coredump page: every run of at least 8 visible
+ * characters, as page_text lines. The firmware's exception header
+ * ("; exception type", "; bug hang daddr", "; slave noclk acc") and its
+ * register lines are text inside the binary pages.
+ */
+static VOID stp_dbg_dump_text(PUINT8 buf, INT32 size, UINT32 page)
+{
+	INT32 i = 0, start;
+
+	while (i < size) {
+		while (i < size && !IS_VISIBLE_CHAR(buf[i]))
+			i++;
+		start = i;
+		while (i < size && IS_VISIBLE_CHAR(buf[i]))
+			i++;
+		while (i - start >= 8) {
+			INT32 n = min(i - start, DUMP_LOG_BYTES_PER_LINE);
+
+			pr_info("page_text %u+%x: %.*s\n", page, start, n, &buf[start]);
+			start += n;
+		}
+	}
+}
+
+/*
+ * The last paged coredump, raw, as debugfs wmt_coredump (the AEE sink
+ * only compresses it, and there is no AEE): the firmware's text and the
+ * memory regions it lists ("[core dump start] ;memory base:... len:...").
+ */
+#define STP_DBG_RAW_DUMP_SIZE (2 * 1024 * 1024)
+static struct debugfs_blob_wrapper stp_dbg_raw_dump;
+
+static VOID stp_dbg_raw_dump_add(PUINT8 buf, INT32 len, UINT32 page)
+{
+	if (!stp_dbg_raw_dump.data) {
+		stp_dbg_raw_dump.data = vzalloc(STP_DBG_RAW_DUMP_SIZE);
+		if (!stp_dbg_raw_dump.data)
+			return;
+		debugfs_create_blob("wmt_coredump", 0400, NULL, &stp_dbg_raw_dump);
+	}
+	if (page == 1)
+		stp_dbg_raw_dump.size = 0;
+	if (len > 0 && stp_dbg_raw_dump.size + len <= STP_DBG_RAW_DUMP_SIZE) {
+		osal_memcpy((PUINT8)stp_dbg_raw_dump.data + stp_dbg_raw_dump.size, buf, len);
+		stp_dbg_raw_dump.size += len;
+	}
+}
+
 static _osal_inline_ VOID stp_dbg_soc_emi_dump_buffer(UINT8 *buffer, UINT32 len);
 
 static VOID stp_dbg_dump_log(PUINT8 buf, INT32 size)
@@ -354,6 +405,9 @@ static _osal_inline_ INT32 stp_dbg_soc_paged_dump(INT32 dump_sink)
 		/* dump 1st 512 bytes data to kernel log for fw requirement */
 		if (page_counter == 1)
 			stp_dbg_dump_log(&g_paged_dump_buffer[0], dump_len < 512 ? dump_len : 512);
+		if (page_counter <= 4)
+			stp_dbg_dump_text(&g_paged_dump_buffer[0], dump_len, page_counter);
+		stp_dbg_raw_dump_add(&g_paged_dump_buffer[0], dump_len, page_counter);
 
 		osal_get_local_time(&start_ts, &start_nsec);
 		while (1) {

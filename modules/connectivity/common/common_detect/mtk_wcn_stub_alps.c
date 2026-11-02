@@ -24,8 +24,11 @@
 */
 
 
-/* kernel wmt_build_in_adapter.c already has these, so always ignored */
-#ifdef MTK_WCN_REMOVE_KERNEL_MODULE
+/*
+ * The vendor kernel's wmt_build_in_adapter.c already has these, so ignored
+ * there; a mainline kernel (TITAN_LINUX612) has no adapter and uses them.
+ */
+#if defined(MTK_WCN_REMOVE_KERNEL_MODULE) && !defined(TITAN_LINUX612)
 #undef MTK_WCN_REMOVE_KERNEL_MODULE
 #endif
 
@@ -67,7 +70,9 @@ do { \
 #include <linux/of_irq.h>
 #include <linux/interrupt.h>
 #include <mtk_wcn_cmb_stub.h>
+#ifndef MTK_WCN_REMOVE_KERNEL_MODULE
 #include <wmt_build_in_adapter.h>
+#endif
 #include "wmt_detect.h"
 
 

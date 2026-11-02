@@ -459,14 +459,14 @@ static VOID consys_set_if_pinmux(MTK_WCN_BOOL enable)
 	UINT8 *consys_if_pinmux_driving_base = NULL;
 
 	/* Switch D die pinmux for connecting A die */
-	consys_if_pinmux_reg_base = ioremap_nocache(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
+	consys_if_pinmux_reg_base = ioremap(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
 	if (!consys_if_pinmux_reg_base) {
 		WMT_PLAT_PR_INFO("consys_if_pinmux_reg_base(%x) ioremap fail\n",
 				CONSYS_IF_PINMUX_REG_BASE);
 		return;
 	}
 
-	consys_if_pinmux_driving_base = ioremap_nocache(CONSYS_IF_PINMUX_DRIVING_BASE, 0x100);
+	consys_if_pinmux_driving_base = ioremap(CONSYS_IF_PINMUX_DRIVING_BASE, 0x100);
 	if (!consys_if_pinmux_driving_base) {
 		WMT_PLAT_PR_INFO("consys_if_pinmux_driving_base(%x) ioremap fail\n",
 				CONSYS_IF_PINMUX_DRIVING_BASE);
@@ -557,7 +557,7 @@ static VOID consys_hw_reset_bit_set(MTK_WCN_BOOL enable)
 
 		if (mtk_wcn_consys_get_adie_chipid() == SECONDARY_ADIE) {
 			/* if(MT6635) CONN_WF_CTRL2 swtich to CONN mode */
-			consys_reg_base = ioremap_nocache(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
+			consys_reg_base = ioremap(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
 			if (!consys_reg_base) {
 				WMT_PLAT_PR_INFO("consys_if_pinmux_reg_base(%x) ioremap fail\n",
 						CONSYS_IF_PINMUX_REG_BASE);
@@ -1007,7 +1007,7 @@ static VOID consys_afe_reg_setting(VOID)
 	 * 0x180B_3094[31:0]  0xC5258251
 	 * 0x180B_3100[31:0]  0x10990C13
 	 */
-	consys_afe_wbg_reg_base = ioremap_nocache(CONSYS_AFE_WBG_REG_BASE, 0x200);
+	consys_afe_wbg_reg_base = ioremap(CONSYS_AFE_WBG_REG_BASE, 0x200);
 	if (consys_afe_wbg_reg_base) {
 		CONSYS_REG_WRITE(consys_afe_wbg_reg_base + CONSYS_AFE_WBG_REG_AFE_01_OFFSET,
 			CONSYS_AFE_WBG_REG_AFE_01_VALUE);
@@ -1048,7 +1048,7 @@ static VOID consys_set_xo_osc_ctrl(VOID)
 	UINT32 value = 0;
 	UINT32 xo_value;
 
-	consys_reg_base = ioremap_nocache(CONSYS_COCLOCK_STABLE_TIME_BASE, 0x100);
+	consys_reg_base = ioremap(CONSYS_COCLOCK_STABLE_TIME_BASE, 0x100);
 	if (consys_reg_base) {
 		if (!consys_is_rc_mode_enable()) {
 		/* set CR "XO initial stable time" and "XO bg stable time"
@@ -1134,7 +1134,7 @@ static VOID consys_identify_adie(VOID)
 {
 	UINT8 *consys_reg_base = NULL;
 
-	consys_reg_base = ioremap_nocache(CONSYS_IDENTIFY_ADIE_CR_ADDRESS, 0x100);
+	consys_reg_base = ioremap(CONSYS_IDENTIFY_ADIE_CR_ADDRESS, 0x100);
 	if (consys_reg_base) {
 		if (mtk_wcn_consys_get_adie_chipid() == SECONDARY_ADIE)
 			CONSYS_REG_WRITE(consys_reg_base,
@@ -1162,7 +1162,7 @@ static VOID consys_wifi_ctrl_setting(VOID)
 	 * CONN_WF_CTRL2 swtich to GPIO mode, GPIO output value
 	 * before patch download swtich back to CONN mode.
 	 */
-	reg_base = ioremap_nocache(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
+	reg_base = ioremap(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
 	if (reg_base) {
 		CONSYS_REG_WRITE(reg_base + CONSYS_WF_CTRL2_01_OFFSET,
 				(CONSYS_REG_READ(reg_base + CONSYS_WF_CTRL2_01_OFFSET) &
@@ -1185,7 +1185,7 @@ static VOID consys_bus_timeout_config(VOID)
 	UINT8 *consys_reg_base = NULL;
 
 	/* connsys bus time out configure,  enable AHB bus timeout */
-	consys_reg_base = ioremap_nocache(CONSYS_AHB_TIMEOUT_EN_ADDRESS, 0x100);
+	consys_reg_base = ioremap(CONSYS_AHB_TIMEOUT_EN_ADDRESS, 0x100);
 	if (consys_reg_base) {
 		CONSYS_REG_WRITE(consys_reg_base, CONSYS_AHB_TIMEOUT_EN_VALUE);
 		iounmap(consys_reg_base);
@@ -1776,7 +1776,7 @@ static UINT32 consys_adie_chipid_checking_flow(UINT32 adie)
 	UINT32 chipid = 0;
 	UINT32 retry = 10;
 
-	conn_rf_spi_base = ioremap_nocache(CONN_RF_SPI_BASE, 0x100);
+	conn_rf_spi_base = ioremap(CONN_RF_SPI_BASE, 0x100);
 	if (!conn_rf_spi_base) {
 		WMT_PLAT_PR_INFO("ioumap 0x180c6000 fail");
 		return 0;
@@ -1980,7 +1980,7 @@ static VOID consys_dedicated_log_path_deinit(VOID)
 static INT32 consys_emi_coredump_remapping(UINT8 __iomem **addr, UINT32 enable)
 {
 	if (enable) {
-		*addr = ioremap_nocache(gConEmiPhyBase + CONSYS_EMI_COREDUMP_OFFSET,
+		*addr = ioremap(gConEmiPhyBase + CONSYS_EMI_COREDUMP_OFFSET,
 				CONSYS_EMI_COREDUMP_MEM_SIZE);
 		if (*addr) {
 			WMT_PLAT_PR_INFO("COREDUMP EMI mapping OK virtual(0x%p) physical(0x%x)\n",
@@ -2087,7 +2087,7 @@ static VOID consys_ic_clock_fail_dump(VOID)
 		CONSYS_REG_READ(conn_reg.mcu_base + CONSYS_BUS_CONTROL));
 #if 0
 	temp = buffer;
-	addr = ioremap_nocache(0x180bc000, 0x100);
+	addr = ioremap(0x180bc000, 0x100);
 	if (addr) {
 		/* conn2ap axi master sleep prot info */
 		temp += sprintf(temp, "0x180bc010=0x%08x\n", CONSYS_REG_READ(addr + 0x10));
@@ -2104,7 +2104,7 @@ static VOID consys_ic_clock_fail_dump(VOID)
 		WMT_PLAT_PR_INFO("0x180bc000 ioremap fail!\n");
 	}
 
-	addr = ioremap_nocache(0x10001B20, 0x100);
+	addr = ioremap(0x10001B20, 0x100);
 	if (addr) {
 		/* 0x10001B20 */
 		temp += sprintf(temp, "0x10001B20=0x%08x\n", CONSYS_REG_READ(addr));
@@ -2116,7 +2116,7 @@ static VOID consys_ic_clock_fail_dump(VOID)
 	/* conn_hif_on misc info */
 	temp += sprintf(temp, "0x1800713c=0x%08x\n", CONSYS_REG_READ(conn_reg.mcu_conn_hif_on_base + 0x13c));
 
-	addr = ioremap_nocache(0x180c1144, 0x100);
+	addr = ioremap(0x180c1144, 0x100);
 	if (addr) {
 		/* conn_on_host debug flag */
 		temp += sprintf(temp, "0x180c1144=0x%08x\n", CONSYS_REG_READ(addr));
@@ -2125,7 +2125,7 @@ static VOID consys_ic_clock_fail_dump(VOID)
 		WMT_PLAT_PR_INFO("0x180c1144 ioremap fail!\n");
 	}
 
-	addr = ioremap_nocache(0x1020E804, 0x100);
+	addr = ioremap(0x1020E804, 0x100);
 	if (addr) {
 		/* 0x1020E804 */
 		temp += sprintf(temp, "0x1020E804=0x%08x\n", CONSYS_REG_READ(addr));
@@ -2334,7 +2334,7 @@ static INT32 consys_is_rc_mode_enable(VOID)
 	INT32 value;
 	UINT8 *reg_base;
 
-	reg_base = ioremap_nocache(SRCLKEN_RC_BASE, 0x10);
+	reg_base = ioremap(SRCLKEN_RC_BASE, 0x10);
 	/* Since RC mode is default on, return 1 if ioremap is failed */
 	if (!reg_base)
 		return 1;

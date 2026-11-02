@@ -91,6 +91,13 @@ static int HifAhbMiscClose(IN struct inode *Inodep, IN struct file *Filp);
 static int HifAhbPltmProbe(IN struct platform_device *pDev);
 
 static int HifAhbPltmRemove(IN struct platform_device *pDev);
+#if (KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE)
+/* .remove returns void since 6.11 */
+static void HifAhbPltmRemoveVoid(IN struct platform_device *pDev)
+{
+	HifAhbPltmRemove(pDev);
+}
+#endif
 
 #ifdef CONFIG_PM
 static int HifAhbPltmSuspend(IN struct platform_device *pDev, pm_message_t message);
@@ -152,6 +159,7 @@ static struct miscdevice MtkAhbDriver = {
 
 #ifdef CONFIG_OF
 static const struct of_device_id apwifi_of_ids[] = {
+	{.compatible = "mediatek,mt6771-wifi",},
 	{.compatible = "mediatek,wifi",},
 	{}
 };
@@ -173,7 +181,11 @@ struct platform_driver MtkAhbPltmDriver = {
 	.suspend = NULL,
 	.resume = NULL,
 #endif /* CONFIG_PM */
+#if (KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE)
+	.remove = __exit_p(HifAhbPltmRemoveVoid),
+#else
 	.remove = __exit_p(HifAhbPltmRemove),
+#endif
 };
 
 static struct platform_device *HifAhbPDev;

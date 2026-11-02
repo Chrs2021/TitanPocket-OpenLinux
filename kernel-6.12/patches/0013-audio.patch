@@ -1,0 +1,1361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 13/15] ASoC: mediatek: mt8183: Titan Pocket audio; codecs: add FS1860
+
+The MT6771's AFE is the MT8183's; this adds the Titan Pocket machine
+driver, the FS1860 speaker amplifier, the AFE's hardware gain and the
+FM paths (hostless and through the CPU).
+---
+ sound/soc/codecs/Kconfig                      |   8 +
+ sound/soc/codecs/Makefile                     |   2 +
+ sound/soc/codecs/fs1860.c                     | 519 ++++++++++++++++++
+ sound/soc/mediatek/Kconfig                    |  11 +
+ .../mediatek/common/mtk-afe-platform-driver.c |  17 +-
+ sound/soc/mediatek/mt8183/Makefile            |   2 +
+ .../soc/mediatek/mt8183/mt6771-titanpocket.c  | 244 ++++++++
+ sound/soc/mediatek/mt8183/mt8183-afe-common.h |   4 +
+ sound/soc/mediatek/mt8183/mt8183-afe-pcm.c    |   7 +
+ sound/soc/mediatek/mt8183/mt8183-dai-adda.c   |   4 +
+ .../soc/mediatek/mt8183/mt8183-dai-hostless.c |  29 +
+ .../soc/mediatek/mt8183/mt8183-dai-hw-gain.c  | 163 ++++++
+ sound/soc/mediatek/mt8183/mt8183-dai-i2s.c    |  98 ++++
+ .../mediatek/mt8183/mt8183-interconnection.h  |   2 +
+ 14 files changed, 1106 insertions(+), 4 deletions(-)
+
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index 399dcf3d1c64b6b7a6b57d2bb2ed4834ecfee292..41e4128a89e6aaca54a4d1104b90f0b0ed17265f 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -1125,6 +1125,14 @@ config SND_SOC_HDMI_CODEC
+ 	select SND_PCM_IEC958
+ 	select HDMI
+ 
++config SND_SOC_FS1860
++	tristate "FourSemi FS1860 smart amplifier"
++	depends on I2C
++	help
++	  The FourSemi FS1860 mono smart speaker amplifier with DSP, as
++	  in the Unihertz Titan Pocket. Needs the preset file
++	  fs16xx_01s_mono.preset from the phone's vendor partition.
++
+ config SND_SOC_ES7134
+ 	tristate "Everest Semi ES7134 CODEC"
+ 
+diff --git a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
+index 47c621b3a03787da1860ef4c9ef83cc3af7898d8..3b55852aa902f660bb098fa8eb9f0aa2a25376c5 100644
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -121,6 +121,7 @@ snd-soc-da732x-y := da732x.o
+ snd-soc-da9055-y := da9055.o
+ snd-soc-dmic-y := dmic.o
+ snd-soc-es7134-y := es7134.o
++snd-soc-fs1860-y := fs1860.o
+ snd-soc-es7241-y := es7241.o
+ snd-soc-es83xx-dsm-common-y := es83xx-dsm-common.o
+ snd-soc-es8311-y := es8311.o
+@@ -529,6 +530,7 @@ obj-$(CONFIG_SND_SOC_DA732X)	+= snd-soc-da732x.o
+ obj-$(CONFIG_SND_SOC_DA9055)	+= snd-soc-da9055.o
+ obj-$(CONFIG_SND_SOC_DMIC)	+= snd-soc-dmic.o
+ obj-$(CONFIG_SND_SOC_ES7134)	+= snd-soc-es7134.o
++obj-$(CONFIG_SND_SOC_FS1860)	+= snd-soc-fs1860.o
+ obj-$(CONFIG_SND_SOC_ES7241)	+= snd-soc-es7241.o
+ obj-$(CONFIG_SND_SOC_ES83XX_DSM_COMMON)    += snd-soc-es83xx-dsm-common.o
+ obj-$(CONFIG_SND_SOC_ES8311)    += snd-soc-es8311.o
+diff --git a/sound/soc/codecs/fs1860.c b/sound/soc/codecs/fs1860.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..0084a6dc8cb6bf3a6372531f4cd2c8cf90bbf491
+--- /dev/null
++++ b/sound/soc/codecs/fs1860.c
+@@ -0,0 +1,519 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * FourSemi FS1860 smart speaker amplifier (Unihertz Titan Pocket).
++ *
++ * On stock Android this amp is driven entirely from the vendor HAL
++ * (libfs1860.so) through a raw I2C pass-through device. The sequences here
++ * were recovered from that library, and the steady-state configuration was
++ * captured from the running phone (see fs1860_config below). This is the
++ * 4.14 driver (docs/drivers/fs1860.md) on the current ASoC API: a plain
++ * component, bound by the machine driver's I2S3 back end.
++ *
++ * Registers are 16-bit big-endian. The register map closely follows the
++ * NXP TFA98xx family: 0x00 status, 0x04 I2S control, 0x06 volume,
++ * 0x09 system control (bit0 power-down, bit3 amp enable).
++ */
++
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <sound/tlv.h>
++
++#define FS1860_PRESET_FW	"fs16xx_01s_mono.preset"
++
++#define FS1860_REG_STATUS	0x00
++#define FS1860_STATUS_PLLS	BIT(1)
++#define FS1860_REG_REVID	0x03
++#define FS1860_REVID		0x0703
++#define FS1860_REG_I2SCTRL	0x04
++#define FS1860_REG_AUDIOCTRL	0x06
++#define FS1860_REG_SYSCTRL	0x09
++#define FS1860_SYSCTRL_PWDN	BIT(0)
++#define FS1860_SYSCTRL_AMPE	BIT(3)
++#define FS1860_REG_ACCKEY	0x0b
++#define FS1860_ACCKEY_UNLOCK	0xca91
++#define FS1860_REG_DSPCOEF	0x82
++#define FS1860_REG_COEFADDR	0x86
++#define FS1860_REG_DSPRAM	0xa2
++#define FS1860_REG_DSPADDR	0xa6
++#define FS1860_REG_TEMPPROT	0xaf
++#define FS1860_REG_DSPSTATUS	0xbd
++#define FS1860_REG_PWRKEY	0xc4
++
++/* Preset file layout (libfs1860 v0x0703): 468-byte header, then coefficients */
++#define FS1860_PRESET_VERSION	0x0703
++#define FS1860_PRESET_HDR_LEN	468
++#define FS1860_PRESET_NCOEF	42	/* u16 count field offset */
++#define FS1860_PRESET_RAM	144	/* 81 x u32 DSP RAM words */
++#define FS1860_PRESET_RAM_WORDS	81
++
++/*
++ * Volume until userspace sets one: the chip init below writes full gain
++ * (0xff), which on 4.14 played every first sound after boot at full level.
++ */
++#define FS1860_DEFAULT_VOLUME	160
++
++struct fs1860_reg {
++	u8 reg;
++	u16 val;
++};
++
++/* Fs16xx_reg_defaults from libfs1860.so, written first by fs16xx_init() */
++static const struct fs1860_reg fs1860_defaults[] = {
++	{ 0x0b, 0xca91 }, { 0x04, 0x800b }, { 0x06, 0xff00 }, { 0xc0, 0xb54e },
++	{ 0xc4, 0x000f }, { 0xae, 0x0010 }, { 0xb9, 0xffff }, { 0x09, 0x0009 },
++	{ 0xd7, 0x60a0 }, { 0xa1, 0x5802 }, { 0x99, 0x0000 }, { 0x0b, 0x0000 },
++};
++
++/*
++ * Configuration registers as left by the stock HAL after init (speaker
++ * idle), read back from this phone. Covers the 44.1/48k preset selection,
++ * mono channel select, mute/volume and protection thresholds.
++ * 0x62-0x69 are speaker-protection coefficients the HAL derives from the
++ * factory R25 calibration in OTP (0xe8); they are specific to this unit.
++ */
++static const struct fs1860_reg fs1860_config[] = {
++	{ 0x04, 0x801b }, { 0x06, 0xff00 }, { 0x08, 0x01fe }, { 0x0a, 0x0400 },
++	{ 0x62, 0x7f10 }, { 0x63, 0x8e4f }, { 0x64, 0x8c27 }, { 0x65, 0x8c27 },
++	{ 0x66, 0x8c27 }, { 0x67, 0x8c27 }, { 0x68, 0x89a6 }, { 0x69, 0x873c },
++	{ 0x6a, 0x0a05 }, { 0x6b, 0x2015 }, { 0x6c, 0x402a },
++	{ 0x72, 0x0a53 }, { 0x73, 0xeb59 }, { 0x74, 0x0a53 },
++	{ 0x77, 0x000b }, { 0x78, 0x0016 }, { 0x79, 0x000b },
++	{ 0x7e, 0x1000 }, { 0x7f, 0x0000 },
++	{ 0x89, 0x9080 }, { 0x8a, 0x0345 }, { 0x8b, 0x18bc }, { 0x8c, 0x14c7 },
++	{ 0xa1, 0x5802 }, { 0xa7, 0x0004 }, { 0xa8, 0x00e5 }, { 0xa9, 0x02d8 },
++	{ 0xaa, 0x0035 }, { 0xad, 0x00a3 }, { 0xae, 0x0010 }, { 0xb9, 0xffff },
++	{ 0xba, 0x0031 }, { 0xc0, 0x4aae }, { 0xc1, 0x0168 }, { 0xc2, 0x00f0 },
++	{ 0xc3, 0x0006 },
++};
++
++struct fs1860 {
++	struct i2c_client *client;
++	struct mutex lock;
++	bool initialized;
++	bool on;
++	u8 volume;
++};
++
++static int fs1860_read(struct fs1860 *fs, u8 reg)
++{
++	return i2c_smbus_read_word_swapped(fs->client, reg);
++}
++
++static int fs1860_write(struct fs1860 *fs, u8 reg, u16 val)
++{
++	return i2c_smbus_write_word_swapped(fs->client, reg, val);
++}
++
++static int fs1860_write_table(struct fs1860 *fs, const struct fs1860_reg *t,
++			      int n)
++{
++	int i, ret;
++
++	for (i = 0; i < n; i++) {
++		ret = fs1860_write(fs, t[i].reg, t[i].val);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int fs1860_bulk_write(struct fs1860 *fs, u8 reg, const u8 data[4])
++{
++	u8 buf[5] = { reg, data[0], data[1], data[2], data[3] };
++	int ret = i2c_master_send(fs->client, buf, sizeof(buf));
++
++	return ret == sizeof(buf) ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++/* Poll until (reg & mask) == want, up to tries x 1ms */
++static int fs1860_wait(struct fs1860 *fs, u8 reg, u16 mask, u16 want, int tries)
++{
++	while (tries--) {
++		int v = fs1860_read(fs, reg);
++
++		if (v >= 0 && (v & mask) == want)
++			return 0;
++		usleep_range(1000, 1200);
++	}
++	return -ETIMEDOUT;
++}
++
++static int fs1860_set_volume(struct fs1860 *fs, u8 vol)
++{
++	int v = fs1860_read(fs, FS1860_REG_AUDIOCTRL);
++
++	return v < 0 ? v : fs1860_write(fs, FS1860_REG_AUDIOCTRL,
++					(v & 0xff) | vol << 8);
++}
++
++/* fs16xx_load_presets_to_dev(): DSP RAM and coefficient upload */
++static int fs1860_load_preset(struct fs1860 *fs, const struct firmware *fw)
++{
++	const u8 *p = fw->data;
++	u16 ncoef = p[FS1860_PRESET_NCOEF] | p[FS1860_PRESET_NCOEF + 1] << 8;
++	int sysctrl, i, ret;
++	u8 b[4];
++
++	if (fw->size < FS1860_PRESET_HDR_LEN ||
++	    (p[0] | p[1] << 8) != FS1860_PRESET_VERSION ||
++	    fw->size != FS1860_PRESET_HDR_LEN + 2 * ncoef || ncoef & 1) {
++		dev_err(&fs->client->dev, "unexpected preset file layout\n");
++		return -EINVAL;
++	}
++
++	sysctrl = fs1860_read(fs, FS1860_REG_SYSCTRL);
++	if (sysctrl < 0)
++		return sysctrl;
++	fs1860_write(fs, FS1860_REG_SYSCTRL, sysctrl & ~FS1860_SYSCTRL_AMPE);
++	fs1860_write(fs, FS1860_REG_ACCKEY, FS1860_ACCKEY_UNLOCK);
++	if (fs1860_wait(fs, FS1860_REG_DSPSTATUS, 0x3, 0, 50))
++		dev_warn(&fs->client->dev, "DSP did not stop\n");
++
++	ret = fs1860_write(fs, FS1860_REG_DSPADDR, 0);
++	for (i = 0; !ret && i < FS1860_PRESET_RAM_WORDS; i++) {
++		const u8 *w = p + FS1860_PRESET_RAM + 4 * i;	/* LE u32 */
++
++		b[0] = w[1];
++		b[1] = w[0];
++		b[2] = 0;
++		b[3] = w[2];
++		ret = fs1860_bulk_write(fs, FS1860_REG_DSPRAM, b);
++	}
++
++	if (!ret)
++		ret = fs1860_write(fs, FS1860_REG_COEFADDR, 0);
++	for (i = 0; !ret && i < ncoef / 2; i++) {
++		const u8 *c = p + FS1860_PRESET_HDR_LEN + 4 * i;	/* 2 x LE u16 */
++
++		ret = fs1860_write(fs, FS1860_REG_COEFADDR, i);
++		b[0] = c[1];
++		b[1] = c[0];
++		b[2] = c[3];
++		b[3] = c[2];
++		if (!ret)
++			ret = fs1860_bulk_write(fs, FS1860_REG_DSPCOEF, b);
++	}
++
++	fs1860_write(fs, FS1860_REG_ACCKEY, 0);
++	fs1860_write(fs, FS1860_REG_SYSCTRL, sysctrl);
++	return ret;
++}
++
++static int fs1860_init_chip(struct fs1860 *fs)
++{
++	const struct firmware *fw;
++	int ret;
++
++	ret = fs1860_write_table(fs, fs1860_defaults,
++				 ARRAY_SIZE(fs1860_defaults));
++	if (ret)
++		return ret;
++
++	ret = request_firmware(&fw, FS1860_PRESET_FW, &fs->client->dev);
++	if (ret) {
++		dev_err(&fs->client->dev, "missing %s: %d\n",
++			FS1860_PRESET_FW, ret);
++		return ret;
++	}
++	ret = fs1860_load_preset(fs, fw);
++	release_firmware(fw);
++	if (ret)
++		return ret;
++
++	fs1860_write(fs, FS1860_REG_ACCKEY, FS1860_ACCKEY_UNLOCK);
++	ret = fs1860_write_table(fs, fs1860_config, ARRAY_SIZE(fs1860_config));
++	fs1860_write(fs, FS1860_REG_ACCKEY, 0);
++	if (!ret)
++		ret = fs1860_set_volume(fs, fs->volume);
++	if (ret)
++		return ret;
++
++	dev_info(&fs->client->dev, "initialized with %s\n", FS1860_PRESET_FW);
++	return 0;
++}
++
++static int fs1860_ensure_init(struct fs1860 *fs)
++{
++	int ret = 0;
++
++	if (!fs->initialized) {
++		ret = fs1860_init_chip(fs);
++		fs->initialized = !ret;
++	}
++	return ret;
++}
++
++/*
++ * fs16xx_powerdown(dev, 0) + the AMPE cycle from fs16xx_set_preset() +
++ * fs16xx_set_tempr_protection(dev, 1). The DSP only starts on an AMPE rising
++ * edge while the I2S clock is present, so power up with AMPE clear, wait for
++ * the PLL to lock, then enable the amplifier.
++ */
++static int fs1860_speaker_on(struct fs1860 *fs)
++{
++	int v, ret;
++
++	fs1860_write(fs, FS1860_REG_PWRKEY, 0x000f);
++	v = fs1860_read(fs, FS1860_REG_SYSCTRL);
++	if (v < 0)
++		return v;
++	v &= ~(FS1860_SYSCTRL_PWDN | FS1860_SYSCTRL_AMPE);
++	ret = fs1860_write(fs, FS1860_REG_SYSCTRL, v);
++	if (ret)
++		return ret;
++
++	/* The PLL locks to the I2S bit clock; no clock means no audio */
++	if (fs1860_wait(fs, FS1860_REG_STATUS, FS1860_STATUS_PLLS,
++			FS1860_STATUS_PLLS, 100))
++		dev_warn(&fs->client->dev, "PLL not locked (no I2S clock?)\n");
++	fs1860_wait(fs, FS1860_REG_DSPSTATUS, 0x3, 0, 50);
++
++	ret = fs1860_write(fs, FS1860_REG_SYSCTRL, v | FS1860_SYSCTRL_AMPE);
++	if (ret)
++		return ret;
++	usleep_range(5000, 6000);	/* boost soft-start */
++
++	ret = fs1860_write(fs, FS1860_REG_TEMPPROT, 0x362b);
++	fs->on = !ret;
++	dev_dbg(&fs->client->dev, "speaker on: status=0x%04x dsp=0x%04x\n",
++		fs1860_read(fs, FS1860_REG_STATUS),
++		fs1860_read(fs, FS1860_REG_DSPSTATUS));
++	return ret;
++}
++
++/* fs16xx_powerdown(dev, 1) */
++static int fs1860_speaker_off(struct fs1860 *fs)
++{
++	int v;
++
++	fs1860_write(fs, FS1860_REG_TEMPPROT, 0x7623);
++	v = fs1860_read(fs, FS1860_REG_SYSCTRL);
++	if (v >= 0)
++		fs1860_write(fs, FS1860_REG_SYSCTRL, v | FS1860_SYSCTRL_PWDN);
++	if (fs1860_wait(fs, FS1860_REG_DSPSTATUS, 0x3, 0, 50))
++		dev_warn(&fs->client->dev, "DSP did not stop\n");
++	fs1860_write(fs, FS1860_REG_PWRKEY, 0x0000);
++	fs->on = false;
++	return 0;
++}
++
++/* fs16xx_set_samplerate(): rate code in I2SCTRL[15:12], clear [7:6] */
++static int fs1860_rate_code(unsigned int rate)
++{
++	switch (rate) {
++	case 8000:	return 0x0;
++	case 16000:	return 0x3;
++	case 32000:	return 0x6;
++	case 44100:	return 0x7;
++	case 48000:	return 0x8;
++	default:	return -EINVAL;
++	}
++}
++
++static int fs1860_hw_params(struct snd_pcm_substream *substream,
++			    struct snd_pcm_hw_params *params,
++			    struct snd_soc_dai *dai)
++{
++	struct fs1860 *fs = snd_soc_component_get_drvdata(dai->component);
++	int code = fs1860_rate_code(params_rate(params));
++	int v, ret;
++
++	dev_dbg(&fs->client->dev, "%s: rate=%u ch=%u\n", __func__,
++		params_rate(params), params_channels(params));
++	if (code < 0)
++		return code;
++
++	mutex_lock(&fs->lock);
++	ret = fs1860_ensure_init(fs);
++	if (!ret) {
++		v = fs1860_read(fs, FS1860_REG_I2SCTRL);
++		ret = v < 0 ? v : fs1860_write(fs, FS1860_REG_I2SCTRL,
++					       (v & 0x0f3f) | code << 12);
++	}
++	mutex_unlock(&fs->lock);
++	return ret;
++}
++
++/*
++ * ASoC unmutes after the stream event has started the back end, so the
++ * I2S bit clock is running here: the amp is switched on at unmute and off
++ * at mute, not at prepare as on 4.14 (where a hostless link held it).
++ */
++static int fs1860_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
++{
++	struct fs1860 *fs = snd_soc_component_get_drvdata(dai->component);
++	int sysctrl, ret = 0;
++
++	mutex_lock(&fs->lock);
++	/* Trust the chip, not our flag: it may have been powered down behind us */
++	sysctrl = fs1860_read(fs, FS1860_REG_SYSCTRL);
++	if (sysctrl >= 0)
++		fs->on = !(sysctrl & FS1860_SYSCTRL_PWDN);
++	dev_dbg(&fs->client->dev, "%s: mute=%d sysctrl=0x%04x\n", __func__,
++		mute, sysctrl);
++
++	if (!mute && !fs->on) {
++		ret = fs1860_ensure_init(fs);
++		if (!ret)
++			ret = fs1860_speaker_on(fs);
++	} else if (mute && fs->on) {
++		ret = fs1860_speaker_off(fs);
++	}
++	if (ret)
++		dev_err(&fs->client->dev, "speaker %s failed: %d\n",
++			mute ? "off" : "on", ret);
++	mutex_unlock(&fs->lock);
++	return ret;
++}
++
++static const struct snd_soc_dai_ops fs1860_dai_ops = {
++	.hw_params	= fs1860_hw_params,
++	.mute_stream	= fs1860_mute_stream,
++	.no_capture_mute = 1,
++};
++
++static struct snd_soc_dai_driver fs1860_dai = {
++	.name = "fs1860-aif",
++	.playback = {
++		.stream_name	= "Playback",
++		.channels_min	= 1,
++		.channels_max	= 2,
++		.rates		= SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |
++				  SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 |
++				  SNDRV_PCM_RATE_48000,
++		.formats	= SNDRV_PCM_FMTBIT_S16_LE |
++				  SNDRV_PCM_FMTBIT_S24_LE |
++				  SNDRV_PCM_FMTBIT_S32_LE,
++	},
++	.ops = &fs1860_dai_ops,
++};
++
++/*
++ * Volume: AUDIOCTRL[15:8], 0xff is the HAL's normal (full) level, -0.5dB
++ * steps. Kept here and written after the chip init, which sets 0xff.
++ */
++static int fs1860_volume_get(struct snd_kcontrol *kc,
++			     struct snd_ctl_elem_value *uc)
++{
++	struct snd_soc_component *component = snd_soc_kcontrol_component(kc);
++	struct fs1860 *fs = snd_soc_component_get_drvdata(component);
++
++	uc->value.integer.value[0] = fs->volume;
++	return 0;
++}
++
++static int fs1860_volume_put(struct snd_kcontrol *kc,
++			     struct snd_ctl_elem_value *uc)
++{
++	struct snd_soc_component *component = snd_soc_kcontrol_component(kc);
++	struct fs1860 *fs = snd_soc_component_get_drvdata(component);
++	u8 vol = clamp_t(long, uc->value.integer.value[0], 0, 0xff);
++	int ret = 0;
++
++	mutex_lock(&fs->lock);
++	if (vol != fs->volume) {
++		fs->volume = vol;
++		if (fs->initialized)
++			ret = fs1860_set_volume(fs, vol);
++	}
++	mutex_unlock(&fs->lock);
++	return ret ? ret : 1;
++}
++
++static const DECLARE_TLV_DB_SCALE(fs1860_vol_tlv, -12750, 50, 1);
++
++static const struct snd_kcontrol_new fs1860_controls[] = {
++	SOC_SINGLE_EXT_TLV("Speaker Amp Volume", SND_SOC_NOPM, 0, 0xff, 0,
++			   fs1860_volume_get, fs1860_volume_put,
++			   fs1860_vol_tlv),
++};
++
++/* The speaker ends the DAPM path, so the CPU's I2S back end powers up */
++static const struct snd_soc_dapm_widget fs1860_dapm_widgets[] = {
++	SND_SOC_DAPM_OUTPUT("SPK"),
++};
++
++static const struct snd_soc_dapm_route fs1860_dapm_routes[] = {
++	{ "SPK", NULL, "Playback" },
++};
++
++static const struct snd_soc_component_driver fs1860_component = {
++	.controls		= fs1860_controls,
++	.num_controls		= ARRAY_SIZE(fs1860_controls),
++	.dapm_widgets		= fs1860_dapm_widgets,
++	.num_dapm_widgets	= ARRAY_SIZE(fs1860_dapm_widgets),
++	.dapm_routes		= fs1860_dapm_routes,
++	.num_dapm_routes	= ARRAY_SIZE(fs1860_dapm_routes),
++	.endianness		= 1,
++};
++
++static int fs1860_probe(struct i2c_client *client)
++{
++	struct fs1860 *fs;
++	int rev;
++
++	rev = i2c_smbus_read_word_swapped(client, FS1860_REG_REVID);
++	if (rev != FS1860_REVID)
++		return dev_err_probe(&client->dev, -ENODEV,
++				     "unexpected revision 0x%04x\n", rev);
++
++	fs = devm_kzalloc(&client->dev, sizeof(*fs), GFP_KERNEL);
++	if (!fs)
++		return -ENOMEM;
++	fs->client = client;
++	fs->volume = FS1860_DEFAULT_VOLUME;
++	mutex_init(&fs->lock);
++	i2c_set_clientdata(client, fs);
++
++	/* Keep the amp powered down until a stream starts */
++	fs1860_write(fs, FS1860_REG_SYSCTRL,
++		     FS1860_SYSCTRL_PWDN | FS1860_SYSCTRL_AMPE);
++	dev_info(&client->dev, "FS1860 rev 0x%04x\n", rev);
++
++	return devm_snd_soc_register_component(&client->dev, &fs1860_component,
++					       &fs1860_dai, 1);
++}
++
++static void fs1860_shutdown(struct i2c_client *client)
++{
++	struct fs1860 *fs = i2c_get_clientdata(client);
++
++	if (fs && fs->on) {
++		mutex_lock(&fs->lock);
++		fs1860_speaker_off(fs);
++		mutex_unlock(&fs->lock);
++	}
++}
++
++static const struct of_device_id fs1860_of_match[] = {
++	{ .compatible = "foursemi,fs1860" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, fs1860_of_match);
++
++static const struct i2c_device_id fs1860_i2c_id[] = {
++	{ "fs1860" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, fs1860_i2c_id);
++
++static struct i2c_driver fs1860_driver = {
++	.driver = {
++		.name = "fs1860",
++		.of_match_table = fs1860_of_match,
++	},
++	.probe = fs1860_probe,
++	.shutdown = fs1860_shutdown,
++	.id_table = fs1860_i2c_id,
++};
++module_i2c_driver(fs1860_driver);
++
++MODULE_DESCRIPTION("FourSemi FS1860 smart amplifier (Titan Pocket)");
++MODULE_FIRMWARE(FS1860_PRESET_FW);
++MODULE_LICENSE("GPL");
+diff --git a/sound/soc/mediatek/Kconfig b/sound/soc/mediatek/Kconfig
+index 3033e2d3fe16840631a465dd967da77f7a6ff43c..f241a6b7b1b43a9adc6b1420acf2b169ba2f3e4b 100644
+--- a/sound/soc/mediatek/Kconfig
++++ b/sound/soc/mediatek/Kconfig
+@@ -138,6 +138,17 @@ config SND_SOC_MT8183
+ 	  Select Y if you have such device.
+ 	  If unsure select "N".
+ 
++config SND_SOC_MT6771_TITANPOCKET
++	tristate "ASoC Audio driver for the Unihertz Titan Pocket (MT6771)"
++	depends on I2C
++	depends on SND_SOC_MT8183
++	select SND_SOC_MT6358
++	select SND_SOC_FS1860
++	help
++	  The Titan Pocket's sound card: the MT6771 AFE (the MT8183's),
++	  the MT6358 codec (earpiece, headphones, microphones) and the
++	  FS1860 smart amp on I2S3 (loudspeaker).
++
+ config SND_SOC_MT8183_MT6358_TS3A227E_MAX98357A
+ 	tristate "ASoC Audio driver for MT8183 with MT6358 TS3A227E MAX98357A RT1015 codec"
+ 	depends on I2C && GPIOLIB
+diff --git a/sound/soc/mediatek/common/mtk-afe-platform-driver.c b/sound/soc/mediatek/common/mtk-afe-platform-driver.c
+index 70fd05d5ff486c6da7e648eaef90e0a4f1a6567f..2f744f9a4534d761f3acb31b42e06d9156e7bb39 100644
+--- a/sound/soc/mediatek/common/mtk-afe-platform-driver.c
++++ b/sound/soc/mediatek/common/mtk-afe-platform-driver.c
+@@ -82,15 +82,24 @@ snd_pcm_uframes_t mtk_afe_pcm_pointer(struct snd_soc_component *component,
+ {
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+ 	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
+-	struct mtk_base_afe_memif *memif = &afe->memif[snd_soc_rtd_to_cpu(rtd, 0)->id];
+-	const struct mtk_base_memif_data *memif_data = memif->data;
++	int id = snd_soc_rtd_to_cpu(rtd, 0)->id;
++	struct mtk_base_afe_memif *memif;
++	const struct mtk_base_memif_data *memif_data;
+ 	struct regmap *regmap = afe->regmap;
+ 	struct device *dev = afe->dev;
+-	int reg_ofs_base = memif_data->reg_ofs_base;
+-	int reg_ofs_cur = memif_data->reg_ofs_cur;
++	int reg_ofs_base, reg_ofs_cur;
+ 	unsigned int hw_ptr = 0, hw_base = 0;
+ 	int ret, pcm_ptr_bytes;
+ 
++	/* a hostless front end (not a memif) moves no data through memory */
++	if (id >= afe->memif_size)
++		return 0;
++
++	memif = &afe->memif[id];
++	memif_data = memif->data;
++	reg_ofs_base = memif_data->reg_ofs_base;
++	reg_ofs_cur = memif_data->reg_ofs_cur;
++
+ 	ret = regmap_read(regmap, reg_ofs_cur, &hw_ptr);
+ 	if (ret || hw_ptr == 0) {
+ 		dev_err(dev, "%s hw_ptr err\n", __func__);
+diff --git a/sound/soc/mediatek/mt8183/Makefile b/sound/soc/mediatek/mt8183/Makefile
+index 0d0dcdde00fcc88ae687795a828da8818dd379f6..ba4b460c42cd56ae1ba7ea1f9b32fd4c8bff7fd2 100644
+--- a/sound/soc/mediatek/mt8183/Makefile
++++ b/sound/soc/mediatek/mt8183/Makefile
+@@ -8,8 +8,10 @@ snd-soc-mt8183-afe-y := \
+ 	mt8183-dai-tdm.o \
+ 	mt8183-dai-pcm.o \
+ 	mt8183-dai-hostless.o \
++	mt8183-dai-hw-gain.o \
+ 	mt8183-dai-adda.o
+ 
+ obj-$(CONFIG_SND_SOC_MT8183) += snd-soc-mt8183-afe.o
++obj-$(CONFIG_SND_SOC_MT6771_TITANPOCKET) += mt6771-titanpocket.o
+ obj-$(CONFIG_SND_SOC_MT8183_MT6358_TS3A227E_MAX98357A) += mt8183-mt6358-ts3a227-max98357.o
+ obj-$(CONFIG_SND_SOC_MT8183_DA7219_MAX98357A) += mt8183-da7219-max98357.o
+diff --git a/sound/soc/mediatek/mt8183/mt6771-titanpocket.c b/sound/soc/mediatek/mt8183/mt6771-titanpocket.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..bba710614d8e495bf05855919368adaa567aacd0
+--- /dev/null
++++ b/sound/soc/mediatek/mt8183/mt6771-titanpocket.c
+@@ -0,0 +1,244 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Unihertz Titan Pocket (MT6771) sound card.
++ *
++ * The MT6771's audio front end is the MT8183's, so this runs on the
++ * MT8183 AFE driver. Outputs:
++ *   - loudspeaker: I2S3 -> FourSemi FS1860 smart amp (i2c3/0x34)
++ *   - earpiece, headphones: the AFE's ADDA link -> MT6358 codec
++ * the microphones through the MT6358's ADC on the same link, and the FM
++ * radio's audio: CONNSYS I2S, captured through UL2.
++ *
++ * Front ends (PCMs) are memory interfaces; which back ends they reach is
++ * set by the AFE's interconnect mixers, e.g. for DL1 on the loudspeaker:
++ *   "I2S3_CH1 DL1_CH1" and "I2S3_CH2 DL1_CH2" on;
++ * for FM into Capture_2 (UL2): "UL2_CH1 CONNSYS_I2S_CH1" and
++ * "UL2_CH2 CONNSYS_I2S_CH2" on.
++ */
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#include "mt8183-afe-common.h"
++
++/* The FS1860 takes 32-bit slots at the stream's rate, as on 4.14 */
++static int titanpocket_i2s_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
++					   struct snd_pcm_hw_params *params)
++{
++	snd_mask_reset_range(hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT),
++			     0, (__force unsigned int)SNDRV_PCM_FORMAT_LAST);
++	params_set_format(params, SNDRV_PCM_FORMAT_S32_LE);
++	return 0;
++}
++
++static int titanpocket_i2s_hw_params(struct snd_pcm_substream *substream,
++				     struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++
++	/* MCLK at 128 fs, as upstream's MT8183 boards; the amp ignores it */
++	return snd_soc_dai_set_sysclk(snd_soc_rtd_to_cpu(rtd, 0), 0,
++				      params_rate(params) * 128,
++				      SND_SOC_CLOCK_OUT);
++}
++
++static const struct snd_soc_ops titanpocket_i2s_ops = {
++	.hw_params = titanpocket_i2s_hw_params,
++};
++
++/* FE */
++SND_SOC_DAILINK_DEFS(playback1,
++	DAILINK_COMP_ARRAY(COMP_CPU("DL1")),
++	DAILINK_COMP_ARRAY(COMP_DUMMY()),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(playback2,
++	DAILINK_COMP_ARRAY(COMP_CPU("DL2")),
++	DAILINK_COMP_ARRAY(COMP_DUMMY()),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(capture1,
++	DAILINK_COMP_ARRAY(COMP_CPU("UL1")),
++	DAILINK_COMP_ARRAY(COMP_DUMMY()),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(capture2,
++	DAILINK_COMP_ARRAY(COMP_CPU("UL2")),
++	DAILINK_COMP_ARRAY(COMP_DUMMY()),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++/* FM through the AFE: CONNSYS I2S -> HW gain 1 -> I2S3/ADDA, no CPU */
++SND_SOC_DAILINK_DEFS(hostless_fm,
++	DAILINK_COMP_ARRAY(COMP_CPU("Hostless FM DAI")),
++	DAILINK_COMP_ARRAY(COMP_DUMMY()),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++/* BE */
++SND_SOC_DAILINK_DEFS(primary_codec,
++	DAILINK_COMP_ARRAY(COMP_CPU("ADDA")),
++	DAILINK_COMP_ARRAY(COMP_CODEC("mt6358-sound", "mt6358-snd-codec-aif1")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(connsys_i2s,
++	DAILINK_COMP_ARRAY(COMP_CPU("CONNSYS_I2S")),
++	DAILINK_COMP_ARRAY(COMP_DUMMY()),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++/* Bluetooth SCO: the BTCVSD driver is the platform */
++SND_SOC_DAILINK_DEFS(btcvsd,
++	DAILINK_COMP_ARRAY(COMP_DUMMY()),
++	DAILINK_COMP_ARRAY(COMP_DUMMY()),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(hw_gain1,
++	DAILINK_COMP_ARRAY(COMP_CPU("HW Gain 1")),
++	DAILINK_COMP_ARRAY(COMP_DUMMY()),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++SND_SOC_DAILINK_DEFS(i2s3,
++	DAILINK_COMP_ARRAY(COMP_CPU("I2S3")),
++	DAILINK_COMP_ARRAY(COMP_EMPTY()),	/* the amp, from the DT */
++	DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
++#define TITANPOCKET_FE(_name, _link, _dir)			\
++	{							\
++		.name = _name,					\
++		.stream_name = _name,				\
++		.trigger = { SND_SOC_DPCM_TRIGGER_PRE,		\
++			     SND_SOC_DPCM_TRIGGER_PRE },	\
++		.dynamic = 1,					\
++		._dir = 1,					\
++		SND_SOC_DAILINK_REG(_link),			\
++	}
++
++static struct snd_soc_dai_link titanpocket_dai_links[] = {
++	/* FE */
++	TITANPOCKET_FE("Playback_1", playback1, dpcm_playback),
++	TITANPOCKET_FE("Playback_2", playback2, dpcm_playback),
++	TITANPOCKET_FE("Capture_1", capture1, dpcm_capture),
++	TITANPOCKET_FE("Capture_2", capture2, dpcm_capture),
++	{
++		.name = "Hostless_FM",
++		.stream_name = "Hostless_FM",
++		.trigger = { SND_SOC_DPCM_TRIGGER_PRE,
++			     SND_SOC_DPCM_TRIGGER_PRE },
++		.dynamic = 1,
++		.dpcm_playback = 1,
++		.dpcm_capture = 1,
++		.ignore_suspend = 1,
++		SND_SOC_DAILINK_REG(hostless_fm),
++	},
++
++	/* BE */
++	{
++		.name = "Primary Codec",
++		.no_pcm = 1,
++		.dpcm_playback = 1,
++		.dpcm_capture = 1,
++		.ignore_suspend = 1,
++		SND_SOC_DAILINK_REG(primary_codec),
++	},
++	{
++		.name = "I2S3",
++		.no_pcm = 1,
++		.dpcm_playback = 1,
++		.ignore_suspend = 1,
++		.be_hw_params_fixup = titanpocket_i2s_hw_params_fixup,
++		.ops = &titanpocket_i2s_ops,
++		SND_SOC_DAILINK_REG(i2s3),
++	},
++	{
++		.name = "CONNSYS_I2S",
++		.no_pcm = 1,
++		.dpcm_capture = 1,
++		.ignore_suspend = 1,
++		SND_SOC_DAILINK_REG(connsys_i2s),
++	},
++	{
++		.name = "HW Gain 1",
++		.no_pcm = 1,
++		.dpcm_playback = 1,
++		.dpcm_capture = 1,
++		.ignore_suspend = 1,
++		SND_SOC_DAILINK_REG(hw_gain1),
++	},
++
++	/* last: dropped when the tree has no mediatek,btcvsd */
++	{
++		.name = "BTCVSD",
++		.stream_name = "BTCVSD",
++		SND_SOC_DAILINK_REG(btcvsd),
++	},
++};
++
++static struct snd_soc_card titanpocket_card = {
++	.name = "titanpocket",
++	.owner = THIS_MODULE,
++	.dai_link = titanpocket_dai_links,
++	.num_links = ARRAY_SIZE(titanpocket_dai_links),
++};
++
++static int titanpocket_dev_probe(struct platform_device *pdev)
++{
++	struct snd_soc_card *card = &titanpocket_card;
++	struct device_node *platform_node, *amp_node, *btcvsd_node;
++	struct snd_soc_dai_link *dai_link;
++	int ret, i;
++
++	platform_node = of_parse_phandle(pdev->dev.of_node,
++					 "mediatek,platform", 0);
++	if (!platform_node)
++		return dev_err_probe(&pdev->dev, -EINVAL,
++				     "mediatek,platform missing\n");
++
++	amp_node = of_find_compatible_node(NULL, NULL, "foursemi,fs1860");
++	if (!amp_node) {
++		of_node_put(platform_node);
++		return dev_err_probe(&pdev->dev, -ENODEV, "no FS1860 node\n");
++	}
++
++	btcvsd_node = of_parse_phandle(pdev->dev.of_node, "mediatek,btcvsd", 0);
++	card->num_links = ARRAY_SIZE(titanpocket_dai_links) - !btcvsd_node;
++
++	card->dev = &pdev->dev;
++	for_each_card_prelinks(card, i, dai_link) {
++		if (!strcmp(dai_link->name, "BTCVSD")) {
++			dai_link->platforms->of_node = btcvsd_node;
++			continue;
++		}
++		if (!strcmp(dai_link->name, "I2S3")) {
++			dai_link->codecs->of_node = amp_node;
++			dai_link->codecs->dai_name = "fs1860-aif";
++		}
++		if (!dai_link->platforms->name)
++			dai_link->platforms->of_node = platform_node;
++	}
++
++	ret = devm_snd_soc_register_card(&pdev->dev, card);
++
++	of_node_put(btcvsd_node);
++	of_node_put(amp_node);
++	of_node_put(platform_node);
++	return ret;
++}
++
++static const struct of_device_id titanpocket_dt_match[] = {
++	{ .compatible = "unihertz,titan-pocket-sound" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, titanpocket_dt_match);
++
++static struct platform_driver titanpocket_driver = {
++	.driver = {
++		.name = "titanpocket-sound",
++		.of_match_table = titanpocket_dt_match,
++		.pm = &snd_soc_pm_ops,
++	},
++	.probe = titanpocket_dev_probe,
++};
++module_platform_driver(titanpocket_driver);
++
++MODULE_DESCRIPTION("Unihertz Titan Pocket sound card");
++MODULE_LICENSE("GPL");
+diff --git a/sound/soc/mediatek/mt8183/mt8183-afe-common.h b/sound/soc/mediatek/mt8183/mt8183-afe-common.h
+index 40ab48c1566c8cac33af206f9caae784855fab27..fa213ce399eb7123be30ad654c64a459dc678e3d 100644
+--- a/sound/soc/mediatek/mt8183/mt8183-afe-common.h
++++ b/sound/soc/mediatek/mt8183/mt8183-afe-common.h
+@@ -36,6 +36,9 @@ enum {
+ 	MT8183_DAI_TDM,
+ 	MT8183_DAI_HOSTLESS_LPBK,
+ 	MT8183_DAI_HOSTLESS_SPEECH,
++	MT8183_DAI_CONNSYS_I2S,
++	MT8183_DAI_HW_GAIN_1,
++	MT8183_DAI_HOSTLESS_FM,
+ 	MT8183_DAI_NUM,
+ };
+ 
+@@ -108,4 +111,5 @@ int mt8183_dai_pcm_register(struct mtk_base_afe *afe);
+ int mt8183_dai_i2s_register(struct mtk_base_afe *afe);
+ int mt8183_dai_tdm_register(struct mtk_base_afe *afe);
+ int mt8183_dai_hostless_register(struct mtk_base_afe *afe);
++int mt8183_dai_hw_gain_register(struct mtk_base_afe *afe);
+ #endif
+diff --git a/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c b/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c
+index 23c8974d9adbd9fd97e8394582cd89822c789c8e..1d85e8cc69f7282bb98f77d8f84ed290df552612 100644
+--- a/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c
++++ b/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c
+@@ -316,6 +316,8 @@ static const struct snd_kcontrol_new memif_ul2_ch1_mix[] = {
+ 				    I_DL3_CH1, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("I2S2_CH1", AFE_CONN5,
+ 				    I_I2S2_CH1, 1, 0),
++	SOC_DAPM_SINGLE_AUTODISABLE("CONNSYS_I2S_CH1", AFE_CONN5_1,
++				    I_CONNSYS_I2S_CH1 - 32, 1, 0),
+ };
+ 
+ static const struct snd_kcontrol_new memif_ul2_ch2_mix[] = {
+@@ -329,6 +331,8 @@ static const struct snd_kcontrol_new memif_ul2_ch2_mix[] = {
+ 				    I_DL3_CH2, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("I2S2_CH2", AFE_CONN6,
+ 				    I_I2S2_CH2, 1, 0),
++	SOC_DAPM_SINGLE_AUTODISABLE("CONNSYS_I2S_CH2", AFE_CONN6_1,
++				    I_CONNSYS_I2S_CH2 - 32, 1, 0),
+ };
+ 
+ static const struct snd_kcontrol_new memif_ul3_ch1_mix[] = {
+@@ -404,6 +408,8 @@ static const struct snd_soc_dapm_route mt8183_memif_routes[] = {
+ 	{"UL2_CH2", "ADDA_UL_CH2", "ADDA Capture"},
+ 	{"UL2_CH1", "I2S2_CH1", "I2S2"},
+ 	{"UL2_CH2", "I2S2_CH2", "I2S2"},
++	{"UL2_CH1", "CONNSYS_I2S_CH1", "Connsys I2S"},
++	{"UL2_CH2", "CONNSYS_I2S_CH2", "Connsys I2S"},
+ 
+ 	{"UL3", NULL, "UL3_CH1"},
+ 	{"UL3", NULL, "UL3_CH2"},
+@@ -945,6 +951,7 @@ static const dai_register_cb dai_register_cbs[] = {
+ 	mt8183_dai_pcm_register,
+ 	mt8183_dai_tdm_register,
+ 	mt8183_dai_hostless_register,
++	mt8183_dai_hw_gain_register,
+ 	mt8183_dai_memif_register,
+ };
+ 
+diff --git a/sound/soc/mediatek/mt8183/mt8183-dai-adda.c b/sound/soc/mediatek/mt8183/mt8183-dai-adda.c
+index be69bcea2a786af7710ef4b173b5a2606f86d91b..ecffcb73610b98a9ae1537ef41c6b2319222ddd7 100644
+--- a/sound/soc/mediatek/mt8183/mt8183-dai-adda.c
++++ b/sound/soc/mediatek/mt8183/mt8183-dai-adda.c
+@@ -22,6 +22,8 @@ enum {
+ /* dai component */
+ static const struct snd_kcontrol_new mtk_adda_dl_ch1_mix[] = {
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH1", AFE_CONN3, I_DL1_CH1, 1, 0),
++	SOC_DAPM_SINGLE_AUTODISABLE("GAIN1_OUT_CH1", AFE_CONN3,
++				    I_GAIN1_OUT_CH1, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH1", AFE_CONN3, I_DL2_CH1, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL3_CH1", AFE_CONN3, I_DL3_CH1, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("ADDA_UL_CH2", AFE_CONN3,
+@@ -36,6 +38,8 @@ static const struct snd_kcontrol_new mtk_adda_dl_ch1_mix[] = {
+ 
+ static const struct snd_kcontrol_new mtk_adda_dl_ch2_mix[] = {
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH1", AFE_CONN4, I_DL1_CH1, 1, 0),
++	SOC_DAPM_SINGLE_AUTODISABLE("GAIN1_OUT_CH2", AFE_CONN4,
++				    I_GAIN1_OUT_CH2, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH2", AFE_CONN4, I_DL1_CH2, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH1", AFE_CONN4, I_DL2_CH1, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH2", AFE_CONN4, I_DL2_CH2, 1, 0),
+diff --git a/sound/soc/mediatek/mt8183/mt8183-dai-hostless.c b/sound/soc/mediatek/mt8183/mt8183-dai-hostless.c
+index 1667ad352d34f19f3d41b90dcfb57abf13a14af4..e7d7d3795a892d4866d990eb88de6201eaaac664 100644
+--- a/sound/soc/mediatek/mt8183/mt8183-dai-hostless.c
++++ b/sound/soc/mediatek/mt8183/mt8183-dai-hostless.c
+@@ -31,6 +31,16 @@ static const struct snd_soc_dapm_route mtk_dai_hostless_routes[] = {
+ 	{"Hostless Speech UL", NULL, "PCM 1 Capture"},
+ 	{"Hostless Speech UL", NULL, "PCM 2 Capture"},
+ 	{"Hostless Speech UL", NULL, "ADDA Capture"},
++
++	/* Hostless FM: CONNSYS I2S -> HW gain 1 -> I2S3 and ADDA DL */
++	{"Hostless FM UL", NULL, "Connsys I2S"},
++	{"HW_GAIN1_IN_CH1", "CONNSYS_I2S_CH1", "Hostless FM DL"},
++	{"HW_GAIN1_IN_CH2", "CONNSYS_I2S_CH2", "Hostless FM DL"},
++	{"Hostless FM UL", NULL, "HW Gain 1 Out"},
++	{"I2S3_CH1", "GAIN1_OUT_CH1", "Hostless FM DL"},
++	{"I2S3_CH2", "GAIN1_OUT_CH2", "Hostless FM DL"},
++	{"ADDA_DL_CH1", "GAIN1_OUT_CH1", "Hostless FM DL"},
++	{"ADDA_DL_CH2", "GAIN1_OUT_CH2", "Hostless FM DL"},
+ };
+ 
+ /* dai ops */
+@@ -96,6 +106,25 @@ static struct snd_soc_dai_driver mtk_dai_hostless_driver[] = {
+ 		},
+ 		.ops = &mtk_dai_hostless_ops,
+ 	},
++	{
++		.name = "Hostless FM DAI",
++		.id = MT8183_DAI_HOSTLESS_FM,
++		.playback = {
++			.stream_name = "Hostless FM DL",
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = MTK_HOSTLESS_RATES,
++			.formats = MTK_HOSTLESS_FORMATS,
++		},
++		.capture = {
++			.stream_name = "Hostless FM UL",
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = MTK_HOSTLESS_RATES,
++			.formats = MTK_HOSTLESS_FORMATS,
++		},
++		.ops = &mtk_dai_hostless_ops,
++	},
+ };
+ 
+ int mt8183_dai_hostless_register(struct mtk_base_afe *afe)
+diff --git a/sound/soc/mediatek/mt8183/mt8183-dai-hw-gain.c b/sound/soc/mediatek/mt8183/mt8183-dai-hw-gain.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..332add993c0fd12711ff5548c5b991aa246bcd85
+--- /dev/null
++++ b/sound/soc/mediatek/mt8183/mt8183-dai-hw-gain.c
+@@ -0,0 +1,163 @@
++// SPDX-License-Identifier: GPL-2.0
++//
++// MediaTek ALSA SoC Audio DAI HW Gain Control (MT8183)
++//
++// HW gain 1 sits on interconnect outputs O13/O14 and feeds inputs I10/I11
++// (GAIN1_OUT). The MT6771's FM path runs through it: CONNSYS I2S -> HW
++// gain 1 -> I2S3/ADDA DL, with no samples through the CPU. Modelled on
++// mt8186-dai-hw-gain.c.
++
++#include <linux/regmap.h>
++#include "mt8183-afe-common.h"
++#include "mt8183-interconnection.h"
++#include "mt8183-reg.h"
++
++#define HW_GAIN_1_EN_W_NAME "HW GAIN 1 Enable"
++
++/* dai component */
++static const struct snd_kcontrol_new mtk_hw_gain1_in_ch1_mix[] = {
++	SOC_DAPM_SINGLE_AUTODISABLE("CONNSYS_I2S_CH1", AFE_CONN13_1,
++				    I_CONNSYS_I2S_CH1 - 32, 1, 0),
++};
++
++static const struct snd_kcontrol_new mtk_hw_gain1_in_ch2_mix[] = {
++	SOC_DAPM_SINGLE_AUTODISABLE("CONNSYS_I2S_CH2", AFE_CONN14_1,
++				    I_CONNSYS_I2S_CH2 - 32, 1, 0),
++};
++
++static int mtk_hw_gain_event(struct snd_soc_dapm_widget *w,
++			     struct snd_kcontrol *kcontrol,
++			     int event)
++{
++	struct snd_soc_component *cmpnt = snd_soc_dapm_to_component(w->dapm);
++	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(cmpnt);
++
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		/* ramp up from silence to the target gain ("HW Gain 1 Volume") */
++		regmap_update_bits(afe->regmap, AFE_GAIN1_CUR,
++				   AFE_GAIN1_CUR_MASK << AFE_GAIN1_CUR_SFT, 0);
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++static const struct snd_soc_dapm_widget mtk_dai_hw_gain_widgets[] = {
++	/* inter-connections */
++	SND_SOC_DAPM_MIXER("HW_GAIN1_IN_CH1", SND_SOC_NOPM, 0, 0,
++			   mtk_hw_gain1_in_ch1_mix,
++			   ARRAY_SIZE(mtk_hw_gain1_in_ch1_mix)),
++	SND_SOC_DAPM_MIXER("HW_GAIN1_IN_CH2", SND_SOC_NOPM, 0, 0,
++			   mtk_hw_gain1_in_ch2_mix,
++			   ARRAY_SIZE(mtk_hw_gain1_in_ch2_mix)),
++
++	SND_SOC_DAPM_SUPPLY(HW_GAIN_1_EN_W_NAME,
++			    AFE_GAIN1_CON0, GAIN1_ON_SFT, 0,
++			    mtk_hw_gain_event,
++			    SND_SOC_DAPM_PRE_PMU),
++
++	SND_SOC_DAPM_INPUT("HW Gain 1 Out Endpoint"),
++	SND_SOC_DAPM_OUTPUT("HW Gain 1 In Endpoint"),
++};
++
++static const struct snd_soc_dapm_route mtk_dai_hw_gain_routes[] = {
++	{"HW Gain 1 In", NULL, "HW_GAIN1_IN_CH1"},
++	{"HW Gain 1 In", NULL, "HW_GAIN1_IN_CH2"},
++
++	{"HW Gain 1 In", NULL, HW_GAIN_1_EN_W_NAME},
++	{"HW Gain 1 Out", NULL, HW_GAIN_1_EN_W_NAME},
++
++	{"HW Gain 1 In Endpoint", NULL, "HW Gain 1 In"},
++	{"HW Gain 1 Out", NULL, "HW Gain 1 Out Endpoint"},
++};
++
++/* target gain, 20 bits: 0x80000 is 0 dB */
++static const struct snd_kcontrol_new mtk_hw_gain_controls[] = {
++	SOC_SINGLE("HW Gain 1 Volume", AFE_GAIN1_CON1,
++		   GAIN1_TARGET_SFT, GAIN1_TARGET_MASK, 0),
++};
++
++/* dai ops */
++static int mtk_dai_gain_hw_params(struct snd_pcm_substream *substream,
++				  struct snd_pcm_hw_params *params,
++				  struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	unsigned int rate_reg = mt8183_rate_transform(afe->dev,
++						      params_rate(params),
++						      dai->id);
++
++	regmap_update_bits(afe->regmap, AFE_GAIN1_CON0, GAIN1_MODE_MASK_SFT,
++			   rate_reg << GAIN1_MODE_SFT);
++	/* 64 samples per ramp step, as MT8186 and MediaTek's MT6771 kernel */
++	regmap_update_bits(afe->regmap, AFE_GAIN1_CON0,
++			   GAIN1_SAMPLE_PER_STEP_MASK_SFT,
++			   0x40 << GAIN1_SAMPLE_PER_STEP_SFT);
++
++	return 0;
++}
++
++static const struct snd_soc_dai_ops mtk_dai_gain_ops = {
++	.hw_params = mtk_dai_gain_hw_params,
++};
++
++/* dai driver */
++#define MTK_HW_GAIN_RATES (SNDRV_PCM_RATE_8000_48000 |\
++			   SNDRV_PCM_RATE_88200 |\
++			   SNDRV_PCM_RATE_96000 |\
++			   SNDRV_PCM_RATE_176400 |\
++			   SNDRV_PCM_RATE_192000)
++
++#define MTK_HW_GAIN_FORMATS (SNDRV_PCM_FMTBIT_S16_LE |\
++			     SNDRV_PCM_FMTBIT_S24_LE |\
++			     SNDRV_PCM_FMTBIT_S32_LE)
++
++static struct snd_soc_dai_driver mtk_dai_gain_driver[] = {
++	{
++		.name = "HW Gain 1",
++		.id = MT8183_DAI_HW_GAIN_1,
++		.playback = {
++			.stream_name = "HW Gain 1 In",
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = MTK_HW_GAIN_RATES,
++			.formats = MTK_HW_GAIN_FORMATS,
++		},
++		.capture = {
++			.stream_name = "HW Gain 1 Out",
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = MTK_HW_GAIN_RATES,
++			.formats = MTK_HW_GAIN_FORMATS,
++		},
++		.ops = &mtk_dai_gain_ops,
++		.symmetric_rate = 1,
++		.symmetric_channels = 1,
++		.symmetric_sample_bits = 1,
++	},
++};
++
++int mt8183_dai_hw_gain_register(struct mtk_base_afe *afe)
++{
++	struct mtk_base_afe_dai *dai;
++
++	dai = devm_kzalloc(afe->dev, sizeof(*dai), GFP_KERNEL);
++	if (!dai)
++		return -ENOMEM;
++
++	list_add(&dai->list, &afe->sub_dais);
++
++	dai->dai_drivers = mtk_dai_gain_driver;
++	dai->num_dai_drivers = ARRAY_SIZE(mtk_dai_gain_driver);
++
++	dai->controls = mtk_hw_gain_controls;
++	dai->num_controls = ARRAY_SIZE(mtk_hw_gain_controls);
++	dai->dapm_widgets = mtk_dai_hw_gain_widgets;
++	dai->num_dapm_widgets = ARRAY_SIZE(mtk_dai_hw_gain_widgets);
++	dai->dapm_routes = mtk_dai_hw_gain_routes;
++	dai->num_dapm_routes = ARRAY_SIZE(mtk_dai_hw_gain_routes);
++	return 0;
++}
+diff --git a/sound/soc/mediatek/mt8183/mt8183-dai-i2s.c b/sound/soc/mediatek/mt8183/mt8183-dai-i2s.c
+index 65e46ebe7be6c65cd9b22e3414f07c10dfcb380c..97dce798bbc31214f0880c99dea58bce5f082f78 100644
+--- a/sound/soc/mediatek/mt8183/mt8183-dai-i2s.c
++++ b/sound/soc/mediatek/mt8183/mt8183-dai-i2s.c
+@@ -178,6 +178,8 @@ static const struct snd_kcontrol_new mtk_dai_i2s_controls[] = {
+ /* interconnection */
+ static const struct snd_kcontrol_new mtk_i2s3_ch1_mix[] = {
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH1", AFE_CONN0, I_DL1_CH1, 1, 0),
++	SOC_DAPM_SINGLE_AUTODISABLE("GAIN1_OUT_CH1", AFE_CONN0,
++				    I_GAIN1_OUT_CH1, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH1", AFE_CONN0, I_DL2_CH1, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL3_CH1", AFE_CONN0, I_DL3_CH1, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("ADDA_UL_CH1", AFE_CONN0,
+@@ -190,6 +192,8 @@ static const struct snd_kcontrol_new mtk_i2s3_ch1_mix[] = {
+ 
+ static const struct snd_kcontrol_new mtk_i2s3_ch2_mix[] = {
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH2", AFE_CONN1, I_DL1_CH2, 1, 0),
++	SOC_DAPM_SINGLE_AUTODISABLE("GAIN1_OUT_CH2", AFE_CONN1,
++				    I_GAIN1_OUT_CH2, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH2", AFE_CONN1, I_DL2_CH2, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL3_CH2", AFE_CONN1, I_DL3_CH2, 1, 0),
+ 	SOC_DAPM_SINGLE_AUTODISABLE("ADDA_UL_CH2", AFE_CONN1,
+@@ -325,6 +329,8 @@ static int mtk_mclk_en_event(struct snd_soc_dapm_widget *w,
+ }
+ 
+ static const struct snd_soc_dapm_widget mtk_dai_i2s_widgets[] = {
++	SND_SOC_DAPM_INPUT("CONNSYS"),
++
+ 	SND_SOC_DAPM_MIXER("I2S1_CH1", SND_SOC_NOPM, 0, 0,
+ 			   mtk_i2s1_ch1_mix,
+ 			   ARRAY_SIZE(mtk_i2s1_ch1_mix)),
+@@ -540,6 +546,8 @@ static int mtk_afe_mclk_apll_connect(struct snd_soc_dapm_widget *source,
+ }
+ 
+ static const struct snd_soc_dapm_route mtk_dai_i2s_routes[] = {
++	{"Connsys I2S", NULL, "CONNSYS"},
++
+ 	/* i2s0 */
+ 	{"I2S0", NULL, "I2S0_EN"},
+ 	{"I2S0", NULL, "I2S1_EN", mtk_afe_i2s_share_connect},
+@@ -873,6 +881,84 @@ static const struct snd_soc_dai_ops mtk_dai_i2s_ops = {
+ 	.set_fmt = mtk_dai_i2s_set_fmt,
+ };
+ 
++/*
++ * CONNSYS I2S: the FM radio's audio, an I2S input from CONNSYS (the
++ * MT6631 is the master, 32 kHz) through the AFE's ASRC to the stream rate.
++ * Register sequence and ASRC constants are the vendor MT6771 kernel's
++ * (setConnsysI2SIn/Asrc/Enable in mtk-soc-afe-control.c); its
++ * AFE_ASRC_CONNSYS_CON0/13-21 are upstream's AFE_ASRC_2CH_CON0/2-10.
++ */
++static int mtk_dai_connsys_i2s_hw_params(struct snd_pcm_substream *substream,
++					 struct snd_pcm_hw_params *params,
++					 struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++	unsigned int rate = params_rate(params);
++	unsigned int i2s_con;
++
++	/* i2s format, slave (proxy) mode, 16 bits, pad from connsys */
++	i2s_con = I2S_FMT_I2S << I2S_FMT_SFT |
++		  1 << I2S_SRC_SFT |
++		  get_i2s_wlen(SNDRV_PCM_FORMAT_S16_LE) << I2S_WLEN_SFT |
++		  I2S_IN_PAD_CONNSYS << I2SIN_PAD_SEL_SFT;
++	regmap_update_bits(afe->regmap, AFE_CONNSYS_I2S_CON, ~0x1u, i2s_con);
++
++	/* through the ASRC, to the stream rate */
++	regmap_update_bits(afe->regmap, AFE_CONNSYS_I2S_CON,
++			   I2S_BYPSRC_MASK_SFT, 0);
++	regmap_update_bits(afe->regmap, AFE_CONNSYS_I2S_CON, I2S_MODE_MASK_SFT,
++			   mt8183_general_rate_transform(afe->dev, rate) <<
++			   I2S_MODE_SFT);
++
++	regmap_write(afe->regmap, AFE_ASRC_2CH_CON3,
++		     rate == 44100 ? 0x001b9000 : 0x001e0000);
++	regmap_write(afe->regmap, AFE_ASRC_2CH_CON4, 0x00140000);
++	regmap_write(afe->regmap, AFE_ASRC_2CH_CON5, 0x00ff5987);
++	regmap_write(afe->regmap, AFE_ASRC_2CH_CON6, 0x00007ef4);
++	regmap_write(afe->regmap, AFE_ASRC_2CH_CON5, 0x00ff5986);
++	regmap_write(afe->regmap, AFE_ASRC_2CH_CON5, 0x00ff5987);
++	/* stereo */
++	regmap_update_bits(afe->regmap, AFE_ASRC_2CH_CON2, BIT(16), 0);
++	/* calibration */
++	regmap_write(afe->regmap, AFE_ASRC_2CH_CON9, 0x00036000);
++	regmap_write(afe->regmap, AFE_ASRC_2CH_CON10, 0x0002fc00);
++	return 0;
++}
++
++#define ASRC_2CH_CON0_EN	(BIT(6) | BIT(4) | BIT(0))
++
++static int mtk_dai_connsys_i2s_trigger(struct snd_pcm_substream *substream,
++				       int cmd, struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++		regmap_update_bits(afe->regmap, AFE_ASRC_2CH_CON0,
++				   ASRC_2CH_CON0_EN, ASRC_2CH_CON0_EN);
++		regmap_update_bits(afe->regmap, AFE_CONNSYS_I2S_CON,
++				   I2S_EN_MASK_SFT, 1 << I2S_EN_SFT);
++		return 0;
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++		regmap_update_bits(afe->regmap, AFE_CONNSYS_I2S_CON,
++				   I2S_EN_MASK_SFT, 0);
++		regmap_update_bits(afe->regmap, AFE_ASRC_2CH_CON0,
++				   ASRC_2CH_CON0_EN, 0);
++		regmap_update_bits(afe->regmap, AFE_CONNSYS_I2S_CON,
++				   I2S_BYPSRC_MASK_SFT, I2S_BYPSRC_MASK_SFT);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct snd_soc_dai_ops mtk_dai_connsys_i2s_ops = {
++	.hw_params = mtk_dai_connsys_i2s_hw_params,
++	.trigger = mtk_dai_connsys_i2s_trigger,
++};
++
+ /* dai driver */
+ #define MTK_I2S_RATES (SNDRV_PCM_RATE_8000_48000 |\
+ 		       SNDRV_PCM_RATE_88200 |\
+@@ -885,6 +971,18 @@ static const struct snd_soc_dai_ops mtk_dai_i2s_ops = {
+ 			 SNDRV_PCM_FMTBIT_S32_LE)
+ 
+ static struct snd_soc_dai_driver mtk_dai_i2s_driver[] = {
++	{
++		.name = "CONNSYS_I2S",
++		.id = MT8183_DAI_CONNSYS_I2S,
++		.capture = {
++			.stream_name = "Connsys I2S",
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000,
++			.formats = MTK_I2S_FORMATS,
++		},
++		.ops = &mtk_dai_connsys_i2s_ops,
++	},
+ 	{
+ 		.name = "I2S0",
+ 		.id = MT8183_DAI_I2S_0,
+diff --git a/sound/soc/mediatek/mt8183/mt8183-interconnection.h b/sound/soc/mediatek/mt8183/mt8183-interconnection.h
+index 6332f5f3e9871e431fdceee965d3395cad92719e..0509cd35a14e8df3929875926b7150efc76b3634 100644
+--- a/sound/soc/mediatek/mt8183/mt8183-interconnection.h
++++ b/sound/soc/mediatek/mt8183/mt8183-interconnection.h
+@@ -29,5 +29,7 @@
+ #define I_DL3_CH2 24
+ #define I_I2S2_CH1 25
+ #define I_I2S2_CH2 26
++#define I_CONNSYS_I2S_CH1 34
++#define I_CONNSYS_I2S_CH2 35
+ 
+ #endif

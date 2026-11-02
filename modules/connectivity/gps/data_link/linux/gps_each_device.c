@@ -437,7 +437,11 @@ int gps_dl_cdev_setup(struct gps_each_device *dev, int index)
 		return result;
 	}
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	dev->cls = class_create(dev->cfg.dev_name);
+#else
 	dev->cls = class_create(THIS_MODULE, dev->cfg.dev_name);
+#endif
 	if (IS_ERR(dev->cls)) {
 		GDL_LOGE("class_create fail on %s", dev->cfg.dev_name);
 		return -1;

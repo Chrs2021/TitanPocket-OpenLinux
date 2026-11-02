@@ -1,0 +1,172 @@
+#!/bin/busybox sh
+# /init of the 6.12 first-light ramdisk (tools/mainline/mkboot.sh).
+# Writes what the kernel sees to the kernel log. If a USB device controller
+# came up, it starts the same gadget as the 4.14 ramdisk (ttyGS0 + NCM,
+# telnet on 172.16.42.1) and stays up once a host configures it, or when no
+# cable is in (for tests over Wi-Fi); with a cable and no host it returns to
+# LK's fastboot after 90 s. `reboot-bootloader` then returns to
+# LK's fastboot. Otherwise it reboots to LK's fastboot itself after a
+# pause long enough to photograph the screen console, which ends with a
+# summary: stopping in fastboot shows that the kernel reached userspace
+# (pstore does not survive the watchdog's full PMIC reset,
+# docs/mainline.md). If that blocks it restarts with sysrq b. Nothing
+# here writes to the UFS. With titan.root on the command line it boots
+# Debian instead, once the gadget is up.
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t configfs configfs /sys/kernel/config
+mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
+
+log() { echo "firstlight: $*" > /dev/kmsg; }
+# A read can block in a driver for good, where timeout(1) can't stop it,
+# so the copy runs in the background and is given up after 5 s.
+logfile() {
+	cat "$2" > /tmp/lf 2>&1 &
+	n=0
+	while kill -0 $! 2>/dev/null; do
+		n=$((n + 1))
+		[ $n -gt 50 ] && { log "$1: stuck reading $2"; return; }
+		usleep 100000
+	done
+	while IFS= read -r l; do log "$1: $l"; done < /tmp/lf
+}
+
+log "up: $(uname -a)"
+logfile cmdline /proc/cmdline
+logfile iomem /proc/iomem
+logfile meminfo /proc/meminfo
+log "cpus online: $(cat /sys/devices/system/cpu/online)"
+dt=/sys/firmware/devicetree/base
+for p in "$dt"/chosen/*; do
+	log "chosen $(basename "$p"): $(od -An -tx1 -v "$p" | tr -d '\n' | cut -c1-160)"
+done
+for n in "$dt"/reserved-memory/*/; do
+	log "reserved $(basename "$n"): reg $(od -An -tx1 -v "$n/reg" 2>/dev/null | tr -d '\n')"
+done
+logfile partitions /proc/partitions
+ls /sys/class/udc /sys/class/regulator /sys/class/rtc > /tmp/cls 2>&1; logfile class /tmp/cls
+# devices that a platform driver bound (the driver directories' symlinks
+# other than module)
+for e in /sys/bus/platform/drivers/*/*; do
+	[ -L "$e" ] && [ "${e##*/}" != module ] && echo "${e%/*}" "${e##*/}"
+done | sed 's|^/sys/bus/platform/drivers/||' > /tmp/bound
+logfile bound /tmp/bound
+logfile input /proc/bus/input/devices; cp /tmp/lf /tmp/input
+logfile fb /proc/fb
+for b in /sys/class/power_supply/*/uevent; do [ -e "$b" ] && logfile battery "$b"; done
+mount -t debugfs debugfs /sys/kernel/debug
+
+# A short summary last, so that it stays on the screen console
+log "summary: udc [$(ls /sys/class/udc 2>/dev/null)] rtc [$(ls /sys/class/rtc 2>/dev/null)]"
+log "summary: $(ls /sys/class/regulator 2>/dev/null | wc -l) regulators, $(wc -l < /tmp/bound) bound"
+log "summary: input [$(sed -n 's/^N: Name=//p' /tmp/input 2>/dev/null | tr '\n' ' ')]"
+logfile deferred /sys/kernel/debug/devices_deferred
+# the USB controller's and PHY's own messages, then the latest errors
+dmesg | grep -iE 'mtu3|ssusb|11201000|t-phy|11f40000|udc' | grep -v firstlight |
+	tail -n 8 > /tmp/usb
+logfile usb /tmp/usb
+dmesg | grep -iE " (error|failed|fail|timeout)\b" | grep -vE 'firstlight|ufshcd' |
+	tail -n 8 > /tmp/err
+logfile err /tmp/err
+# With the supplies on by now, a probe that failed at boot can be retried.
+# First the PHY's 26 MHz reference gate (apmixedsys 0x20 bit 4, set = on),
+# which the tree's PHY nodes don't name.
+if [ -z "$(ls /sys/class/udc 2>/dev/null)" ] && [ -e /sys/bus/platform/devices/11201000.usb ]; then
+	a=$(devmem 0x1000c020 32)
+	devmem 0x1000c020 32 $((a | 0x10))
+	echo 11201000.usb > /sys/bus/platform/drivers/mtu3/bind 2>/dev/null &
+	sleep 3
+	log "retry: apmixed 0x20 was $a, now $(devmem 0x1000c020 32)"
+	dmesg | grep -E 'mtu3.*(sts|failed with)' | tail -n 2 > /tmp/usb
+	logfile retry /tmp/usb
+fi
+# the USB supplies and clock muxes, last so they stay on screen
+for r in /sys/class/regulator/*; do
+	case "$(cat $r/name 2>/dev/null)" in va09|vusb)
+		log "regulator $(cat $r/name): $(cat $r/state 2>/dev/null)";;
+	esac
+done
+log "clk_cfg_7 $(devmem 0x100000b0 32) infra_cg2_sta $(devmem 0x100010ac 32)"
+
+udc=$(ls /sys/class/udc 2>/dev/null | head -n1)
+if [ -n "$udc" ]; then
+	g=/sys/kernel/config/usb_gadget/g1
+	mkdir -p $g/strings/0x409 $g/configs/c.1/strings/0x409 \
+		$g/functions/acm.usb0 $g/functions/ncm.usb0
+	echo 0x1d6b > $g/idVendor	# Linux Foundation
+	echo 0x0104 > $g/idProduct	# Multifunction composite gadget
+	echo "titanpocket" > $g/strings/0x409/serialnumber
+	echo "Unihertz" > $g/strings/0x409/manufacturer
+	echo "Titan Pocket 6.12 first light" > $g/strings/0x409/product
+	echo "acm+ncm" > $g/configs/c.1/strings/0x409/configuration
+	# fixed NCM addresses (locally administered, made up): with random
+	# ones each boot is a new interface to macOS, which then waits for
+	# approval before it gets an address
+	echo 42:7b:a8:03:96:fa > $g/functions/ncm.usb0/dev_addr
+	echo 6a:ba:89:1a:0d:e7 > $g/functions/ncm.usb0/host_addr
+	ln -s $g/functions/acm.usb0 $g/configs/c.1/
+	ln -s $g/functions/ncm.usb0 $g/configs/c.1/
+	echo "$udc" > $g/UDC && log "gadget bound to $udc"
+	# titan.root on the command line (mkboot.sh DEBIAN=1): hand over to
+	# Debian on the partition labelled titanroot, as the 4.14 ramdisk does.
+	# Mounted read-only; Debian's systemd checks it and remounts it rw. The
+	# gadget stays up and Debian configures usb0. On any failure first
+	# light carries on.
+	if grep -qw titan.root /proc/cmdline; then
+		# this busybox has no findfs: the GPT partition named linux, as
+		# the 4.14 ramdisk falls back to
+		root=$(findfs LABEL=titanroot 2>/dev/null) ||
+			root=$(grep -l '^PARTNAME=linux$' /sys/class/block/*/uevent 2>/dev/null |
+				head -n1 | xargs -r sed -n 's|^DEVNAME=|/dev/|p')
+		if [ -n "$root" ] && mkdir -p /newroot &&
+		   mount -t ext4 -o ro "$root" /newroot &&
+		   { [ -e /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; }; then
+			log "switching to Debian on $root"
+			umount /sys/kernel/debug /sys/kernel/config /dev/pts 2>/dev/null
+			mount --move /dev /newroot/dev
+			mount --move /proc /newroot/proc
+			mount --move /sys /newroot/sys
+			exec switch_root /newroot /sbin/init
+		fi
+		log "no Debian root (${root:-titanroot not found}); staying in first light"
+		umount /newroot 2>/dev/null
+	fi
+	ifconfig usb0 172.16.42.1 netmask 255.255.255.0 up &&
+		telnetd -b 172.16.42.1 -l /bin/sh && udhcpd /etc/udhcpd.conf && log "telnet on 172.16.42.1"
+	(while true; do getty -n -l /bin/sh 115200 ttyGS0; sleep 1; done) &
+	# Stay up once a host has configured the gadget; otherwise return to
+	# fastboot after 90 s, so that the next image can be flashed. No cable
+	# (the Type-C port without a partner) also stays up: a phone that
+	# booted or reset unplugged is reached over Wi-Fi.
+	# telnet has no login, so it listens on the USB address only.
+	n=0
+	until [ "$(cat /sys/class/udc/$udc/state 2>/dev/null)" = configured ]; do
+		n=$((n + 1))
+		[ $n -gt 90 ] && break
+		sleep 1
+	done
+	log "udc state: $(cat /sys/class/udc/$udc/state 2>/dev/null)"
+	if [ $n -le 90 ]; then
+		while true; do sleep 3600; done
+	fi
+	if [ -e /sys/class/typec/port0 ] && [ ! -e /sys/class/typec/port0-partner ]; then
+		log "no cable; staying up"
+		while true; do sleep 3600; done
+	fi
+	log "no host configured the gadget; rebooting to fastboot"
+	sync
+	reboot-bootloader &
+	sleep 15
+	echo b > /proc/sysrq-trigger
+fi
+
+log "no USB device controller; waiting 120 s, then rebooting to fastboot"
+sleep 120
+sync
+reboot-bootloader &
+sleep 15
+# reboot(2) can block in a reboot notifier; sysrq b restarts without them
+log "reboot-bootloader did not reboot; sysrq b"
+echo b > /proc/sysrq-trigger

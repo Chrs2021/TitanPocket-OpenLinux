@@ -1116,7 +1116,7 @@ static int drv_interface_init(void)
 	info->spi_phy_addr = TOP_RF_SPI_AON_ADDR;
 	info->spi_size = TOP_RF_SPI_AON_SIZE;
 	request_mem_region(info->spi_phy_addr, info->spi_size, "FM_SPI");
-	info->spi_vir_addr = ioremap_nocache(
+	info->spi_vir_addr = ioremap(
 		info->spi_phy_addr, info->spi_size);
 	if (info->spi_vir_addr == NULL) {
 		WCN_DBG(FM_ERR | CHIP, "Cannot remap address.\n");
@@ -1126,7 +1126,7 @@ static int drv_interface_init(void)
 	info->top_phy_addr = TOP_MISC_OFF_ADDR;
 	info->top_size = TOP_MISC_OFF_SIZE;
 	request_mem_region(info->top_phy_addr, info->top_size, "FM_TOP");
-	info->top_vir_addr = ioremap_nocache(
+	info->top_vir_addr = ioremap(
 		info->top_phy_addr, info->top_size);
 	if (info->top_vir_addr == NULL) {
 		WCN_DBG(FM_ERR | CHIP, "Cannot remap address.\n");
@@ -1136,7 +1136,7 @@ static int drv_interface_init(void)
 	info->mcu_phy_addr = MCU_CFG_ADDR;
 	info->mcu_size = MCU_CFG_SIZE;
 	request_mem_region(info->mcu_phy_addr, info->mcu_size, "FM_MCU");
-	info->mcu_vir_addr = ioremap_nocache(
+	info->mcu_vir_addr = ioremap(
 		info->mcu_phy_addr, info->mcu_size);
 	if (info->mcu_vir_addr == NULL) {
 		WCN_DBG(FM_ERR | CHIP, "Cannot remap address.\n");

@@ -25,7 +25,9 @@
 #endif
 #define DFT_TAG "[WMT-CONSYS-HW]"
 
+#ifndef TITAN_LINUX612
 #include <connectivity_build_in_adapter.h>
+#endif
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/memblock.h>
@@ -39,7 +41,31 @@
 #include "wmt_plat.h"
 #include "stp_dbg.h"
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0))
+#ifdef TITAN_LINUX612
+/*
+ * Mainline Linux (6.12) has none of the vendor kernel's PMIC, clock buffer
+ * or EMI drivers: this file reaches the MT6358 through its regmap (the
+ * consys node's mediatek,pmic), programs the EMI MPU with the SMC the
+ * vendor EMI driver makes, and powers the CONN domain through runtime PM
+ * (a genpd domain; the vendor kernel had it as a clock). Register values
+ * are the vendor drivers' (upmu_hw.h, clkbuf_v1/mt6771, emi/mt6771).
+ */
+#include <linux/arm-smccc.h>
+#include <linux/io.h>
+#include <linux/mfd/mt6397/core.h>
+#include <linux/of_platform.h>
+#include <linux/pm_runtime.h>
+#include <linux/regmap.h>
+#define MT6358_LDO_VCN18_OP_EN	0x1c5a
+#define MT6358_LDO_VCN33_OP_EN	0x1d1e
+#define MT6358_LDO_VCN28_OP_EN	0x1d8a	/* bit 1: HW0 op enable */
+#define MT6358_LDO_VCN28_OP_CFG	0x1d90	/* bit 1: HW0 op config */
+#define MT6358_DCXO_CW00	0x788
+#define MTK_SIP_KERNEL_EMIMPU_SET	0xc2000262
+#define EMI_MPU_ALIGN_BITS	16
+static struct device *consys_dev;
+static struct regmap *pmic_map;
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0))
 #include <mtk-clkbuf-bridge.h>
 #else
 #include <mtk_clkbuf_ctl.h>
@@ -51,7 +77,9 @@
 
 #if CONSYS_PMIC_CTRL_ENABLE
 #include <linux/regulator/consumer.h>
+#ifndef TITAN_LINUX612
 #include <upmu_common.h>
+#endif
 #endif
 
 /*******************************************************************************
@@ -196,6 +224,11 @@ UINT32 mtk_wcn_consys_jtag_flag_ctrl(UINT32 en)
 /* stock 0x48a0 */
 static INT32 consys_clk_get_from_dts(struct platform_device *pdev)
 {
+#ifdef TITAN_LINUX612
+	consys_dev = &pdev->dev;
+	pm_runtime_enable(consys_dev);
+	return 0;
+#endif
 	clk_scp_conn_main = devm_clk_get(&pdev->dev, "conn");
 	if (IS_ERR(clk_scp_conn_main)) {
 		WMT_PLAT_PR_ERR("[CCF]cannot get clk_scp_conn_main clock.\n");
@@ -209,6 +242,19 @@ static INT32 consys_clk_get_from_dts(struct platform_device *pdev)
 /* stock 0x496c */
 static INT32 consys_pmic_get_from_dts(struct platform_device *pdev)
 {
+#ifdef TITAN_LINUX612
+	struct device_node *np = of_parse_phandle(pdev->dev.of_node, "mediatek,pmic", 0);
+	struct platform_device *pmic = np ? of_find_device_by_node(np) : NULL;
+	struct mt6397_chip *chip = pmic ? platform_get_drvdata(pmic) : NULL;
+
+	of_node_put(np);
+	if (chip)
+		pmic_map = chip->regmap;
+	else
+		WMT_PLAT_PR_ERR("no MT6358 regmap (mediatek,pmic)\n");
+	if (pmic)
+		put_device(&pmic->dev);
+#endif
 #if CONSYS_PMIC_CTRL_ENABLE
 	reg_VCN18 = regulator_get(&pdev->dev, "vcn18");
 	if (!reg_VCN18)
@@ -216,6 +262,12 @@ static INT32 consys_pmic_get_from_dts(struct platform_device *pdev)
 	reg_VCN28 = regulator_get(&pdev->dev, "vcn28");
 	if (!reg_VCN28)
 		WMT_PLAT_PR_ERR("Regulator_get VCN_2V8 fail\n");
+#ifdef TITAN_LINUX612
+	/* one VCN33 regulator in 6.12's MT6358 driver */
+	reg_VCN33_BT = regulator_get(&pdev->dev, "vcn33");
+	reg_VCN33_WIFI = NULL;
+	return 0;
+#endif
 	reg_VCN33_BT = regulator_get(&pdev->dev, "vcn33_bt");
 	if (!reg_VCN33_BT)
 		WMT_PLAT_PR_ERR("Regulator_get VCN33_BT fail\n");
@@ -235,7 +287,22 @@ static INT32 consys_co_clock_type(VOID)
 /* stock 0x3910 */
 static INT32 consys_clock_buffer_ctrl(MTK_WCN_BOOL enable)
 {
+#ifdef TITAN_LINUX612
+	/*
+	 * Nothing to switch: the preloader sets XO_WCN (the MT6358's EXTBUF2)
+	 * to run with buffer 4 (DCXO_CW00 0x4e1d, mode 3), and the vendor
+	 * kernel's clk_buf_ctrl() only records the request for its low-power
+	 * bookkeeping. Clearing the mode, as its internal path does, turns
+	 * the buffer off: CONNSYS then reads all zeros. Logged for debugging.
+	 */
+	UINT32 cw00 = 0;
+
+	if (pmic_map)
+		regmap_read(pmic_map, MT6358_DCXO_CW00, &cw00);
+	WMT_PLAT_PR_INFO("XO_WCN %s request, DCXO_CW00 0x%x\n", enable ? "on" : "off", cw00);
+#else
 	KERNEL_clk_buf_ctrl(CLK_BUF_CONN, enable ? true : false);	/* XO_WCN */
+#endif
 	return 0;
 }
 
@@ -245,7 +312,7 @@ static VOID consys_set_if_pinmux(MTK_WCN_BOOL enable)
 	UINT8 *consys_if_pinmux_reg_base = NULL;
 
 	/* Switch D die pinmux for connecting A die */
-	consys_if_pinmux_reg_base = ioremap_nocache(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
+	consys_if_pinmux_reg_base = ioremap(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
 	if (!consys_if_pinmux_reg_base) {
 		WMT_PLAT_PR_ERR("consys_if_pinmux_reg_base(%x) ioremap fail\n", CONSYS_IF_PINMUX_REG_BASE);
 		return;
@@ -297,6 +364,23 @@ static INT32 consys_hw_power_ctrl(MTK_WCN_BOOL enable)
 {
 	INT32 iRet = -1;
 
+#ifdef TITAN_LINUX612
+	/*
+	 * CONNSYS stalls while infracfg 0xf00 bit 11 (the BT CVSD interrupt
+	 * mask) is clear; the BTCVSD driver sets it at probe, as on 4.14.
+	 */
+	if (!(CONSYS_REG_READ(conn_reg.topckgen_base + CONSYS_AP2CONN_OSC_EN_OFFSET) &
+	      CONSYS_BT_CVSD_IRQ_MASK_BIT))
+		WMT_PLAT_PR_WARN("BT CVSD interrupt unmasked: is the BTCVSD driver bound?\n");
+	if (enable) {
+		iRet = pm_runtime_resume_and_get(consys_dev);
+		if (iRet)
+			WMT_PLAT_PR_ERR("CONN power domain on fail(%d)\n", iRet);
+	} else {
+		iRet = pm_runtime_put_sync(consys_dev);
+	}
+	return iRet;
+#endif
 	if (enable) {
 		iRet = clk_prepare_enable(clk_scp_conn_main);
 		if (iRet)
@@ -421,7 +505,7 @@ static VOID consys_afe_reg_setting(VOID)
 	UINT8 *consys_afe_reg_base = NULL;
 
 	/* update ANA_WBG(AFE) CR */
-	consys_afe_reg_base = ioremap_nocache(CONSYS_AFE_REG_BASE, 0x100);
+	consys_afe_reg_base = ioremap(CONSYS_AFE_REG_BASE, 0x100);
 	if (consys_afe_reg_base) {
 		CONSYS_REG_WRITE(consys_afe_reg_base + CONSYS_AFE_RG_WBG_PLL_03_OFFSET,
 				CONSYS_AFE_RG_WBG_PLL_03_VALUE);
@@ -446,7 +530,11 @@ static INT32 consys_hw_vcn18_ctrl(MTK_WCN_BOOL enable)
 #if CONSYS_PMIC_CTRL_ENABLE
 	if (enable) {
 		/* VCN18 under SW control */
+#ifdef TITAN_LINUX612
+		regmap_write(pmic_map, MT6358_LDO_VCN18_OP_EN, 1);
+#else
 		KERNEL_upmu_set_reg_value(MT6358_LDO_VCN18_OP_EN, 1);
+#endif
 		if (reg_VCN18) {
 			regulator_set_voltage(reg_VCN18, 1800000, 1800000);
 			if (regulator_enable(reg_VCN18))
@@ -456,7 +544,11 @@ static INT32 consys_hw_vcn18_ctrl(MTK_WCN_BOOL enable)
 		}
 
 		/* VCN33 (BT/Wi-Fi PA) at 3.5 V, under SW control */
+#ifdef TITAN_LINUX612
+		regmap_write(pmic_map, MT6358_LDO_VCN33_OP_EN, 1);
+#else
 		KERNEL_upmu_set_reg_value(MT6358_LDO_VCN33_OP_EN, 1);
+#endif
 		if (reg_VCN33_BT) {
 			regulator_set_voltage(reg_VCN33_BT, 3500000, 3500000);
 			if (regulator_enable(reg_VCN33_BT))
@@ -481,8 +573,13 @@ static INT32 consys_hw_vcn18_ctrl(MTK_WCN_BOOL enable)
 static VOID consys_vcn28_hw_mode_ctrl(UINT32 enable)
 {
 #if CONSYS_PMIC_CTRL_ENABLE
+#ifdef TITAN_LINUX612
+	regmap_update_bits(pmic_map, MT6358_LDO_VCN28_OP_EN, BIT(1), enable ? BIT(1) : 0);
+	regmap_update_bits(pmic_map, MT6358_LDO_VCN28_OP_CFG, BIT(1), 0);
+#else
 	KERNEL_pmic_set_register_value(PMIC_RG_LDO_VCN28_HW0_OP_EN, enable ? 1 : 0);
 	KERNEL_pmic_set_register_value(PMIC_RG_LDO_VCN28_HW0_OP_CFG, 0);
+#endif
 #endif
 }
 
@@ -523,7 +620,26 @@ static INT32 consys_hw_wifi_vcn33_ctrl(UINT32 enable)
 /* stock 0x4700 */
 static INT32 consys_emi_mpu_set_region_protection(VOID)
 {
-#ifdef CONFIG_MTK_EMI
+#ifdef TITAN_LINUX612
+	/*
+	 * The vendor EMI driver's emi_mpu_set_protection(): one SMC per domain
+	 * group, addresses in 64 KiB units, the region number in bits 24-31
+	 * of the start and the group in those of the end.
+	 */
+	UINT32 apc[2] = { CONSYS_EMI_MPU_APC0, CONSYS_EMI_MPU_APC1 };
+	UINT32 start = (UINT32)((gConEmiPhyBase + CONSYS_EMI_MPU_OFFSET) >> EMI_MPU_ALIGN_BITS) |
+		       (CONSYS_EMI_MPU_REGION << 24);
+	UINT32 end;
+	struct arm_smccc_res res;
+	int i;
+
+	for (i = 1; i >= 0; i--) {
+		end = (UINT32)((gConEmiPhyBase + gConEmiSize - 1) >> EMI_MPU_ALIGN_BITS) | (i << 24);
+		arm_smccc_smc(MTK_SIP_KERNEL_EMIMPU_SET, start, end, apc[i], 0, 0, 0, 0, &res);
+		WMT_PLAT_PR_INFO("EMI MPU region %d group %d: 0x%x-0x%x apc 0x%x: %ld\n",
+				 CONSYS_EMI_MPU_REGION, i, start, end, apc[i], (long)res.a0);
+	}
+#elif defined(CONFIG_MTK_EMI)
 	struct emi_region_info_t region_info;
 
 	/*set MPU for EMI share Memory */
@@ -666,7 +782,7 @@ static UINT32 consys_read_cpupcr(VOID)
 static INT32 consys_emi_coredump_remapping(UINT8 __iomem **addr, UINT32 enable)
 {
 	if (enable) {
-		*addr = ioremap_nocache(gConEmiPhyBase + CONSYS_EMI_COREDUMP_OFFSET, CONSYS_EMI_MEM_SIZE);
+		*addr = ioremap(gConEmiPhyBase + CONSYS_EMI_COREDUMP_OFFSET, CONSYS_EMI_MEM_SIZE);
 		if (*addr) {
 			WMT_PLAT_PR_INFO("COREDUMP EMI mapping OK virtual(0x%p) physical(0x%x)\n",
 					   *addr, (UINT32) gConEmiPhyBase + CONSYS_EMI_COREDUMP_OFFSET);

@@ -10,7 +10,9 @@
  * See http://www.gnu.org/licenses/gpl-2.0.html for more details.
  */
 
+#ifndef TITAN_LINUX612	/* the vendor kernel's adapter; mainline has none */
 #include <connectivity_build_in_adapter.h>
+#endif
 #include <linux/platform_device.h>
 
 #include "osal.h"
@@ -307,7 +309,7 @@ static unsigned char __iomem *wmt_step_get_emi_base_address(void)
 {
 	if (g_step_env.emi_base_addr == NULL) {
 		if (gConEmiPhyBase)
-			g_step_env.emi_base_addr = ioremap_nocache(gConEmiPhyBase, gConEmiSize);
+			g_step_env.emi_base_addr = ioremap(gConEmiPhyBase, gConEmiSize);
 	}
 
 	return g_step_env.emi_base_addr;
@@ -1655,7 +1657,7 @@ static int wmt_step_do_write_register_action(struct step_reigster_info *p_reg_in
 			return -1;
 		}
 
-		p_addr = ioremap_nocache(phy_addr, 0x4);
+		p_addr = ioremap(phy_addr, 0x4);
 		if (p_addr) {
 			CONSYS_REG_WRITE_MASK((unsigned int *)p_addr, p_reg_info->value, p_reg_info->mask);
 			WMT_INFO_FUNC(
@@ -1725,7 +1727,7 @@ static int wmt_step_do_read_register_action(struct step_reigster_info *p_reg_inf
 			return -1;
 		}
 
-		p_addr = ioremap_nocache(phy_addr, 0x4);
+		p_addr = ioremap(phy_addr, 0x4);
 		if (p_addr) {
 			if (snprintf(buf, WMT_STEP_REGISTER_ACTION_BUF_LEN,
 				"STEP show: reg read Phy addr(0x%08x): 0x%08x\n",

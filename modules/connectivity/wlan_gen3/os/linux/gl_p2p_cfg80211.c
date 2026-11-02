@@ -958,8 +958,15 @@ int mtk_p2p_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *dev, struc
  * };
  */
 
+#if (KERNEL_VERSION(6, 7, 0) <= LINUX_VERSION_CODE)
+/* 6.7 passes the AP update, which carries the beacon data */
+int mtk_p2p_cfg80211_change_beacon(struct wiphy *wiphy, struct net_device *dev, struct cfg80211_ap_update *update)
+{
+	struct cfg80211_beacon_data *beacon = update ? &update->beacon : NULL;
+#else
 int mtk_p2p_cfg80211_change_beacon(struct wiphy *wiphy, struct net_device *dev, struct cfg80211_beacon_data *beacon)
 {
+#endif
 	P_GLUE_INFO_T prGlueInfo = (P_GLUE_INFO_T) NULL;
 	INT_32 i4Rslt = -EINVAL;
 	P_MSG_P2P_BEACON_UPDATE_T prP2pBcnUpdateMsg = (P_MSG_P2P_BEACON_UPDATE_T) NULL;

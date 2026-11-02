@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 09/15] pinctrl: aw9523, Input: matrix_keypad: fix locking for I2C expanders
+
+pinctrl-aw9523 deferred interrupt mask writes by putting the whole
+regmap in cache-only mode while the GPIO calls kept using it under
+another lock: reads failed (gpio-matrix-keypad took that for a pressed
+key) and writes stayed in the cache. Keep a shadow of the mask registers
+and write it under i2c_lock instead. matrix_keypad enabled and disabled
+the row interrupts under its spinlock, which an I2C expander's irq chip
+cannot allow (its bus lock is a mutex).
+---
+ drivers/input/keyboard/matrix_keypad.c | 22 +++++++-----
+ drivers/pinctrl/pinctrl-aw9523.c       | 46 +++++++++++++++++++-------
+ 2 files changed, 48 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/input/keyboard/matrix_keypad.c b/drivers/input/keyboard/matrix_keypad.c
+index 3c38bae576edd69a31f785066668414a02529f64..64a89f3479c4a9d8d7379ed87896084f3c4355a4 100644
+--- a/drivers/input/keyboard/matrix_keypad.c
++++ b/drivers/input/keyboard/matrix_keypad.c
+@@ -157,11 +157,16 @@ static void matrix_keypad_scan(struct work_struct *work)
+ 
+ 	activate_all_cols(keypad, true);
+ 
+-	/* Enable IRQs again */
++	/*
++	 * Enable IRQs again, outside the lock: for rows on an I2C expander
++	 * (AW9523) enable_irq() takes the irq chip's bus lock, a mutex. An
++	 * interrupt from a row already enabled disables all rows once and
++	 * schedules a scan, which enables them all once: the depths balance.
++	 */
+ 	spin_lock_irq(&keypad->lock);
+ 	keypad->scan_pending = false;
+-	enable_row_irqs(keypad);
+ 	spin_unlock_irq(&keypad->lock);
++	enable_row_irqs(keypad);
+ }
+ 
+ static irqreturn_t matrix_keypad_interrupt(int irq, void *id)
+@@ -176,16 +181,17 @@ static irqreturn_t matrix_keypad_interrupt(int irq, void *id)
+ 	 * scan already. In that case we should not try to
+ 	 * disable IRQs again.
+ 	 */
+-	if (unlikely(keypad->scan_pending || keypad->stopped))
+-		goto out;
++	if (unlikely(keypad->scan_pending || keypad->stopped)) {
++		spin_unlock_irqrestore(&keypad->lock, flags);
++		return IRQ_HANDLED;
++	}
++	keypad->scan_pending = true;
++	spin_unlock_irqrestore(&keypad->lock, flags);
+ 
++	/* outside the lock, as in matrix_keypad_scan() */
+ 	disable_row_irqs(keypad);
+-	keypad->scan_pending = true;
+ 	schedule_delayed_work(&keypad->work,
+ 			      msecs_to_jiffies(keypad->debounce_ms));
+-
+-out:
+-	spin_unlock_irqrestore(&keypad->lock, flags);
+ 	return IRQ_HANDLED;
+ }
+ 
+diff --git a/drivers/pinctrl/pinctrl-aw9523.c b/drivers/pinctrl/pinctrl-aw9523.c
+index 1374f30166bc3b679b5c7e418f4848e7ca1cf40a..d0c405dafe4f4b885b0785d9d2f2b9724149165c 100644
+--- a/drivers/pinctrl/pinctrl-aw9523.c
++++ b/drivers/pinctrl/pinctrl-aw9523.c
+@@ -62,6 +62,7 @@
+ struct aw9523_irq {
+ 	struct mutex lock;
+ 	u16 cached_gpio;
++	u16 disabled;	/* INTR_DIS bits, written at bus_sync_unlock */
+ };
+ 
+ /*
+@@ -428,10 +429,8 @@ static void aw9523_irq_mask(struct irq_data *d)
+ {
+ 	struct aw9523 *awi = gpiochip_get_data(irq_data_get_irq_chip_data(d));
+ 	irq_hw_number_t hwirq = irqd_to_hwirq(d);
+-	unsigned int n = hwirq % AW9523_PINS_PER_PORT;
+ 
+-	regmap_update_bits(awi->regmap, AW9523_REG_INTR_DIS(hwirq),
+-			   BIT(n), BIT(n));
++	awi->irq->disabled |= BIT(hwirq);
+ 	gpiochip_disable_irq(&awi->gpio, hwirq);
+ }
+ 
+@@ -446,11 +445,9 @@ static void aw9523_irq_unmask(struct irq_data *d)
+ {
+ 	struct aw9523 *awi = gpiochip_get_data(irq_data_get_irq_chip_data(d));
+ 	irq_hw_number_t hwirq = irqd_to_hwirq(d);
+-	unsigned int n = hwirq % AW9523_PINS_PER_PORT;
+ 
+ 	gpiochip_enable_irq(&awi->gpio, hwirq);
+-	regmap_update_bits(awi->regmap, AW9523_REG_INTR_DIS(hwirq),
+-			   BIT(n), 0);
++	awi->irq->disabled &= ~BIT(hwirq);
+ }
+ 
+ static irqreturn_t aw9523_irq_thread_func(int irq, void *dev_id)
+@@ -460,15 +457,24 @@ static irqreturn_t aw9523_irq_thread_func(int irq, void *dev_id)
+ 	unsigned long changed_gpio;
+ 	unsigned int tmp, port_pin, i, ret;
+ 
++	/*
++	 * Reading the input state releases INTN: if a read failed, INTN
++	 * would stay low. Under i2c_lock like every other register access
++	 * (the regmap has no locking of its own).
++	 */
++	mutex_lock(&awi->i2c_lock);
+ 	for (i = 0; i < AW9523_NUM_PORTS; i++) {
+ 		port_pin = i * AW9523_PINS_PER_PORT;
+ 		ret = regmap_read(awi->regmap,
+ 				  AW9523_REG_IN_STATE(port_pin),
+ 				  &tmp);
+ 		if (ret)
+-			return ret;
++			break;
+ 		val |= (u8)tmp << (i * 8);
+ 	}
++	mutex_unlock(&awi->i2c_lock);
++	if (ret)
++		return IRQ_NONE;
+ 
+ 	/* Handle GPIO input release interrupt as well */
+ 	changed_gpio = awi->irq->cached_gpio ^ val;
+@@ -499,7 +505,6 @@ static void aw9523_irq_bus_lock(struct irq_data *d)
+ 	struct aw9523 *awi = gpiochip_get_data(irq_data_get_irq_chip_data(d));
+ 
+ 	mutex_lock(&awi->irq->lock);
+-	regcache_cache_only(awi->regmap, true);
+ }
+ 
+ /*
+@@ -512,9 +517,22 @@ static void aw9523_irq_bus_lock(struct irq_data *d)
+ static void aw9523_irq_bus_sync_unlock(struct irq_data *d)
+ {
+ 	struct aw9523 *awi = gpiochip_get_data(irq_data_get_irq_chip_data(d));
++	u16 dis = awi->irq->disabled;
+ 
+-	regcache_cache_only(awi->regmap, false);
+-	regcache_sync(awi->regmap);
++	/*
++	 * Not through regcache_cache_only() and regcache_sync(): that put
++	 * the whole regmap in cache-only mode, while the GPIO calls (under
++	 * i2c_lock) went on using it. Their reads failed (-EBUSY, which
++	 * gpio-matrix-keypad took for a pressed key) and their writes
++	 * stayed in the cache; regcache_sync() then skipped any register
++	 * back at its default, so the keyboard's columns were left driven
++	 * high and no key raised an interrupt (measured on the Titan Pocket).
++	 */
++	mutex_lock(&awi->i2c_lock);
++	regmap_update_bits(awi->regmap, AW9523_REG_INTR_DIS(0), U8_MAX, dis & U8_MAX);
++	regmap_update_bits(awi->regmap, AW9523_REG_INTR_DIS(AW9523_PINS_PER_PORT),
++			   U8_MAX, dis >> 8);
++	mutex_unlock(&awi->i2c_lock);
+ 	mutex_unlock(&awi->irq->lock);
+ }
+ 
+@@ -542,8 +560,11 @@ static int aw9523_gpio_get(struct gpio_chip *chip, unsigned int offset)
+ 	mutex_lock(&awi->i2c_lock);
+ 	ret = aw9523_get_port_state(awi->regmap, offset, regbit, &val);
+ 	mutex_unlock(&awi->i2c_lock);
+-	if (ret)
++	if (ret) {
++		dev_warn_ratelimited(awi->dev, "reading gpio%u failed: %d\n",
++				     offset, ret);
+ 		return ret;
++	}
+ 
+ 	return !!(val & BIT(regbit));
+ }
+@@ -814,6 +835,7 @@ static int aw9523_init_irq(struct aw9523 *awi, int irq)
+ 		return -ENOMEM;
+ 
+ 	mutex_init(&awi->irq->lock);
++	awi->irq->disabled = U16_MAX;	/* as aw9523_hw_init() leaves them */
+ 
+ 	ret = devm_request_threaded_irq(dev, irq, NULL, aw9523_irq_thread_func,
+ 					IRQF_ONESHOT, dev_name(dev), awi);
+@@ -825,7 +847,7 @@ static int aw9523_init_irq(struct aw9523 *awi, int irq)
+ 	girq->parent_handler = NULL;
+ 	girq->num_parents = 0;
+ 	girq->parents = NULL;
+-	girq->default_type = IRQ_TYPE_EDGE_BOTH;
++	girq->default_type = IRQ_TYPE_NONE;
+ 	girq->handler = handle_simple_irq;
+ 	girq->threaded = true;
+ 

@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 04/15] regulator: mt6358: add VA09; rtc: mt6397: LK reboot modes
+
+mt6358-regulator gains ldo_va09, the external 0.9 V supply that the
+MT6358's EXT_PMIC_EN2 pin switches (USB and UFS PHYs). rtc-mt6397 records
+the reboot mode the way LK reads it, so reboot bootloader/recovery work.
+---
+ drivers/regulator/mt6358-regulator.c       | 26 +++++++++++++
+ drivers/rtc/rtc-mt6397.c                   | 43 ++++++++++++++++++++++
+ include/linux/mfd/mt6358/registers.h       |  1 +
+ include/linux/mfd/mt6397/rtc.h             |  6 +++
+ include/linux/regulator/mt6358-regulator.h |  1 +
+ 5 files changed, 77 insertions(+)
+
+diff --git a/drivers/regulator/mt6358-regulator.c b/drivers/regulator/mt6358-regulator.c
+index 44bef0bdfdbe35132a026230c85780e10eb69dc0..2386baae961b69af30a6cefe38d1c8b7bd4038bb 100644
+--- a/drivers/regulator/mt6358-regulator.c
++++ b/drivers/regulator/mt6358-regulator.c
+@@ -501,6 +501,18 @@ static const struct regulator_ops mt6358_volt_fixed_ops = {
+ };
+ 
+ /* The array is indexed by id(MT6358_ID_XXX) */
++/*
++ * VA09 is not one of the MT6358's LDOs: its EXT_PMIC_EN2 pin switches an
++ * external 0.9 V supply, which MediaTek's MT6771 kernel turns on for the
++ * USB controller. The pin's enable and select bits are set together.
++ */
++static const struct regulator_ops mt6358_ext_pmic_ops = {
++	.list_voltage = regulator_list_voltage_linear,
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++};
++
+ static const struct mt6358_regulator_info mt6358_regulators[] = {
+ 	MT6358_BUCK("buck_vdram1", VDRAM1, "vsys-vdram1", 500000, 2087500, 12500,
+ 		    0x7f, MT6358_BUCK_VDRAM1_DBG0, 0x7f, MT6358_VDRAM1_ANA_CON0, 8),
+@@ -570,6 +582,20 @@ static const struct mt6358_regulator_info mt6358_regulators[] = {
+ 		    MT6358_LDO_VSRAM_GPU_DBG0, 0x7f00, MT6358_LDO_VSRAM_CON3, 0x7f),
+ 	MT6358_LDO1("ldo_vsram_proc12", VSRAM_PROC12, "vs2-ldo3", 500000, 1293750, 6250,
+ 		    MT6358_LDO_VSRAM_PROC12_DBG0, 0x7f00, MT6358_LDO_VSRAM_CON1, 0x7f),
++	[MT6358_ID_VA09] = {
++		.desc = {
++			.name = "VA09",
++			.of_match = of_match_ptr("ldo_va09"),
++			.ops = &mt6358_ext_pmic_ops,
++			.type = REGULATOR_VOLTAGE,
++			.id = MT6358_ID_VA09,
++			.owner = THIS_MODULE,
++			.n_voltages = 1,
++			.min_uV = 900000,
++			.enable_reg = MT6358_STRUP_CON5,
++			.enable_mask = BIT(5) | BIT(1),
++		},
++	},
+ };
+ 
+ /* The array is indexed by id(MT6366_ID_XXX) */
+diff --git a/drivers/rtc/rtc-mt6397.c b/drivers/rtc/rtc-mt6397.c
+index 1617063669cc58a4314957a98a9832856229cadc..867af17d22981eed8771ffa1d7cbc310cc3b578a 100644
+--- a/drivers/rtc/rtc-mt6397.c
++++ b/drivers/rtc/rtc-mt6397.c
+@@ -11,6 +11,7 @@
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/reboot.h>
+ #include <linux/regmap.h>
+ #include <linux/rtc.h>
+ #include <linux/mfd/mt6397/rtc.h>
+@@ -257,6 +258,41 @@ static const struct rtc_class_ops mtk_rtc_ops = {
+ 	.set_alarm  = mtk_rtc_set_alarm,
+ };
+ 
++/*
++ * MediaTek's bootloader (LK) picks its boot mode from spare bits in the
++ * RTC's PDN1 register, which survive the reset: bit 13 stops it in
++ * fastboot, bits 5:4 = 1 start recovery. The vendor kernel sets them for
++ * "reboot bootloader" and "reboot recovery" (rtc_mark_fast(),
++ * rtc_mark_recovery()); this does the same when the device tree asks for
++ * it with mediatek,lk-reboot-mode.
++ */
++static int mtk_rtc_reboot_notify(struct notifier_block *nb,
++				 unsigned long action, void *data)
++{
++	struct mt6397_rtc *rtc = container_of(nb, struct mt6397_rtc, reboot_nb);
++	const char *cmd = data;
++	u32 mask, val;
++
++	if (action != SYS_RESTART || !cmd)
++		return NOTIFY_DONE;
++	if (!strcmp(cmd, "bootloader")) {
++		mask = RTC_PDN1_FAST_BOOT;
++		val = RTC_PDN1_FAST_BOOT;
++	} else if (!strcmp(cmd, "recovery")) {
++		mask = RTC_PDN1_RECOVERY_MASK;
++		val = RTC_PDN1_RECOVERY;
++	} else {
++		return NOTIFY_DONE;
++	}
++
++	mutex_lock(&rtc->lock);
++	if (!regmap_update_bits(rtc->regmap, rtc->addr_base + RTC_PDN1, mask, val))
++		mtk_rtc_write_trigger(rtc);
++	mutex_unlock(&rtc->lock);
++
++	return NOTIFY_DONE;
++}
++
+ static int mtk_rtc_probe(struct platform_device *pdev)
+ {
+ 	struct resource *res;
+@@ -303,6 +339,13 @@ static int mtk_rtc_probe(struct platform_device *pdev)
+ 
+ 	rtc->rtc_dev->ops = &mtk_rtc_ops;
+ 
++	if (of_property_read_bool(pdev->dev.of_node, "mediatek,lk-reboot-mode")) {
++		rtc->reboot_nb.notifier_call = mtk_rtc_reboot_notify;
++		ret = devm_register_reboot_notifier(&pdev->dev, &rtc->reboot_nb);
++		if (ret)
++			return ret;
++	}
++
+ 	return devm_rtc_register_device(rtc->rtc_dev);
+ }
+ 
+diff --git a/include/linux/mfd/mt6358/registers.h b/include/linux/mfd/mt6358/registers.h
+index d83e87298ac46889dbb96c85adc7dc5e9f54b2d1..32a3248129a312d674424ee0310e898a31c516f0 100644
+--- a/include/linux/mfd/mt6358/registers.h
++++ b/include/linux/mfd/mt6358/registers.h
+@@ -75,6 +75,7 @@
+ #define MT6358_RTC_SEC_WRTGR                  0x618
+ #define MT6358_PSC_TOP_INT_CON0               0x910
+ #define MT6358_PSC_TOP_INT_STATUS0            0x91c
++#define MT6358_STRUP_CON5                     0xa1e
+ #define MT6358_BM_TOP_INT_CON0                0xc32
+ #define MT6358_BM_TOP_INT_CON1                0xc38
+ #define MT6358_BM_TOP_INT_STATUS0             0xc4a
+diff --git a/include/linux/mfd/mt6397/rtc.h b/include/linux/mfd/mt6397/rtc.h
+index 068ae1c0f0e8e9a43c11309b44f11b41d15cfe50..a34e3d3f004e38390536fa3cb37965da90183e1a 100644
+--- a/include/linux/mfd/mt6397/rtc.h
++++ b/include/linux/mfd/mt6397/rtc.h
+@@ -57,6 +57,11 @@
+ #define RTC_AL_MTH_MASK        0x000f
+ #define RTC_AL_YEA_MASK        0x007f
+ 
++#define RTC_PDN1               0x002c
++#define RTC_PDN1_RECOVERY_MASK GENMASK(5, 4)
++#define RTC_PDN1_RECOVERY      BIT(4)
++#define RTC_PDN1_FAST_BOOT     BIT(13)
++
+ #define RTC_PDN2               0x002e
+ #define RTC_PDN2_PWRON_ALARM   BIT(4)
+ 
+@@ -81,6 +86,7 @@ struct mt6397_rtc {
+ 	int                     irq;
+ 	u32                     addr_base;
+ 	const struct mtk_rtc_data *data;
++	struct notifier_block   reboot_nb;
+ };
+ 
+ #endif /* _LINUX_MFD_MT6397_RTC_H_ */
+diff --git a/include/linux/regulator/mt6358-regulator.h b/include/linux/regulator/mt6358-regulator.h
+index 562386f9b80ebe7b73e755cf08c9165cecdf2b69..bb3ea2113c2e968523e8d505717ae9289127322c 100644
+--- a/include/linux/regulator/mt6358-regulator.h
++++ b/include/linux/regulator/mt6358-regulator.h
+@@ -47,6 +47,7 @@ enum {
+ 	MT6358_ID_VLDO28,
+ 	MT6358_ID_VAUD28,
+ 	MT6358_ID_VSIM2,
++	MT6358_ID_VA09,
+ 	MT6358_ID_RG_MAX,
+ };
+ 

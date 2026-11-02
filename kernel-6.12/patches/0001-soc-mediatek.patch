@@ -1,0 +1,2043 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 01/15] soc: mediatek: add MT6771 MCDI, SPM, SCP and LK framebuffer drivers
+
+mtk-mcdi: keeps the SSPM's available-CPU mask in step with the online
+CPUs and pauses MCDI (and cpuidle) across hotplug as MediaTek's kernel
+does, and powers parked cores and empty clusters off through SiP calls.
+Without it a core that enters PSCI power-down never wakes.
+
+mt6771-spm: holds the AP's 26 MHz, bus and DRAM requests that the SPM
+firmware holds on MediaTek's kernel (SPM_SRC_REQ 0x83), and optionally
+(mt6771_spm.deep=1) starts the SPM firmware and suspends through it as
+spm_go_to_sleep() does, refusing while a display, GPU or camera power
+domain is still on; mt6771_spm.wake_mask sets the wake sources.
+
+mt6771-scp: starts the SCP and talks to its sensor hub; the
+accelerometer, gyroscope, magnetometer, light and proximity sensors
+become IIO devices with several buffers each.
+
+mtk-lk-fb: hands the bootloader's live framebuffer to simplefb, for a
+console before the display driver binds.
+---
+ drivers/soc/mediatek/Kconfig          |   44 +
+ drivers/soc/mediatek/Makefile         |    4 +
+ drivers/soc/mediatek/mt6771-scp.c     | 1090 +++++++++++++++++++++++++
+ drivers/soc/mediatek/mt6771-spm.c     |  354 ++++++++
+ drivers/soc/mediatek/mtk-lk-fb.c      |  249 ++++++
+ drivers/soc/mediatek/mtk-mcdi.c       |  196 +++++
+ include/linux/soc/mediatek/mtk-mcdi.h |   13 +
+ 7 files changed, 1950 insertions(+)
+
+diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
+index 1b7afb19ccd637471ad82ad833f589cb0f9405b1..cc73ddf801462547795930636f466c91eb5a83e9 100644
+--- a/drivers/soc/mediatek/Kconfig
++++ b/drivers/soc/mediatek/Kconfig
+@@ -34,6 +34,38 @@ config MTK_INFRACFG
+ 	  INFRACFG controller contains various infrastructure registers not
+ 	  directly associated to any device.
+ 
++config MTK_LK_FB
++	tristate "MediaTek LK framebuffer handover"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on OF
++	imply FB_SIMPLE
++	help
++	  Hands the framebuffer MediaTek's bootloader (LK) leaves on the
++	  panel to simplefb, so the kernel console shows on the screen
++	  before a display driver runs. The geometry and pixel format are
++	  read from the display overlay engines LK left running.
++
++config MTK_MCDI
++	bool "MediaTek MCDI available-CPU mask (MT6771)"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on OF
++	help
++	  Keeps the SSPM firmware's MCDI available-CPU mask equal to the
++	  online CPUs, so cores that enter PSCI core or cluster power-down
++	  (cpuidle) are powered back on when woken.
++
++config MTK_MT6771_SPM
++	bool "MediaTek MT6771 SPM resource requests and system suspend"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on OF && ARM_PSCI_FW
++	select MFD_SYSCON
++	help
++	  Holds the AP's 26 MHz clock, bus and DRAM requests in the SPM, as
++	  MediaTek's SPM firmware does, so they stay up when blocks such as
++	  UFS release theirs (in suspend). Also starts the SPM firmware and
++	  suspends to RAM through it, as MediaTek's kernel does, in place
++	  of PSCI SYSTEM_SUSPEND.
++
+ config MTK_PMIC_WRAP
+ 	tristate "MediaTek PMIC Wrapper Support"
+ 	depends on RESET_CONTROLLER
+@@ -49,6 +81,18 @@ config MTK_REGULATOR_COUPLER
+ 	default ARCH_MEDIATEK
+ 	depends on REGULATOR
+ 
++config MTK_MT6771_SCP
++	tristate "MediaTek MT6771 SCP and sensor hub"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on IIO
++	select IIO_BUFFER
++	select IIO_KFIFO_BUF
++	help
++	  Starts the MT6771's SCP (the Cortex-M4 running MediaTek's tinysys
++	  firmware, loaded by the bootloader), talks to it over its IPI and
++	  runs the sensor hub on it: the accelerometer, gyroscope,
++	  magnetometer, light and proximity sensors as IIO devices.
++
+ config MTK_MMSYS
+ 	tristate "MediaTek MMSYS Support"
+ 	default ARCH_MEDIATEK
+diff --git a/drivers/soc/mediatek/Makefile b/drivers/soc/mediatek/Makefile
+index 6830512848fd0feb2d559894ac1b88397b487e91..e02ca4c3f3ef7dd57b0ee87c32237f18cfaa9237 100644
+--- a/drivers/soc/mediatek/Makefile
++++ b/drivers/soc/mediatek/Makefile
+@@ -2,9 +2,13 @@
+ obj-$(CONFIG_MTK_CMDQ) += mtk-cmdq-helper.o
+ obj-$(CONFIG_MTK_DEVAPC) += mtk-devapc.o
+ obj-$(CONFIG_MTK_INFRACFG) += mtk-infracfg.o
++obj-$(CONFIG_MTK_LK_FB) += mtk-lk-fb.o
++obj-$(CONFIG_MTK_MCDI) += mtk-mcdi.o
++obj-$(CONFIG_MTK_MT6771_SPM) += mt6771-spm.o
+ obj-$(CONFIG_MTK_PMIC_WRAP) += mtk-pmic-wrap.o
+ obj-$(CONFIG_MTK_REGULATOR_COUPLER) += mtk-regulator-coupler.o
+ obj-$(CONFIG_MTK_MMSYS) += mtk-mmsys.o
++obj-$(CONFIG_MTK_MT6771_SCP) += mt6771-scp.o
+ obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
+ obj-$(CONFIG_MTK_SVS) += mtk-svs.o
+ obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
+diff --git a/drivers/soc/mediatek/mt6771-scp.c b/drivers/soc/mediatek/mt6771-scp.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac001c7fc67
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6771-scp.c
+@@ -0,0 +1,1090 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6771 SCP (Cortex-M4, MediaTek's tinysys firmware) and its sensor hub
++ *
++ * LK loads the SCP: the loader at SRAM 0, the firmware and the SCP's DRAM
++ * described by the region info at SRAM+0x400, and leaves the core in
++ * reset. This driver releases it and talks to it over the vendor IPI: one
++ * receive and one send object in SRAM below the RTOS (0x5C0, 0x6E0: id,
++ * length, 8 reserved bytes, 272 bytes of data), a doorbell (GIPC_IN bit
++ * 0) and an interrupt back (A_TO_HOST bit 0; bit 8 is the SCP watchdog).
++ *
++ * The sensor hub on top (the vendor's SCP_nanoHub protocol):
++ * - IPI_SENSOR: the hub reports INIT_DONE, gets the DRAM FIFO's address
++ *   (SET_CONFIG) and the time (SET_TIMESTAMP), and notifies new data with
++ *   the FIFO's write pointer. The FIFO holds packed data_unit_t records.
++ * - IPI_CHRE / IPI_CHREX: nanohub packets (sync 0x31, sequence, reason,
++ *   length, data, STM32 CRC-32). A ConfigCmd in a CMD_COMMS_WRITE packet
++ *   enables a sensor and sets its rate; over IPI the hub answers with the
++ *   reply alone (the command echoed, one byte: accepted), where nanohub
++ *   over SPI sends an ACK packet first. Every packet received is
++ *   acknowledged with a CHREX token holding its size.
++ *
++ * The SCP's own log: at boot it sends IPI_LOGGER_INIT_A with an SRAM
++ * address where the AP writes the DRAM log buffer's address; after
++ * IPI_LOGGER_ENABLE it writes text there (a control block with magic
++ * 0x504C5402, read/write positions, 1 MB ring). debugfs: mt6771-scp/log.
++ *
++ * Sleep: once the hub ran, the SCP went into deep sleep (CPU_SLEEP_STATUS
++ * 3), its SRAM read as zeros and the AP's awake request (INFRA_IRQ_SET)
++ * no longer woke it; the vendor's SPM firmware, which 6.12 lacks, handles
++ * that wake. So the SCP's sleep is switched off (IPI_DVFS_SLEEP 0, the
++ * vendor's "SCP Sleep: OFF") as soon as it is ready.
++ *
++ * Each sensor is an IIO device: read once (enabled for the read) or
++ * through a buffer. Several programs read the same sensor at once (the
++ * lock screen, the apps' tilt), so each device has SCP_BUFFERS buffers,
++ * one per reader; the sensor runs while any of them is enabled. Units as the hub reports them: acceleration in
++ * 1/1000 m/s^2, angular velocity in 1/7505747 rad/s, magnetic field in
++ * 1/100 uT, light in lux, proximity 0 near / 1 far.
++ */
++
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/iio/buffer.h>
++#include <linux/iio/iio.h>
++#include <linux/iio/kfifo_buf.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/timekeeping.h>
++#include <linux/workqueue.h>
++#include <asm/arch_timer.h>
++
++/* configuration registers */
++#define SCP_CFG_RESET		0x000	/* 1: core running */
++#define SCP_A_TO_HOST		0x01c
++#define  SCP_IRQ_SCP2HOST	BIT(0)
++#define  SCP_IRQ_WDT		BIT(8)
++#define SCP_GIPC_IN		0x028
++#define  HOST_TO_SCP_A		BIT(0)
++#define SCP_DEBUG_PC		0x0b4
++/* clock control */
++#define SCP_SRAM_PDN		0x02c
++/* SCPSYS: the AP's awake requests */
++#define INFRA_IRQ_SET		0xb14
++#define INFRA_IRQ_CLEAR		0xb18
++#define  AP_AWAKE_LOCK		0
++#define  AP_AWAKE_UNLOCK	1
++
++/* SRAM */
++#define SCP_REGION_INFO		0x400
++#define SCP_RTOS_START		0x800
++#define SHARE_OBJ_SIZE		288
++#define SHARE_RCV		(SCP_RTOS_START - 2 * SHARE_OBJ_SIZE)
++#define SHARE_SEND		(SHARE_RCV + SHARE_OBJ_SIZE)
++#define SHARE_DATA		16	/* after id, len, reserve[8] */
++#define SHARE_DATA_SIZE		(SHARE_OBJ_SIZE - SHARE_DATA)
++
++/* IPI ids (vendor scp_ipi.h) */
++#define IPI_LOGGER_ENABLE	2
++#define IPI_LOGGER_INIT_A	4
++#define IPI_SENSOR		8
++#define IPI_DVFS_SLEEP		21
++#define IPI_SCP_A_READY		12
++#define IPI_CHRE		24
++#define IPI_CHREX		25
++#define IPI_NR			34
++
++/* sensor hub actions and notify events */
++#define SENSOR_HUB_SET_CONFIG	4
++#define SENSOR_HUB_NOTIFY	6
++#define SENSOR_HUB_SET_TIMESTAMP 8
++#define SCP_INIT_DONE		0
++#define SCP_FIFO_FULL		1
++#define SCP_DIRECT_PUSH		4
++
++/* nanohub */
++#define COMMS_SYNC		0x31
++#define CMD_COMMS_ACK		0x00000000
++#define CMD_COMMS_NACK		0x00000001
++#define CMD_COMMS_BUSY		0x00000002
++#define CMD_COMMS_WRITE		0x00001091
++#define EVT_NO_SENSOR_CONFIG_EVENT 0x00000300
++#define CONFIG_CMD_DISABLE	0
++#define CONFIG_CMD_ENABLE	1
++#define SENSOR_RATE_ONCHANGE	0xffffff01
++
++/* Android sensor types, as the hub numbers them */
++#define SENSOR_TYPE_ACCELEROMETER 1
++#define SENSOR_TYPE_MAGNETIC_FIELD 2
++#define SENSOR_TYPE_GYROSCOPE	4
++#define SENSOR_TYPE_LIGHT	5
++#define SENSOR_TYPE_PROXIMITY	8
++
++#define SCP_READY_TIMEOUT_MS	3000
++#define SCP_SEND_TIMEOUT_US	50000
++#define NANOHUB_TIMEOUT_MS	100
++#define NANOHUB_RETRIES		10
++#define READ_TIMEOUT_MS		1000
++/* IIO buffers per sensor: each reader takes one (IIO_BUFFER_GET_FD_IOCTL) */
++#define SCP_BUFFERS		4
++
++/* the log's control block at the start of its DRAM */
++#define SCP_LOG_MAGIC		0x504c5402
++#define SCP_LOG_BUF_LEN		(1024 * 1024)
++
++struct scp_log_ctl {
++	u32 base;		/* magic */
++	u32 size;		/* of this block */
++	u32 enable;
++	u32 info_ofs;		/* r_pos, w_pos */
++	u32 buff_ofs;
++	u32 buff_size;
++};
++
++struct scp_log_info {		/* IPI_LOGGER_INIT_A */
++	u32 dram_addr;		/* SRAM offset to write the DRAM address to */
++	u32 buf_addr;
++	u32 start_addr;
++	u32 end_addr;
++	u32 buf_maxlen;
++};
++
++struct sensor_fifo {
++	u32 rp;
++	u32 wp;
++	u32 size;
++	u32 reserve;
++	u8 data[];
++};
++
++/* one FIFO record (the vendor's data_unit_t) */
++struct data_unit {
++	u8 sensor_type;
++	u8 flush_action;
++	u8 reserve[2];
++	u64 time_stamp;
++	s32 data[8];
++} __packed;
++
++struct set_config_req {
++	u8 sensor_type;
++	u8 action;
++	u8 reserve[2];
++	u32 buffer_base;
++	u32 buffer_size;
++	u32 pad;
++	u64 ap_timestamp;
++	u64 arch_counter;
++};
++
++/* the vendor's union with 64-bit members puts the write pointer at 8 */
++struct notify_rsp {
++	u8 sensor_type;
++	u8 action;
++	u8 event;
++	u8 reserve;
++	u32 pad;
++	u32 curr_wp;
++};
++
++struct config_cmd {
++	u32 evt_type;
++	u64 latency;
++	u32 rate;
++	u8 sensor_type;
++	u8 cmd;
++	u16 flags;
++} __packed;
++
++struct nanohub_packet {
++	u8 sync;
++	u32 seq;
++	u32 reason;
++	u8 len;
++	u8 data[];
++} __packed;
++
++struct mt6771_scp;
++
++struct scp_sensor {
++	struct mt6771_scp *scp;
++	struct iio_dev *indio;
++	const char *name;
++	u8 type;
++	bool on_change;
++	int nch;			/* data words per sample */
++	u32 freq_hz;
++	bool want;			/* asked for: buffer or a read */
++	bool buffered;
++	bool reading;
++	s32 last[3];
++	struct completion sample;
++	struct {
++		s32 val[3];
++		s64 timestamp __aligned(8);
++	} scan;
++};
++
++struct mt6771_scp {
++	struct device *dev;
++	void __iomem *sram;
++	void __iomem *cfg;
++	void __iomem *clkctrl;
++	void __iomem *scpsys;
++	int irq;
++
++	struct mutex send_lock;
++	u8 rcv[SHARE_OBJ_SIZE];
++	unsigned int rcv_len;
++	unsigned int rcv_id;
++
++	bool ready;
++	bool hub_up;
++	struct completion ready_done;
++	struct work_struct hub_up_work;
++	struct work_struct no_sleep_work;
++
++	/* sensor hub */
++	struct sensor_fifo *fifo;
++	phys_addr_t fifo_phys;
++	size_t fifo_bytes;
++	u32 notify_wp;
++	spinlock_t notify_lock;
++	struct work_struct drain_work;
++	struct completion hub_rsp;	/* a response to a sensor hub request */
++	struct mutex hub_lock;		/* one nanohub exchange at a time */
++
++	/* nanohub */
++	u32 seq;
++	u8 nh_rx[SHARE_DATA_SIZE];
++	unsigned int nh_rx_len;
++	struct completion nh_rx_done;
++	spinlock_t nh_lock;
++	unsigned int chrex_token;
++	struct work_struct chrex_work;
++
++	struct scp_sensor sensors[5];
++
++	/* the SCP's log */
++	struct scp_log_ctl *log;
++	phys_addr_t log_phys;
++	struct work_struct log_work;
++	DECLARE_BITMAP(ipi_seen, IPI_NR);
++};
++
++/* ---- SCP IPI ---- */
++
++static void scp_awake(struct mt6771_scp *scp, int bit)
++{
++	u32 v;
++	int i;
++
++	writel(0xa0 | BIT(bit), scp->scpsys + INFRA_IRQ_SET);
++	for (i = 0; i < 10000; i++) {
++		v = readl(scp->scpsys + INFRA_IRQ_SET);
++		if ((v & 0xf0) != 0xa0 || !(v & BIT(bit)))
++			break;
++		udelay(10);
++	}
++	writel(readl(scp->scpsys + INFRA_IRQ_SET), scp->scpsys + INFRA_IRQ_CLEAR);
++}
++
++/*
++ * The SCP SRAM takes only 32-bit writes: a byte write is lost (seen as a
++ * nanohub packet whose CRC arrived with a byte zeroed). Copy whole words,
++ * the last one zero padded.
++ */
++static void scp_copy_to_sram(void __iomem *dst, const void *src,
++			     unsigned int len)
++{
++	unsigned int i;
++	u32 word;
++
++	for (i = 0; i < len; i += 4) {
++		word = 0;
++		memcpy(&word, src + i, min(4u, len - i));
++		writel(word, dst + i);
++	}
++}
++
++static int scp_ipi_send(struct mt6771_scp *scp, u32 id, const void *buf,
++			unsigned int len)
++{
++	void __iomem *obj = scp->sram + SHARE_SEND;
++	u32 v;
++	int ret;
++
++	if (len > SHARE_DATA_SIZE)
++		return -EINVAL;
++
++	mutex_lock(&scp->send_lock);
++	ret = readl_poll_timeout(scp->cfg + SCP_GIPC_IN, v,
++				 !(v & HOST_TO_SCP_A), 20, SCP_SEND_TIMEOUT_US);
++	if (ret) {
++		dev_warn(scp->dev, "IPI %u: previous IPI not taken\n", id);
++		goto out;
++	}
++	scp_awake(scp, AP_AWAKE_LOCK);
++	scp_copy_to_sram(obj + SHARE_DATA, buf, len);
++	writel(len, obj + 4);
++	writel(id, obj);
++	/* read back: the SRAM is reachable */
++	if (readl(obj) != id)
++		dev_warn(scp->dev, "IPI %u: send object read back wrong\n", id);
++	wmb();
++	writel(HOST_TO_SCP_A, scp->cfg + SCP_GIPC_IN);
++	ret = readl_poll_timeout(scp->cfg + SCP_GIPC_IN, v,
++				 !(v & HOST_TO_SCP_A), 20, SCP_SEND_TIMEOUT_US);
++	if (ret)
++		dev_warn(scp->dev, "IPI %u: not taken\n", id);
++	scp_awake(scp, AP_AWAKE_UNLOCK);
++out:
++	mutex_unlock(&scp->send_lock);
++	return ret;
++}
++
++/* ---- nanohub ---- */
++
++/* the STM32 CRC-32 nanohub uses: word by word, last word zero padded */
++static u32 nanohub_crc32(const u8 *buf, int len)
++{
++	static const u32 table[16] = {
++		0x00000000, 0x04c11db7, 0x09823b6e, 0x0d4326d9,
++		0x130476dc, 0x17c56b6b, 0x1a864db2, 0x1e475005,
++		0x2608edb8, 0x22c9f00f, 0x2f8ad6d6, 0x2b4bcb61,
++		0x350c9b64, 0x31cd86d3, 0x3c8ea00a, 0x384fbdbd,
++	};
++	u32 crc = ~0, word;
++	int i, j;
++
++	for (i = 0; i < len; i += 4) {
++		word = 0;
++		for (j = 0; j < 4 && i + j < len; j++)
++			word |= buf[i + j] << (8 * j);
++		crc ^= word;
++		for (j = 0; j < 8; j++)
++			crc = (crc << 4) ^ table[crc >> 28];
++	}
++	return crc;
++}
++
++static int nanohub_check(const u8 *buf, unsigned int len)
++{
++	const struct nanohub_packet *p = (const void *)buf;
++	u32 crc;
++
++	if (len < sizeof(*p) + 4 || len != sizeof(*p) + p->len + 4)
++		return -EPROTO;
++	memcpy(&crc, buf + sizeof(*p) + p->len, 4);
++	return crc == nanohub_crc32(buf, sizeof(*p) + p->len) ? 0 : -EBADMSG;
++}
++
++/* wait for the next packet from the hub; copies it to buf */
++static int nanohub_read(struct mt6771_scp *scp, u8 *buf)
++{
++	unsigned int len;
++
++	if (!wait_for_completion_timeout(&scp->nh_rx_done,
++					 msecs_to_jiffies(NANOHUB_TIMEOUT_MS)))
++		return -ETIMEDOUT;
++	spin_lock_irq(&scp->nh_lock);
++	len = scp->nh_rx_len;
++	memcpy(buf, scp->nh_rx, len);
++	spin_unlock_irq(&scp->nh_lock);
++	return nanohub_check(buf, len);
++}
++
++/* one CMD_COMMS_WRITE exchange: 1 if the hub accepted the data */
++static int nanohub_write(struct mt6771_scp *scp, const void *data, u8 len)
++{
++	u8 tx[SHARE_DATA_SIZE], rx[SHARE_DATA_SIZE];
++	struct nanohub_packet *p = (void *)tx, *r = (void *)rx;
++	u32 seq, crc;
++	int try, ret = -EIO;
++
++	mutex_lock(&scp->hub_lock);
++	seq = scp->seq++;
++	p->sync = COMMS_SYNC;
++	p->seq = seq;
++	p->reason = CMD_COMMS_WRITE;
++	p->len = len;
++	memcpy(p->data, data, len);
++	crc = nanohub_crc32(tx, sizeof(*p) + len);
++	memcpy(p->data + len, &crc, 4);
++
++	for (try = 0; try < NANOHUB_RETRIES; try++) {
++		reinit_completion(&scp->nh_rx_done);
++		ret = scp_ipi_send(scp, IPI_CHRE, tx, sizeof(*p) + len + 4);
++		if (ret)
++			continue;
++		ret = nanohub_read(scp, rx);
++		/* over IPI the hub answers with the reply alone, or an ACK first */
++		if (!ret && r->reason == CMD_COMMS_ACK)
++			ret = nanohub_read(scp, rx);
++		if (ret)
++			continue;
++		if (r->seq != seq || r->reason == CMD_COMMS_NACK) {
++			ret = -EPROTO;
++			continue;
++		}
++		if (r->reason == CMD_COMMS_BUSY) {
++			ret = -EBUSY;
++			msleep(100);
++			continue;
++		}
++		ret = r->len >= 1 && r->data[0] ? 1 : 0;
++		break;
++	}
++	mutex_unlock(&scp->hub_lock);
++	if (ret < 0)
++		dev_warn(scp->dev, "nanohub write: %d\n", ret);
++	return ret;
++}
++
++static void chrex_work(struct work_struct *work)
++{
++	struct mt6771_scp *scp = container_of(work, struct mt6771_scp, chrex_work);
++	u32 token;
++
++	spin_lock_irq(&scp->nh_lock);
++	token = scp->chrex_token;
++	spin_unlock_irq(&scp->nh_lock);
++	scp_ipi_send(scp, IPI_CHREX, &token, sizeof(token));
++}
++
++/*
++ * With the vendor's SPM firmware running (mt6771_spm.deep=1), which handles
++ * the wake from the SCP's deep sleep, the SCP may sleep: an awake SCP keeps
++ * its SPM request up (R12_SCP_SPM_IRQ_B) and ends every system suspend at
++ * once (measured).
++ */
++static bool scp_sleep;
++module_param_named(sleep, scp_sleep, bool, 0444);
++MODULE_PARM_DESC(sleep, "Leave the SCP's sleep on (needs the SPM firmware: mt6771_spm.deep=1)");
++
++static void no_sleep_work(struct work_struct *work)
++{
++	struct mt6771_scp *scp = container_of(work, struct mt6771_scp, no_sleep_work);
++	s32 sleep = scp_sleep;
++
++	if (scp_ipi_send(scp, IPI_DVFS_SLEEP, &sleep, sizeof(sleep)))
++		dev_warn(scp->dev, "SCP sleep not switched %s\n", sleep ? "on" : "off");
++}
++
++/* ---- log ---- */
++
++static void log_work(struct work_struct *work)
++{
++	struct mt6771_scp *scp = container_of(work, struct mt6771_scp, log_work);
++	u32 enable = 1;
++
++	if (!scp_ipi_send(scp, IPI_LOGGER_ENABLE, &enable, sizeof(enable)))
++		WRITE_ONCE(scp->log->enable, 1);
++}
++
++static void scp_log_init(struct mt6771_scp *scp)
++{
++	struct scp_log_ctl *c = scp->log;
++	u32 *pos;
++
++	c->base = SCP_LOG_MAGIC;
++	c->size = sizeof(*c);
++	c->enable = 0;
++	c->info_ofs = sizeof(*c);
++	c->buff_ofs = ALIGN(sizeof(*c) + 2 * sizeof(u32), 4);
++	c->buff_size = SCP_LOG_BUF_LEN;
++	pos = (void *)c + c->info_ofs;
++	pos[0] = 0;	/* r_pos */
++	pos[1] = 0;	/* w_pos */
++}
++
++/* the text written since the last read */
++static ssize_t scp_log_read(struct file *file, char __user *ubuf,
++			    size_t count, loff_t *ppos)
++{
++	struct mt6771_scp *scp = file->private_data;
++	struct scp_log_ctl *c = scp->log;
++	u32 *pos = (void *)c + c->info_ofs;
++	const char *buf = (void *)c + c->buff_ofs;
++	u32 r = READ_ONCE(pos[0]), w = READ_ONCE(pos[1]), n;
++
++	if (r >= c->buff_size || w >= c->buff_size || r == w)
++		return 0;
++	n = w > r ? w - r : c->buff_size - r;
++	n = min_t(size_t, n, count);
++	rmb();
++	if (copy_to_user(ubuf, buf + r, n))
++		return -EFAULT;
++	WRITE_ONCE(pos[0], (r + n) % c->buff_size);
++	return n;
++}
++
++static const struct file_operations scp_log_fops = {
++	.open = simple_open,
++	.read = scp_log_read,
++	.llseek = noop_llseek,
++};
++
++/* ---- sensor hub ---- */
++
++static int sensor_hub_set(struct scp_sensor *s, bool enable, u32 freq_hz)
++{
++	struct config_cmd cmd = {
++		.evt_type = EVT_NO_SENSOR_CONFIG_EVENT,
++		.sensor_type = s->type,
++		.cmd = enable ? CONFIG_CMD_ENABLE : CONFIG_CMD_DISABLE,
++		.rate = s->on_change ? SENSOR_RATE_ONCHANGE : freq_hz * 1024,
++	};
++	int ret;
++
++	ret = nanohub_write(s->scp, &cmd, sizeof(cmd));
++	if (ret < 0)
++		return ret;
++	return ret ? 0 : -EIO;
++}
++
++/*
++ * The accelerometer and gyroscope are one chip (Senodia SH3001). The hub
++ * firmware powers it up only through the gyroscope: once both had been
++ * off, enabling the accelerometer alone kept reporting its last sample
++ * (measured: 1 distinct value in 50; with the gyroscope on, 50 of 50).
++ * So the gyroscope runs on the hub whenever either is wanted.
++ */
++static int sensor_config(struct scp_sensor *s, bool enable)
++{
++	struct mt6771_scp *scp = s->scp;
++	struct scp_sensor *acc = &scp->sensors[0], *gyro = &scp->sensors[1];
++	int ret;
++
++	if (!scp->hub_up)
++		return -EAGAIN;
++	s->want = enable;
++	if (s != acc && s != gyro)
++		return sensor_hub_set(s, enable, s->freq_hz);
++	ret = sensor_hub_set(gyro, gyro->want || acc->want,
++			     gyro->want ? gyro->freq_hz : acc->freq_hz);
++	if (!ret && s == acc)
++		ret = sensor_hub_set(acc, enable, acc->freq_hz);
++	return ret;
++}
++
++static void sensor_report(struct mt6771_scp *scp, const struct data_unit *u)
++{
++	struct scp_sensor *s = NULL;
++	int i;
++
++	/* records carry the handle: the Android type - 1 (vendor ID_*) */
++	for (i = 0; i < ARRAY_SIZE(scp->sensors); i++)
++		if (scp->sensors[i].type == u->sensor_type + 1)
++			s = &scp->sensors[i];
++	if (!s || u->flush_action)		/* flush, bias, calibration */
++		return;
++
++	for (i = 0; i < s->nch; i++)
++		s->last[i] = u->data[i];
++	if (s->type == SENSOR_TYPE_PROXIMITY)
++		s->last[0] = u->data[0] ? u->data[0] - 1 : 0;	/* 1 near, 2 far */
++	complete(&s->sample);
++	if (s->buffered) {
++		memcpy(s->scan.val, s->last, sizeof(s->scan.val));
++		iio_push_to_buffers_with_timestamp(s->indio, &s->scan,
++						   iio_get_time_ns(s->indio));
++	}
++}
++
++static void drain_work(struct work_struct *work)
++{
++	struct mt6771_scp *scp = container_of(work, struct mt6771_scp, drain_work);
++	struct sensor_fifo *f = scp->fifo;
++	struct data_unit u;
++	u32 rp, wp, size;
++
++	spin_lock_irq(&scp->notify_lock);
++	wp = scp->notify_wp;
++	spin_unlock_irq(&scp->notify_lock);
++	size = READ_ONCE(f->size);
++	rp = READ_ONCE(f->rp);
++
++	if (wp > size || rp > size)
++		return;
++	rmb();
++	while (rp != wp) {
++		memcpy(&u, f->data + rp, sizeof(u));
++		sensor_report(scp, &u);
++		rp += sizeof(u);
++		if (rp >= size)
++			rp = 0;
++	}
++	WRITE_ONCE(f->rp, wp);
++}
++
++/*
++ * A sensor hub request, then its response: the SCP reads the send object
++ * from its task, after taking the doorbell, so the next request must wait
++ * (SET_TIMESTAMP right after SET_CONFIG overwrote it: the hub read FIFO
++ * base 0)
++ */
++static int hub_request(struct mt6771_scp *scp, void *req, unsigned int len)
++{
++	int ret;
++
++	reinit_completion(&scp->hub_rsp);
++	ret = scp_ipi_send(scp, IPI_SENSOR, req, len);
++	if (ret)
++		return ret;
++	if (!wait_for_completion_timeout(&scp->hub_rsp, msecs_to_jiffies(500)))
++		return -ETIMEDOUT;
++	return 0;
++}
++
++static void hub_send_time(struct mt6771_scp *scp)
++{
++	struct set_config_req req = {
++		.action = SENSOR_HUB_SET_TIMESTAMP,
++	};
++
++	local_irq_disable();
++	req.ap_timestamp = ktime_get_boottime_ns();
++	req.arch_counter = __arch_counter_get_cntvct();
++	local_irq_enable();
++	if (hub_request(scp, &req, sizeof(req)))
++		dev_warn(scp->dev, "sensor hub: no answer to the time\n");
++}
++
++static void hub_up_work(struct work_struct *work)
++{
++	struct mt6771_scp *scp = container_of(work, struct mt6771_scp, hub_up_work);
++	struct set_config_req req = {
++		.action = SENSOR_HUB_SET_CONFIG,
++		.buffer_base = lower_32_bits(scp->fifo_phys),
++	};
++	int ret;
++
++	ret = hub_request(scp, &req, sizeof(req));
++	if (ret) {
++		dev_err(scp->dev, "sensor hub: FIFO address not taken: %d\n", ret);
++		return;
++	}
++	hub_send_time(scp);
++	scp->hub_up = true;
++	dev_info(scp->dev, "sensor hub up (FIFO %pa, %u bytes)\n",
++		 &scp->fifo_phys, scp->fifo->size);
++}
++
++/* ---- interrupt ---- */
++
++static void scp_dispatch(struct mt6771_scp *scp, u32 id, const u8 *data,
++			 unsigned int len)
++{
++	switch (id) {
++	case IPI_SCP_A_READY: {
++		u32 sram = 0;
++
++		if (len >= 4)
++			memcpy(&sram, data, 4);
++		dev_info(scp->dev, "SCP ready (SRAM %u KB)\n", sram / 1024);
++		scp->ready = true;
++		schedule_work(&scp->no_sleep_work);
++		complete(&scp->ready_done);
++		break;
++	}
++	case IPI_SENSOR: {
++		const struct notify_rsp *n = (const void *)data;
++
++		if (len < 4)
++			break;
++		if (n->action != SENSOR_HUB_NOTIFY) {
++			complete(&scp->hub_rsp);
++			break;
++		}
++		if (n->event == SCP_INIT_DONE) {
++			schedule_work(&scp->hub_up_work);
++		} else if ((n->event == SCP_DIRECT_PUSH ||
++			    n->event == SCP_FIFO_FULL) && len >= 12 && scp->hub_up) {
++			spin_lock(&scp->notify_lock);
++			scp->notify_wp = n->curr_wp;
++			spin_unlock(&scp->notify_lock);
++			schedule_work(&scp->drain_work);
++		}
++		break;
++	}
++	case IPI_LOGGER_INIT_A: {
++		struct scp_log_info info;
++
++		if (len < sizeof(info) || !scp->log)
++			break;
++		memcpy(&info, data, sizeof(info));
++		if (info.dram_addr + 4 > SCP_RTOS_START + 0x7f800)
++			break;
++		writel(lower_32_bits(scp->log_phys), scp->sram + info.dram_addr);
++		schedule_work(&scp->log_work);
++		break;
++	}
++	case IPI_CHRE:
++		spin_lock(&scp->nh_lock);
++		scp->nh_rx_len = len;
++		memcpy(scp->nh_rx, data, len);
++		scp->chrex_token = len;
++		spin_unlock(&scp->nh_lock);
++		complete(&scp->nh_rx_done);
++		schedule_work(&scp->chrex_work);
++		break;
++	default:
++		if (!test_and_set_bit(id, scp->ipi_seen))
++			dev_info(scp->dev, "IPI %u (%u bytes) not handled\n", id, len);
++		break;
++	}
++}
++
++static irqreturn_t scp_irq_thread(int irq, void *data)
++{
++	struct mt6771_scp *scp = data;
++	void __iomem *obj = scp->sram + SHARE_RCV;
++	u32 status = readl(scp->cfg + SCP_A_TO_HOST);
++	u32 id, len;
++
++	if (status & SCP_IRQ_WDT)
++		dev_err(scp->dev, "SCP watchdog (PC %#x)\n",
++			readl(scp->cfg + SCP_DEBUG_PC));
++	if (status & SCP_IRQ_SCP2HOST) {
++		id = readl(obj);
++		len = min_t(u32, readl(obj + 4), SHARE_DATA_SIZE);
++		memcpy_fromio(scp->rcv, obj + SHARE_DATA, len);
++		if (id < IPI_NR)
++			scp_dispatch(scp, id, scp->rcv, len);
++	}
++	writel(status & (SCP_IRQ_SCP2HOST | SCP_IRQ_WDT), scp->cfg + SCP_A_TO_HOST);
++	return IRQ_HANDLED;
++}
++
++/* ---- IIO ---- */
++
++static struct scp_sensor *to_sensor(struct iio_dev *indio)
++{
++	return *(struct scp_sensor **)iio_priv(indio);
++}
++
++#define SCP_AXIS(_type, _axis, _idx) {					\
++	.type = _type,							\
++	.modified = 1,							\
++	.channel2 = IIO_MOD_##_axis,					\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),			\
++	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |		\
++				    BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
++	.scan_index = _idx,						\
++	.scan_type = { .sign = 's', .realbits = 32, .storagebits = 32,	\
++		       .endianness = IIO_CPU },				\
++}
++
++#define SCP_VECTOR(_name, _type)					\
++static const struct iio_chan_spec _name[] = {				\
++	SCP_AXIS(_type, X, 0), SCP_AXIS(_type, Y, 1), SCP_AXIS(_type, Z, 2), \
++	IIO_CHAN_SOFT_TIMESTAMP(3),					\
++}
++
++SCP_VECTOR(scp_accel_channels, IIO_ACCEL);
++SCP_VECTOR(scp_gyro_channels, IIO_ANGL_VEL);
++SCP_VECTOR(scp_magn_channels, IIO_MAGN);
++
++static const struct iio_chan_spec scp_light_channels[] = {
++	{
++		.type = IIO_LIGHT,
++		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
++		.scan_index = 0,
++		.scan_type = { .sign = 's', .realbits = 32, .storagebits = 32,
++			       .endianness = IIO_CPU },
++	},
++	IIO_CHAN_SOFT_TIMESTAMP(1),
++};
++
++static const struct iio_chan_spec scp_prox_channels[] = {
++	{
++		.type = IIO_PROXIMITY,
++		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
++		.scan_index = 0,
++		.scan_type = { .sign = 's', .realbits = 32, .storagebits = 32,
++			       .endianness = IIO_CPU },
++	},
++	IIO_CHAN_SOFT_TIMESTAMP(1),
++};
++
++static int scp_read_once(struct scp_sensor *s, int idx, int *val)
++{
++	int ret = 0;
++
++	if (!s->buffered) {
++		reinit_completion(&s->sample);
++		s->reading = true;
++		ret = sensor_config(s, true);
++		if (!ret && !wait_for_completion_timeout(&s->sample,
++					msecs_to_jiffies(READ_TIMEOUT_MS)))
++			ret = -ETIMEDOUT;
++		sensor_config(s, false);
++		s->reading = false;
++	}
++	*val = s->last[idx];
++	return ret;
++}
++
++static int scp_read_raw(struct iio_dev *indio, struct iio_chan_spec const *ch,
++			int *val, int *val2, long mask)
++{
++	struct scp_sensor *s = to_sensor(indio);
++	int ret;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++	case IIO_CHAN_INFO_PROCESSED:
++		ret = iio_device_claim_direct_mode(indio);
++		if (ret)
++			return ret;
++		ret = scp_read_once(s, ch->scan_index, val);
++		iio_device_release_direct_mode(indio);
++		return ret ? ret : IIO_VAL_INT;
++	case IIO_CHAN_INFO_SCALE:
++		*val = 1;
++		switch (s->type) {
++		case SENSOR_TYPE_ACCELEROMETER:
++			*val2 = 1000;		/* m/s^2 */
++			break;
++		case SENSOR_TYPE_GYROSCOPE:
++			*val2 = 7505747;	/* rad/s */
++			break;
++		default:
++			*val2 = 10000;		/* gauss (1/100 uT) */
++			break;
++		}
++		return IIO_VAL_FRACTIONAL;
++	case IIO_CHAN_INFO_SAMP_FREQ:
++		*val = s->freq_hz;
++		return IIO_VAL_INT;
++	}
++	return -EINVAL;
++}
++
++static int scp_write_raw(struct iio_dev *indio, struct iio_chan_spec const *ch,
++			 int val, int val2, long mask)
++{
++	struct scp_sensor *s = to_sensor(indio);
++
++	if (mask != IIO_CHAN_INFO_SAMP_FREQ || val < 1 || val > 200)
++		return -EINVAL;
++	s->freq_hz = val;
++	return s->buffered ? sensor_config(s, true) : 0;
++}
++
++static const struct iio_info scp_iio_info = {
++	.read_raw = scp_read_raw,
++	.write_raw = scp_write_raw,
++};
++
++static int scp_buffer_postenable(struct iio_dev *indio)
++{
++	struct scp_sensor *s = to_sensor(indio);
++
++	s->buffered = true;
++	return sensor_config(s, true);
++}
++
++static int scp_buffer_predisable(struct iio_dev *indio)
++{
++	struct scp_sensor *s = to_sensor(indio);
++
++	s->buffered = false;
++	return sensor_config(s, false);
++}
++
++static const struct iio_buffer_setup_ops scp_buffer_ops = {
++	.postenable = scp_buffer_postenable,
++	.predisable = scp_buffer_predisable,
++};
++
++static void scp_kfifo_put(void *buffer)
++{
++	iio_kfifo_free(buffer);
++}
++
++static int scp_add_sensor(struct mt6771_scp *scp, int i, const char *name,
++			  u8 type, const struct iio_chan_spec *ch, int nch_spec,
++			  int nch)
++{
++	struct iio_buffer *buffer;
++	struct iio_dev *indio;
++	struct scp_sensor *s;
++	int ret, n;
++
++	indio = devm_iio_device_alloc(scp->dev, sizeof(s));
++	if (!indio)
++		return -ENOMEM;
++	/* the sensor state lives in the hub's array */
++	s = &scp->sensors[i];
++	*(struct scp_sensor **)iio_priv(indio) = s;
++	s->scp = scp;
++	s->indio = indio;
++	s->name = name;
++	s->type = type;
++	s->nch = nch;
++	s->on_change = type == SENSOR_TYPE_LIGHT || type == SENSOR_TYPE_PROXIMITY;
++	s->freq_hz = 50;
++	init_completion(&s->sample);
++
++	indio->name = name;
++	indio->info = &scp_iio_info;
++	indio->channels = ch;
++	indio->num_channels = nch_spec;
++	indio->modes = INDIO_DIRECT_MODE;
++	ret = devm_iio_kfifo_buffer_setup(scp->dev, indio, &scp_buffer_ops);
++	if (ret)
++		return ret;
++	for (n = 1; n < SCP_BUFFERS; n++) {
++		buffer = iio_kfifo_allocate();
++		if (!buffer)
++			return -ENOMEM;
++		ret = devm_add_action_or_reset(scp->dev, scp_kfifo_put, buffer);
++		if (ret)
++			return ret;
++		ret = iio_device_attach_buffer(indio, buffer);
++		if (ret)
++			return ret;
++	}
++	return devm_iio_device_register(scp->dev, indio);
++}
++
++/* ---- probe ---- */
++
++static int mt6771_scp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct reserved_mem *rmem;
++	struct device_node *np;
++	struct mt6771_scp *scp;
++	struct clk *clk;
++	int ret;
++
++	scp = devm_kzalloc(dev, sizeof(*scp), GFP_KERNEL);
++	if (!scp)
++		return -ENOMEM;
++	scp->dev = dev;
++	mutex_init(&scp->send_lock);
++	mutex_init(&scp->hub_lock);
++	spin_lock_init(&scp->notify_lock);
++	spin_lock_init(&scp->nh_lock);
++	init_completion(&scp->ready_done);
++	init_completion(&scp->nh_rx_done);
++	init_completion(&scp->hub_rsp);
++	INIT_WORK(&scp->hub_up_work, hub_up_work);
++	INIT_WORK(&scp->no_sleep_work, no_sleep_work);
++	INIT_WORK(&scp->drain_work, drain_work);
++	INIT_WORK(&scp->chrex_work, chrex_work);
++	scp->seq = 1;
++
++	scp->sram = devm_platform_ioremap_resource_byname(pdev, "sram");
++	if (IS_ERR(scp->sram))
++		return PTR_ERR(scp->sram);
++	scp->cfg = devm_platform_ioremap_resource_byname(pdev, "cfg");
++	if (IS_ERR(scp->cfg))
++		return PTR_ERR(scp->cfg);
++	scp->clkctrl = devm_platform_ioremap_resource_byname(pdev, "clkctrl");
++	if (IS_ERR(scp->clkctrl))
++		return PTR_ERR(scp->clkctrl);
++	scp->scpsys = devm_platform_ioremap_resource_byname(pdev, "scpsys");
++	if (IS_ERR(scp->scpsys))
++		return PTR_ERR(scp->scpsys);
++
++	clk = devm_clk_get_enabled(dev, "main");
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk), "no clock\n");
++
++	np = of_parse_phandle(dev->of_node, "memory-region", 0);
++	rmem = np ? of_reserved_mem_lookup(np) : NULL;
++	of_node_put(np);
++	if (!rmem)
++		return dev_err_probe(dev, -ENODEV, "no sensor FIFO memory\n");
++	scp->fifo_phys = rmem->base;
++	scp->fifo_bytes = rmem->size;
++	scp->fifo = devm_memremap(dev, rmem->base, rmem->size, MEMREMAP_WC);
++	if (IS_ERR(scp->fifo))
++		return PTR_ERR(scp->fifo);
++	scp->fifo->rp = 0;
++	scp->fifo->wp = 0;
++	scp->fifo->size = (scp->fifo_bytes - sizeof(struct sensor_fifo)) /
++			  sizeof(struct data_unit) * sizeof(struct data_unit);
++
++	np = of_parse_phandle(dev->of_node, "memory-region", 1);
++	rmem = np ? of_reserved_mem_lookup(np) : NULL;
++	of_node_put(np);
++	if (rmem && rmem->size >= SCP_LOG_BUF_LEN + 64) {
++		scp->log_phys = rmem->base;
++		scp->log = devm_memremap(dev, rmem->base, rmem->size, MEMREMAP_WC);
++		if (IS_ERR(scp->log))
++			scp->log = NULL;
++		else
++			scp_log_init(scp);
++	}
++	INIT_WORK(&scp->log_work, log_work);
++
++	/* LK loads the SCP only when the scp node reads "okay" */
++	if (readl(scp->clkctrl + SCP_SRAM_PDN) ||
++	    !readl(scp->sram + SCP_REGION_INFO + 4))
++		return dev_err_probe(dev, -ENODEV,
++				     "SCP not loaded by the bootloader\n");
++
++	scp->irq = platform_get_irq(pdev, 0);
++	if (scp->irq < 0)
++		return scp->irq;
++	writel(SCP_IRQ_SCP2HOST | SCP_IRQ_WDT, scp->cfg + SCP_A_TO_HOST);
++	ret = devm_request_threaded_irq(dev, scp->irq, NULL, scp_irq_thread,
++					IRQF_ONESHOT, "scp", scp);
++	if (ret)
++		return ret;
++
++	ret = scp_add_sensor(scp, 0, "scp-accel", SENSOR_TYPE_ACCELEROMETER,
++			     scp_accel_channels, ARRAY_SIZE(scp_accel_channels), 3);
++	if (!ret)
++		ret = scp_add_sensor(scp, 1, "scp-gyro", SENSOR_TYPE_GYROSCOPE,
++				     scp_gyro_channels, ARRAY_SIZE(scp_gyro_channels), 3);
++	if (!ret)
++		ret = scp_add_sensor(scp, 2, "scp-magn", SENSOR_TYPE_MAGNETIC_FIELD,
++				     scp_magn_channels, ARRAY_SIZE(scp_magn_channels), 3);
++	if (!ret)
++		ret = scp_add_sensor(scp, 3, "scp-light", SENSOR_TYPE_LIGHT,
++				     scp_light_channels, ARRAY_SIZE(scp_light_channels), 1);
++	if (!ret)
++		ret = scp_add_sensor(scp, 4, "scp-proximity", SENSOR_TYPE_PROXIMITY,
++				     scp_prox_channels, ARRAY_SIZE(scp_prox_channels), 1);
++	if (ret)
++		return ret;
++
++	/* start the core (restart it if it already runs: no ready IPI then) */
++	if (readl(scp->cfg + SCP_CFG_RESET)) {
++		writel(0, scp->cfg + SCP_CFG_RESET);
++		udelay(100);
++	}
++	writel(1, scp->cfg + SCP_CFG_RESET);
++	if (!wait_for_completion_timeout(&scp->ready_done,
++					 msecs_to_jiffies(SCP_READY_TIMEOUT_MS)))
++		dev_warn(dev, "SCP not ready (PC %#x)\n",
++			 readl(scp->cfg + SCP_DEBUG_PC));
++	platform_set_drvdata(pdev, scp);
++	if (scp->log)
++		debugfs_create_file("log", 0400, debugfs_create_dir("mt6771-scp", NULL),
++				    scp, &scp_log_fops);
++	return 0;
++}
++
++static const struct of_device_id mt6771_scp_of_match[] = {
++	{ .compatible = "mediatek,mt6771-scp-tinysys" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt6771_scp_of_match);
++
++static struct platform_driver mt6771_scp_driver = {
++	.probe = mt6771_scp_probe,
++	.driver = {
++		.name = "mt6771-scp",
++		.of_match_table = mt6771_scp_of_match,
++		/* waits up to SCP_READY_TIMEOUT_MS for the SCP */
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++	},
++};
++module_platform_driver(mt6771_scp_driver);
++
++MODULE_DESCRIPTION("MT6771 SCP (tinysys) and its sensor hub");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/mediatek/mt6771-spm.c b/drivers/soc/mediatek/mt6771-spm.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa89d5c41c4428c7b6cbf8264e33edee6177b182
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6771-spm.c
+@@ -0,0 +1,354 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6771 SPM: resource requests and system suspend.
++ *
++ * Resource requests. On MediaTek's kernel the SPM firmware holds the AP's
++ * requests for the 26 MHz clock, the bus/DRAM power source and DRAM
++ * (SPM_SRC_REQ reads 0x83 on 4.14). Without them, when UFS suspends it
++ * drops its reference-clock request; then nothing keeps 26 MHz, the
++ * display goes white and cores in power-down never wake (an RCU stall,
++ * measured on 6.12 in suspend with pm_test=devices). This sets the same
++ * requests at probe (after starting the firmware, which clears them) and
++ * keeps them, except across the SPM's own suspend: there they are what
++ * MediaTek's drivers drop (spm_resource_req()) so the SPM can turn 26 MHz
++ * and DRAM down.
++ *
++ * System suspend. The MT6771's ATF does not implement PSCI SYSTEM_SUSPEND
++ * usefully (the call reset the phone, measured). MediaTek's kernel never
++ * makes it: spm_go_to_sleep() (drivers/misc/mediatek/base/power/spm_v4)
++ * sets the SPM firmware's suspend scenario up through SiP calls and enters
++ * the vendor's suspend idle state through PSCI CPU_SUSPEND, with MCDI
++ * paused, and tells the SSPM around it (spm_to_sspm_command(): without
++ * that, the SSPM's MCDI task never answered again after the first
++ * suspend, measured). This does the same, after starting the SPM firmware
++ * at probe as spm_module_init() and spm_vcorefs_init() do (Vcore and DRAM
++ * frequency scaling off). Left out: the GIC masking and the CIRQ (edge
++ * interrupts that arrive while the GIC is off are lost; the PMIC's is a
++ * level).
++ */
++#include <linux/arm-smccc.h>
++#include <linux/bits.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/psci.h>
++#include <linux/regmap.h>
++#include <linux/soc/mediatek/mtk-mcdi.h>
++#include <linux/soc/mediatek/mtk_sip_svc.h>
++#include <linux/suspend.h>
++
++#define SPM_SRC_REQ		0x0b8
++#define PWR_STATUS		0x180
++#define PWR_STATUS_2ND		0x184
++#define SPM_APSRC_REQ		BIT(0)
++#define SPM_F26M_REQ		BIT(1)
++#define SPM_DDREN_REQ		BIT(7)
++
++/* Wake-up status the firmware leaves (vendor __spm_get_wakeup_status()) */
++#define PCM_REG_DATA_INI	0x028	/* PC if the PCM asserted */
++#define PCM_REG13_DATA		0x134
++#define SPM_WAKEUP_STA		0x15c
++#define SPM_BSI_D1_SR		0x420	/* sleep time, 32 kHz ticks */
++#define SPM_SW_DEBUG		0x604
++#define SPM_SW_RSV_0		0x608	/* wake-up events (PCM R12) */
++
++/* SiP calls (vendor mtk_secure_api.h) */
++#define MTK_SIP_SPM_SUSPEND_ARGS	MTK_SIP_SMC_CMD(0x220)
++#define MTK_SIP_SPM_FIRMWARE_STATUS	MTK_SIP_SMC_CMD(0x221)
++#define MTK_SIP_SPM_VCOREFS_ARGS	MTK_SIP_SMC_CMD(0x226)
++#define MTK_SIP_SPM_ARGS		MTK_SIP_SMC_CMD(0x22a)
++#define MTK_SIP_SPM_GET_PWR_CTRL_ARGS	MTK_SIP_SMC_CMD(0x22b)
++#define MTK_SIP_SPM_PWR_CTRL_ARGS	MTK_SIP_SMC_CMD(0x224)
++
++/* SPM_ARGS commands */
++#define SPM_ARGS_SPMFW_IDX	0
++#define SPM_ARGS_PCM_WDT	8
++/* VCOREFS_ARGS commands */
++#define VCOREFS_DVFSFW_INIT	0
++#define VCOREFS_GO		1
++#define VCOREFS_PWRAP_CMD	3
++/* GET_PWR_CTRL_ARGS: the suspend scenario's wake sources */
++#define SPM_PWR_CTRL_SUSPEND	17
++#define PW_WAKE_SRC		12
++
++/*
++ * Firmware index 0 (LPDDR4X, 2 channels), no external buck; the Vcore
++ * PMIC codes for 0.725 V and 0.8 V; vcorefs flags 0x8418: the common
++ * scenario with Vcore and DRAM scaling and MMSYS DVFS off.
++ */
++#define SPMFW_IDX		0
++#define VCORE_PMIC_LOW		36
++#define VCORE_PMIC_HIGH		48
++#define VCOREFS_FLAGS		0x8418
++
++/*
++ * Suspend flags, the vendor's slp_spm_flags for the MT6771: Vcore DVS and
++ * DFS off, no ATF abort, the suspend option; CPU, infra and DDR PHY power
++ * down.
++ */
++#define SPM_SUSPEND_FLAGS	0x80098
++#define PCM_WDT_SEC		30
++#define PCM_TIMER_MAX		(0xffffffff - PCM_WDT_SEC * 32768)
++
++/*
++ * SSPM IPI pin 6 (SPM_SUSPEND): mailbox 1, slots 2-9, doorbell bit 1
++ * (vendor sspm/mt6771/sspm_ipi_mbox_layout.h). The command, then 7 words
++ * of arguments; the SSPM answers in slot 2.
++ */
++#define SSPM_MBOX_IN_IRQ	0x0
++#define SSPM_MBOX_OUT_IRQ	0x4
++#define SSPM_SPM_SLOT		2
++#define SSPM_SPM_LEN		8
++#define SSPM_SPM_IRQ		BIT(1)
++
++/* SSPM commands (vendor mtk_spm_internal.h) */
++#define SSPM_SPM_SUSPEND		0
++#define SSPM_SPM_RESUME			1
++#define SSPM_SPM_SUSPEND_PREPARE	8
++#define SSPM_SPM_POST_SUSPEND		9
++
++/* The vendor tree's "suspend" idle state: cluster power-down, state 5 */
++#define MT6771_PSCI_SUSPEND	0x01010005
++
++static uint pcm_flags = SPM_SUSPEND_FLAGS;
++module_param(pcm_flags, uint, 0644);
++MODULE_PARM_DESC(pcm_flags, "SPM suspend flags (vendor SPM_FLAG_*)");
++
++/*
++ * Off until it is stable: the first runs left the display tinted (the
++ * suspend ran with LK's display pipeline live, which the vendor's
++ * suspend refuses: "CANNOT SLEEP: power domain(s) still on").
++ */
++/*
++ * The suspend's wake sources (PCM R12 bits, pcm_def_mt6771.h): 0 keeps
++ * ATF's. An awake SCP (sensor hub, its sleep off) holds R12_SCP_SPM_IRQ_B
++ * (bit 11) and ends every suspend at once; clearing it here lets the SPM
++ * sleep with the SCP's request granted.
++ */
++static uint wake_mask;
++module_param(wake_mask, uint, 0644);
++MODULE_PARM_DESC(wake_mask, "SPM suspend wake sources (R12 bits), 0 for ATF's");
++
++static bool deep;
++module_param(deep, bool, 0444);
++MODULE_PARM_DESC(deep, "Start the SPM firmware and suspend through it");
++
++static struct regmap *spm_regmap;
++static void __iomem *sspm_slots, *sspm_ctrl;
++
++static unsigned long spm_sip(unsigned long id, unsigned long a1,
++			     unsigned long a2, unsigned long a3)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(id, a1, a2, a3, 0, 0, 0, 0, &res);
++	return res.a0;
++}
++
++#define SPM_HELD_REQ		(SPM_APSRC_REQ | SPM_F26M_REQ | SPM_DDREN_REQ)
++
++/* sspm_ipi_send_sync() in polling mode, as spm_to_sspm_command() */
++static int sspm_spm_command(u32 cmd)
++{
++	u32 val;
++	int i, ret;
++
++	if (readl(sspm_ctrl + SSPM_MBOX_OUT_IRQ) & SSPM_SPM_IRQ)
++		return -EBUSY;
++	writel(cmd, sspm_slots + 4 * SSPM_SPM_SLOT);
++	for (i = 1; i < SSPM_SPM_LEN; i++)
++		writel(0, sspm_slots + 4 * (SSPM_SPM_SLOT + i));
++	writel(SSPM_SPM_IRQ, sspm_ctrl + SSPM_MBOX_IN_IRQ);
++
++	ret = readl_poll_timeout_atomic(sspm_ctrl + SSPM_MBOX_OUT_IRQ, val,
++					val & SSPM_SPM_IRQ, 1, 500000);
++	if (ret) {
++		pr_warn("mt6771-spm: SSPM command %u: no answer\n", cmd);
++		return ret;
++	}
++	writel(SSPM_SPM_IRQ, sspm_ctrl + SSPM_MBOX_OUT_IRQ);
++	ret = readl(sspm_slots + 4 * SSPM_SPM_SLOT);
++	if (ret < 0)
++		pr_warn("mt6771-spm: SSPM command %u: %d\n", cmd, ret);
++	return ret;
++}
++
++/*
++ * Power domains that must be off for the SPM's suspend, as MediaTek's
++ * kernel checks them (subsys_if_on(), clk-mt6771-pg.c: DIS, MFG, ISP,
++ * MFG_CORE0/1, VEN, MFG_2D, MFG_ASYNC, CAM, VPU_TOP/CORE0/CORE1, VDE; MD1,
++ * CONN and AUDIO only warn there). Suspending with the display path on
++ * left the screen tinted until a later reboot (measured).
++ */
++static const struct {
++	u8 bit;
++	const char *name;
++} spm_busy_domains[] = {
++	{ 3, "DIS" }, { 4, "MFG" }, { 5, "ISP" }, { 7, "MFG_CORE0" },
++	{ 20, "MFG_CORE1" }, { 21, "VEN" }, { 22, "MFG_2D" },
++	{ 23, "MFG_ASYNC" }, { 25, "CAM" }, { 26, "VPU_TOP" },
++	{ 27, "VPU_CORE0" }, { 28, "VPU_CORE1" }, { 31, "VDE" },
++};
++
++static int mt6771_spm_domains_off(void)
++{
++	u32 sta, sta2;
++	int i, busy = 0;
++
++	regmap_read(spm_regmap, PWR_STATUS, &sta);
++	regmap_read(spm_regmap, PWR_STATUS_2ND, &sta2);
++	sta &= sta2;
++	for (i = 0; i < ARRAY_SIZE(spm_busy_domains); i++) {
++		if (!(sta & BIT(spm_busy_domains[i].bit)))
++			continue;
++		pr_warn("mt6771-spm: cannot sleep: %s is on\n",
++			spm_busy_domains[i].name);
++		busy++;
++	}
++	return busy ? -EBUSY : 0;
++}
++
++static int mt6771_spm_hold(struct regmap *regmap)
++{
++	return regmap_set_bits(regmap, SPM_SRC_REQ, SPM_HELD_REQ);
++}
++
++static int mt6771_spm_suspend_enter(suspend_state_t state)
++{
++	u32 r12, wake_sta, r13, timer, debug, pc;
++	unsigned long wake_src;
++	int ret;
++
++	ret = mt6771_spm_domains_off();
++	if (ret)
++		return ret;
++
++	if (wake_mask)
++		spm_sip(MTK_SIP_SPM_PWR_CTRL_ARGS, SPM_PWR_CTRL_SUSPEND,
++			PW_WAKE_SRC, wake_mask);
++	wake_src = spm_sip(MTK_SIP_SPM_GET_PWR_CTRL_ARGS, SPM_PWR_CTRL_SUSPEND,
++			   PW_WAKE_SRC, 0);
++	spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 1, PCM_WDT_SEC);
++	mtk_mcdi_pause(true);
++	sspm_spm_command(SSPM_SPM_SUSPEND);
++
++	regmap_clear_bits(spm_regmap, SPM_SRC_REQ, SPM_HELD_REQ);
++	spm_sip(MTK_SIP_SPM_SUSPEND_ARGS, pcm_flags, 0, PCM_TIMER_MAX);
++	ret = psci_cpu_suspend_enter(MT6771_PSCI_SUSPEND);
++	mt6771_spm_hold(spm_regmap);
++
++	sspm_spm_command(SSPM_SPM_RESUME);
++	mtk_mcdi_pause(false);
++	spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 0, 0);
++
++	regmap_read(spm_regmap, SPM_SW_RSV_0, &r12);
++	regmap_read(spm_regmap, SPM_WAKEUP_STA, &wake_sta);
++	regmap_read(spm_regmap, PCM_REG13_DATA, &r13);
++	regmap_read(spm_regmap, SPM_BSI_D1_SR, &timer);
++	regmap_read(spm_regmap, SPM_SW_DEBUG, &debug);
++	regmap_read(spm_regmap, PCM_REG_DATA_INI, &pc);
++	pr_info("mt6771-spm: suspend %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x\n",
++		ret, wake_src, r12, wake_sta, r13,
++		(u32)div_u64((u64)timer * 1000, 32768), debug, pc);
++
++	return ret;
++}
++
++/* The vendor sends these from its PM notifier; here only for "mem" */
++static int mt6771_spm_suspend_begin(suspend_state_t state)
++{
++	int ret = sspm_spm_command(SSPM_SPM_SUSPEND_PREPARE);
++
++	return ret < 0 ? ret : 0;
++}
++
++static void mt6771_spm_suspend_end(void)
++{
++	sspm_spm_command(SSPM_SPM_POST_SUSPEND);
++}
++
++static const struct platform_suspend_ops mt6771_spm_suspend_ops = {
++	.valid = suspend_valid_only_mem,
++	.begin = mt6771_spm_suspend_begin,
++	.enter = mt6771_spm_suspend_enter,
++	.end = mt6771_spm_suspend_end,
++};
++
++/* As spm_module_init() and spm_vcorefs_init() */
++static void mt6771_spm_start_firmware(struct device *dev)
++{
++	unsigned long status = spm_sip(MTK_SIP_SPM_FIRMWARE_STATUS, 0, 0, 0);
++
++	spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_SPMFW_IDX, SPMFW_IDX, 0);
++	spm_sip(MTK_SIP_SPM_VCOREFS_ARGS, VCOREFS_PWRAP_CMD, 0, VCORE_PMIC_LOW);
++	spm_sip(MTK_SIP_SPM_VCOREFS_ARGS, VCOREFS_PWRAP_CMD, 1, VCORE_PMIC_HIGH);
++	spm_sip(MTK_SIP_SPM_VCOREFS_ARGS, VCOREFS_DVFSFW_INIT, 0, 0);
++	spm_sip(MTK_SIP_SPM_VCOREFS_ARGS, VCOREFS_GO, VCOREFS_FLAGS, 0);
++	dev_info(dev, "SPM firmware started (status %lu)\n", status);
++}
++
++static int mt6771_spm_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	u32 val;
++	int ret;
++
++	spm_regmap = syscon_node_to_regmap(dev->parent->of_node);
++	if (IS_ERR(spm_regmap))
++		return dev_err_probe(dev, PTR_ERR(spm_regmap), "no SPM regmap\n");
++
++	if (deep) {
++		struct device_node *np;
++
++		np = of_parse_phandle(dev->of_node, "mediatek,sspm-mbox", 0);
++		if (!np)
++			return dev_err_probe(dev, -EINVAL, "no SSPM mailbox\n");
++		sspm_slots = devm_of_iomap(dev, np, 0, NULL);
++		sspm_ctrl = devm_of_iomap(dev, np, 1, NULL);
++		of_node_put(np);
++		if (IS_ERR(sspm_slots) || IS_ERR(sspm_ctrl))
++			return dev_err_probe(dev, -ENOMEM, "SSPM mailbox\n");
++		mt6771_spm_start_firmware(dev);
++	}
++
++	ret = mt6771_spm_hold(spm_regmap);
++	if (ret)
++		return ret;
++	regmap_read(spm_regmap, SPM_SRC_REQ, &val);
++	dev_info(dev, "SPM_SRC_REQ 0x%x\n", val);
++
++	if (deep)
++		suspend_set_ops(&mt6771_spm_suspend_ops);
++	return 0;
++}
++
++/* The SPM keeps its registers in suspend; set again in case ATF changed it */
++static int mt6771_spm_resume(struct device *dev)
++{
++	return mt6771_spm_hold(spm_regmap);
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(mt6771_spm_pm_ops, NULL, mt6771_spm_resume);
++
++static const struct of_device_id mt6771_spm_of_match[] = {
++	{ .compatible = "mediatek,mt6771-spm-resources" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt6771_spm_of_match);
++
++static struct platform_driver mt6771_spm_driver = {
++	.driver = {
++		.name = "mt6771-spm",
++		.of_match_table = mt6771_spm_of_match,
++		.pm = pm_sleep_ptr(&mt6771_spm_pm_ops),
++	},
++	.probe = mt6771_spm_probe,
++};
++module_platform_driver(mt6771_spm_driver);
++
++MODULE_DESCRIPTION("MT6771 SPM resource requests and system suspend");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/mediatek/mtk-lk-fb.c b/drivers/soc/mediatek/mtk-lk-fb.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..28528069e27e714e036b99aaa546bcf953d5564a
+--- /dev/null
++++ b/drivers/soc/mediatek/mtk-lk-fb.c
+@@ -0,0 +1,249 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek LK framebuffer handover.
++ *
++ * MediaTek's bootloader (LK) brings up the panel and leaves the display
++ * pipeline scanning out a framebuffer. Its device tree fixups name the
++ * framebuffer area in /chosen (atag,videolfb-fb_base_h/_l and
++ * atag,videolfb-vramSize), but not its geometry or pixel format. Those
++ * are read here from the display overlay engines (OVL) LK left running:
++ * each enabled layer holds its address, size, pitch and color format.
++ * The layer that scans out of LK's area becomes a "simple-framebuffer"
++ * device, so the kernel has a screen console before any display driver
++ * runs. A display driver taking over later removes it through the
++ * aperture helpers, as it does for firmware framebuffers.
++ *
++ * LK's framebuffer area is the reservation LK adds to /reserved-memory
++ * as mblock-N-framebuffer (N is its index in LK's list). The device tree
++ * cannot name it itself: LK refuses to boot a tree whose static
++ * reservations overlap its own. The atag,videolfb-fb_base and -vramSize
++ * properties LK leaves in /chosen are not used: on the Titan Pocket they
++ * keep the dtbo's placeholder values.
++ *
++ * The registers are only read when the display power domain is on and the
++ * OVL's clock is ungated; reading a powered-off or gated block can hang
++ * the bus. The engines are mapped without claiming their regions, so the
++ * real display drivers can still claim them.
++ *
++ * Register layout as in the MT8183 (mtk_disp_ovl.c, mtk-pm-domains.h,
++ * clk-mt8183-mm.c), which the MT6771 shares.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/io.h>
++#include <linux/ioport.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_data/simplefb.h>
++#include <linux/platform_device.h>
++
++#define SPM_PWR_STATUS			0x180
++#define SPM_PWR_STATUS_2ND		0x184
++#define SPM_PWR_STATUS_DISP		BIT(3)
++
++#define MMSYS_CG_CON0			0x100
++
++#define OVL_EN				0x00c
++#define OVL_ROI_SIZE			0x020
++#define OVL_SRC_CON			0x02c
++#define OVL_CON(n)			(0x030 + 0x20 * (n))
++#define OVL_SRC_SIZE(n)			(0x038 + 0x20 * (n))
++#define OVL_PITCH(n)			(0x044 + 0x20 * (n))
++#define OVL_ADDR(n)			(0xf40 + 0x20 * (n))
++
++#define OVL_CON_AEN			BIT(8)
++#define OVL_CON_CLRFMT			GENMASK(15, 12)
++#define OVL_CON_BYTE_SWAP		BIT(24)
++
++struct mtk_lk_fb_ovl {
++	const char *name;	/* reg-names entry */
++	unsigned int cg_bit;	/* its gate in MMSYS_CG_CON0 */
++	unsigned int layers;
++};
++
++static const struct mtk_lk_fb_ovl mt6771_ovls[] = {
++	{ "ovl0", 20, 4 },
++	{ "ovl0-2l", 21, 2 },
++};
++
++struct mtk_lk_fb_layer {
++	u32 addr, con, size, pitch;
++};
++
++static void __iomem *mtk_lk_fb_map(struct platform_device *pdev, const char *name)
++{
++	struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++
++	if (!res)
++		return NULL;
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
++}
++
++/* simplefb's name for the layer's color format, or NULL */
++static const char *mtk_lk_fb_format(u32 con, unsigned int *bpp)
++{
++	bool swap = con & OVL_CON_BYTE_SWAP;
++	bool alpha = con & OVL_CON_AEN;
++
++	switch (FIELD_GET(OVL_CON_CLRFMT, con)) {
++	case 0:			/* RGB565 (MT8183 numbering) */
++		*bpp = 2;
++		return swap ? NULL : "r5g6b5";
++	case 1:			/* RGB888 */
++		*bpp = 3;
++		return swap ? NULL : "r8g8b8";
++	case 2:			/* ARGB8888: XRGB in memory, byte swap = XBGR */
++		*bpp = 4;
++		/*
++		 * With blending on, the alpha byte must be opaque; simplefb
++		 * fills it for the a8 formats.
++		 */
++		if (swap)
++			return alpha ? "a8b8g8r8" : "x8b8g8r8";
++		return alpha ? "a8r8g8b8" : "x8r8g8b8";
++	default:
++		return NULL;
++	}
++}
++
++static int mtk_lk_fb_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct simplefb_platform_data pd = {};
++	struct mtk_lk_fb_layer pick = {};
++	struct platform_device *fb;
++	struct resource mem = {}, area = {};
++	void __iomem *spm, *mmsys;
++	struct device_node *rmem, *np;
++	unsigned int i, n, bpp;
++	bool found = false, in_area = false;
++	u32 cg;
++
++	rmem = of_find_node_by_path("/reserved-memory");
++	for_each_child_of_node(rmem, np) {
++		if (of_node_name_prefix(np, "mblock-") &&
++		    strstr(np->name, "-framebuffer") &&
++		    !of_address_to_resource(np, 0, &area)) {
++			of_node_put(np);
++			break;
++		}
++	}
++	of_node_put(rmem);
++	if (!area.end)
++		dev_warn(dev, "no mblock-N-framebuffer: cannot tell LK's layer apart\n");
++	else
++		dev_info(dev, "LK framebuffer area %pR\n", &area);
++
++	spm = mtk_lk_fb_map(pdev, "spm");
++	mmsys = mtk_lk_fb_map(pdev, "mmsys");
++	if (!spm || !mmsys)
++		return -ENOMEM;
++	if (!(readl(spm + SPM_PWR_STATUS) & SPM_PWR_STATUS_DISP) ||
++	    !(readl(spm + SPM_PWR_STATUS_2ND) & SPM_PWR_STATUS_DISP)) {
++		dev_info(dev, "display power domain is off: nothing to hand over\n");
++		return -ENODEV;
++	}
++	cg = readl(mmsys + MMSYS_CG_CON0);
++
++	for (i = 0; i < ARRAY_SIZE(mt6771_ovls); i++) {
++		const struct mtk_lk_fb_ovl *o = &mt6771_ovls[i];
++		void __iomem *ovl;
++		u32 src_con;
++
++		if (cg & BIT(o->cg_bit)) {
++			dev_info(dev, "%s: clock gated\n", o->name);
++			continue;
++		}
++		ovl = mtk_lk_fb_map(pdev, o->name);
++		if (!ovl)
++			continue;
++		src_con = readl(ovl + OVL_SRC_CON);
++		dev_info(dev, "%s: en %x roi %x src_con %x\n", o->name,
++			 readl(ovl + OVL_EN), readl(ovl + OVL_ROI_SIZE), src_con);
++
++		for (n = 0; n < o->layers; n++) {
++			struct mtk_lk_fb_layer l;
++
++			if (!(src_con & BIT(n)))
++				continue;
++			l.addr = readl(ovl + OVL_ADDR(n));
++			l.con = readl(ovl + OVL_CON(n));
++			l.size = readl(ovl + OVL_SRC_SIZE(n));
++			l.pitch = readl(ovl + OVL_PITCH(n)) & 0xffff;
++			dev_info(dev, "%s layer %u: addr %08x con %08x size %08x pitch %u\n",
++				 o->name, n, l.addr, l.con, l.size, l.pitch);
++			/* the first layer in LK's area, else the first one */
++			if (!in_area && area.end && l.addr >= area.start &&
++			    l.addr <= area.end) {
++				pick = l;
++				found = in_area = true;
++			} else if (!found) {
++				pick = l;
++				found = true;
++			}
++		}
++	}
++	if (!found) {
++		dev_info(dev, "no enabled overlay layer: nothing to hand over\n");
++		return -ENODEV;
++	}
++
++	pd.width = pick.size & 0xffff;
++	pd.height = pick.size >> 16;
++	pd.stride = pick.pitch;
++	pd.format = mtk_lk_fb_format(pick.con, &bpp);
++	if (!pd.format || !pd.width || !pd.height || pd.stride < pd.width * bpp) {
++		dev_err(dev, "layer at %08x: unusable format %08x or geometry %ux%u/%u\n",
++			pick.addr, pick.con, pd.width, pd.height, pd.stride);
++		return -EINVAL;
++	}
++
++	mem.flags = IORESOURCE_MEM;
++	mem.start = pick.addr;
++	mem.end = mem.start + (resource_size_t)pd.stride * pd.height - 1;
++	/*
++	 * simplefb maps the framebuffer as I/O memory, which arm64 refuses
++	 * for RAM the kernel maps itself, and RAM the kernel owns may be
++	 * handed out under the screen: LK must have reserved it no-map.
++	 */
++	if (region_intersects(mem.start, resource_size(&mem), IORESOURCE_SYSTEM_RAM,
++			      IORES_DESC_NONE) != REGION_DISJOINT) {
++		dev_err(dev, "framebuffer %pR is kernel RAM: reserve it no-map in /reserved-memory\n",
++			&mem);
++		return -EBUSY;
++	}
++
++	fb = platform_device_register_resndata(dev, "simple-framebuffer", 0, &mem, 1,
++					       &pd, sizeof(pd));
++	if (IS_ERR(fb))
++		return PTR_ERR(fb);
++	platform_set_drvdata(pdev, fb);
++	dev_info(dev, "simple-framebuffer %pR: %ux%u, stride %u, %s\n",
++		 &mem, pd.width, pd.height, pd.stride, pd.format);
++	return 0;
++}
++
++static void mtk_lk_fb_remove(struct platform_device *pdev)
++{
++	platform_device_unregister(platform_get_drvdata(pdev));
++}
++
++static const struct of_device_id mtk_lk_fb_of_match[] = {
++	{ .compatible = "mediatek,mt6771-lk-framebuffer" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mtk_lk_fb_of_match);
++
++static struct platform_driver mtk_lk_fb_driver = {
++	.driver = {
++		.name = "mtk-lk-fb",
++		.of_match_table = mtk_lk_fb_of_match,
++	},
++	.probe = mtk_lk_fb_probe,
++	.remove = mtk_lk_fb_remove,
++};
++module_platform_driver(mtk_lk_fb_driver);
++
++MODULE_DESCRIPTION("MediaTek LK framebuffer handover");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/mediatek/mtk-mcdi.c b/drivers/soc/mediatek/mtk-mcdi.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a56e138bf75d705acc775510d077596ebb2b3e7
+--- /dev/null
++++ b/drivers/soc/mediatek/mtk-mcdi.c
+@@ -0,0 +1,196 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MCDI (multi-core deep idle) for the MT6771.
++ *
++ * When a core or cluster enters PSCI power-down (the mcdi-cpu and
++ * mcdi-cluster idle states), ATF switches it off and the SSPM firmware's
++ * MCDI task powers it back on when it is woken - but only cores in the
++ * available-CPU mask the kernel keeps in SSPM mailbox 3. Nobody else sets
++ * that mask: left at 0, a core that powers down never comes back.
++ *
++ * This keeps the mask equal to the online CPUs, as MediaTek's kernel does
++ * (drivers/misc/mediatek/base/power/mcdi, mailbox layout mtk_mcdi_reg.h):
++ * set once before cpuidle can use the states, and on every hotplug.
++ *
++ * Hotplug follows MediaTek's kernel: MCDI is paused from before PSCI
++ * CPU_ON until the new core is online, and from before a core goes down
++ * until it is dead; the mask is written before MCDI resumes. Run with
++ * MCDI live, bring-up failed or hung (measured on 6.12).
++ *
++ * While MCDI is paused nothing may power down in idle: a core that does
++ * never wakes (offlining a core hung the phone, measured). MediaTek's idle
++ * governor sees the pause; cpuidle-psci does not, so cpuidle is paused
++ * for the same window. In suspend it is paused already (cpuhp_tasks_frozen).
++ *
++ * PSCI CPU_OFF only parks the core in ATF. MediaTek's kernel then cuts
++ * its power from another CPU with a SiP call (and the cluster's, when its
++ * last core went), drivers/misc/mediatek/base/power/cpuhotplug; without
++ * it the next CPU_ON failed (measured). The cluster's PLL and buck stay
++ * on here; the vendor also switches those off with the cluster.
++ */
++#include <linux/arm-smccc.h>
++#include <linux/cpu.h>
++#include <linux/cpuhotplug.h>
++#include <linux/cpuidle.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/printk.h>
++#include <linux/spinlock.h>
++
++#include <linux/soc/mediatek/mtk-mcdi.h>
++#include <linux/soc/mediatek/mtk_sip_svc.h>
++
++#include <asm/cputype.h>
++#include <asm/smp_plat.h>
++
++/* SSPM mailbox 3 slots (32 bits each) */
++#define MCDI_MBOX_PAUSE_ACTION		6
++#define MCDI_MBOX_AVAIL_CPU_MASK	7
++#define MCDI_MBOX_CPU_ISOLATION_MASK	12
++#define MCDI_MBOX_PAUSE_ACK		13
++
++/* MediaTek SiP calls: power a parked core or an empty cluster off */
++#define MTK_SIP_POWER_DOWN_CLUSTER	MTK_SIP_SMC_CMD(0x210)
++#define MTK_SIP_POWER_DOWN_CORE		MTK_SIP_SMC_CMD(0x212)
++
++static void __iomem *mcdi_mbox;
++static DEFINE_SPINLOCK(mcdi_lock);
++
++static void mcdi_write(int slot, u32 val)
++{
++	writel(val, mcdi_mbox + 4 * slot);
++}
++
++/* The MCDI task stops (or resumes) and acknowledges */
++static void mcdi_pause(bool pause)
++{
++	u32 ack;
++
++	mcdi_write(MCDI_MBOX_PAUSE_ACTION, pause);
++	if (readl_poll_timeout_atomic(mcdi_mbox + 4 * MCDI_MBOX_PAUSE_ACK, ack,
++				      ack == pause, 1, 10000))
++		pr_warn("mcdi: no %s acknowledge\n", pause ? "pause" : "resume");
++}
++
++/*
++ * Also for system suspend through the SPM (mt6771-spm), which MediaTek's
++ * kernel runs with MCDI paused (mcdi_task_pause()).
++ */
++void mtk_mcdi_pause(bool pause)
++{
++	unsigned long flags;
++
++	if (!mcdi_mbox)
++		return;
++	spin_lock_irqsave(&mcdi_lock, flags);
++	mcdi_pause(pause);
++	spin_unlock_irqrestore(&mcdi_lock, flags);
++}
++
++static void mcdi_hotplug_enter(void)
++{
++	if (!cpuhp_tasks_frozen)
++		cpuidle_pause();
++	mtk_mcdi_pause(true);
++}
++
++/* The mask follows cpu_online_mask, then MCDI and cpuidle resume */
++static void mcdi_hotplug_leave(void)
++{
++	unsigned long flags;
++	u32 mask = 0;
++	int cpu;
++
++	for_each_online_cpu(cpu)
++		mask |= BIT(cpu);
++
++	spin_lock_irqsave(&mcdi_lock, flags);
++	mcdi_write(MCDI_MBOX_AVAIL_CPU_MASK, mask);
++	mcdi_pause(false);
++	spin_unlock_irqrestore(&mcdi_lock, flags);
++
++	if (!cpuhp_tasks_frozen)
++		cpuidle_resume();
++}
++
++/* Before CPU_ON, on the control CPU */
++static int mcdi_cpu_prepare(unsigned int cpu)
++{
++	mcdi_hotplug_enter();
++	return 0;
++}
++
++/* On the new core */
++static int mcdi_cpu_online(unsigned int cpu)
++{
++	mcdi_hotplug_leave();
++	return 0;
++}
++
++/* On the core going down */
++static int mcdi_cpu_offline(unsigned int cpu)
++{
++	mcdi_hotplug_enter();
++	return 0;
++}
++
++/* After the core is dead (or a failed bring-up), on the control CPU */
++static int mcdi_cpu_dead(unsigned int cpu)
++{
++	unsigned int cluster = MPIDR_AFFINITY_LEVEL(cpu_logical_map(cpu), 1);
++	struct arm_smccc_res res;
++	int i;
++
++	arm_smccc_smc(MTK_SIP_POWER_DOWN_CORE, cpu, 0, 0, 0, 0, 0, 0, &res);
++	if (res.a0)
++		pr_warn("mcdi: CPU%u power-down: %ld\n", cpu, (long)res.a0);
++
++	for_each_online_cpu(i)
++		if (MPIDR_AFFINITY_LEVEL(cpu_logical_map(i), 1) == cluster)
++			goto out;
++	arm_smccc_smc(MTK_SIP_POWER_DOWN_CLUSTER, cluster, 0, 0, 0, 0, 0, 0, &res);
++	if (res.a0)
++		pr_warn("mcdi: cluster %u power-down: %ld\n", cluster, (long)res.a0);
++out:
++	mcdi_hotplug_leave();
++	return 0;
++}
++
++/*
++ * arch_initcall: after SMP bring-up, before cpuidle-psci (device_initcall)
++ * can put a core into power-down.
++ */
++static int __init mcdi_init(void)
++{
++	struct device_node *np;
++	u32 mask = 0;
++	int cpu, ret;
++
++	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6771-mcdi");
++	if (!np)
++		return 0;
++	mcdi_mbox = of_iomap(np, 0);
++	of_node_put(np);
++	if (!mcdi_mbox)
++		return -ENOMEM;
++
++	for_each_online_cpu(cpu)
++		mask |= BIT(cpu);
++	mcdi_write(MCDI_MBOX_CPU_ISOLATION_MASK, 0);
++	mcdi_write(MCDI_MBOX_AVAIL_CPU_MASK, mask);
++
++	ret = cpuhp_setup_state_nocalls(CPUHP_BP_PREPARE_DYN, "soc/mediatek/mcdi:prepare",
++					mcdi_cpu_prepare, mcdi_cpu_dead);
++	if (ret < 0)
++		return ret;
++	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "soc/mediatek/mcdi:online",
++					mcdi_cpu_online, mcdi_cpu_offline);
++	if (ret < 0)
++		return ret;
++
++	pr_info("mcdi: available CPUs 0x%x\n", mask);
++	return 0;
++}
++arch_initcall(mcdi_init);
+diff --git a/include/linux/soc/mediatek/mtk-mcdi.h b/include/linux/soc/mediatek/mtk-mcdi.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..98389925bb23df3b3e68441c65d23054f850964e
+--- /dev/null
++++ b/include/linux/soc/mediatek/mtk-mcdi.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __SOC_MEDIATEK_MTK_MCDI_H
++#define __SOC_MEDIATEK_MTK_MCDI_H
++
++#include <linux/types.h>
++
++#if IS_ENABLED(CONFIG_MTK_MCDI)
++void mtk_mcdi_pause(bool pause);
++#else
++static inline void mtk_mcdi_pause(bool pause) { }
++#endif
++
++#endif

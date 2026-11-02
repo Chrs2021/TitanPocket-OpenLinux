@@ -34,7 +34,9 @@
 #include "precomp.h"
 
 #ifndef MTK_WCN_BUILT_IN_DRIVER
+#ifndef TITAN_LINUX612	/* the vendor kernel's adapter; mainline has none */
 #include "connectivity_build_in_adapter.h"
+#endif
 #endif
 /*******************************************************************************
 *                              C O N S T A N T S

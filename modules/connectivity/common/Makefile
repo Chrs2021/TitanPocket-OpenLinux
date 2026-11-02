@@ -87,7 +87,19 @@ ccflags-y += -I$(srctree)/drivers/misc/mediatek/include/mt-plat
 ###############################################################################
 
 
+ifeq ($(TITAN_LINUX612),y)
+# Mainline Linux 6.12 (../build612.sh): no vendor kernel underneath; the
+# shared memory comes from the consys node's memory-region.
+ccflags-y += -D ALLOCATE_CONNSYS_EMI_FROM_KO
+# and no build-in adapter: the stub keeps the SDIO hooks itself
+ccflags-y += -D MTK_WCN_REMOVE_KERNEL_MODULE
+# The functions built as their own modules, which the vendor kernel's
+# config named (CONFIG_MTK_COMBO_*, CONFIG_MTK_FMRADIO)
+ccflags-y += -D CONFIG_MTK_COMBO_BT -D CONFIG_MTK_COMBO_GPS
+ccflags-y += -D CONFIG_MTK_COMBO_WIFI -D CONFIG_MTK_FMRADIO
+else
 ccflags-y += -Werror
+endif
 
 ifneq ($(filter "MT6628",$(CONFIG_MTK_COMBO_CHIP)),)
     ccflags-y += -D MT6628

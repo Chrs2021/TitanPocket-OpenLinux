@@ -54,6 +54,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DIR: &str = "/var/log/titan-charge";
 const PS: &str = "/sys/class/power_supply";
 const GAUGE: &str = "oz8806-battery";
+const CHG612: &str = "mt6370-charger";
 const VBUS: &str = "/sys/devices/platform/charger/ADC_Charger_Voltage";
 const SCREEN_OFF: &str = "/run/titan-screen.off";
 const POLL: Duration = Duration::from_secs(10);
@@ -174,7 +175,8 @@ struct Sources {
 
 fn reading(src: &Sources) -> Reading {
     let online = |s: &str| ps_i64(s, "online") == Some(1);
-    let plugged = online("usb") || online("ac");
+    // 4.14's vendor supplies, else 6.12's MT6370 charger
+    let plugged = online("usb") || online("ac") || online(CHG612);
     let percent = ps_i64(GAUGE, "capacity");
     let fields = vec![
         (plugged as i32).to_string(),
@@ -185,7 +187,13 @@ fn reading(src: &Sources) -> Reading {
         opt(ps_i64(GAUGE, "temp"), 10),
         opt_int(ps_i64(GAUGE, "charge_now"), 1000),
         opt(read_i64(VBUS), 1),
-        if online("usb") { opt_int(ps_i64("usb", "current_max"), 1000) } else { String::new() },
+        if online("usb") {
+            opt_int(ps_i64("usb", "current_max"), 1000)
+        } else if online(CHG612) {
+            opt_int(ps_i64(CHG612, "input_current_limit"), 1000)
+        } else {
+            String::new()
+        },
         ps("battery", "status").unwrap_or_default().replace(',', " "),
         opt(ps_i64("battery", "capacity"), 1),
         opt(src.charger_t.as_deref().and_then(read_i64), 1000),
@@ -328,7 +336,8 @@ fn main() {
 fn run(cmd: Option<&str>) {
     let src = Sources {
         charger_t: thermal_zone("mtktscharger"),
-        soc_t: thermal_zone("mtktsAP"),
+        // 4.14's vendor zone, else 6.12's upstream CPU zone
+        soc_t: thermal_zone("mtktsAP").or_else(|| thermal_zone("cpu-thermal")),
     };
     if matches!(cmd, Some("status") | Some("--once")) {
         let r = reading(&src);

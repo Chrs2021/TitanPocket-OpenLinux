@@ -190,7 +190,11 @@ static int __init gps_fw_log_init(void)
 		pr_err("cdev_add fail: %d\n", err);
 		goto err_out;
 	}
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	logdevobj->cls = class_create("gpsfwlog");
+#else
 	logdevobj->cls = class_create(THIS_MODULE, "gpsfwlog");
+#endif
 	if (IS_ERR(logdevobj->cls)) {
 		pr_err("Unable to create class, err = %d\n", (int)PTR_ERR(logdevobj->cls));
 	goto err_out;

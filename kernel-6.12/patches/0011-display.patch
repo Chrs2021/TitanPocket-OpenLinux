@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 11/15] drm/mediatek: hand the firmware framebuffer over; drm/panel: add the Synaptics R63308 panel
+
+mediatek-drm removes a firmware framebuffer (the bootloader's, through
+simplefb) before registering. The MT6771's DSI interrupt is requested
+before the host registers. panel-synaptics-r63308 drives the Titan
+Pocket's 720x720 MIPI-DSI panel with the vendor's power and init
+sequences.
+---
+ drivers/gpu/drm/mediatek/mtk_drm_drv.c        |  10 +
+ drivers/gpu/drm/mediatek/mtk_dsi.c            |  20 +-
+ drivers/gpu/drm/panel/Kconfig                 |  10 +
+ drivers/gpu/drm/panel/Makefile                |   1 +
+ .../gpu/drm/panel/panel-synaptics-r63308.c    | 247 ++++++++++++++++++
+ 5 files changed, 280 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index 0ed249ccd1ea93a9a06b412d18acb0fde332a78d..9e850d20295c3de85c97bdd9cf16b55467337ff3 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -12,6 +12,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/dma-mapping.h>
+ 
++#include <drm/drm_aperture.h>
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_drv.h>
+@@ -670,6 +671,15 @@ static int mtk_drm_bind(struct device *dev)
+ 	if (ret < 0)
+ 		goto err_free;
+ 
++	/*
++	 * A firmware framebuffer (simplefb on the bootloader's scanout, as
++	 * the Titan Pocket's mtk-lk-fb registers) stops being shown once the
++	 * display path is set up again: hand its console over.
++	 */
++	ret = drm_aperture_remove_framebuffers(&mtk_drm_driver);
++	if (ret < 0)
++		goto err_deinit;
++
+ 	ret = drm_dev_register(drm, 0);
+ 	if (ret < 0)
+ 		goto err_deinit;
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 57e8abc5c5f6fc09889e3ad6a904f57b89e49f10..cf585bde9b660a2bd15e34c4928bd74a6443ee48 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -654,9 +654,10 @@ static irqreturn_t mtk_dsi_irq(int irq, void *dev_id)
+ 		mtk_dsi_mask(dsi, DSI_INTSTA, status, 0);
+ 		mtk_dsi_irq_data_set(dsi, status);
+ 		wake_up_interruptible(&dsi->irq_wait_queue);
++		return IRQ_HANDLED;
+ 	}
+ 
+-	return IRQ_HANDLED;
++	return IRQ_NONE;
+ }
+ 
+ static s32 mtk_dsi_switch_to_cmd_mode(struct mtk_dsi *dsi, u8 irq_flag, u32 t)
+@@ -1230,16 +1231,19 @@ static int mtk_dsi_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, dsi);
+ 
+-	ret = mipi_dsi_host_register(&dsi->host);
+-	if (ret < 0)
+-		return dev_err_probe(dev, ret, "Failed to register DSI host\n");
+-
++	/*
++	 * Request the interrupt before registering the host: registering
++	 * can attach a panel that is already loaded, bind the DRM device
++	 * and send the panel's first commands, which wait for this IRQ.
++	 */
+ 	ret = devm_request_irq(&pdev->dev, irq_num, mtk_dsi_irq,
+ 			       IRQF_TRIGGER_NONE, dev_name(&pdev->dev), dsi);
+-	if (ret) {
+-		mipi_dsi_host_unregister(&dsi->host);
++	if (ret)
+ 		return dev_err_probe(&pdev->dev, ret, "Failed to request DSI irq\n");
+-	}
++
++	ret = mipi_dsi_host_register(&dsi->host);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "Failed to register DSI host\n");
+ 
+ 	dsi->bridge.of_node = dev->of_node;
+ 	dsi->bridge.type = DRM_MODE_CONNECTOR_DSI;
+diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
+index a8cf1b0a512f2853de703b0e4cbb2e4778c0cb7e..5ff3099ee5aae330d79892f5250539fd69a7e179 100644
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -895,6 +895,16 @@ config DRM_PANEL_SIMPLE
+ 	  that it can be automatically turned off when the panel goes into a
+ 	  low power state.
+ 
++config DRM_PANEL_SYNAPTICS_R63308
++	tristate "Synaptics R63308-based panel (Unihertz Titan Pocket)"
++	depends on OF
++	depends on DRM_MIPI_DSI
++	depends on BACKLIGHT_CLASS_DEVICE
++	help
++	  Say Y if you want to enable support for the 720x720 MIPI-DSI
++	  panel of the Unihertz Titan Pocket, built on the Synaptics
++	  R63308 controller.
++
+ config DRM_PANEL_SYNAPTICS_R63353
+ 	tristate "Synaptics R63353-based panels"
+ 	depends on OF
+diff --git a/drivers/gpu/drm/panel/Makefile b/drivers/gpu/drm/panel/Makefile
+index 987a0870241035c6184a25c412c17caf03465dff..4381eb65fcc1d2595624cb612ba8b67e5ebded89 100644
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -85,6 +85,7 @@ obj-$(CONFIG_DRM_PANEL_SHARP_LS060T1SX01) += panel-sharp-ls060t1sx01.o
+ obj-$(CONFIG_DRM_PANEL_SITRONIX_ST7701) += panel-sitronix-st7701.o
+ obj-$(CONFIG_DRM_PANEL_SITRONIX_ST7703) += panel-sitronix-st7703.o
+ obj-$(CONFIG_DRM_PANEL_SITRONIX_ST7789V) += panel-sitronix-st7789v.o
++obj-$(CONFIG_DRM_PANEL_SYNAPTICS_R63308) += panel-synaptics-r63308.o
+ obj-$(CONFIG_DRM_PANEL_SYNAPTICS_R63353) += panel-synaptics-r63353.o
+ obj-$(CONFIG_DRM_PANEL_SONY_ACX565AKM) += panel-sony-acx565akm.o
+ obj-$(CONFIG_DRM_PANEL_SONY_TD4353_JDI) += panel-sony-td4353-jdi.o
+diff --git a/drivers/gpu/drm/panel/panel-synaptics-r63308.c b/drivers/gpu/drm/panel/panel-synaptics-r63308.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6e069d83c220f637330bb2a525a2a841b332e8c
+--- /dev/null
++++ b/drivers/gpu/drm/panel/panel-synaptics-r63308.c
+@@ -0,0 +1,247 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Synaptics R63308 MIPI-DSI panel: the Unihertz Titan Pocket's 720x720
++ * module (vendor LCM driver "R63308_CASCADEMDZ40").
++ *
++ * The sequences are the vendor driver's: two supply enables, a reset
++ * pulse, a soft reset, then the display bias (+/-5.0 V from the MT6370)
++ * and a short manufacturer table. As in the vendor DSI driver, commands
++ * below 0xb0 are sent as DCS packets and the manufacturer commands
++ * (0xb0 and up) as generic packets.
++ */
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/media-bus-format.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/regulator/consumer.h>
++
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_panel.h>
++
++struct r63308 {
++	struct drm_panel panel;
++	struct mipi_dsi_device *dsi;
++	struct regulator *vddi;		/* first enable (vendor GPIO 175) */
++	struct regulator *vci;		/* second enable (vendor GPIO 177) */
++	struct regulator_bulk_data bias[2];	/* avdd (+), avee (-) */
++	struct gpio_desc *reset_gpio;
++};
++
++static inline struct r63308 *to_r63308(struct drm_panel *panel)
++{
++	return container_of(panel, struct r63308, panel);
++}
++
++static void r63308_init_seq(struct mipi_dsi_multi_context *ctx)
++{
++	mipi_dsi_generic_write_seq_multi(ctx, 0xb0, 0x00);	/* unlock */
++	mipi_dsi_generic_write_seq_multi(ctx, 0xe4, 0x00, 0x00, 0x00, 0x00, 0x08);
++	mipi_dsi_generic_write_seq_multi(ctx, 0xd0, 0x45, 0x45, 0x71);
++	mipi_dsi_dcs_exit_sleep_mode_multi(ctx);
++	mipi_dsi_generic_write_seq_multi(ctx, 0xd0, 0x52, 0x4a, 0x71);
++	mipi_dsi_generic_write_seq_multi(ctx, 0xbe, 0xff, 0x0f, 0x00, 0x18,
++					 0x04, 0x04, 0x00, 0x5d);
++	mipi_dsi_generic_write_seq_multi(ctx, 0xbb, 0x2f);
++	mipi_dsi_generic_write_seq_multi(ctx, 0xb0, 0x03);	/* lock */
++	mipi_dsi_msleep(ctx, 50);
++	mipi_dsi_dcs_set_display_on_multi(ctx);
++	mipi_dsi_msleep(ctx, 20);
++}
++
++static int r63308_prepare(struct drm_panel *panel)
++{
++	struct r63308 *ctx = to_r63308(panel);
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++	int ret;
++
++	ret = regulator_enable(ctx->vddi);
++	if (ret)
++		return ret;
++	msleep(10);
++	ret = regulator_enable(ctx->vci);
++	if (ret)
++		goto err_vddi;
++	usleep_range(5000, 6000);
++
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	msleep(10);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
++	msleep(10);
++
++	mipi_dsi_dcs_soft_reset_multi(&dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 17);
++	if (dsi_ctx.accum_err) {
++		ret = dsi_ctx.accum_err;
++		goto err_reset;
++	}
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(ctx->bias), ctx->bias);
++	if (ret)
++		goto err_reset;
++	usleep_range(5000, 6000);
++
++	r63308_init_seq(&dsi_ctx);
++	if (dsi_ctx.accum_err) {
++		ret = dsi_ctx.accum_err;
++		goto err_bias;
++	}
++	return 0;
++
++err_bias:
++	regulator_bulk_disable(ARRAY_SIZE(ctx->bias), ctx->bias);
++err_reset:
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	regulator_disable(ctx->vci);
++err_vddi:
++	regulator_disable(ctx->vddi);
++	return ret;
++}
++
++static int r63308_unprepare(struct drm_panel *panel)
++{
++	struct r63308 *ctx = to_r63308(panel);
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 20);
++	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 110);
++
++	regulator_bulk_disable(ARRAY_SIZE(ctx->bias), ctx->bias);
++	msleep(100);
++
++	/* the vendor driver re-opens manufacturer access last */
++	dsi_ctx.accum_err = 0;
++	mipi_dsi_generic_write_seq_multi(&dsi_ctx, 0xb0, 0x00);
++
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	msleep(50);
++	regulator_disable(ctx->vci);
++	usleep_range(2000, 3000);
++	regulator_disable(ctx->vddi);
++
++	return 0;
++}
++
++/* 720x720, 60 Hz: the vendor's porches (h 16/16/96, v 3/4/9) */
++static const struct drm_display_mode r63308_mode = {
++	.clock = (720 + 96 + 16 + 16) * (720 + 9 + 3 + 4) * 60 / 1000,
++	.hdisplay = 720,
++	.hsync_start = 720 + 96,
++	.hsync_end = 720 + 96 + 16,
++	.htotal = 720 + 96 + 16 + 16,
++	.vdisplay = 720,
++	.vsync_start = 720 + 9,
++	.vsync_end = 720 + 9 + 3,
++	.vtotal = 720 + 9 + 3 + 4,
++	.width_mm = 56,
++	.height_mm = 56,
++	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
++};
++
++static int r63308_get_modes(struct drm_panel *panel,
++			    struct drm_connector *connector)
++{
++	static const u32 bus_format = MEDIA_BUS_FMT_RGB888_1X24;
++	struct drm_display_mode *mode;
++
++	mode = drm_mode_duplicate(connector->dev, &r63308_mode);
++	if (!mode)
++		return -ENOMEM;
++	drm_mode_set_name(mode);
++	drm_mode_probed_add(connector, mode);
++
++	connector->display_info.width_mm = mode->width_mm;
++	connector->display_info.height_mm = mode->height_mm;
++	drm_display_info_set_bus_formats(&connector->display_info,
++					 &bus_format, 1);
++	return 1;
++}
++
++static const struct drm_panel_funcs r63308_panel_funcs = {
++	.prepare = r63308_prepare,
++	.unprepare = r63308_unprepare,
++	.get_modes = r63308_get_modes,
++};
++
++static int r63308_probe(struct mipi_dsi_device *dsi)
++{
++	struct device *dev = &dsi->dev;
++	struct r63308 *ctx;
++	int ret;
++
++	ctx = devm_kzalloc(dev, sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++
++	ctx->vddi = devm_regulator_get(dev, "vddi");
++	if (IS_ERR(ctx->vddi))
++		return dev_err_probe(dev, PTR_ERR(ctx->vddi), "no vddi\n");
++	ctx->vci = devm_regulator_get(dev, "vci");
++	if (IS_ERR(ctx->vci))
++		return dev_err_probe(dev, PTR_ERR(ctx->vci), "no vci\n");
++	ctx->bias[0].supply = "avdd";
++	ctx->bias[1].supply = "avee";
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(ctx->bias), ctx->bias);
++	if (ret)
++		return dev_err_probe(dev, ret, "no bias supplies\n");
++
++	/* as LK left it (the panel running) until prepare resets it */
++	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_ASIS);
++	if (IS_ERR(ctx->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio), "no reset\n");
++
++	ctx->dsi = dsi;
++	mipi_dsi_set_drvdata(dsi, ctx);
++
++	dsi->lanes = 2;
++	dsi->format = MIPI_DSI_FMT_RGB888;
++	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
++			  MIPI_DSI_MODE_LPM;
++
++	drm_panel_init(&ctx->panel, dev, &r63308_panel_funcs,
++		       DRM_MODE_CONNECTOR_DSI);
++	ctx->panel.prepare_prev_first = true;
++
++	ret = drm_panel_of_backlight(&ctx->panel);
++	if (ret)
++		return dev_err_probe(dev, ret, "no backlight\n");
++
++	drm_panel_add(&ctx->panel);
++
++	ret = mipi_dsi_attach(dsi);
++	if (ret < 0) {
++		drm_panel_remove(&ctx->panel);
++		return dev_err_probe(dev, ret, "mipi_dsi_attach failed\n");
++	}
++	return 0;
++}
++
++static void r63308_remove(struct mipi_dsi_device *dsi)
++{
++	struct r63308 *ctx = mipi_dsi_get_drvdata(dsi);
++
++	mipi_dsi_detach(dsi);
++	drm_panel_remove(&ctx->panel);
++}
++
++static const struct of_device_id r63308_of_match[] = {
++	{ .compatible = "unihertz,titan-pocket-panel" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, r63308_of_match);
++
++static struct mipi_dsi_driver r63308_driver = {
++	.probe = r63308_probe,
++	.remove = r63308_remove,
++	.driver = {
++		.name = "panel-synaptics-r63308",
++		.of_match_table = r63308_of_match,
++	},
++};
++module_mipi_dsi_driver(r63308_driver);
++
++MODULE_DESCRIPTION("Synaptics R63308 MIPI-DSI panel (Unihertz Titan Pocket)");
++MODULE_LICENSE("GPL");

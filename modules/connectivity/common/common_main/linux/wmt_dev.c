@@ -38,6 +38,7 @@
 */
 
 #ifdef CONFIG_COMPAT
+#include <linux/version.h>
 #include <linux/compat.h>
 #endif
 #include <linux/ctype.h>
@@ -566,14 +567,14 @@ LONG wmt_dev_tm_temp_query(VOID)
 
 	static INT32 s_temp_table[HISTORY_NUM] = { 99 };	/* not query yet. */
 	static INT32 s_idx_temp_table;
-	static struct timeval s_query_time;
-	static struct timeval sync_log_last_time = {0, 0};
+	static struct timespec64 s_query_time;
+	static struct timespec64 sync_log_last_time = {0, 0};
 
 	INT32 temp_table[HISTORY_NUM];
 	INT32 idx_temp_table;
-	struct timeval query_time;
+	struct timespec64 query_time;
 
-	struct timeval now_time;
+	struct timespec64 now_time;
 	INT32 current_temp = 0;
 	INT32 index = 0;
 	LONG return_temp = 0;
@@ -582,7 +583,7 @@ LONG wmt_dev_tm_temp_query(VOID)
 	/* Let us work on the copied version of function static variables */
 	osal_lock_unsleepable_lock(&g_temp_query_spinlock);
 	osal_memcpy(temp_table, s_temp_table, sizeof(s_temp_table));
-	osal_memcpy(&query_time, &s_query_time, sizeof(struct timeval));
+	osal_memcpy(&query_time, &s_query_time, sizeof(struct timespec64));
 	idx_temp_table = s_idx_temp_table;
 	osal_unlock_unsleepable_lock(&g_temp_query_spinlock);
 
@@ -1501,7 +1502,11 @@ static INT32 WMT_mmap(struct file *pFile, struct vm_area_struct *pVma)
 	unsigned long bufId = pVma->vm_pgoff;
 	P_CONSYS_EMI_ADDR_INFO emiInfo = mtk_wcn_consys_soc_get_emi_phy_add();
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0))
+	vm_flags_clear(pVma, VM_WRITE | VM_MAYWRITE);
+#else
 	pVma->vm_flags &= ~(VM_WRITE | VM_MAYWRITE);
+#endif
 	WMT_INFO_FUNC("WMT_mmap start:%lu end:%lu size: %lu buffer id=%lu\n",
 		pVma->vm_start, pVma->vm_end,
 		pVma->vm_end - pVma->vm_start, bufId);
@@ -1609,7 +1614,11 @@ static INT32 WMT_init(VOID)
 	WMT_INFO_FUNC("driver(major %d) installed\n", gWmtMajor);
 
 #if WMT_CREATE_NODE_DYNAMIC
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	wmt_class = class_create("stpwmt");
+#else
 	wmt_class = class_create(THIS_MODULE, "stpwmt");
+#endif
 	if (IS_ERR(wmt_class))
 		goto error;
 	wmt_dev = device_create(wmt_class, NULL, devID, NULL, "stpwmt");

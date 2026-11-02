@@ -14,6 +14,7 @@
 #ifndef __FM_MAIN_H__
 #define __FM_MAIN_H__
 
+#include <linux/version.h>
 #include "fm_typedef.h"
 #include "fm_dbg.h"
 #include "fm_err.h"
@@ -219,17 +220,24 @@ struct fm_tx_scan_parm {
 	unsigned short ScanTBLSize;	/* IN: desired size, OUT: scan result size */
 };
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0))
+/* ioctl layout shared with GPS userspace: the 64-bit timeval of old */
+typedef struct __kernel_old_timeval fm_timeval;
+#else
+typedef struct timeval fm_timeval;
+#endif
+
 struct fm_gps_rtc_info {
 	signed int err;		/* error number, 0: success, other: err code */
 	signed int retryCnt;	/* GPS mnl can decide retry times */
 	signed int ageThd;		/* GPS 3D fix time diff threshold */
 	signed int driftThd;	/* GPS RTC drift threshold */
-	struct timeval tvThd;	/* time value diff threshold */
+	fm_timeval tvThd;	/* time value diff threshold */
 	signed int age;		/* GPS 3D fix time diff */
 	signed int drift;		/* GPS RTC drift */
 	union {
 		unsigned long stamp;	/* time stamp in jiffies */
-		struct timeval tv;	/* time stamp value in RTC */
+		fm_timeval tv;	/* time stamp value in RTC */
 	};
 	signed int flag;		/* rw flag */
 };

@@ -31,7 +31,9 @@
 *                    E X T E R N A L   R E F E R E N C E S
 ********************************************************************************
 */
+#ifndef TITAN_LINUX612	/* the vendor kernel's adapter; mainline has none */
 #include <connectivity_build_in_adapter.h>
+#endif
 #include "osal_typedef.h"
 #include "connsys_debug_utility.h"
 #include "wmt_lib.h"

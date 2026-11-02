@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 02/15] cpufreq, cpuidle, devfreq: mediatek: support the MT6771
+
+mediatek-cpufreq and mtk-cci-devfreq gain MT6771 data (MediaTek's V5_T
+table: A53 to 1989 MHz, A73 to 1924 MHz, CCI to 1196 MHz), cpufreq-dt
+leaves the SoC to mediatek-cpufreq, and dt_idle_states can start every
+idle state disabled (dt_idle_states.off=1) for bring-up.
+---
+ drivers/cpufreq/cpufreq-dt-platdev.c |  1 +
+ drivers/cpufreq/mediatek-cpufreq.c   | 11 +++++++++++
+ drivers/cpuidle/dt_idle_states.c     | 11 +++++++++++
+ drivers/devfreq/mtk-cci-devfreq.c    |  9 +++++++++
+ 4 files changed, 32 insertions(+)
+
+diff --git a/drivers/cpufreq/cpufreq-dt-platdev.c b/drivers/cpufreq/cpufreq-dt-platdev.c
+index 9e86a0e8b9e8615fd63c8c046b267d98cb41dee9..45409550b447b2bad1e14b91af4493958527b624 100644
+--- a/drivers/cpufreq/cpufreq-dt-platdev.c
++++ b/drivers/cpufreq/cpufreq-dt-platdev.c
+@@ -134,6 +134,7 @@ static const struct of_device_id blocklist[] __initconst = {
+ 	{ .compatible = "mediatek,mt817x", },
+ 	{ .compatible = "mediatek,mt8173", },
+ 	{ .compatible = "mediatek,mt8176", },
++	{ .compatible = "mediatek,mt6771", },
+ 	{ .compatible = "mediatek,mt8183", },
+ 	{ .compatible = "mediatek,mt8186", },
+ 	{ .compatible = "mediatek,mt8365", },
+diff --git a/drivers/cpufreq/mediatek-cpufreq.c b/drivers/cpufreq/mediatek-cpufreq.c
+index 663f61565cf7289fe34d9a735e825206dd13152c..e1db464ececa17d540367c5280a691cbdd18ace3 100644
+--- a/drivers/cpufreq/mediatek-cpufreq.c
++++ b/drivers/cpufreq/mediatek-cpufreq.c
+@@ -728,6 +728,16 @@ static const struct mtk_cpufreq_platform_data mt8186_platform_data = {
+ 	.ccifreq_supported = true,
+ };
+ 
++/* MediaTek's MT6771 limits (cpufreq_v1 mach/mt6771): Vsram = Vproc + 100 mV */
++static const struct mtk_cpufreq_platform_data mt6771_platform_data = {
++	.min_volt_shift = 100000,
++	.max_volt_shift = 262500,
++	.proc_max_volt = 1118750,
++	.sram_min_volt = 850000,
++	.sram_max_volt = 1118750,
++	.ccifreq_supported = true,
++};
++
+ static const struct mtk_cpufreq_platform_data mt8516_platform_data = {
+ 	.min_volt_shift = 100000,
+ 	.max_volt_shift = 200000,
+@@ -748,6 +758,7 @@ static const struct of_device_id mtk_cpufreq_machines[] __initconst __maybe_unus
+ 	{ .compatible = "mediatek,mt817x", .data = &mt2701_platform_data },
+ 	{ .compatible = "mediatek,mt8173", .data = &mt2701_platform_data },
+ 	{ .compatible = "mediatek,mt8176", .data = &mt2701_platform_data },
++	{ .compatible = "mediatek,mt6771", .data = &mt6771_platform_data },
+ 	{ .compatible = "mediatek,mt8183", .data = &mt8183_platform_data },
+ 	{ .compatible = "mediatek,mt8186", .data = &mt8186_platform_data },
+ 	{ .compatible = "mediatek,mt8365", .data = &mt2701_platform_data },
+diff --git a/drivers/cpuidle/dt_idle_states.c b/drivers/cpuidle/dt_idle_states.c
+index 97feb7d8fb2329fa4e0f20a858e0a9c1680ff49a..78e95eb170022932592b7ff1785349d354643948 100644
+--- a/drivers/cpuidle/dt_idle_states.c
++++ b/drivers/cpuidle/dt_idle_states.c
+@@ -17,6 +17,15 @@
+ 
+ #include "dt_idle_states.h"
+ 
++/*
++ * Bring-up aid: dt_idle_states.off=1 starts every DT idle state disabled
++ * (CPUIDLE_FLAG_OFF), to be enabled one at a time through cpuidle's sysfs
++ * "disable" files.
++ */
++static bool off;
++module_param(off, bool, 0444);
++MODULE_PARM_DESC(off, "start DT idle states disabled");
++
+ static int init_state_node(struct cpuidle_state *idle_state,
+ 			   const struct of_device_id *match_id,
+ 			   struct device_node *state_node)
+@@ -77,6 +86,8 @@ static int init_state_node(struct cpuidle_state *idle_state,
+ 		desc = state_node->name;
+ 
+ 	idle_state->flags = CPUIDLE_FLAG_RCU_IDLE;
++	if (off)
++		idle_state->flags |= CPUIDLE_FLAG_OFF;
+ 	if (of_property_read_bool(state_node, "local-timer-stop"))
+ 		idle_state->flags |= CPUIDLE_FLAG_TIMER_STOP;
+ 	/*
+diff --git a/drivers/devfreq/mtk-cci-devfreq.c b/drivers/devfreq/mtk-cci-devfreq.c
+index 6e608d92f7e66a42fedaf83d96db35100fa80988..dd909396bcc5e7e5fd886c74b07fef7916b85fe8 100644
+--- a/drivers/devfreq/mtk-cci-devfreq.c
++++ b/drivers/devfreq/mtk-cci-devfreq.c
+@@ -414,6 +414,14 @@ static const struct mtk_ccifreq_platform_data mt8183_platform_data = {
+ 	.proc_max_volt = 1150000,
+ };
+ 
++static const struct mtk_ccifreq_platform_data mt6771_platform_data = {
++	.min_volt_shift = 100000,
++	.max_volt_shift = 262500,
++	.proc_max_volt = 1118750,
++	.sram_min_volt = 850000,
++	.sram_max_volt = 1118750,
++};
++
+ static const struct mtk_ccifreq_platform_data mt8186_platform_data = {
+ 	.min_volt_shift = 100000,
+ 	.max_volt_shift = 250000,
+@@ -423,6 +431,7 @@ static const struct mtk_ccifreq_platform_data mt8186_platform_data = {
+ };
+ 
+ static const struct of_device_id mtk_ccifreq_machines[] = {
++	{ .compatible = "mediatek,mt6771-cci", .data = &mt6771_platform_data },
+ 	{ .compatible = "mediatek,mt8183-cci", .data = &mt8183_platform_data },
+ 	{ .compatible = "mediatek,mt8186-cci", .data = &mt8186_platform_data },
+ 	{ },

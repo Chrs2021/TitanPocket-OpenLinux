@@ -201,7 +201,11 @@ void gps_icap_probe(void)
 		goto err_out;
 	}
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	gps_icap_dev_ptr->cls = class_create("gpsemi");
+#else
 	gps_icap_dev_ptr->cls = class_create(THIS_MODULE, "gpsemi");
+#endif
 	if (IS_ERR(gps_icap_dev_ptr->cls)) {
 		GDL_LOGE("unable to create class, err = %d\n", (int)PTR_ERR(gps_icap_dev_ptr->cls));
 		goto err_out;

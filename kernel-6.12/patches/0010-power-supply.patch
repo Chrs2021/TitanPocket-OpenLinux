@@ -1,0 +1,822 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 10/15] power: supply: add the OZ8806 gauge; mt6370-charger: charging policy
+
+oz8806_battery: the Titan Pocket's O2Micro fuel gauge (coulomb counter,
+voltage, current, NTC temperature).
+
+mt6370-charger: the input current follows the Type-C source (a supplier
+named with power-supplies) and BC1.2; charge current, voltage and
+termination come from the monitored battery, with end of charge enabled;
+charging stops outside the battery's operating temperature range.
+---
+ drivers/power/supply/Kconfig          |   7 +
+ drivers/power/supply/Makefile         |   1 +
+ drivers/power/supply/mt6370-charger.c | 163 +++++++-
+ drivers/power/supply/oz8806_battery.c | 525 ++++++++++++++++++++++++++
+ 4 files changed, 694 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index bcfa63fb9f1e207b92ca1cf675165ca861d3dc93..fdaa82a768ff866a8f948c68a9ed6fa76143945a 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -396,6 +396,13 @@ config BATTERY_MAX17040
+ 
+ 	  Driver can be build as a module (max17040_battery).
+ 
++config BATTERY_OZ8806
++	tristate "O2Micro OZ8806 fuel gauge"
++	depends on I2C
++	help
++	  Say Y here to enable support for the O2Micro OZ8806 coulomb
++	  counter fuel gauge used in the Unihertz Titan Pocket.
++
+ config BATTERY_MAX17042
+ 	tristate "Maxim MAX17042/17047/17050/8997/8966 family Fuel Gauge"
+ 	depends on I2C
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index 8dcb4154531718875a2a1aaeba05b1f3268cb4d7..6fde145b9f1112470816498449643c792be19c2c 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -52,6 +52,7 @@ obj-$(CONFIG_BATTERY_DA9052)	+= da9052-battery.o
+ obj-$(CONFIG_CHARGER_DA9150)	+= da9150-charger.o
+ obj-$(CONFIG_BATTERY_DA9150)	+= da9150-fg.o
+ obj-$(CONFIG_BATTERY_MAX17040)	+= max17040_battery.o
++obj-$(CONFIG_BATTERY_OZ8806)	+= oz8806_battery.o
+ obj-$(CONFIG_BATTERY_MAX17042)	+= max17042_battery.o
+ obj-$(CONFIG_BATTERY_MAX1720X)	+= max1720x_battery.o
+ obj-$(CONFIG_BATTERY_MAX1721X)	+= max1721x_battery.o
+diff --git a/drivers/power/supply/mt6370-charger.c b/drivers/power/supply/mt6370-charger.c
+index ad8793bf997e15a7d6a6bca96e538e6056bb3153..7830dafaab4233082c96d6ad9068a5466897a07e 100644
+--- a/drivers/power/supply/mt6370-charger.c
++++ b/drivers/power/supply/mt6370-charger.c
+@@ -20,6 +20,7 @@
+ #include <linux/power_supply.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/driver.h>
++#include <linux/string.h>
+ #include <linux/workqueue.h>
+ 
+ #define MT6370_REG_CHG_CTRL1		0x111
+@@ -50,7 +51,7 @@
+ 
+ enum mt6370_chg_reg_field {
+ 	/* MT6370_REG_CHG_CTRL2 */
+-	F_IINLMTSEL, F_CFO_EN, F_CHG_EN,
++	F_IINLMTSEL, F_CFO_EN, F_CHG_EN, F_TE_EN,
+ 	/* MT6370_REG_CHG_CTRL3 */
+ 	F_IAICR, F_AICR_EN, F_ILIM_EN,
+ 	/* MT6370_REG_CHG_CTRL4 */
+@@ -96,6 +97,9 @@ struct mt6370_priv {
+ 	struct workqueue_struct *wq;
+ 	struct work_struct bc12_work;
+ 	struct delayed_work mivr_dwork;
++	struct delayed_work temp_dwork;
++	int temp_min, temp_max;		/* charging range, tenths of a degree C */
++	bool temp_hold;			/* charging stopped for the temperature */
+ 	unsigned int irq_nums[MT6370_IRQ_MAX];
+ 	int attach;
+ 	int psy_usb_type;
+@@ -153,6 +157,7 @@ static const struct linear_range mt6370_chg_ranges[MT6370_RANGE_F_MAX] = {
+ 
+ static const struct mt6370_chg_field mt6370_chg_fields[F_MAX] = {
+ 	MT6370_CHG_FIELD(F_IINLMTSEL, MT6370_REG_CHG_CTRL2, 2, 3),
++	MT6370_CHG_FIELD(F_TE_EN, MT6370_REG_CHG_CTRL2, 4, 4),
+ 	MT6370_CHG_FIELD(F_CFO_EN, MT6370_REG_CHG_CTRL2, 1, 1),
+ 	MT6370_CHG_FIELD(F_CHG_EN, MT6370_REG_CHG_CTRL2, 0, 0),
+ 	MT6370_CHG_FIELD_RANGE(F_IAICR, MT6370_REG_CHG_CTRL3, 2, 7),
+@@ -251,6 +256,31 @@ static int mt6370_chg_otg_of_parse_cb(struct device_node *of,
+ 				  MT6370_OTG_PIN_EN_MASK);
+ }
+ 
++/*
++ * Input current: what the source offers. A Type-C supplier (TCPM, linked
++ * with "power-supplies") reports its advertised current; a BC1.2 charging
++ * port (DCP, CDP) allows 1.5 A even behind a default Rp. Otherwise USB's
++ * 500 mA.
++ */
++static void mt6370_chg_update_aicr(struct mt6370_priv *priv,
++				   struct power_supply *psy)
++{
++	union power_supply_propval val = {};
++	int aicr = 500000;
++
++	if (!power_supply_get_property_from_supplier(psy,
++						     POWER_SUPPLY_PROP_CURRENT_MAX,
++						     &val) && val.intval > 0)
++		aicr = val.intval;
++
++	if (priv->psy_usb_type == POWER_SUPPLY_USB_TYPE_DCP ||
++	    priv->psy_usb_type == POWER_SUPPLY_USB_TYPE_CDP)
++		aicr = max(aicr, 1500000);
++
++	if (mt6370_chg_field_set(priv, F_IAICR, aicr))
++		dev_err(priv->dev, "Failed to set input current limit\n");
++}
++
+ static void mt6370_chg_bc12_work_func(struct work_struct *work)
+ {
+ 	struct mt6370_priv *priv = container_of(work, struct mt6370_priv,
+@@ -306,8 +336,10 @@ static void mt6370_chg_bc12_work_func(struct work_struct *work)
+ bc12_work_func_out:
+ 	mutex_unlock(&priv->attach_lock);
+ 
+-	if (rpt_psy)
++	if (rpt_psy) {
++		mt6370_chg_update_aicr(priv, priv->psy);
+ 		power_supply_changed(priv->psy);
++	}
+ }
+ 
+ static int mt6370_chg_toggle_cfo(struct mt6370_priv *priv)
+@@ -624,6 +656,11 @@ static enum power_supply_property mt6370_chg_properties[] = {
+ 	POWER_SUPPLY_PROP_USB_TYPE,
+ };
+ 
++static void mt6370_chg_external_power_changed(struct power_supply *psy)
++{
++	mt6370_chg_update_aicr(power_supply_get_drvdata(psy), psy);
++}
++
+ static const struct power_supply_desc mt6370_chg_psy_desc = {
+ 	.name = "mt6370-charger",
+ 	.type = POWER_SUPPLY_TYPE_USB,
+@@ -632,6 +669,7 @@ static const struct power_supply_desc mt6370_chg_psy_desc = {
+ 	.get_property = mt6370_chg_get_property,
+ 	.set_property = mt6370_chg_set_property,
+ 	.property_is_writeable = mt6370_chg_property_is_writeable,
++	.external_power_changed = mt6370_chg_external_power_changed,
+ 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
+ 		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
+ 		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
+@@ -727,6 +765,118 @@ static int mt6370_chg_init_setting(struct mt6370_priv *priv)
+ 	return 0;
+ }
+ 
++/*
++ * Battery temperature: charging stops outside the battery's operating range
++ * and resumes MT6370_CHG_TEMP_HYST inside it, as MediaTek's kernel does
++ * (min_charge_temp 0 C / max_charge_temp 59 C, resuming at 6 C / 53 C).
++ * The temperature is the battery's that this charger supplies (its
++ * "power-supplies" names the charger), checked every 10 s. The phone keeps
++ * running from VBUS through the power path meanwhile.
++ */
++#define MT6370_CHG_TEMP_HYST	60	/* tenths of a degree C */
++#define MT6370_CHG_TEMP_POLL_MS	10000
++
++struct mt6370_chg_temp_lookup {
++	struct power_supply *chg;
++	int temp;
++};
++
++static int mt6370_chg_supplied_battery_temp(struct device *dev, void *data)
++{
++	struct mt6370_chg_temp_lookup *l = data;
++	struct power_supply *psy = dev_get_drvdata(dev);
++	union power_supply_propval val;
++	size_t i;
++
++	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
++		return 0;
++	for (i = 0; i < psy->num_supplies; i++)
++		if (!strcmp(psy->supplied_from[i], l->chg->desc->name))
++			break;
++	if (i == psy->num_supplies)
++		return 0;
++	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val))
++		return 0;
++
++	l->temp = val.intval;
++	return 1;
++}
++
++static void mt6370_chg_temp_dwork_func(struct work_struct *work)
++{
++	struct mt6370_priv *priv = container_of(work, struct mt6370_priv,
++						temp_dwork.work);
++	struct mt6370_chg_temp_lookup l = { .chg = priv->psy };
++	bool hold = priv->temp_hold;
++
++	if (power_supply_for_each_device(&l, mt6370_chg_supplied_battery_temp) <= 0)
++		goto out;
++
++	if (hold)
++		hold = l.temp < priv->temp_min + MT6370_CHG_TEMP_HYST ||
++		       l.temp > priv->temp_max - MT6370_CHG_TEMP_HYST;
++	else
++		hold = l.temp < priv->temp_min || l.temp > priv->temp_max;
++
++	if (hold != priv->temp_hold) {
++		if (mt6370_chg_field_set(priv, F_CHG_EN, !hold)) {
++			dev_err(priv->dev, "Failed to %s charging\n",
++				hold ? "stop" : "resume");
++			goto out;
++		}
++		priv->temp_hold = hold;
++		dev_info(priv->dev, "battery at %d.%d C: charging %s\n",
++			 l.temp / 10, abs(l.temp % 10), hold ? "stopped" : "resumed");
++		power_supply_changed(priv->psy);
++	}
++out:
++	schedule_delayed_work(&priv->temp_dwork,
++			      msecs_to_jiffies(MT6370_CHG_TEMP_POLL_MS));
++}
++
++/* The monitored battery's limits, if the tree names one */
++static int mt6370_chg_init_battery(struct mt6370_priv *priv)
++{
++	struct power_supply_battery_info *info;
++	int ret;
++
++	ret = power_supply_get_battery_info(priv->psy, &info);
++	if (ret == -ENODEV)
++		return 0;
++	if (ret)
++		return ret;
++
++	if (info->constant_charge_current_max_ua > 0) {
++		ret = mt6370_chg_field_set(priv, F_ICHG,
++					   info->constant_charge_current_max_ua);
++		if (ret)
++			return ret;
++	}
++	if (info->constant_charge_voltage_max_uv > 0) {
++		ret = mt6370_chg_field_set(priv, F_VOREG,
++					   info->constant_charge_voltage_max_uv);
++		if (ret)
++			return ret;
++	}
++	if (info->temp_min > INT_MIN && info->temp_max < INT_MAX) {
++		priv->temp_min = info->temp_min * 10;
++		priv->temp_max = info->temp_max * 10;
++		schedule_delayed_work(&priv->temp_dwork, 0);
++	}
++
++	/* end of charge at this current, as the vendor sets it (enable_te) */
++	if (info->charge_term_current_ua > 0) {
++		ret = mt6370_chg_field_set(priv, F_IEOC,
++					   info->charge_term_current_ua);
++		if (ret)
++			return ret;
++		ret = mt6370_chg_field_set(priv, F_TE_EN, 1);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
+ #define MT6370_CHG_DT_PROP_DECL(_name, _type, _field)	\
+ {							\
+ 	.name = "mediatek,chg-" #_name,			\
+@@ -920,11 +1070,20 @@ static int mt6370_chg_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to init mivr delayed work\n");
+ 
++	ret = devm_delayed_work_autocancel(dev, &priv->temp_dwork, mt6370_chg_temp_dwork_func);
++	if (ret)
++		return dev_err_probe(dev, ret, "Failed to init temperature work\n");
++
+ 	ret = mt6370_chg_init_setting(priv);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret,
+ 				     "Failed to init mt6370 charger setting\n");
+ 
++	ret = mt6370_chg_init_battery(priv);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "Failed to apply the battery's limits\n");
++
+ 	ret = mt6370_chg_init_irq(priv);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/power/supply/oz8806_battery.c b/drivers/power/supply/oz8806_battery.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..516e7832d454426b2b4e6c6e3a91a7b9c23029e6
+--- /dev/null
++++ b/drivers/power/supply/oz8806_battery.c
+@@ -0,0 +1,525 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * O2Micro OZ8806 battery fuel gauge driver for the Unihertz Titan Pocket.
++ *
++ * Clean-room replacement for the Agold/O2Micro "coulomb" driver in the
++ * stock kernel. Register layout, scaling and battery tables were recovered
++ * from the stock 4.14.186 kernel binary (afe_read_* / bmu_* functions).
++ *
++ * The chip keeps a coulomb counter (CAR) that the stock driver uses as the
++ * remaining capacity in mAh, so state of charge is CAR / design capacity,
++ * re-anchored to 100% at end of charge and to 0% at end of discharge, and
++ * seeded from the OCV table when the counter holds nothing sensible.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/power_supply.h>
++#include <linux/workqueue.h>
++
++#define OZ8806_REG_CHIP_ID	0x00
++#define OZ8806_REG_OP_CTRL	0x09
++#define OZ8806_REG_TEMP		0x0c
++#define OZ8806_REG_VOLT		0x0e
++#define OZ8806_REG_OCV		0x10
++#define OZ8806_REG_CURR		0x12
++#define OZ8806_REG_CAR		0x14
++
++#define OZ8806_OP_CTRL_SLEEP	BIT(6)
++#define OZ8806_OP_CTRL_ACTIVE	0x20	/* single cell, awake */
++#define OZ8806_OP_CTRL_PWRDOWN	0x60	/* single cell, sleep */
++
++/* Values from the stock kernel's config_data (Titan Pocket battery) */
++#define OZ8806_RSENSE_MOHM	10
++#define OZ8806_CAR_LSB		5	/* uVh */
++#define OZ8806_CURR_LSB		781	/* 7.8125 uV, x100 */
++#define OZ8806_VOLT_LSB		250	/* 2.5 mV, x100 */
++#define OZ8806_NTC_REF_MV	1800
++#define OZ8806_DESIGN_MAH	4250
++/*
++ * The charger's CV: the vendor charges to 4.35 V (battery_cv), not the
++ * 4.40 V of the gauge's config_data, so a full anchor at 4.35 V never fired.
++ */
++#define OZ8806_CV_MV		4350
++#define OZ8806_EOC_MA		300
++#define OZ8806_EOD_MV		3450
++
++#define OZ8806_POLL_MS		5000
++#define OZ8806_ANCHOR_POLLS	3	/* consecutive polls before re-anchoring */
++#define OZ8806_IDLE_MA		20
++/*
++ * Cell resistance for a rest-equivalent voltage: V - I * R (I > 0 charging).
++ * ~0.19 ohm from the log (38 mV more drop for 200 mA more load); 170 used.
++ */
++#define OZ8806_RINT_MOHM	170
++#define OZ8806_OCV_STALE_MV	100	/* OCV register vs. the cell: stale beyond */
++#define OZ8806_SEED_DRIFT	30	/* % : retained count vs. voltage at probe */
++#define OZ8806_DRIFT		25	/* % : count vs. voltage while running */
++#define OZ8806_DRIFT_POLLS	12	/* a minute of disagreement before resyncing */
++
++struct oz8806_lut {
++	int x;
++	int y;
++};
++
++/* Open-circuit voltage (mV) -> state of charge (%) */
++static const struct oz8806_lut oz8806_ocv[] = {
++	{3104, 0}, {3472, 2}, {3583, 3}, {3658, 5}, {3685, 6}, {3687, 8},
++	{3688, 9}, {3689, 11}, {3693, 12}, {3707, 14}, {3717, 16}, {3727, 17},
++	{3735, 19}, {3741, 20}, {3746, 22}, {3753, 23}, {3759, 25}, {3765, 27},
++	{3771, 28}, {3777, 30}, {3782, 31}, {3787, 33}, {3792, 34}, {3797, 36},
++	{3802, 38}, {3807, 39}, {3813, 41}, {3819, 42}, {3827, 44}, {3834, 45},
++	{3841, 47}, {3850, 48}, {3859, 50}, {3869, 52}, {3879, 53}, {3893, 55},
++	{3911, 56}, {3929, 58}, {3946, 59}, {3960, 61}, {3974, 62}, {3987, 64},
++	{3998, 66}, {4012, 67}, {4030, 69}, {4046, 70}, {4061, 72}, {4077, 73},
++	{4094, 75}, {4110, 77}, {4128, 78}, {4145, 80}, {4162, 81}, {4180, 83},
++	{4198, 84}, {4216, 86}, {4234, 88}, {4253, 89}, {4271, 91}, {4289, 92},
++	{4307, 94}, {4326, 95}, {4343, 97}, {4362, 98}, {4386, 100},
++};
++
++/* NTC resistance (ohm) -> temperature (degC) */
++static const struct oz8806_lut oz8806_ntc[] = {
++	{721, 112}, {755, 107}, {908, 102}, {1024, 97}, {1158, 92},
++	{1314, 87}, {1496, 82}, {1710, 77}, {1962, 72}, {2261, 67},
++	{2615, 62}, {3039, 57}, {3547, 52}, {4160, 47}, {4903, 42},
++	{5809, 37}, {6921, 32}, {8295, 27}, {10000, 22}, {12133, 17},
++	{14820, 12}, {18234, 7}, {22594, 2}, {28223, -3}, {35548, -8},
++	{45168, -13}, {57926, -18}, {75021, -23},
++};
++
++struct oz8806 {
++	struct i2c_client *client;
++	struct power_supply *psy;
++	struct delayed_work work;
++	struct mutex lock;
++
++	u32 ntc_pullup_ohm;
++	int volt_mv;
++	int curr_ma;
++	int car_mah;
++	int temp_dc;	/* tenths of a degree C */
++	int full_polls;
++	int empty_polls;
++	int drift_polls;
++	bool valid;
++};
++
++static int oz8806_lut_interp(const struct oz8806_lut *t, int n, int x)
++{
++	int i;
++
++	if (x <= t[0].x)
++		return t[0].y;
++	if (x >= t[n - 1].x)
++		return t[n - 1].y;
++	for (i = 1; i < n; i++) {
++		if (x <= t[i].x)
++			return t[i - 1].y + (x - t[i - 1].x) *
++			       (t[i].y - t[i - 1].y) / (t[i].x - t[i - 1].x);
++	}
++	return t[n - 1].y;
++}
++
++static int oz8806_read_s16(struct oz8806 *oz, u8 reg, s16 *val)
++{
++	int i, ret;
++
++	/* The stock driver retries every access; the bus is shared and noisy */
++	for (i = 0; i < 8; i++) {
++		ret = i2c_smbus_read_word_data(oz->client, reg);
++		if (ret >= 0) {
++			*val = (s16)ret;
++			return 0;
++		}
++		msleep(5);
++	}
++	return ret;
++}
++
++static int oz8806_raw_to_mv(s16 raw)
++{
++	return (raw / 16) * OZ8806_VOLT_LSB / 100;
++}
++
++static int oz8806_write_car(struct oz8806 *oz, int mah)
++{
++	s16 raw = mah * OZ8806_RSENSE_MOHM / OZ8806_CAR_LSB;
++
++	return i2c_smbus_write_word_data(oz->client, OZ8806_REG_CAR, (u16)raw);
++}
++
++/* state of charge (%) from a cell voltage under current (rest-equivalent) */
++static int oz8806_soc_from_cell(int mv, int ma)
++{
++	int rest = mv - ma * OZ8806_RINT_MOHM / 1000;
++
++	return oz8806_lut_interp(oz8806_ocv, ARRAY_SIZE(oz8806_ocv), rest);
++}
++
++static int oz8806_wake(struct oz8806 *oz)
++{
++	int ctrl = i2c_smbus_read_byte_data(oz->client, OZ8806_REG_OP_CTRL);
++
++	if (ctrl < 0)
++		return ctrl;
++	if (ctrl & OZ8806_OP_CTRL_SLEEP)
++		return i2c_smbus_write_byte_data(oz->client, OZ8806_REG_OP_CTRL,
++						 OZ8806_OP_CTRL_ACTIVE);
++	return 0;
++}
++
++static int oz8806_update(struct oz8806 *oz)
++{
++	s16 v, c, car, t;
++	int ret, ntc_mv;
++
++	ret = oz8806_read_s16(oz, OZ8806_REG_VOLT, &v);
++	if (!ret)
++		ret = oz8806_read_s16(oz, OZ8806_REG_CURR, &c);
++	if (!ret)
++		ret = oz8806_read_s16(oz, OZ8806_REG_CAR, &car);
++	if (!ret)
++		ret = oz8806_read_s16(oz, OZ8806_REG_TEMP, &t);
++	if (ret) {
++		dev_warn_ratelimited(&oz->client->dev, "read failed: %d\n", ret);
++		return ret;
++	}
++
++	oz->volt_mv = oz8806_raw_to_mv(v);
++	oz->curr_ma = c * OZ8806_CURR_LSB / OZ8806_RSENSE_MOHM / 100 / 4;
++	oz->car_mah = car * OZ8806_CAR_LSB / OZ8806_RSENSE_MOHM;
++
++	ntc_mv = oz8806_raw_to_mv(t);
++	if (ntc_mv > 0 && ntc_mv < OZ8806_NTC_REF_MV) {
++		int r = ntc_mv * oz->ntc_pullup_ohm / (OZ8806_NTC_REF_MV - ntc_mv);
++
++		oz->temp_dc = 10 * oz8806_lut_interp(oz8806_ntc,
++						     ARRAY_SIZE(oz8806_ntc), r);
++	} else {
++		oz->temp_dc = 250;	/* NTC open/shorted: stock assumes 25C */
++	}
++
++	/* End of charge: near CV voltage with taper current below threshold */
++	/* after termination the cell takes ~0 mA, either sign */
++	if (oz->volt_mv >= OZ8806_CV_MV - 50 &&
++	    oz->curr_ma > -20 && oz->curr_ma < OZ8806_EOC_MA)
++		oz->full_polls++;
++	else
++		oz->full_polls = 0;
++
++	/* End of discharge: under cut-off voltage while discharging */
++	if (oz->volt_mv < OZ8806_EOD_MV && oz->curr_ma < 0)
++		oz->empty_polls++;
++	else
++		oz->empty_polls = 0;
++
++	if (oz->full_polls >= OZ8806_ANCHOR_POLLS &&
++	    oz->car_mah < OZ8806_DESIGN_MAH) {
++		oz8806_write_car(oz, OZ8806_DESIGN_MAH);
++		oz->car_mah = OZ8806_DESIGN_MAH;
++	} else if (oz->empty_polls >= OZ8806_ANCHOR_POLLS && oz->car_mah > 0) {
++		oz8806_write_car(oz, 0);
++		oz->car_mah = 0;
++	} else if (oz->car_mah > OZ8806_DESIGN_MAH) {
++		oz8806_write_car(oz, OZ8806_DESIGN_MAH);
++		oz->car_mah = OZ8806_DESIGN_MAH;
++	}
++
++	/*
++	 * Drift: the count can be wrong (2026-10-25: seeded from a stale OCV
++	 * register it read 95 % on an empty cell). When the voltage says
++	 * something else by more than OZ8806_DRIFT for a minute, follow it. The
++	 * voltage curve is flat in the middle, so only a gross error trips this;
++	 * the full/empty anchors stay the precise corrections.
++	 */
++	{
++		int vsoc = oz8806_soc_from_cell(oz->volt_mv, oz->curr_ma);
++		int csoc = clamp(oz->car_mah * 100 / OZ8806_DESIGN_MAH, 0, 100);
++
++		if (abs(vsoc - csoc) > OZ8806_DRIFT)
++			oz->drift_polls++;
++		else
++			oz->drift_polls = 0;
++		if (oz->drift_polls >= OZ8806_DRIFT_POLLS) {
++			int mah = OZ8806_DESIGN_MAH * vsoc / 100;
++
++			dev_info(&oz->client->dev,
++				 "count %d%% disagrees with the cell (%d mV, %d mA: %d%%), resyncing\n",
++				 csoc, oz->volt_mv, oz->curr_ma, vsoc);
++			oz8806_write_car(oz, mah);
++			oz->car_mah = mah;
++			oz->drift_polls = 0;
++		}
++	}
++
++	oz->valid = true;
++	return 0;
++}
++
++static void oz8806_seed_car(struct oz8806 *oz)
++{
++	s16 car, ocv, v, c;
++	int mah, soc, cell_mv, ocv_mv, rest_mv, ma, vsoc;
++
++	if (oz8806_read_s16(oz, OZ8806_REG_CAR, &car) ||
++	    oz8806_read_s16(oz, OZ8806_REG_OCV, &ocv) ||
++	    oz8806_read_s16(oz, OZ8806_REG_VOLT, &v) ||
++	    oz8806_read_s16(oz, OZ8806_REG_CURR, &c))
++		return;
++	mah = car * OZ8806_CAR_LSB / OZ8806_RSENSE_MOHM;
++	ocv_mv = oz8806_raw_to_mv(ocv);
++	cell_mv = oz8806_raw_to_mv(v);
++	ma = c * OZ8806_CURR_LSB / OZ8806_RSENSE_MOHM / 100 / 4;
++	rest_mv = cell_mv - ma * OZ8806_RINT_MOHM / 1000;
++	vsoc = oz8806_soc_from_cell(cell_mv, ma);
++
++	if (mah > 0 && mah <= OZ8806_DESIGN_MAH + OZ8806_DESIGN_MAH / 20 &&
++	    abs(mah * 100 / OZ8806_DESIGN_MAH - vsoc) <= OZ8806_SEED_DRIFT) {
++		dev_info(&oz->client->dev, "using retained capacity %d mAh\n", mah);
++		return;
++	}
++
++	/*
++	 * The OCV register holds the chip's last rest sample: after the battery
++	 * ran flat it can be days old (4330 mV on a 3575 mV cell). Use it only
++	 * when it agrees with the cell now; otherwise the cell voltage,
++	 * corrected for the current.
++	 */
++	if (abs(ocv_mv - rest_mv) <= OZ8806_OCV_STALE_MV) {
++		soc = oz8806_lut_interp(oz8806_ocv, ARRAY_SIZE(oz8806_ocv), ocv_mv);
++		dev_info(&oz->client->dev, "seeding capacity from OCV %d mV: %d%%\n",
++			 ocv_mv, soc);
++	} else {
++		soc = vsoc;
++		dev_info(&oz->client->dev,
++			 "OCV register stale (%d mV); seeding from the cell %d mV (%d mA): %d%%%s\n",
++			 ocv_mv, cell_mv, ma, soc,
++			 mah > 0 ? " (retained count disagreed)" : "");
++	}
++	oz8806_write_car(oz, OZ8806_DESIGN_MAH * soc / 100);
++}
++
++static void oz8806_work(struct work_struct *work)
++{
++	struct oz8806 *oz = container_of(work, struct oz8806, work.work);
++
++	mutex_lock(&oz->lock);
++	oz8806_update(oz);
++	mutex_unlock(&oz->lock);
++
++	power_supply_changed(oz->psy);
++	schedule_delayed_work(&oz->work, msecs_to_jiffies(OZ8806_POLL_MS));
++}
++
++static int oz8806_capacity(struct oz8806 *oz)
++{
++	return clamp(oz->car_mah * 100 / OZ8806_DESIGN_MAH, 0, 100);
++}
++
++static int oz8806_get_property(struct power_supply *psy,
++			       enum power_supply_property psp,
++			       union power_supply_propval *val)
++{
++	struct oz8806 *oz = power_supply_get_drvdata(psy);
++	int ret = 0;
++
++	mutex_lock(&oz->lock);
++	if (!oz->valid) {
++		mutex_unlock(&oz->lock);
++		return -EAGAIN;
++	}
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		if (oz->curr_ma > OZ8806_IDLE_MA)
++			val->intval = POWER_SUPPLY_STATUS_CHARGING;
++		else if (oz->curr_ma < -OZ8806_IDLE_MA)
++			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
++		else if (oz8806_capacity(oz) >= 100)
++			val->intval = POWER_SUPPLY_STATUS_FULL;
++		else
++			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		break;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 1;
++		break;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LIPO;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		val->intval = oz->volt_mv * 1000;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		val->intval = oz->curr_ma * 1000;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		val->intval = oz8806_capacity(oz);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_NOW:
++		val->intval = max(oz->car_mah, 0) * 1000;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		val->intval = OZ8806_DESIGN_MAH * 1000;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		val->intval = OZ8806_CV_MV * 1000;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
++		val->intval = OZ8806_EOD_MV * 1000;
++		break;
++	case POWER_SUPPLY_PROP_TEMP:
++		val->intval = oz->temp_dc;
++		break;
++	default:
++		ret = -EINVAL;
++	}
++	mutex_unlock(&oz->lock);
++	return ret;
++}
++
++static enum power_supply_property oz8806_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CHARGE_NOW,
++	POWER_SUPPLY_PROP_CHARGE_FULL,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
++	POWER_SUPPLY_PROP_TEMP,
++};
++
++static const struct power_supply_desc oz8806_desc = {
++	.name		= "oz8806-battery",
++	.type		= POWER_SUPPLY_TYPE_BATTERY,
++	.properties	= oz8806_props,
++	.num_properties	= ARRAY_SIZE(oz8806_props),
++	.get_property	= oz8806_get_property,
++};
++
++static int oz8806_probe(struct i2c_client *client)
++{
++	struct power_supply_config cfg = {};
++	struct gpio_desc *strap;
++	struct oz8806 *oz;
++	int chip_id, ret;
++
++	oz = devm_kzalloc(&client->dev, sizeof(*oz), GFP_KERNEL);
++	if (!oz)
++		return -ENOMEM;
++
++	oz->client = client;
++	mutex_init(&oz->lock);
++	INIT_DELAYED_WORK(&oz->work, oz8806_work);
++	i2c_set_clientdata(client, oz);
++
++	/*
++	 * Board strap (GPIO 5 on the Titan Pocket): stock uses a 24k NTC
++	 * pull-up when it reads high, 120k when low
++	 */
++	strap = devm_gpiod_get_optional(&client->dev, "o2micro,ntc-strap", GPIOD_IN);
++	if (IS_ERR(strap))
++		return PTR_ERR(strap);
++	oz->ntc_pullup_ohm = strap && gpiod_get_value_cansleep(strap) == 1 ? 24000 : 120000;
++	of_property_read_u32(client->dev.of_node, "o2micro,ntc-pullup-ohm",
++			     &oz->ntc_pullup_ohm);
++
++	chip_id = i2c_smbus_read_byte_data(client, OZ8806_REG_CHIP_ID);
++	if (chip_id < 0) {
++		dev_err(&client->dev, "no response from gauge: %d\n", chip_id);
++		return chip_id;
++	}
++
++	ret = oz8806_wake(oz);
++	if (ret)
++		dev_warn(&client->dev, "wake failed: %d\n", ret);
++	oz8806_seed_car(oz);
++
++	cfg.drv_data = oz;
++	cfg.of_node = client->dev.of_node;
++	oz->psy = devm_power_supply_register(&client->dev, &oz8806_desc, &cfg);
++	if (IS_ERR(oz->psy))
++		return PTR_ERR(oz->psy);
++
++	mutex_lock(&oz->lock);
++	oz8806_update(oz);
++	mutex_unlock(&oz->lock);
++	schedule_delayed_work(&oz->work, msecs_to_jiffies(OZ8806_POLL_MS));
++
++	dev_info(&client->dev, "OZ8806 id 0x%02x: %d mV, %d mA, %d%%\n",
++		 chip_id, oz->volt_mv, oz->curr_ma, oz8806_capacity(oz));
++	return 0;
++}
++
++static void oz8806_remove(struct i2c_client *client)
++{
++	struct oz8806 *oz = i2c_get_clientdata(client);
++
++	cancel_delayed_work_sync(&oz->work);
++}
++
++static void oz8806_shutdown(struct i2c_client *client)
++{
++	struct oz8806 *oz = i2c_get_clientdata(client);
++
++	cancel_delayed_work_sync(&oz->work);
++	/* Keep coulomb counting but drop the chip to its low-power state */
++	i2c_smbus_write_byte_data(client, OZ8806_REG_OP_CTRL,
++				  OZ8806_OP_CTRL_PWRDOWN);
++}
++
++static int oz8806_suspend(struct device *dev)
++{
++	struct oz8806 *oz = dev_get_drvdata(dev);
++
++	cancel_delayed_work_sync(&oz->work);
++	return 0;
++}
++
++static int oz8806_resume(struct device *dev)
++{
++	struct oz8806 *oz = dev_get_drvdata(dev);
++
++	oz8806_wake(oz);
++	schedule_delayed_work(&oz->work, 0);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(oz8806_pm_ops, oz8806_suspend, oz8806_resume);
++
++static const struct of_device_id oz8806_of_match[] = {
++	{ .compatible = "o2micro,oz8806" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, oz8806_of_match);
++
++static const struct i2c_device_id oz8806_id[] = {
++	{ "oz8806" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, oz8806_id);
++
++static struct i2c_driver oz8806_driver = {
++	.driver = {
++		.name		= "oz8806",
++		.of_match_table	= oz8806_of_match,
++		.pm		= pm_sleep_ptr(&oz8806_pm_ops),
++	},
++	.probe		= oz8806_probe,
++	.remove		= oz8806_remove,
++	.shutdown	= oz8806_shutdown,
++	.id_table	= oz8806_id,
++};
++module_i2c_driver(oz8806_driver);
++
++MODULE_DESCRIPTION("O2Micro OZ8806 fuel gauge (Titan Pocket)");
++MODULE_LICENSE("GPL v2");

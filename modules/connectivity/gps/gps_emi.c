@@ -28,7 +28,11 @@
 #include <linux/uaccess.h>
 #include <linux/printk.h>
 #include <linux/version.h>
+#ifdef TITAN_LINUX612
+#include <linux/arm-smccc.h>
+#else
 #include <asm/memblock.h>
+#endif
 #include "gps.h"
 
 #ifdef pr_fmt
@@ -69,7 +73,7 @@
 #define GPS_EMI_BASE_ADDR_OFFSET     (SZ_1M)
 #define GPS_EMI_MPU_SIZE             (SZ_1M)
 #define EMI_MPU_PROTECTION_IS_READY  1
-#if EMI_MPU_PROTECTION_IS_READY
+#if EMI_MPU_PROTECTION_IS_READY && !defined(TITAN_LINUX612)
 #include <mt_emi_api.h>
 #endif
 #endif
@@ -176,6 +180,23 @@ INT32 gps_emi_mpu_set_region_protection(INT32 region)
 	emimpu_ret6 = mtk_emimpu_free_region(&region_info);
 	GPS_DBG("emi mpu cfg: ret = %d, %d, %d, %d, %d, %d",
 	    emimpu_ret1, emimpu_ret2, emimpu_ret3, emimpu_ret4, emimpu_ret5, emimpu_ret6);
+#elif defined(TITAN_LINUX612)
+	/*
+	 * Mainline Linux has no vendor EMI driver: the SMC its
+	 * emi_mpu_set_protection() makes (as the WMT core's mt6771.c), with
+	 * the permissions below: AP and CONN unprotected, the rest
+	 * forbidden, locked.
+	 */
+	UINT32 apc[2] = { 0x80b6da28, 0x00b6db6d };
+	UINT32 start = (UINT32)(gGpsEmiPhyBase >> 16) | (region << 24);
+	struct arm_smccc_res res;
+	int i;
+
+	for (i = 1; i >= 0; i--)
+		arm_smccc_smc(0xc2000262, start,
+			      (UINT32)((gGpsEmiPhyBase + GPS_EMI_MPU_SIZE - 1) >> 16) | (i << 24),
+			      apc[i], 0, 0, 0, 0, &res);
+	GPS_DBG("EMI MPU region %d: 0x%llx\n", region, (unsigned long long)gGpsEmiPhyBase);
 #else
 	struct emi_region_info_t region_info;
 	/*set MPU for EMI share Memory */
@@ -247,7 +268,7 @@ INT32 mtk_wcn_consys_gps_emi_init(void)
 			CONSYS_REG_READ(conn_reg.topckgen_base + CONSYS_EMI_MAPPING_OFFSET));
 		#endif
 		#if EMI_MPU_PROTECTION_IS_READY
-		pGpsEmibaseaddr = ioremap_nocache(gGpsEmiPhyBase, GPS_EMI_MPU_SIZE);
+		pGpsEmibaseaddr = ioremap(gGpsEmiPhyBase, GPS_EMI_MPU_SIZE);
 		#endif
 		iRet = 1;
 		#if 0
@@ -442,7 +463,11 @@ static int __init gps_emi_mod_init(void)
 		GPS_ERR("cdev_add fail: %d\n", err);
 		goto err_out;
 	}
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	devobj->cls = class_create("gpsemi");
+#else
 	devobj->cls = class_create(THIS_MODULE, "gpsemi");
+#endif
 	if (IS_ERR(devobj->cls)) {
 		GPS_ERR("Unable to create class, err = %d\n", (int)PTR_ERR(devobj->cls));
 	goto err_out;

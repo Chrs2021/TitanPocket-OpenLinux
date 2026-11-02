@@ -22,7 +22,8 @@ endif
 ifndef TOP
     TOP := $(srctree)/..
 endif
-ifeq ($(TARGET_BUILD_VARIANT),$(filter $(TARGET_BUILD_VARIANT),userdebug user))
+# (an empty variant matched too, and stripped the export symbols modpost reads)
+ifneq ($(filter userdebug user,$(TARGET_BUILD_VARIANT)),)
     ldflags-y += -s
 endif
 
@@ -32,6 +33,12 @@ KBUILD_MODPOST_FAIL_ON_WARNINGS := y
 
 # only WMT align this design flow, but gps use this also.
 #ccflags-y += -D MTK_WCN_REMOVE_KERNEL_MODULE
+
+ifeq ($(TITAN_LINUX612),y)
+# Mainline Linux 6.12 (../build612.sh): the SoC the vendor kernel's config
+# named, which selects the MT6771 EMI layout in gps_emi.c
+ccflags-y += -D CONFIG_MACH_MT6771
+endif
 
 ifeq ($(CONFIG_ARM64), y)
     ccflags-y += -D CONFIG_MTK_WCN_ARM64

@@ -12,6 +12,7 @@
 * If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <linux/version.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -658,7 +659,11 @@ static int WIFI_init(void)
 		goto error;
 
 #if CREATE_NODE_DYNAMIC	/* mknod replace */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	wmtwifi_class = class_create("wmtWifi");
+#else
 	wmtwifi_class = class_create(THIS_MODULE, "wmtWifi");
+#endif
 	if (IS_ERR(wmtwifi_class))
 		goto error;
 	wmtwifi_dev = device_create(wmtwifi_class, NULL, dev, NULL, "wmtWifi");

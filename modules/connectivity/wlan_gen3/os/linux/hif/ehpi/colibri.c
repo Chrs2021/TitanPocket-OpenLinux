@@ -448,10 +448,10 @@ static VOID mt5931_ehpi_reg_init(VOID)
 	}
 
 	/* 2. memory regioin remapping */
-	mt5931_mcr_base = ioremap_nocache(MEM_MAPPED_ADDR, MEM_MAPPED_LEN);
+	mt5931_mcr_base = ioremap(MEM_MAPPED_ADDR, MEM_MAPPED_LEN);
 	if (!(mt5931_mcr_base)) {
 		release_mem_region(MEM_MAPPED_ADDR, MEM_MAPPED_LEN);
-		DBGLOG(INIT, ERROR, "ioremap_nocache(0x%08X) failed.\n", MEM_MAPPED_ADDR);
+		DBGLOG(INIT, ERROR, "ioremap(0x%08X) failed.\n", MEM_MAPPED_ADDR);
 		return;
 	}
 

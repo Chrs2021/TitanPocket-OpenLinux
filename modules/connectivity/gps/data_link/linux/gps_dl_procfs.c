@@ -12,6 +12,7 @@
  */
 #include "gps_dl_config.h"
 
+#include <linux/version.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/proc_fs.h>
@@ -205,11 +206,18 @@ ssize_t gps_dl_procfs_read(struct file *filp, char __user *buf, size_t count, lo
 	return 0;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0))
+static const struct proc_ops gps_dl_procfs_fops = {
+	.proc_read = gps_dl_procfs_read,
+	.proc_write = gps_dl_procfs_write,
+};
+#else
 static const struct file_operations gps_dl_procfs_fops = {
 	.owner = THIS_MODULE,
 	.read = gps_dl_procfs_read,
 	.write = gps_dl_procfs_write,
 };
+#endif
 
 static struct proc_dir_entry *g_gps_dl_procfs_entry;
 #define GPS_DL_PROCFS_NAME "driver/gpsdl_dbg"

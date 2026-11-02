@@ -43,8 +43,10 @@
 #include "hif_sdio.h"
 #include "wmt_gpio.h"
 /* #include "hif_sdio_chrdev.h" */
+#ifndef TITAN_LINUX612	/* the vendor kernel's adapter; mainline has none */
 #include <connectivity_build_in_adapter.h>
 #include <wmt_build_in_adapter.h>
+#endif
 #include <linux/mmc/card.h>
 
 #define mmc_power_up_ext(x)
@@ -260,11 +262,19 @@ INT32 mtk_wcn_hif_sdio_irq_flag_set(INT32 flag)
 	if (flag == 0) {
 		atomic_dec(&hif_sdio_irq_enable_flag);
 		if (atomic_read(&hif_sdio_irq_enable_flag) == 0)
+#ifdef MTK_WCN_REMOVE_KERNEL_MODULE
+			mtk_wcn_sdio_irq_flag_set(0);	/* the stub's own (mtk_wcn_stub_alps.c) */
+#else
 			wmt_export_mtk_wcn_sdio_irq_flag_set(0);
+#endif
 	} else {
 		atomic_inc(&hif_sdio_irq_enable_flag);
 		if (atomic_read(&hif_sdio_irq_enable_flag) == 1)
+#ifdef MTK_WCN_REMOVE_KERNEL_MODULE
+			mtk_wcn_sdio_irq_flag_set(1);	/* the stub's own (mtk_wcn_stub_alps.c) */
+#else
 			wmt_export_mtk_wcn_sdio_irq_flag_set(1);
+#endif
 	}
 
 	return 0;
@@ -1287,7 +1297,12 @@ INT32 mtk_wcn_hif_sdio_abort(MTK_WCN_HIF_SDIO_CLTCTX ctx)
 	 * read CTMDPCR1(0xBC) to switch function 2
 	 */
 	sdio_readl(func, 0xBC, &ret);
+#ifdef TITAN_LINUX612
+	/* SDIO combo chips only; mainline doesn't export mmc_io_rw_direct() */
+	ret = -EOPNOTSUPP;
+#else
 	ret = KERNEL_mmc_io_rw_direct(func->card, 1, 0, SDIO_CCCR_ABORT, func->num, NULL);
+#endif
 	sdio_release_host(func);
 	osal_ftrace_print("%s|E|L|\n", __func__);
 

@@ -21,7 +21,9 @@
 #include "osal_typedef.h"
 #include "stp_exp.h"
 #include "wmt_exp.h"
+#ifndef TITAN_LINUX612	/* the vendor kernel's adapter; mainline has none */
 #include <connectivity_build_in_adapter.h>
+#endif
 #if defined(CONFIG_MACH_MT6580)
 #include <mt_clkbuf_ctl.h>
 #endif
@@ -1167,7 +1169,11 @@ static int GPS_init(void)
 		goto error;
 #if WMT_CREATE_NODE_DYNAMIC || REMOVE_MK_NODE
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	stpgps_class = class_create("stpgps");
+#else
 	stpgps_class = class_create(THIS_MODULE, "stpgps");
+#endif
 	if (IS_ERR(stpgps_class))
 		goto error;
 	stpgps_dev = device_create(stpgps_class, NULL, dev, NULL, "stpgps");
@@ -1191,7 +1197,11 @@ static int GPS_init(void)
 		goto error;
 #if WMT_CREATE_NODE_DYNAMIC || REMOVE_MK_NODE
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	stpgps2_class = class_create("stpgps2");
+#else
 	stpgps2_class = class_create(THIS_MODULE, "stpgps2");
+#endif
 	if (IS_ERR(stpgps2_class))
 		goto error;
 	stpgps2_dev = device_create(stpgps2_class, NULL, dev2, NULL, "stpgps2");

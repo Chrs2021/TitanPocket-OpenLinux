@@ -347,7 +347,7 @@ BOOLEAN hs20IsForgedGTKFrame(IN P_ADAPTER_T prAdapter, IN P_BSS_INFO_T prBssInfo
 				}
 			}
 		}
-#ifdef CONFIG_IPV6
+#if IS_ENABLED(CONFIG_IPV6)
 		else if (*pu2PktIpVer == htons(ETH_P_IPV6)) {
 			UINT_8 aucIPv6Mac[MAC_ADDR_LEN];
 			PUINT_8 pucIdx =

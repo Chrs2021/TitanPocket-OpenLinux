@@ -153,7 +153,7 @@
 #include <net/netlink.h>
 #include <linux/fb.h>
 
-#ifdef CONFIG_IPV6
+#if IS_ENABLED(CONFIG_IPV6)
 #include <linux/ipv6.h>
 #include <linux/in6.h>
 #include <net/if_inet6.h>

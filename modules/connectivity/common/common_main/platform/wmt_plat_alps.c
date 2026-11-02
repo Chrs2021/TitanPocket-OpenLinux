@@ -67,7 +67,9 @@
 #include "osal.h"
 #include "wmt_gpio.h"
 #include "wmt_detect.h"
+#ifndef TITAN_LINUX612	/* the vendor kernel's adapter; mainline has none */
 #include <connectivity_build_in_adapter.h>
+#endif
 
 #include <linux/of.h>
 #include <linux/of_irq.h>

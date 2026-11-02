@@ -2,6 +2,7 @@
 /*
  * Copyright (c) 2019 MediaTek Inc.
  */
+#include <linux/version.h>
 #include <linux/io.h>
 #include <linux/uaccess.h>
 #include <linux/proc_fs.h>
@@ -323,11 +324,18 @@ ssize_t bt_dbg_write(struct file *filp, const char __user *buffer, size_t count,
 int bt_dev_dbg_init(void)
 {
 	int i_ret = 0;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0))
+	static const struct proc_ops bt_dbg_fops = {
+		.proc_read = bt_dbg_read,
+		.proc_write = bt_dbg_write,
+	};
+#else
 	static const struct file_operations bt_dbg_fops = {
 		.owner = THIS_MODULE,
 		.read = bt_dbg_read,
 		.write = bt_dbg_write,
 	};
+#endif
 
 	// initialize debug function struct
 	g_bt_dbg_st.trx_enable = FALSE;

@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 15/15] arm64: configs: add titanpocket.config
+
+A fragment on top of defconfig: make defconfig titanpocket.config.
+---
+ arch/arm64/configs/titanpocket.config | 137 ++++++++++++++++++++++++++
+ 1 file changed, 137 insertions(+)
+
+diff --git a/arch/arm64/configs/titanpocket.config b/arch/arm64/configs/titanpocket.config
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ad76243031facaf8eda861af80c8d844783bedc
+--- /dev/null
++++ b/arch/arm64/configs/titanpocket.config
+@@ -0,0 +1,137 @@
++# Titan Pocket on top of arm64 defconfig:
++#   make defconfig titanpocket.config
++CONFIG_LOCALVERSION="-titanpocket"
++# LK's watchdog is still running when the kernel starts (MTK_WDT_MODE 0xdd
++# in the vendor boot log): keep it fed until userspace takes over
++CONFIG_WATCHDOG=y
++CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED=y
++CONFIG_MEDIATEK_WATCHDOG=y
++CONFIG_SERIAL_8250_MT6577=y
++# first-light logs come back through pstore into the next 4.14 boot
++CONFIG_PSTORE=y
++CONFIG_PSTORE_CONSOLE=y
++CONFIG_PSTORE_PMSG=y
++CONFIG_PSTORE_RAM=y
++CONFIG_PANIC_TIMEOUT=5
++CONFIG_MAGIC_SYSRQ=y
++# LK's framebuffer as a console, once its address is known
++CONFIG_FB=y
++CONFIG_FB_SIMPLE=y
++CONFIG_FRAMEBUFFER_CONSOLE=y
++CONFIG_BLK_DEV_INITRD=y
++# root filesystem on UFS, built in (no modules yet)
++CONFIG_SCSI_UFS_MEDIATEK=y
++CONFIG_PHY_MTK_UFS=y
++# PMIC: power key and RTC
++CONFIG_KEYBOARD_MTK_PMIC=y
++CONFIG_RTC_DRV_MT6397=y
++# USB gadget (ttyGS0 + NCM) set up through configfs by the ramdisk's init,
++# as on 4.14
++CONFIG_USB_CONFIGFS=y
++CONFIG_USB_CONFIGFS_ACM=y
++CONFIG_USB_CONFIGFS_NCM=y
++# keyboard: key matrix on the AW9523 GPIO expander (i2c4)
++CONFIG_PINCTRL_AW9523=y
++CONFIG_KEYBOARD_MATRIX=y
++# sensors: the SCP's sensor hub (our mt6771-scp), as IIO devices
++CONFIG_IIO=y
++CONFIG_MTK_MT6771_SCP=y
++# touchscreen: Goodix GT1151QM on i2c0
++CONFIG_TOUCHSCREEN_GOODIX=y
++# side keys: the SoC key matrix (power is the PMIC key)
++CONFIG_KEYBOARD_MT6779=y
++# vibration motor: regulator-haptic on the MT6358 VIBR LDO
++CONFIG_INPUT_MISC=y
++CONFIG_INPUT_REGULATOR_HAPTIC=y
++# IR LED: PWM channel 0 in memory mode (our mtk-pwm-ir-tx), /dev/lirc0
++CONFIG_RC_CORE=y
++CONFIG_LIRC=y
++CONFIG_RC_DEVICES=y
++CONFIG_IR_MTK_PWM_TX=y
++# keyboard touchpad: Synaptics RMI4 on i2c6; F55 breaks its probe,
++# F54 needs V4L2, F34 (firmware update) is not wanted
++CONFIG_RMI4_CORE=y
++CONFIG_RMI4_I2C=y
++CONFIG_RMI4_F12=y
++# CONFIG_RMI4_F34 is not set
++# CONFIG_RMI4_F54 is not set
++# CONFIG_RMI4_F55 is not set
++# battery gauge (i2c6)
++CONFIG_BATTERY_OZ8806=y
++# screen console on LK's framebuffer (drivers/soc/mediatek/mtk-lk-fb.c)
++CONFIG_MTK_LK_FB=y
++
++# GPU: Panfrost on the Mali-G72, with the MT8183 MFG clocks
++CONFIG_COMMON_CLK_MT8183_MFGCFG=y
++CONFIG_DRM=y
++CONFIG_DRM_PANFROST=y
++# Connectivity: the MediaTek WMT/STP modules (modules/connectivity) are
++# built out of tree against this kernel; what they use is built in.
++CONFIG_IPV6=y
++CONFIG_RFKILL=y
++CONFIG_CFG80211=y
++CONFIG_CFG80211_WEXT=y
++# the gen3 Wi-Fi driver needs nl80211 test mode
++CONFIG_NL80211_TESTMODE=y
++CONFIG_ZLIB_DEFLATE=y
++CONFIG_BT=y
++CONFIG_BT_HCIVHCI=y
++# Audio: the MT8183 AFE driver runs the MT6771's; MT6358 codec and the
++# FS1860 amp (sound/soc/codecs/fs1860.c) on a machine driver of our own
++CONFIG_COMMON_CLK_MT8183_AUDIOSYS=y
++CONFIG_SOUND=y
++CONFIG_SND=y
++CONFIG_SND_SOC=y
++CONFIG_SND_SOC_MT8183=y
++CONFIG_SND_SOC_MT6771_TITANPOCKET=y
++# Bluetooth SCO audio (and the BT CVSD interrupt mask CONNSYS needs set)
++CONFIG_SND_SOC_MTK_BTCVSD=y
++# cpuidle core/cluster power-down: SSPM's MCDI must know the online CPUs
++CONFIG_MTK_MCDI=y
++# no SPM firmware: hold 26 MHz, bus and DRAM requests (suspend)
++CONFIG_MTK_MT6771_SPM=y
++# CPU DVFS: mediatek-cpufreq waits for the CCI devfreq, so build it in
++CONFIG_ARM_MEDIATEK_CCI_DEVFREQ=y
++CONFIG_DEVFREQ_GOV_PASSIVE=y
++CONFIG_CPU_FREQ_GOV_USERSPACE=y
++CONFIG_CPU_FREQ_STAT=y
++# Thermal: upstream auxadc_thermal (the MT8183's controller), its AUXADC,
++# CPU cooling through cpufreq
++CONFIG_MEDIATEK_MT6577_AUXADC=y
++CONFIG_MTK_THERMAL=y
++CONFIG_MTK_SOC_THERMAL=y
++# Suspend bring-up: /sys/power/pm_test, suspend timing and wakeup-source debug
++CONFIG_PM_DEBUG=y
++CONFIG_PM_ADVANCED_DEBUG=y
++CONFIG_PM_SLEEP_DEBUG=y
++# USB cable detection: the MT6370's Type-C port (TCPM) drives mtu3's role switch
++CONFIG_MFD_MT6370=y
++CONFIG_TYPEC=y
++CONFIG_TYPEC_TCPM=y
++CONFIG_TYPEC_TCPCI=y
++CONFIG_TYPEC_TCPCI_MT6370=y
++
++# Display: upstream mediatek-drm (MT8183 data) on the MT6771's display path,
++# the R63308 panel, the MT6370's display bias, the PWM backlight
++# GCE, built in: as modules they would cap MMSYS (and DRM) at m
++CONFIG_MTK_CMDQ_MBOX=y
++CONFIG_MTK_CMDQ=y
++CONFIG_MTK_MMSYS=y
++CONFIG_COMMON_CLK_MT8183_MMSYS=y
++CONFIG_DRM_MEDIATEK=y
++CONFIG_PHY_MTK_MIPI_DSI=y
++CONFIG_DRM_PANEL_SYNAPTICS_R63308=y
++CONFIG_DRM_FBDEV_EMULATION=y
++CONFIG_REGULATOR_MT6370=y
++CONFIG_PWM_MTK_DISP=y
++CONFIG_BACKLIGHT_CLASS_DEVICE=y
++CONFIG_BACKLIGHT_PWM=y
++CONFIG_CMA=y
++CONFIG_DMA_CMA=y
++
++# Charging: the MT6370 charger (input limit from the Type-C source and
++# BC1.2, charge limits from the battery node) and its ADC
++CONFIG_MEDIATEK_MT6370_ADC=y
++CONFIG_CHARGER_MT6370=y
++CONFIG_LEDS_CLASS_MULTICOLOR=y
++CONFIG_LEDS_MT6370_RGB=y

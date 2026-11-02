@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 05/15] scsi: ufs: mediatek: support the MT6771
+
+The MT6771's controller is UniPro 1.6: skip PA_TXHSADAPTTYPE (a 1.8
+attribute) when the host version is below 3, and treat the reset
+controls as optional.
+---
+ drivers/ufs/host/ufs-mediatek.c | 27 +++++++++++++--------------
+ 1 file changed, 13 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/ufs/host/ufs-mediatek.c b/drivers/ufs/host/ufs-mediatek.c
+index e4156238f51d9443bb8bb331b3df47fd62c3ffba..d0205f0bf1161e7593ce9dbe9efa405acba0035b 100644
+--- a/drivers/ufs/host/ufs-mediatek.c
++++ b/drivers/ufs/host/ufs-mediatek.c
+@@ -215,7 +215,7 @@ static void ufs_mtk_init_reset_control(struct ufs_hba *hba,
+ 				       struct reset_control **rc,
+ 				       char *str)
+ {
+-	*rc = devm_reset_control_get(hba->dev, str);
++	*rc = devm_reset_control_get_optional_exclusive(hba->dev, str);
+ 	if (IS_ERR(*rc)) {
+ 		dev_info(hba->dev, "Failed to get reset control %s: %ld\n",
+ 			 str, PTR_ERR(*rc));
+@@ -1217,22 +1217,21 @@ static int ufs_mtk_pre_pwr_change(struct ufs_hba *hba,
+ 		}
+ 	}
+ 
+-	if (dev_req_params->pwr_rx == FAST_MODE ||
+-	    dev_req_params->pwr_rx == FASTAUTO_MODE) {
+-		if (host->hw_ver.major >= 3) {
+-			ret = ufshcd_dme_configure_adapt(hba,
+-						   dev_req_params->gear_tx,
+-						   PA_INITIAL_ADAPT);
+-		} else {
+-			ret = ufshcd_dme_configure_adapt(hba,
+-				   dev_req_params->gear_tx,
+-				   PA_NO_ADAPT);
+-		}
+-	} else {
++	/*
++	 * PA_TXHSADAPTTYPE is new in UniPro 1.8: an older controller (MT6771,
++	 * UniPro 1.6) rejects it.
++	 */
++	if (host->hw_ver.major < 3)
++		ret = 0;
++	else if (dev_req_params->pwr_rx == FAST_MODE ||
++		 dev_req_params->pwr_rx == FASTAUTO_MODE)
++		ret = ufshcd_dme_configure_adapt(hba,
++					   dev_req_params->gear_tx,
++					   PA_INITIAL_ADAPT);
++	else
+ 		ret = ufshcd_dme_configure_adapt(hba,
+ 			   dev_req_params->gear_tx,
+ 			   PA_NO_ADAPT);
+-	}
+ 
+ 	return ret;
+ }

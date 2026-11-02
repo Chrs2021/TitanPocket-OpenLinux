@@ -466,14 +466,14 @@ static VOID consys_set_if_pinmux(MTK_WCN_BOOL enable)
 	UINT8 *consys_if_pinmux_driving_base = NULL;
 
 	/* Switch D die pinmux for connecting A die */
-	consys_if_pinmux_reg_base = ioremap_nocache(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
+	consys_if_pinmux_reg_base = ioremap(CONSYS_IF_PINMUX_REG_BASE, 0x1000);
 	if (!consys_if_pinmux_reg_base) {
 		WMT_PLAT_PR_ERR("consys_if_pinmux_reg_base(%x) ioremap fail\n",
 				CONSYS_IF_PINMUX_REG_BASE);
 		return;
 	}
 
-	consys_if_pinmux_driving_base = ioremap_nocache(CONSYS_IF_PINMUX_DRIVING_BASE, 0x100);
+	consys_if_pinmux_driving_base = ioremap(CONSYS_IF_PINMUX_DRIVING_BASE, 0x100);
 	if (!consys_if_pinmux_driving_base) {
 		WMT_PLAT_PR_ERR("consys_if_pinmux_driving_base(%x) ioremap fail\n",
 				CONSYS_IF_PINMUX_DRIVING_BASE);
@@ -894,7 +894,7 @@ static INT32 polling_consys_chipid(VOID)
 	WMT_PLAT_PR_INFO("consys FW version id(0x%x)\n", consys_ver_id & 0xFFFF);
 
 	if (wmt_plat_soc_co_clock_flag_get()) {
-		consys_reg_base = ioremap_nocache(CONSYS_COCLOCK_STABLE_TIME_BASE, 0x100);
+		consys_reg_base = ioremap(CONSYS_COCLOCK_STABLE_TIME_BASE, 0x100);
 		if (consys_reg_base) {
 			/**
 			 * 1. set CR "vcore ready stable time" "XO initial stable time" and
@@ -921,7 +921,7 @@ static INT32 polling_consys_chipid(VOID)
 			CONSYS_SLPPROT_CONTROL_MASK) | CONSYS_SLPPROT_CONTROL_VALUE);
 
 	/* toppose_restore_done rollback */
-	consys_reg_base = ioremap_nocache(CONSYS_TOPPOSE_RESTORE_ADDRESS, 0x100);
+	consys_reg_base = ioremap(CONSYS_TOPPOSE_RESTORE_ADDRESS, 0x100);
 	if (consys_reg_base) {
 		CONSYS_REG_WRITE(consys_reg_base,
 				(CONSYS_REG_READ(consys_reg_base) &
@@ -930,7 +930,7 @@ static INT32 polling_consys_chipid(VOID)
 	}
 
 	/* update WPLL setting for WPLL issue@LT */
-	consys_reg_base = ioremap_nocache(CONSYS_WPLL_SETTING_ADDRESS, 0x100);
+	consys_reg_base = ioremap(CONSYS_WPLL_SETTING_ADDRESS, 0x100);
 	if (consys_reg_base) {
 		CONSYS_REG_WRITE(consys_reg_base,
 				(CONSYS_REG_READ(consys_reg_base) &
@@ -1333,7 +1333,7 @@ static INT32 consys_check_reg_readable(VOID)
 static INT32 consys_emi_coredump_remapping(UINT8 __iomem **addr, UINT32 enable)
 {
 	if (enable) {
-		*addr = ioremap_nocache(gConEmiPhyBase + CONSYS_EMI_COREDUMP_OFFSET,
+		*addr = ioremap(gConEmiPhyBase + CONSYS_EMI_COREDUMP_OFFSET,
 				CONSYS_EMI_MEM_SIZE);
 		if (*addr) {
 			WMT_PLAT_PR_INFO("COREDUMP EMI mapping OK virtual(0x%p) physical(0x%x)\n",
@@ -1476,7 +1476,7 @@ static VOID consys_ic_clock_fail_dump(VOID)
 	WMT_PLAT_PR_ERR("%s length = %d", buffer, osal_strlen(buffer));
 
 	temp = buffer;
-	addr = ioremap_nocache(0x180bc000, 0x100);
+	addr = ioremap(0x180bc000, 0x100);
 	/* conn2ap axi master sleep prot info */
 	temp += sprintf(temp, "0x180bc010=0x%08x\n", CONSYS_REG_READ(addr + 0x10));
 	/* conn_mcu2ap axi master sleep prot info */
@@ -1489,21 +1489,21 @@ static VOID consys_ic_clock_fail_dump(VOID)
 	temp += sprintf(temp, "0x180bc020=0x%08x\n", CONSYS_REG_READ(addr + 0x20));
 	iounmap(addr);
 
-	addr = ioremap_nocache(0x10001B20, 0x100);
+	addr = ioremap(0x10001B20, 0x100);
 	/* 0x1020E804 */
 	temp += sprintf(temp, "0x10001B20=0x%08x\n", CONSYS_REG_READ(addr));
 
-	addr = ioremap_nocache(0x1800713c, 0x100);
+	addr = ioremap(0x1800713c, 0x100);
 	/* conn_hif_on misc info */
 	temp += sprintf(temp, "0x1800713c=0x%08x\n", CONSYS_REG_READ(addr));
 	iounmap(addr);
 
-	addr = ioremap_nocache(0x180c1144, 0x100);
+	addr = ioremap(0x180c1144, 0x100);
 	/* conn_on_host debug flag */
 	temp += sprintf(temp, "0x180c1144=0x%08x\n", CONSYS_REG_READ(addr));
 	iounmap(addr);
 
-	addr = ioremap_nocache(0x1020E804, 0x100);
+	addr = ioremap(0x1020E804, 0x100);
 	/* 0x1020E804 */
 	temp += sprintf(temp, "0x1020E804=0x%08x\n", CONSYS_REG_READ(addr));
 	iounmap(addr);
