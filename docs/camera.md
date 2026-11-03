@@ -1,6 +1,7 @@
 # Cameras (OV16880 rear, OV8865 front)
 
-Status (2026-10-15): **phase 2 done, phase 3 under way**. A V4L2 /
+Status (2026-10-15; the hardware ISP sections below are later, and the
+Linux 6.12 port is at the end): **phase 2 done, phase 3 under way**. A V4L2 /
 media-controller driver (`titan_camera`, loaded at boot) streams both
 cameras at 30 fps, and **libcamera** (v0.7.2, built from source with a
 small patch) turns them into RGB with its software ISP, debayering on the
@@ -1276,3 +1277,82 @@ be off, which would make the AE under-expose — check on a lit scene with
 `ae_manual` stays set until the next stream stops; `ae_step`'s `exp_max` is
 the mode's nominal VTS, so it can't use the longer frames libcamera's default
 frame duration gives the rear full-res mode (20.6 fps).
+
+## On Linux 6.12 (2026-11-02, built, not yet run)
+
+`modules/camera/linux612/titan_camera.c` is the driver for the 6.12 kernel
+(`modules/camera/build612.sh`); the 4.14 one in `v4l2/` is unchanged. The
+sensor tables, seninf/CAMSV/CAM A sequences, statistics, AE/AWB and the DIP
+path are the same code. What 4.14 found through vendor interfaces now comes
+from the device tree and upstream drivers:
+
+- **Hardware description.** `mt6771.dtsi` has `camsv1` (CAMSV1 with the
+  CAM A, seninf and MIPI RX register blocks, its clocks, interrupt and the
+  CAM power domain) and `dip` (pass 2, the ISP power domain), the camsys and
+  imgsys clock controllers, the CAM and ISP power domains under DISP, and
+  larbs 5 and 6. All of it matches the MT8183's data: the clock gates, the
+  power domains' control registers, SRAM bits and bus protection (vendor
+  `clk-mt6771-pg.c`), the larb addresses and their port order (vendor
+  `m4u_port.h`). The board file adds the sensors as `rear` and `front`
+  children of `camsv1`: I2C bus, MCLK (CAMTG/CAMTG2 at 24 MHz, set by
+  `assigned-clock-parents`), the supplies and the reset and power-down
+  GPIOs of the stock dtbo's `kd_camera_hw` states (rear: reset GPIO 101,
+  power-down 97, AVDD the LDO on GPIO 160; front: 102, 98, VCAMA1; both
+  VCAMIO and VCAMD; the rear's AK7371 on VLDO28). The rear sensor's bus,
+  i2c2 (0x11009000), is a shared controller like i2c4: the AP's channel
+  is at +0x100 and ATF's multi-channel register is restored after deep
+  sleep (`mediatek,secure-channel-id = <2>`).
+- **Buffers.** Upstream's MT8183 IOMMU puts every multimedia master in one
+  group with one address space, so a buffer mapped for `camsv1` has the
+  same device address on larb 5 (DIP) as on larb 6 (CAMSV, CAM A). 4.14
+  mapped the raw ring twice (SOCO and IMGI); 6.12 maps it once.
+  Internal buffers are `dma_alloc_coherent()` (uncached, as the 4.14
+  write-combined pages were); the vb2 buffers are vb2-dma-sg's mapping for
+  `camsv1`, which must be one device range (checked in `buf_init`). The
+  IOMMU allows one larb per device, hence two devices; the module carries a
+  small driver for `dip`, which has to be bound for the IOMMU to switch
+  its ports on.
+- **Power.** Runtime PM on `camsv1` and `dip` powers the CAM and ISP
+  domains and, through the IOMMU's device links, larbs 6 and 5 (which
+  program the ports). 4.14's clock-provider lookups by vendor ID and
+  `smi_bus_prepare_enable()` are gone.
+- **V4L2.** Each sensor's child device ("rear", "front") is its subdev
+  node's parent through `sd->dev`; 4.14 moved the registered nodes there.
+  Entity names carry the real I2C bus number. Orientation and rotation are
+  the standard controls.
+- **Kernel.** The media core is built as modules (`build.sh modules`; the
+  camera driver needs `videodev`, `mc` and `videobuf2-*`), and
+  `CONFIG_UDMABUF=y` for libcamera's software ISP.
+- **Install.** The 6.12 system has no in-tree modules installed;
+  `build612.sh` packs the ones the driver needs as
+  `out612/media-modules.tar` (paths under `/lib/modules/<version>/`). Unpack
+  it there, put `titan_camera.ko` in `extra/` and run `depmod`; the driver
+  then loads on its device tree match.
+- **Userspace.** `titan-camera-gui` finds the driver's sysfs directory and
+  libcamera's camera IDs from where `1a050000.camsv*` is (on 6.12 under
+  `platform/soc/`).
+
+- **Clock rates.** On 4.14 MediaTek's mmdvfs set `cam_sel` and `img_sel`
+  at late init: it forces its top step, then releases to the lowest one
+  without a camera request, 364 MHz from syspll_d3 for both
+  (`mmdvfs_pmqos` `cam_step1`/`img_step1`). Nothing sets them on 6.12, so
+  `camsv1` and `dip` assign that parent. The vendor seninf driver only
+  enables `seninf_sel` (no rate), so it is the same on both kernels. The MIPI
+  RX ports' 26 MHz gates (`AP_PLL_CON8` bits 6 and 11) are on as LK leaves
+  them; the vendor clock init's write that would clear them is `#if 0`.
+  6.12's `clk_ignore_unused` keeps them, and `camsv1` now holds them, for
+  when that option goes.
+- **Checked offline.** The vendor `camera-isp` probe (isp_50) only gets its
+  clocks; seninf and CAMSV are programmed by the camera HAL, which never ran
+  here, so 4.14's working state came from LK and our sequences alone. The
+  vendor CAM power-on defines an efuse S2P wait but never uses it. The
+  compiled tree's IOMMU IDs (larb 5 ports 0-2 = 160-162; larb 6 ports 2, 3,
+  11 = 194, 195, 203), power domains (CAM 8, ISP 9), larb IDs and GPIOs were
+  read back from the dtb. libcamera's patch only lowers its kernel version
+  check, which 6.12 passes.
+- **Guards.** Probe fails unless `camsv1` and `dip` are in one IOMMU domain
+  (the DIP gets camsv1's addresses; otherwise its DMA would reach other
+  memory), and system suspend is refused while streaming.
+
+Not ported: the MT6370 flash (its LED driver is not enabled on 6.12), the
+`titan_camcap` and `titan_dip` bring-up modules.

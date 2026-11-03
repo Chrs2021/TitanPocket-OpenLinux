@@ -1,12 +1,14 @@
 #!/bin/bash
 # Build the Linux 6.12 kernel for the Titan Pocket inside the
 # titan_build_ubuntu container (docs/mainline.md):
-#   container exec titan_build_ubuntu bash /workspace/tools/mainline/build.sh [config|build|all]
+#   container exec titan_build_ubuntu bash /workspace/tools/mainline/build.sh [config|build|modules|all]
 # Source: kernel_vol_mnt/mainline/linux-6.12.115 (branch titanpocket-6.12).
 # Objects go to the container's own disk: on the shared /workspace mount
 # `sed -i` fails (merge_config.sh needs it) and builds are slower. Image.gz
-# and the dtb are copied to out/mainline/. Modules are not built yet: first
-# light needs only what is built in.
+# and the dtb are copied to out/mainline/. "modules" builds the kernel's
+# modules and installs them (stripped) under $O/staging, for the out-of-tree
+# drivers that use them (the camera's media core); nothing copies the whole
+# set to the phone.
 set -euo pipefail
 
 KSRC=/workspace/kernel_vol_mnt/mainline/linux-6.12.115
@@ -35,8 +37,16 @@ do_build() {
 	strings "$O/vmlinux" | grep -m1 'Linux version' || true
 }
 
+do_modules() {
+	make -C "$KSRC" O="$O" -j"$(nproc)" modules
+	rm -rf "$O/staging"
+	make -C "$KSRC" O="$O" INSTALL_MOD_PATH="$O/staging" INSTALL_MOD_STRIP=1 modules_install
+	find "$O/staging/lib/modules" -name '*.ko' | wc -l
+}
+
 case "${1:-all}" in
-	config) do_config ;;
-	build)  do_build 2>&1 | tee "$LOG" ;;
-	all)    { do_config; do_build; } 2>&1 | tee "$LOG" ;;
+	config)  do_config ;;
+	build)   do_build 2>&1 | tee "$LOG" ;;
+	modules) do_modules 2>&1 | tee "$DEST/modules.log" ;;
+	all)     { do_config; do_build; do_modules; } 2>&1 | tee "$LOG" ;;
 esac

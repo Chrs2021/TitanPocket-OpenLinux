@@ -15,19 +15,22 @@ domain is still on; mt6771_spm.wake_mask sets the wake sources.
 
 mt6771-scp: starts the SCP and talks to its sensor hub; the
 accelerometer, gyroscope, magnetometer, light and proximity sensors
-become IIO devices with several buffers each.
+become IIO devices with several buffers each. The SCP's own sleep is off
+by default; mt6771_scp.sleep=1 leaves it on, with the MT6358's sensor hub
+supply mode and the SCP's clock mux on its request, as MediaTek's
+scp_dvfs.c does.
 
 mtk-lk-fb: hands the bootloader's live framebuffer to simplefb, for a
 console before the display driver binds.
 ---
  drivers/soc/mediatek/Kconfig          |   44 +
  drivers/soc/mediatek/Makefile         |    4 +
- drivers/soc/mediatek/mt6771-scp.c     | 1090 +++++++++++++++++++++++++
+ drivers/soc/mediatek/mt6771-scp.c     | 1206 +++++++++++++++++++++++++
  drivers/soc/mediatek/mt6771-spm.c     |  354 ++++++++
- drivers/soc/mediatek/mtk-lk-fb.c      |  249 ++++++
- drivers/soc/mediatek/mtk-mcdi.c       |  196 +++++
+ drivers/soc/mediatek/mtk-lk-fb.c      |  249 +++++
+ drivers/soc/mediatek/mtk-mcdi.c       |  196 ++++
  include/linux/soc/mediatek/mtk-mcdi.h |   13 +
- 7 files changed, 1950 insertions(+)
+ 7 files changed, 2066 insertions(+)
 
 diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
 index 1b7afb19ccd637471ad82ad833f589cb0f9405b1..cc73ddf801462547795930636f466c91eb5a83e9 100644
@@ -111,10 +114,10 @@ index 6830512848fd0feb2d559894ac1b88397b487e91..e02ca4c3f3ef7dd57b0ee87c32237f18
  obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
 diff --git a/drivers/soc/mediatek/mt6771-scp.c b/drivers/soc/mediatek/mt6771-scp.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac001c7fc67
+index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279af2704771
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-scp.c
-@@ -0,0 +1,1090 @@
+@@ -0,0 +1,1206 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SCP (Cortex-M4, MediaTek's tinysys firmware) and its sensor hub
@@ -144,9 +147,11 @@ index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac0
 + *
 + * Sleep: once the hub ran, the SCP went into deep sleep (CPU_SLEEP_STATUS
 + * 3), its SRAM read as zeros and the AP's awake request (INFRA_IRQ_SET)
-+ * no longer woke it; the vendor's SPM firmware, which 6.12 lacks, handles
-+ * that wake. So the SCP's sleep is switched off (IPI_DVFS_SLEEP 0, the
-+ * vendor's "SCP Sleep: OFF") as soon as it is ready.
++ * no longer woke it, also with the SPM firmware running. So the SCP's
++ * sleep is switched off (IPI_DVFS_SLEEP 0, the vendor's "SCP Sleep: OFF")
++ * as soon as it is ready. mt6771_scp.sleep=1 leaves it on, with what the
++ * vendor's scp_dvfs.c does and that test lacked: the MT6358's sensor hub
++ * supply levels, and the SCP's clock mux on its request (IPI_SCP_PLL_CTRL).
 + *
 + * Each sensor is an IIO device: read once (enabled for the read) or
 + * through a buffer. Several programs read the same sensor at once (the
@@ -167,8 +172,10 @@ index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac0
 +#include <linux/iio/kfifo_buf.h>
 +#include <linux/module.h>
 +#include <linux/of.h>
++#include <linux/of_platform.h>
 +#include <linux/of_reserved_mem.h>
 +#include <linux/platform_device.h>
++#include <linux/regmap.h>
 +#include <linux/timekeeping.h>
 +#include <linux/workqueue.h>
 +#include <asm/arch_timer.h>
@@ -183,6 +190,21 @@ index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac0
 +#define SCP_DEBUG_PC		0x0b4
 +/* clock control */
 +#define SCP_SRAM_PDN		0x02c
++/*
++ * MT6358 sensor hub mode (vendor scp_dvfs.c mt_pmic_sshub_init(), run at
++ * every 4.14 boot): Vcore and VSRAM_OTHERS hold these levels while the
++ * SCP's voltage request (its V_REQ pin, GPIO 154) is up, whatever the AP
++ * asks for in its sleep. 6.25 mV steps from 0.5 V on both.
++ */
++#define MT6358_BUCK_VCORE_SSHUB_CON0		0x14a4
++#define MT6358_BUCK_VCORE_SSHUB_CON1		0x14a6
++#define MT6358_LDO_VSRAM_OTHERS_SSHUB_CON0	0x1bc4
++#define MT6358_LDO_VSRAM_OTHERS_SSHUB_CON1	0x1bc6
++#define  SSHUB_EN			BIT(0)
++#define  SSHUB_SLEEP_VOSEL_EN		BIT(1)
++#define  SSHUB_VOSEL(uv)		(((uv) - 500000) / 6250)
++#define  SSHUB_VOSEL_MASK		0x7f7f	/* VOSEL, VOSEL_SLEEP << 8 */
++
 +/* SCPSYS: the AP's awake requests */
 +#define INFRA_IRQ_SET		0xb14
 +#define INFRA_IRQ_CLEAR		0xb18
@@ -206,6 +228,7 @@ index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac0
 +#define IPI_SCP_A_READY		12
 +#define IPI_CHRE		24
 +#define IPI_CHREX		25
++#define IPI_SCP_PLL_CTRL	26
 +#define IPI_NR			34
 +
 +/* sensor hub actions and notify events */
@@ -348,6 +371,8 @@ index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac0
 +	int irq;
 +
 +	struct mutex send_lock;
++	struct clk *scp_sel;	/* the SCP's clock mux, with mt6771_scp.sleep */
++	bool scp_sel_on;
 +	u8 rcv[SHARE_OBJ_SIZE];
 +	unsigned int rcv_len;
 +	unsigned int rcv_id;
@@ -388,19 +413,28 @@ index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac0
 +
 +/* ---- SCP IPI ---- */
 +
-+static void scp_awake(struct mt6771_scp *scp, int bit)
++/* the SCP takes the request by clearing its bit (vendor scp_awake_lock()) */
++static int scp_awake(struct mt6771_scp *scp, int bit)
 +{
++	int ret = -ETIMEDOUT;
 +	u32 v;
 +	int i;
 +
 +	writel(0xa0 | BIT(bit), scp->scpsys + INFRA_IRQ_SET);
 +	for (i = 0; i < 10000; i++) {
 +		v = readl(scp->scpsys + INFRA_IRQ_SET);
-+		if ((v & 0xf0) != 0xa0 || !(v & BIT(bit)))
++		if ((v & 0xf0) != 0xa0) {
++			ret = -EIO;
 +			break;
++		}
++		if (!(v & BIT(bit))) {
++			ret = 0;
++			break;
++		}
 +		udelay(10);
 +	}
 +	writel(readl(scp->scpsys + INFRA_IRQ_SET), scp->scpsys + INFRA_IRQ_CLEAR);
++	return ret;
 +}
 +
 +/*
@@ -438,7 +472,12 @@ index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac0
 +		dev_warn(scp->dev, "IPI %u: previous IPI not taken\n", id);
 +		goto out;
 +	}
-+	scp_awake(scp, AP_AWAKE_LOCK);
++	/* an SCP that did not wake has no SRAM to write to */
++	ret = scp_awake(scp, AP_AWAKE_LOCK);
++	if (ret) {
++		dev_warn(scp->dev, "IPI %u: SCP did not wake: %d\n", id, ret);
++		goto out;
++	}
 +	scp_copy_to_sram(obj + SHARE_DATA, buf, len);
 +	writel(len, obj + 4);
 +	writel(id, obj);
@@ -785,6 +824,63 @@ index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac0
 +		 &scp->fifo_phys, scp->fifo->size);
 +}
 +
++/* ---- the SCP's sleep (mt6771_scp.sleep) ---- */
++
++/*
++ * The SCP asks for its clock mux (topckgen scp_sel) around its own sleep.
++ * MediaTek's handler reads the frequency a byte off (data + 1 on a void
++ * pointer), matches no case and so only gates the mux; this does what ran
++ * on 4.14: hold it on PLL_ENABLE, let it go on PLL_DISABLE.
++ */
++static void scp_pll_ctrl(struct mt6771_scp *scp, u32 enable, u32 mhz)
++{
++	dev_dbg(scp->dev, "PLL %s (%u MHz)\n", enable ? "on" : "off", mhz);
++	if (!scp->scp_sel || enable == scp->scp_sel_on)
++		return;
++	if (enable && clk_prepare_enable(scp->scp_sel))
++		return;
++	if (!enable)
++		clk_disable_unprepare(scp->scp_sel);
++	scp->scp_sel_on = enable;
++}
++
++static void scp_sel_release(void *data)
++{
++	struct mt6771_scp *scp = data;
++
++	if (scp->scp_sel_on)
++		clk_disable_unprepare(scp->scp_sel);
++}
++
++static int scp_pmic_sshub(struct mt6771_scp *scp)
++{
++	struct device_node *np = of_parse_phandle(scp->dev->of_node, "mediatek,pwrap", 0);
++	struct platform_device *pwrap = np ? of_find_device_by_node(np) : NULL;
++	struct regmap *map;
++	int ret;
++
++	of_node_put(np);
++	if (!pwrap)
++		return -ENODEV;
++	map = dev_get_regmap(&pwrap->dev, NULL);
++	put_device(&pwrap->dev);
++	if (!map)
++		return -EPROBE_DEFER;
++	ret = regmap_update_bits(map, MT6358_BUCK_VCORE_SSHUB_CON1, SSHUB_VOSEL_MASK,
++				 SSHUB_VOSEL(600000) | SSHUB_VOSEL(600000) << 8);
++	if (!ret)
++		ret = regmap_update_bits(map, MT6358_BUCK_VCORE_SSHUB_CON0,
++					 SSHUB_EN | SSHUB_SLEEP_VOSEL_EN, SSHUB_EN);
++	if (!ret)
++		ret = regmap_update_bits(map, MT6358_LDO_VSRAM_OTHERS_SSHUB_CON1,
++					 SSHUB_VOSEL_MASK,
++					 SSHUB_VOSEL(850000) | SSHUB_VOSEL(850000) << 8);
++	if (!ret)
++		ret = regmap_update_bits(map, MT6358_LDO_VSRAM_OTHERS_SSHUB_CON0,
++					 SSHUB_EN | SSHUB_SLEEP_VOSEL_EN, SSHUB_EN);
++	return ret;
++}
++
 +/* ---- interrupt ---- */
 +
 +static void scp_dispatch(struct mt6771_scp *scp, u32 id, const u8 *data,
@@ -832,6 +928,13 @@ index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac0
 +			break;
 +		writel(lower_32_bits(scp->log_phys), scp->sram + info.dram_addr);
 +		schedule_work(&scp->log_work);
++		break;
++	}
++	case IPI_SCP_PLL_CTRL: {
++		u32 req[2] = { };	/* PLL_ENABLE (1) / PLL_DISABLE (0), MHz */
++
++		memcpy(req, data, min_t(unsigned int, len, sizeof(req)));
++		scp_pll_ctrl(scp, req[0], req[1]);
 +		break;
 +	}
 +	case IPI_CHRE:
@@ -1108,6 +1211,22 @@ index 0000000000000000000000000000000000000000..71a9fcfda96e54ebfa1973a7f988eac0
 +	clk = devm_clk_get_enabled(dev, "main");
 +	if (IS_ERR(clk))
 +		return dev_err_probe(dev, PTR_ERR(clk), "no clock\n");
++	if (scp_sleep) {
++		/* the SCP runs on scp_sel as LK left it; held until it asks */
++		scp->scp_sel = devm_clk_get(dev, "scp-sel");
++		if (IS_ERR(scp->scp_sel))
++			return dev_err_probe(dev, PTR_ERR(scp->scp_sel), "no scp-sel\n");
++		ret = clk_prepare_enable(scp->scp_sel);
++		if (ret)
++			return ret;
++		scp->scp_sel_on = true;
++		ret = devm_add_action_or_reset(dev, scp_sel_release, scp);
++		if (ret)
++			return ret;
++		ret = scp_pmic_sshub(scp);
++		if (ret)
++			return dev_err_probe(dev, ret, "sensor hub supplies\n");
++	}
 +
 +	np = of_parse_phandle(dev->of_node, "memory-region", 0);
 +	rmem = np ? of_reserved_mem_lookup(np) : NULL;

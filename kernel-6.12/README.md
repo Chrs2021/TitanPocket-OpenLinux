@@ -21,7 +21,10 @@ The work is in progress; see the table below for what works.
 
 The CONNSYS drivers (Wi-Fi, Bluetooth, FM, GPS) for 6.12 are out of
 tree in `modules/connectivity/linux612/`, built with
-`modules/connectivity/build612.sh`.
+`modules/connectivity/build612.sh`; the camera driver is
+`modules/camera/linux612/`, built with `modules/camera/build612.sh`. It
+runs on the kernel's media core, which `titanpocket.config` builds as
+modules (`videodev`, `mc`, `videobuf2-*`): install those with it.
 
 ## Patches
 
@@ -56,7 +59,9 @@ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) \
 ```
 
 `tools/build.sh` does the same inside our build container and reports
-config options that Kconfig dropped.
+config options that Kconfig dropped; `tools/build.sh modules` also builds
+and stages the kernel's modules, which the out-of-tree drivers link
+against.
 
 ## Boot image
 
@@ -110,9 +115,9 @@ logs what the kernel found and returns to fastboot.
 | Sensors (accelerometer, gyroscope, magnetometer, light, proximity) | `mt6771-scp` (SCP sensor hub), IIO | ✅ |
 | IR transmitter | `mtk-pwm-ir-tx` | ✅ `/dev/lirc0` |
 | Vibration motor | `regulator-haptic` | ✅ |
-| Suspend to idle | | ✅ |
-| Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; the SCP sensor hub has to stay awake |
-| Cameras | | ❌ not ported yet (the 4.14 drivers are in `modules/camera/`) |
+| Suspend to idle | | ✅ ~120 mA with the screen off |
+| Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; 43.5 mA so far (4.14 reached 12 mA); the SCP sensor hub stays awake unless `mt6771_scp.sleep=1` (untested) |
+| Cameras (OV16880, OV8865) | `modules/camera/linux612/` (CAMSV, CAM A statistics, the DIP) | ⚠️ ported and built, not yet run; the flash is not enabled |
 | NFC, cellular modem | | ❌ |
 
 ## Firmware

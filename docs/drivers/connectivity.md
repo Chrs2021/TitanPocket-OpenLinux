@@ -11,7 +11,11 @@ and audio are untested. FM radio works ([fm.md](fm.md)). GPS shares the same chi
 core driver but isn't brought up yet.
 
 Everything is built **from source** (no stock `.ko`), so it can move to a
-newer kernel later. Two MT6771-specific files that MediaTek never published
+newer kernel later. On Linux 6.12, Wi-Fi and Bluetooth run from the same
+sources (`build612.sh`, a new BTIF driver with APDMA, no vendor adapters;
+it sets the BTIF and its DMA up again when the SPM's deep sleep has reset
+them); see
+[../mainline.md](../mainline.md#connectivity). Two MT6771-specific files that MediaTek never published
 were reconstructed from the stock modules.
 
 ## Hardware

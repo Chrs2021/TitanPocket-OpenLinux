@@ -94,6 +94,7 @@ T flash mode.
 """
 import ctypes
 import fcntl
+import glob
 import json
 import os
 import re
@@ -121,17 +122,27 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstVideo", "1.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gst, GstVideo, Gtk  # noqa: E402
 
-SYSDEV = "/sys/devices/platform/1a050000.camsv1/"
+
+def camsv_dir():
+    """the camera driver's device: /sys/devices/platform/1a050000.camsv1 on
+    4.14, under the soc bus (1a050000.camsv) on 6.12"""
+    found = sorted(glob.glob("/sys/devices/platform/1a050000.camsv*")
+                   + glob.glob("/sys/devices/platform/*/1a050000.camsv*"))
+    return (found[0] if found else "/sys/devices/platform/1a050000.camsv1") + "/"
+
+
+SYSDEV = camsv_dir()
+CAMID = SYSDEV[len("/sys/devices/"):]   # libcamera names cameras by this path
 CAMERAS = [
     # libcamera id, label, mirrored preview, still size, sensor device, focus
     # motor, fallback rotation (clockwise), hardware-ISP preview size, hardware-
     # ISP still size. "still" is the GPU software-ISP size (cropped Bayer
     # margins); "hwstill" is the exact sensor-mode size the DIP delivers (the
     # driver only has a tile list for the mode's own size).
-    {"id": "platform/1a050000.camsv1/rear ov16880", "label": "Rear",
+    {"id": CAMID + "rear ov16880", "label": "Rear",
      "mirror": False, "still": (4668, 3504), "sysdir": SYSDEV + "rear",
      "focus": True, "rotation": 90, "hwisp": (2336, 1752), "hwstill": (4672, 3504)},
-    {"id": "platform/1a050000.camsv1/front ov8865", "label": "Front",
+    {"id": CAMID + "front ov8865", "label": "Front",
      "mirror": True, "still": (3260, 2448), "sysdir": SYSDEV + "front",
      "focus": False, "rotation": 270, "hwisp": (1632, 1224), "hwstill": (3264, 2448)},
 ]

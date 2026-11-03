@@ -375,11 +375,30 @@ pointed at the crash), SCSI cache syncs, battery ADC readings.
 
 | State | Event | Action |
 |---|---|---|
-| awake | short press (< 1.5 s) | blank panel, `echo mem > /sys/power/state` |
+| awake | short press (< 1.5 s) | lock (waits for the lock screen, ≤ 0.6 s), blank panel, `echo mem > /sys/power/state` |
+| awake, unlocked | held 3 s | the power menu (desktop.md); the release does nothing |
+| awake, locked | held 3 s | nothing |
 | suspend refused (USB cable, ...) | — | stay "screen off", retry every 30 s |
+| screen off, a userspace wakelock held | — | no suspend, look again every 30 s |
 | screen off | short press | panel on |
 | asleep | power key | wakes; the key press is swallowed, panel on |
 | asleep | any other wake (RTC, cable plugged in, ...) | straight back to sleep |
+
+**Wakelocks** (2026-10-30): writing `mem` to `/sys/power/state` doesn't
+look at wakelocks (that takes the `wakeup_count` handshake, which nothing
+here does), so titan-powerkey reads `/sys/power/wake_lock` itself and
+doesn't suspend while it names one; the screen still goes off. The GPS
+holds one: with `titan-gnss-open` running the CONNSYS chip woke the SoC
+about once a second (140 suspend/resume cycles in a 10-minute session,
+titan-powerkey sending it back to sleep each time), and twice in about 315
+such cycles a resume crashed the chip: right after resume the WMT thread's
+BTIF write failed (`stp btif write fail`, `written(0)`), then STP
+`tx_timeout`, a firmware coredump and a whole-chip reset; Wi-Fi and
+Bluetooth dropped with it and came back with the reset's end (once
+2 s after the suspend began, once 94 s, the phone asleep in between). No reset in either
+earlier boot (3770 and 856 suspends, the GPS not running). The daemon's
+lock lapses 30 s after its last renewal (every 10 s), so a dead daemon
+doesn't keep the phone awake; it is released when the daemon stops.
 
 The **volume keys** (same `mtk-kpd` device) step the speaker amp
 (`Speaker Amp Volume`, 0–255) by 8 per press or autorepeat, capped at 224
@@ -437,10 +456,31 @@ protocol), `sleepfloor.py` (sleep current per radio setup, see
 26 MHz clock hold and the Wi-Fi/Bluetooth state). Run the long ones with
 `systemd-run --unit=NAME --collect`, so they survive the SSH session.
 
-Long presses are ignored; holding the key for ~10 s makes the PMIC reset
-the phone. systemd-logind would otherwise act on the key (the device is
+Presses between 1.5 and 3 s are ignored, and a 3 s hold only opens the
+power menu (the Weston shell's: Power off, Restart, Suspend, Lock,
+Cancel); holding the key for
+~10 s makes the PMIC reset the phone. systemd-logind would otherwise act on the key (the device is
 tagged `power-switch`, and logind's default is **poweroff**), so
 `/etc/systemd/logind.conf.d/titan-powerkey.conf` sets `HandlePowerKey=ignore`.
+
+## On Linux 6.12 (2026-11-02)
+
+- **Charging** is upstream's `mt6370-charger` with our policy: the input
+  limit follows the Type-C source (TCPM) and BC1.2 (1.5 A from a charger
+  port, 500 mA from a computer's), charge current and voltage come from the
+  battery node (2.0 A, 4.35 V), end of charge is on (150 mA), and charging
+  stops outside 0-59 °C (MediaTek's stock limits) and resumes 6 °C inside.
+  The OZ8806 gauge treats 4.35 V as full. The MT6370's green LED shows a
+  full battery; `titan-charge` reads the 6.12 charger and the `cpu-thermal`
+  zone.
+- **Suspend to idle** works and draws about what awake idle does with the
+  screen off (~120 mA). **Deep sleep** goes through MediaTek's SPM firmware
+  (`mt6771_spm.deep=1`) and wakes with the display, GPU, USB, Wi-Fi,
+  Bluetooth and keyboard working: 43.5 mA over 20 minutes, with the
+  connectivity chip's wake masked. The SPM's record of that sleep shows the
+  26 MHz clock (held by the connectivity chip, whose radio functions were
+  still on) and DRAM staying up; 4.14 reached 12 mA (the sleep floor
+  above). The sensor hub's SCP is kept awake on 6.12 for now.
 
 ## Not done
 

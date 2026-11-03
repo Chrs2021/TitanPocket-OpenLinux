@@ -17,13 +17,22 @@ no vendor firmware is included.
 This kernel boots Debian 12 (systemd) on the phone, with a GPU-accelerated
 Wayland desktop.
 
+**Linux 6.12.** [`kernel-6.12/`](kernel-6.12/README.md) ports the phone to
+Linux 6.12.115 as a patch series against the kernel.org release: upstream
+drivers wherever the MT6771 matches the MT8183 (it mostly does), our own
+where it doesn't. It boots the same Debian with the desktop, touch, keys,
+sound, Wi-Fi, Bluetooth, FM, sensors, charging and suspend; deep sleep is
+in progress and the cameras are ported but not yet run. Its status table
+and build steps are in that README.
+
 ## Contents
 
 | Path | What |
 |---|---|
 | `kernel/` | the kernel tree: MediaTek 4.14.186 BSP for the Titan Pocket with changes needed to support this device. |
-| `modules/connectivity/` | out-of-tree MediaTek CONNSYS drivers: WMT core, Wi-Fi, Bluetooth, FM radio, GPS |
-| `modules/camera/` | the camera driver (`v4l2/`: V4L2 + media controller), bring-up tools (`camprobe/`, `camcap/`) and the ISP register map (`isp/`) |
+| `kernel-6.12/` | the Linux 6.12 port: patches against v6.12.115, build and boot-image tools, status |
+| `modules/connectivity/` | out-of-tree MediaTek CONNSYS drivers: WMT core, Wi-Fi, Bluetooth, FM radio, GPS (`linux612/` and `build612.sh`: the 6.12 build) |
+| `modules/camera/` | the camera driver (`v4l2/`: V4L2 + media controller; `linux612/`: its 6.12 version), the pass-2 ISP (`dip/`), bring-up tools (`camprobe/`, `camcap/`) and the ISP register map (`isp/`) |
 | `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up), the FM radio, camera and photo gallery apps, the libcamera patch, the power/volume keys, charging (log, limit, LED), the microSD card as a USB drive, and the microphone path, with their systemd units |
 | `docs/` | hardware reference, per-driver notes, and how the vendor drivers were reverse-engineered |
 
