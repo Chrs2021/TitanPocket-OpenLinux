@@ -52,7 +52,24 @@ titan-gnss-open (Python)
   ├─ titan-gps-probe (Rust): firmware patch + script → /dev/stpgps → MT6631
   ├─ reads the chip's 29 measurement records as they come
   └─ snapshot fix every 2 s over 30 s of batches → NMEA → UDP 10110 → gpsd
+     (GGA, GSA, GSV, RMC; GSA and GSV between fixes too)
 ```
+
+- **Sky view and DOP** (2026-10-30): every 2 s the daemon sends GSV, the
+  satellites above the horizon (elevation and azimuth from the ephemeris
+  at the last position, every 30 s) with the C/N0 of those the chip has
+  reported in the last 10 s (weak ones too, below the fix's 15 dB-Hz), and
+  GSA, the satellites in the fix (less those `solve_robust` dropped) with
+  PDOP, HDOP and VDOP from their geometry, one clock unknown per
+  constellation. GGA carries that HDOP (it was a fixed 1.0), so gpsd's
+  error estimate follows the geometry: HDOP 0.8 gives `eph` 15.2 m. It is
+  the geometry of one moment, though the fix spans the window's batches.
+  gpsd 3.22 numbers BeiDou in NMEA only as 201-237 (under the `BD`
+  talker; 33-64 it takes for SBAS), so BeiDou 38 and up are left out of GSV
+  and GSA; they still count in the fix, GGA's satellite count and the DOP.
+  Checked against a private gpsd (`-S 2950`, UDP 10111) with today's
+  ephemeris at a public place: 31 satellites in view (GPS, GLONASS,
+  BeiDou with their own numbers), the used ones marked.
 
 - First run, indoors: 3D fixes 45-136 m from libmnl's own fix of the same
   spot (height ~+200 m), the first after ~100 s, then every 2 s; 5-6
@@ -392,6 +409,13 @@ Ephemeris source: `https://igs.bkg.bund.de/root_ftp/IGS/BRDC/<yyyy>/<ddd>/BRDC00
   Bluetooth came back by themselves after a minute; GPS opens failed until
   then. The probe now stops a session when the header isn't answered or a
   chunk fails 3 tries.
+- **Don't suspend with the GPS running.** A resume while the probe runs
+  can crash the connectivity chip (BTIF write fails, `tx_timeout`, whole-
+  chip reset, Wi-Fi gone until it ends): twice in about 315 suspend/resume
+  cycles on 2026-10-30. `titan-gnss-open` holds the wakelock
+  `titan-gnss-open` while it runs and titan-powerkey doesn't suspend while
+  one is held ([power.md](power.md#power-button-titan-powerkey)). The old
+  libmnl stack (`titan-mnld`, `titan-gnss`) holds none.
 - strace: a blocking `read()` is time-stamped at its start, so replies
   appear before the writes they answer. strace often attaches after
   `/dev/stpgps` is opened: use `--fd`.

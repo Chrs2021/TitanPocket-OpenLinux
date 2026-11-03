@@ -1,0 +1,16 @@
+# GPS positions for gpsd without MediaTek's libmnl: titan-gnss-open drives
+# the receiver with titan-gps-probe (our firmware download, our search
+# assignments from broadcast ephemeris) and solves snapshot fixes from the
+# chip's code phases (docs/gnss.md, "Replacing libmnl"). The open
+# alternative to titan-gnss + titan-mnld; only one can own /dev/stpgps.
+# Not enabled: start it by hand (Location off).
+[Unit]
+Description=Open GNSS (no libmnl): titan-gps-probe + snapshot fixes -> gpsd
+Requires=titan-gps-driver.service
+After=titan-gps-driver.service network-online.target
+Conflicts=titan-gnss.service titan-mnld.service
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/titan-gnss-open/titan-gnss-open
+Restart=on-failure
+RestartSec=10

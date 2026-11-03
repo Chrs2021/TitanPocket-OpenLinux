@@ -30,3 +30,7 @@ sed??????
 /modules/connectivity/**/Module.symvers
 /modules/connectivity/**/modules.order
 /modules/connectivity/**/.tmp_versions/
+
+# notes for AI agents working in the private checkout: never published
+CLAUDE.md
+AGENTS.md

@@ -1,13 +1,16 @@
 //! titan-gps-probe: drive the MT6631's GNSS receiver without libmnl, from a
 //! replay script, and log what the chip answers (docs/gnss.md, "Stage 1").
 //!
-//!   titan-gps-probe SCRIPT [--seconds N] [--libmnl PATH] [--log FILE] [--quiet]
+//!   titan-gps-probe SCRIPT [--seconds N] [--patch FILE | --libmnl PATH] [--log FILE] [--quiet]
+//!   titan-gps-probe --extract-patch FILE [--libmnl PATH]
 //!
-//! SCRIPT comes from tools/gnss/stpgps-script.py: `<ms> <type> <payload hex>`
-//! per host frame, and `<ms> PATCH` where the firmware patch goes (taken from
-//! the phone's libmnl.so, see titan_gps::patch). Each frame is written at its
-//! time; the chip's frames are decoded as they come, logged (`<ms> <type>
-//! <seq> <payload hex>`, XOR undone) and counted. At the end: how many of each
+//! SCRIPT comes from tools/gnss/session.py (generated) or stpgps-script.py (a
+//! capture): `<ms> <type> <payload hex>` per host frame, and `<ms> PATCH`
+//! where the firmware patch goes: from FILE, else from patch::FIRMWARE once
+//! extracted there (--extract-patch), else from the phone's libmnl.so (see
+//! titan_gps::patch). Each frame is written at its time; the chip's frames
+//! are decoded as they come, logged (`<ms> <type> <seq> <payload hex>`, XOR
+//! undone) and counted. At the end: how many of each
 //! type arrived, for comparing with a capture of libmnl's own session
 //! (stpgps-decode.py).
 //!
@@ -92,10 +95,17 @@ fn write_frame(dev: &mut File, f: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// the chip's answer to the session header, and to each firmware chunk
+/// the chip's answer to the session header, and to each firmware chunk:
+/// `32 [u16 n]` acknowledges chunk n (from 1; sent raw, not XORed), about
+/// 10 ms after it. Now and then one doesn't come: libmnl then sends the
+/// chunk again, and so does the probe (CHUNK_TRIES writes in all).
 const HEADER_ACK: u8 = 0x31;
 const CHUNK_ACK: u8 = 0x32;
 const ACK_WAIT: Duration = Duration::from_millis(500);
+const CHUNK_TRIES: usize = 3;
+/// the header's answer comes within a few ms or not at all (about one
+/// session in ten, soon after the last one); this is only a generous bound
+const HEADER_WAIT: Duration = Duration::from_secs(3);
 
 type Rx = mpsc::Receiver<(Duration, frame::Frame, usize, usize)>;
 
@@ -106,6 +116,8 @@ struct Seen {
     counts: BTreeMap<u8, usize>,
     stray: usize,
     bad: usize,
+    /// the highest firmware chunk the chip has acknowledged (CHUNK_ACK)
+    acked: u16,
 }
 
 impl Seen {
@@ -120,6 +132,10 @@ impl Seen {
             match self.rx.recv_timeout(until - now) {
                 Ok((t, f, stray, bad)) => {
                     *self.counts.entry(f.kind).or_default() += 1;
+                    if f.kind == CHUNK_ACK && f.payload.len() >= 2 {
+                        let n = u16::from_le_bytes([f.payload[0] ^ 0xCA, f.payload[1] ^ 0xCA]);
+                        self.acked = self.acked.max(n);
+                    }
                     self.stray = stray;
                     self.bad = bad;
                     if !self.quiet {
@@ -146,12 +162,40 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    // once: the patch out of libmnl into a firmware file, so libmnl isn't
+    // needed afterwards (patch::FIRMWARE)
+    if let Some(out) = arg(&args, "--extract-patch") {
+        let libmnl = arg(&args, "--libmnl").unwrap_or_else(|| patch::LIBMNL.to_string());
+        return match Patch::load(&libmnl).and_then(|p| {
+            if let Some(dir) = std::path::Path::new(&out).parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&out, p.to_file_bytes())
+        }) {
+            Ok(()) => {
+                eprintln!("titan-gps-probe: patch written to {out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("titan-gps-probe: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let Some(script_path) = args.get(1).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: titan-gps-probe SCRIPT [--seconds N] [--libmnl PATH] [--log FILE] [--quiet]");
+        eprintln!("usage: titan-gps-probe SCRIPT [--seconds N] [--patch FILE | --libmnl PATH] [--log FILE] [--quiet]\n       titan-gps-probe --extract-patch FILE [--libmnl PATH]");
         return ExitCode::from(2);
     };
     let seconds: f64 = arg(&args, "--seconds").and_then(|s| s.parse().ok()).unwrap_or(30.0);
-    let libmnl = arg(&args, "--libmnl").unwrap_or_else(|| patch::LIBMNL.to_string());
+    // the patch: --patch FILE, else the extracted firmware file if there is
+    // one, else the phone's libmnl.so
+    let source = arg(&args, "--patch").or_else(|| arg(&args, "--libmnl")).unwrap_or_else(|| {
+        if std::path::Path::new(patch::FIRMWARE).exists() {
+            patch::FIRMWARE.to_string()
+        } else {
+            patch::LIBMNL.to_string()
+        }
+    });
     let quiet = args.iter().any(|a| a == "--quiet");
 
     let script = match load_script(script_path) {
@@ -161,7 +205,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let patch = match Patch::load(&libmnl) {
+    let patch = match Patch::load(&source) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("titan-gps-probe: {e}");
@@ -223,6 +267,7 @@ fn main() -> ExitCode {
         counts: BTreeMap::new(),
         stray: 0,
         bad: 0,
+        acked: 0,
     };
     let mut written = 0usize;
     let end = start + Duration::from_secs_f64(seconds);
@@ -243,25 +288,41 @@ fn main() -> ExitCode {
             }
             Step::Patch => {
                 // as libmnl: the header's answer (0x31) first, then each
-                // chunk only once the chip has acknowledged the last (0x32);
-                // a chunk sent on top of one still being taken in stalls
-                // the link (its window fills, writes get ENOSPC)
-                let deadline = Instant::now() + ACK_WAIT;
+                // chunk only once the chip has acknowledged the last (0x32
+                // [n]); a chunk sent on top of one still being taken in
+                // stalls the link (its window fills, writes get ENOSPC). A
+                // chunk not acknowledged is sent again.
+                let deadline = Instant::now() + HEADER_WAIT;
                 if seen.counts.get(&HEADER_ACK).is_none()
                     && !seen.until(&mut log, deadline, Some(HEADER_ACK))
                 {
-                    eprintln!("titan-gps-probe: no answer to the session header");
+                    // the receiver isn't up: sending the patch into it
+                    // anyway has hung the whole connectivity chip
+                    eprintln!("titan-gps-probe: no answer to the session header; giving up \
+                               (wait a while before the next session)");
+                    return ExitCode::FAILURE;
                 }
                 for (i, c) in chunks.iter().enumerate() {
-                    if let Err(e) = write_frame(&mut dev, &frame::encode(patch::FRAME, c)) {
-                        eprintln!("titan-gps-probe: write: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                    written += 1;
-                    if !seen.until(&mut log, Instant::now() + ACK_WAIT, Some(CHUNK_ACK)) {
-                        eprintln!("titan-gps-probe: chunk {} of {} not acknowledged", i + 1,
-                                  chunks.len());
-                        break;
+                    let number = i as u16 + 1;
+                    for attempt in 1..=CHUNK_TRIES {
+                        if let Err(e) = write_frame(&mut dev, &frame::encode(patch::FRAME, c)) {
+                            eprintln!("titan-gps-probe: write: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                        written += 1;
+                        let deadline = Instant::now() + ACK_WAIT;
+                        while seen.acked < number
+                            && seen.until(&mut log, deadline, Some(CHUNK_ACK)) {}
+                        if seen.acked >= number {
+                            break;
+                        }
+                        eprintln!("titan-gps-probe: chunk {number} of {} not acknowledged{}",
+                                  chunks.len(),
+                                  if attempt < CHUNK_TRIES { ", sending it again" } else { "" });
+                        if attempt == CHUNK_TRIES {
+                            eprintln!("titan-gps-probe: giving up on the patch");
+                            return ExitCode::FAILURE;
+                        }
                     }
                 }
             }

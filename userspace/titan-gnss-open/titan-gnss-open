@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""
+titan-gnss-open: GPS positions for gpsd with no libmnl (docs/gnss.md,
+"Replacing libmnl"). The open counterpart of titan-gnss + titan-mnld; run
+one or the other (the units conflict).
+
+Each session it:
+  1. makes sure it has GPS broadcast ephemeris no older than an hour or so
+     (IGS's merged file from BKG, kept in STATE/brdc.rnx; an older one is
+     used while the network is away, up to EPH_MAX_AGE);
+  2. rewrites the GPS search assignments (02) of the replay script
+     a session generated from scratch (session.py) for this moment
+     (own02.regenerate) from the last position;
+  3. runs titan-gps-probe on it (the receiver keeps tracking after the
+     script's ~90 s; sessions are restarted every SESSION s so newly risen
+     satellites get assignments);
+  4. reads the chip's 29 records as they come and, every couple of
+     seconds, solves a snapshot fix over the last WINDOW s of batches
+     (snapfix.py), sending NMEA GGA and RMC to gpsd (udp 127.0.0.1:10110);
+     with and between fixes GSV (the satellites above the horizon, with the
+     signal of those the chip tracks) and GSA (those in the fix and its
+     DOP), so gpsd's sky view and its error estimate are real.
+
+No part of libmnl is used: the DSP firmware patch comes from
+/lib/firmware/titan/mt6631-gnss-patch.bin, extracted once from the phone's
+own libmnl.so (titan-gps-probe --extract-patch; install.sh does it).
+
+While it runs it holds a wakelock (WAKE_LOCK), and titan-powerkey doesn't
+suspend while one is held: with the GPS on the chip wakes the SoC about
+once a second anyway, and a resume while the GPS runs can crash the
+CONNSYS chip (Wi-Fi with it). The lock lapses WAKE_HOLD s after the last
+renewal, so a daemon that dies doesn't keep the phone awake.
+
+STATE (/var/lib/titan-gnss-open) holds brdc.rnx (the download), chip.rnx
+and chip-gnss.json (ephemeris the chip sent), iono (Klobuchar
+coefficients), and position: "lat lon", the last fix, which seeds the next
+session. Before the first fix it must hold a rough position (within some
+tens of km). They say where the phone is or was: they stay on the phone.
+"""
+import collections
+import datetime
+import importlib.util
+import math
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import gzip
+import json
+
+LIB = os.path.dirname(os.path.abspath(__file__))
+STATE = os.environ.get("TITAN_GNSS_OPEN_STATE", "/var/lib/titan-gnss-open")
+PROBE = os.environ.get("TITAN_GPS_PROBE", "/usr/local/bin/titan-gps-probe")
+GPSD = ("127.0.0.1", 10110)
+SESSION = 600           # s: a new session (fresh assignments) this often
+WINDOW = 60             # s of batches in each fix (90 s: sharper, laggier)
+HEIGHT = (0.0, 300.0)   # a-priori height above the ellipsoid and its sigma, m
+EVERY = 2               # s between fixes
+EPH_REFRESH = 3600      # s: fetch the ephemeris again after this
+EPH_MAX_AGE = 4 * 3600  # s: older than this, don't use it
+GAP = 15                # s between sessions (the receiver needs a moment)
+MIN_CN0 = 15
+SKY_EVERY = 30          # s between elevations and azimuths (they move slowly)
+SNR_AGE = 10            # s: a satellite not heard for this long has no SNR in GSV
+WAKE_LOCK = "titan-gnss-open"   # its name in /sys/power/wake_lock
+WAKE_HOLD = 30          # s the wakelock lasts unless renewed (every WAKE_HOLD / 3)
+BRDC_URL = "https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{y}{doy:03d}0000_01D_MN.rnx.gz"
+
+
+def _load(name, file):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(LIB, file))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ge = _load("gpseph", "gpseph.py")
+sf = _load("snapfix", "snapfix.py")
+own02 = _load("own02", "own02.py")
+navsub = _load("navsub", "navsub.py")
+session_gen = _load("session", "session.py")
+mm = sf.mm
+
+
+def say(*a):
+    print("titan-gnss-open:", *a, flush=True)
+
+
+def ephemeris():
+    """the ephemeris {prn: [...]}, fetched again when it's old; None if none usable"""
+    path = os.path.join(STATE, "brdc.rnx")
+    age = time.time() - os.path.getmtime(path) if os.path.exists(path) else None
+    if age is None or age > EPH_REFRESH:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        url = BRDC_URL.format(y=now.year, doy=now.timetuple().tm_yday)
+        try:
+            data = gzip.decompress(urllib.request.urlopen(url, timeout=60).read())
+            with open(path + ".new", "wb") as f:
+                f.write(data)
+            os.replace(path + ".new", path)
+            age = 0
+            say("ephemeris fetched")
+        except Exception as e:                          # offline: keep the old one
+            say("ephemeris fetch failed (%s)" % e)
+    eph = ge.load(path) if age is not None and age <= EPH_MAX_AGE else {}
+    # GPS ephemeris the chip itself sent in earlier sessions (2B subframes):
+    # the newest issues, and all there is while offline
+    now = ge.gps_seconds(datetime.datetime.now(datetime.timezone.utc))
+    for prn, l in chip_ephemeris().items():
+        for e in l:
+            if abs(now - e["t_toe"]) < EPH_MAX_AGE:
+                add_ephemeris(eph, prn, e)
+    return eph or None
+
+
+def load_iono():
+    """Klobuchar coefficients the chip sent before (STATE/iono), into the solver"""
+    try:
+        k = tuple(map(float, open(os.path.join(STATE, "iono")).read().split()))
+        if len(k) == 8:
+            sf.IONO = k
+    except (OSError, ValueError):
+        pass
+
+
+def save_iono(k):
+    path = os.path.join(STATE, "iono")
+    with open(path + ".new", "w") as f:
+        f.write(" ".join("%.6e" % x for x in k) + "\n")
+    os.replace(path + ".new", path)
+
+
+def chip_gnss():
+    """BeiDou and GLONASS ephemerides the chip sent before (STATE/chip-gnss.json),
+    {(system, number): [ephemeris]} of the last EPH_MAX_AGE"""
+    now = ge.gps_seconds(datetime.datetime.now(datetime.timezone.utc))
+    out = {}
+    try:
+        for e in json.load(open(os.path.join(STATE, "chip-gnss.json"))):
+            if abs(now - e["t_toe"]) < EPH_MAX_AGE:
+                out.setdefault((e["sys"], e["num"]), []).append(e)
+    except (OSError, ValueError, KeyError):
+        pass
+    return out
+
+
+def save_chip_gnss(cache):
+    now = ge.gps_seconds(datetime.datetime.now(datetime.timezone.utc))
+    rows = [dict(e, num=key[1]) for key, l in cache.items() for e in l
+            if abs(now - e["t_toe"]) < EPH_MAX_AGE]
+    path = os.path.join(STATE, "chip-gnss.json")
+    with open(path + ".new", "w") as f:
+        json.dump(rows, f)
+    os.replace(path + ".new", path)
+
+
+def same_issue(a, b):
+    return abs(a["t_toe"] - b["t_toe"]) < 1 and a.get("aode") == b.get("aode")
+
+
+def chip_ephemeris():
+    try:
+        return ge.load(os.path.join(STATE, "chip.rnx"))
+    except (OSError, StopIteration, ValueError):
+        return {}
+
+
+def add_ephemeris(eph, prn, e):
+    """add e to eph[prn] unless that issue is there; True if it was new"""
+    l = eph.setdefault(prn, [])
+    if any(x["iode"] == e["iode"] and x["toe"] == e["toe"] for x in l):
+        return False
+    l.append(e)
+    return True
+
+
+def save_chip_ephemeris(new):
+    """keep the chip's ephemerides of the last EPH_MAX_AGE in STATE/chip.rnx"""
+    now = ge.gps_seconds(datetime.datetime.now(datetime.timezone.utc))
+    keep = chip_ephemeris()
+    for prn, e in new:
+        add_ephemeris(keep, prn, e)
+    path = os.path.join(STATE, "chip.rnx")
+    with open(path + ".new", "w") as f:
+        f.write("     3.05           N: GNSS NAV DATA    G: GPS              RINEX VERSION / TYPE\n"
+                "titan-gnss-open     from the chip's 2B subframes            PGM / RUN BY / DATE\n"
+                "                                                            END OF HEADER\n")
+        for prn, l in sorted(keep.items()):
+            for e in l:
+                if abs(now - e["t_toe"]) < EPH_MAX_AGE:
+                    f.write(navsub.rinex(prn, e) + "\n")
+    os.replace(path + ".new", path)
+
+
+def position():
+    try:
+        lat, lon = map(float, open(os.path.join(STATE, "position")).read().split()[:2])
+        return lat, lon
+    except (OSError, ValueError):
+        return None
+
+
+def save_position(lat, lon):
+    path = os.path.join(STATE, "position")
+    with open(path + ".new", "w") as f:
+        f.write("%.6f %.6f\n" % (lat, lon))
+    os.replace(path + ".new", path)
+
+
+def nmea(body):
+    c = 0
+    for ch in body:
+        c ^= ord(ch)
+    return "$%s*%02X\r\n" % (body, c)
+
+
+# NMEA's satellite numbers, as gpsd 3.22 reads them: GPS its PRN, GLONASS
+# 64 + its slot, BeiDou 200 + its PRN under the BD talker (33-64 would be
+# SBAS). It has no number for BeiDou 38 and up: those stay out of GSV and
+# GSA (they still count in GGA and in the DOP).
+TALKER = {"G": "GP", "R": "GL", "C": "BD"}
+SYSTEM_ID = {"G": 1, "R": 2, "C": 4}     # GSA's system id (NMEA 4.11)
+
+
+def nmea_sv(key):
+    if key[0] == "C":
+        return 200 + key[1] if key[1] <= 37 else None
+    return key[1] + 64 if key[0] == "R" else key[1]
+
+
+def sky(eph, t, rx, lat, lon):
+    """{key: (elevation, azimuth deg)} of the satellites above the horizon"""
+    out = {}
+    for key, l in eph.items():
+        e = ge.nearest(l, t)
+        if abs(t - e["t_toe"]) > EPH_MAX_AGE:
+            continue
+        s = ge.position_any(e, t)
+        x, y, z = sf.enu([s[k] - rx[k] for k in range(3)], lat, lon)
+        el = math.degrees(math.atan2(z, math.hypot(x, y)))
+        if el > 0:
+            out[key] = (el, math.degrees(math.atan2(x, y)) % 360)
+    return out
+
+
+def dops(view, used):
+    """(PDOP, HDOP, VDOP) of the satellites in the fix, with a clock unknown
+    for each constellation as in the solution; None if they can't say. The
+    geometry of one moment: the fix spans WINDOW s, but the satellites move
+    little in that time."""
+    sats = [view[k] for k in used if k in view]
+    systems = sorted({k[0] for k in used if k in view})
+    n = 3 + len(systems)
+    if len(sats) < n:
+        return None
+    H = []
+    for k in used:
+        if k in view:
+            el, az = map(math.radians, view[k])
+            H.append([-math.cos(el) * math.sin(az), -math.cos(el) * math.cos(az), -math.sin(el)]
+                     + [1.0 if k[0] == sy else 0.0 for sy in systems])
+    A = [[sum(r[i] * r[j] for r in H) for j in range(n)] for i in range(n)]
+    q = [sf.gauss(A, [1.0 if r == i else 0.0 for r in range(n)])[i] for i in range(3)]
+    if min(q) <= 0:
+        return None
+    return math.sqrt(sum(q)), math.sqrt(q[0] + q[1]), math.sqrt(q[2])
+
+
+def sky_nmea(view, heard, used, dop, now):
+    """GSA (mode 3 with satellites in the fix, else 1) and GSV sentences"""
+    out = []
+    d = ["%.1f" % x for x in dop] if dop else ["", "", ""]
+    for sy in "GRC":
+        sv = sorted(n for n in map(nmea_sv, (k for k in used if k[0] == sy)) if n)[:12]
+        if sv or (sy == "G" and not used):
+            out.append(nmea("GNGSA,A,%d,%s,%s,%d" % (
+                3 if used else 1, ",".join(["%d" % x for x in sv] + [""] * (12 - len(sv))),
+                ",".join(d), SYSTEM_ID[sy])))
+    for sy in "GRC":
+        sats = sorted((nmea_sv(k), k) for k in view if k[0] == sy and nmea_sv(k))
+        pages = [sats[i:i + 4] for i in range(0, len(sats), 4)]
+        for i, page in enumerate(pages):
+            f = []
+            for sv, k in page:
+                cn0, t = heard.get(k, (None, 0.0))
+                el, az = view[k]
+                f.append("%02d,%02d,%03d,%s" % (sv, round(el), round(az) % 360,
+                                          "%02d" % cn0 if cn0 and now - t < SNR_AGE else ""))
+            out.append(nmea("%sGSV,%d,%d,%02d,%s" % (TALKER[sy], len(pages), i + 1, len(sats),
+                                                       ",".join(f))))
+    return "".join(out)
+
+
+def send_fix(sock, lat, lon, h, nsat, utc, hdop, extra=""):
+    def dm(v, deg_digits):
+        a = abs(v)
+        d = int(a)
+        return "%0*d%07.4f" % (deg_digits, d, (a - d) * 60)
+    t = utc.strftime("%H%M%S.") + "%02d" % (utc.microsecond // 10000)
+    ns, ew = "N" if lat >= 0 else "S", "E" if lon >= 0 else "W"
+    gga = nmea("GPGGA,%s,%s,%s,%s,%s,1,%02d,%.1f,%.1f,M,0.0,M,," % (
+        t, dm(lat, 2), ns, dm(lon, 3), ew, nsat, hdop, h))
+    rmc = nmea("GPRMC,%s,A,%s,%s,%s,%s,0.0,0.0,%s,,,A" % (
+        t, dm(lat, 2), ns, dm(lon, 3), ew, utc.strftime("%d%m%y")))
+    sock.sendto((gga + extra + rmc).encode(), GPSD)
+
+
+def session(eph, lat, lon, sock):
+    """one probe session; returns when it ends"""
+    rx = ge.ecef(lat, lon, 0.0)
+    start = time.time() + 2                             # rewrite + probe start
+    # GLONASS and BeiDou search assignments from the same file too: replayed
+    # from the capture, they point at the wrong Doppler and hardly acquire
+    try:
+        gnss = ge.load_gnss(os.path.join(STATE, "brdc.rnx"))
+    except (OSError, ValueError, StopIteration):
+        gnss = None
+    if gnss is None and chip_gnss():
+        gnss = {}                           # offline: the chip's own ephemerides
+    if gnss is not None:
+        for prn, l in eph.items():          # the chip's GPS issues too (ephemeris())
+            for e in l:
+                add_ephemeris(gnss, ("G", prn), e)
+        for key, l in chip_gnss().items():   # BeiDou and GLONASS from the chip
+            for e in l:
+                if not any(same_issue(x, e) for x in gnss.get(key, [])):
+                    gnss.setdefault(key, []).append(e)
+    t_script = ge.gps_seconds(datetime.datetime.fromtimestamp(start, datetime.timezone.utc))
+    # the whole session generated (session.py: setup and clock frames), its
+    # 02/03 for the satellites above the horizon now: no libmnl capture
+    table = gnss if gnss is not None else {("G", prn): l for prn, l in eph.items()}
+    lines, done, _ = own02.regenerate(session_gen.generate(SESSION + 5), ge, eph, table,
+                                      rx, lat, lon, t_script)
+    script = "/run/titan-gnss-open.script"
+    with open(script, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    while time.time() < start:
+        time.sleep(0.05)
+    t_start = ge.gps_seconds(datetime.datetime.now(datetime.timezone.utc))
+    say("session: %d assignments" % done)
+    p = subprocess.Popen([PROBE, script, "--seconds", str(SESSION)], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, bufsize=1)
+    batches = {}            # (constellation, batch bytes, ms // 400) -> (ms, [(key, m)])
+    ident = {}              # (record's satellite, minute) -> ephemeris key
+    solve_eph = gnss or {("G", prn): l for prn, l in eph.items()}
+    last_fix = time.time()
+    last_try = 0.0
+    fixes = 0
+    seed = rx
+    nav = []                # the session's 2B lines (navigation subframes)
+    nav_cr = []             # its 3B and 4B lines (GLONASS strings, BeiDou subframes)
+    heard = {}              # key -> (C/N0 dB-Hz, time) of the satellites tracked
+    view, sky_t = {}, 0.0   # sky(), and when
+    cache_cr = chip_gnss()
+    chip = chip_ephemeris() # what the chip has sent before (STATE/chip.rnx)
+    for line in p.stdout:
+        f = line.split()
+        if len(f) == 4 and f[1] in ("3b", "4b"):
+            nav_cr.append(line)
+            raw = bytes.fromhex(f[3])
+            done_set = (f[1] == "4b" and navsub.decode_bds(raw)[1] == 3) or \
+                (f[1] == "3b" and navsub.decode_glo(raw)[1] == 4)
+            if done_set:
+                found = navsub.bds_from_lines(nav_cr) if f[1] == "4b" else \
+                    navsub.glo_from_lines(nav_cr, t_start)
+                fresh = []
+                for key, l in found.items():
+                    for e in l:
+                        if not any(same_issue(x, e) for x in cache_cr.get(key, [])):
+                            cache_cr.setdefault(key, []).append(e)
+                            fresh.append(key)
+                        if gnss is not None and not any(same_issue(x, e) for x in solve_eph.get(key, [])):
+                            solve_eph.setdefault(key, []).append(e)
+                if fresh:
+                    save_chip_gnss(cache_cr)
+                    say("ephemeris from the chip: %s" % " ".join("%s%02d" % k for k in fresh))
+            continue
+        if len(f) == 4 and f[1] == "2b":
+            nav.append(line)
+            prn_, sfid, status, words = navsub.decode(bytes.fromhex(f[3]))
+            if sfid == 4 and not status:            # page 18: the ionosphere model
+                k = navsub.iono(words)
+                if k and k != sf.IONO:
+                    sf.IONO = k
+                    save_iono(k)
+                    say("ionosphere coefficients from the chip")
+            if sfid == 3:                           # a subframe 3 may complete a set
+                fresh, new = [], []
+                for prn, l in navsub.from_lines(nav, t_start).items():
+                    for e in l:
+                        if add_ephemeris(chip, prn, e):         # cache every issue
+                            fresh.append((prn, e))
+                        if add_ephemeris(eph, prn, e):          # and use the ones we lacked
+                            add_ephemeris(solve_eph, ("G", prn), e)
+                            new.append(prn)
+                if fresh:
+                    save_chip_ephemeris(fresh)
+                    say("ephemeris from the chip: %s%s" % (
+                        " ".join("G%02d" % prn for prn, _ in fresh),
+                        " (new to this session: %s)" % " ".join("G%02d" % n for n in new) if new else ""))
+            continue
+        if len(f) != 4 or f[1] != "29":
+            continue
+        pl = bytes.fromhex(f[3])
+        r = mm.record(pl)
+        if not r or pl[5] != 0xA0:
+            continue
+        if r["sat"][0] != "G" and not gnss:
+            continue
+        ms = int(f[0])
+        # GPS, GLONASS and BeiDou: each batch is one constellation's, with
+        # its own clock bias in the solution
+        ik = (r["sat"], ms // 60000)
+        if ik not in ident:
+            ident[ik] = sf.identify(r["sat"], solve_eph, t_start + ms / 1000, seed, lat, lon)
+        key = ident[ik]
+        if key is None:
+            continue
+        now = time.time()
+        heard[key] = (r["cn0"], now)        # weak ones too: they're in the sky view
+        if r["cn0"] >= MIN_CN0:
+            ms0, l = batches.setdefault((r["sat"][0], pl[20:27], ms // 400), (ms, []))
+            if key not in [x[0] for x in l]:
+                l.append((key, r["codephase"] / r["chips"] * sf.MS))
+        if now - last_try < EVERY:
+            continue
+        last_try = now
+        if now - sky_t > SKY_EVERY:
+            view = sky(solve_eph, t_start + ms / 1000, seed, *sf.ecef_latlon(seed))
+            sky_t = now
+        recent = [(t_start + b_ms / 1000, l_) for b_ms, l_ in batches.values()
+                  if ms - b_ms < WINDOW * 1000 and len(l_) >= 4]
+        # five satellites or more, each in two batches at least: with the
+        # same four in every batch, position and time error can't be told
+        # apart (fixes kilometres off)
+        seen = collections.Counter(prn for _, l_ in recent for prn, _ in l_)
+        if sum(1 for n in seen.values() if n >= 2) < 5:
+            recent = []
+        for k in [k for k, (b_ms, _) in batches.items() if ms - b_ms > WINDOW * 1000]:
+            del batches[k]
+        if len(recent) < 3:
+            sock.sendto(sky_nmea(view, heard, (), None, now).encode(), GPSD)
+            if now - last_fix > 60 and fixes == 0 and ms > 90000:
+                say("no fix after %d s" % (ms // 1000))
+                last_fix = now
+            continue
+        # one time error for all batches (so four satellites a batch
+        # suffice), leaving out satellites whose residuals stay off
+        fx, used, rms, _, dropped = sf.solve_robust(recent, solve_eph, seed, height=HEIGHT)
+        if used < 3 or rms > 120:
+            sock.sendto(sky_nmea(view, heard, (), None, now).encode(), GPSD)
+            continue
+        flat, flon = sf.ecef_latlon(fx)
+        h = math.sqrt(sum(x * x for x in fx)) - math.sqrt(sum(x * x for x in ge.ecef(flat, flon, 0)))
+        if math.dist(fx, seed) > 200e3:                  # a wrong ambiguity, not a fix
+            sock.sendto(sky_nmea(view, heard, (), None, now).encode(), GPSD)
+            continue
+        seed = fx
+        in_fix = {prn for _, l_ in recent for prn, _ in l_} - set(dropped)
+        nsat = len(in_fix)
+        dop = dops(view, in_fix)
+        send_fix(sock, flat, flon, h, nsat, datetime.datetime.now(datetime.timezone.utc),
+                 dop[1] if dop else 1.0, sky_nmea(view, heard, in_fix, dop, now))
+        fixes += 1
+        last_fix = now
+        if fixes % 30 == 1:
+            save_position(flat, flon)
+            say("fix %d: %d satellites, %d batches, residual rms %.0f m" % (fixes, nsat, used, rms))
+    p.wait()
+    err = p.stderr.read()
+    for l in err.splitlines():
+        if "giving up" in l or "not acknowledged" in l:
+            say("probe:", l)
+    if fixes:
+        flat, flon = sf.ecef_latlon(seed)
+        save_position(flat, flon)
+    say("session ended (%d fixes)" % fixes)
+
+
+def keep_awake():
+    """renew the wakelock until the daemon exits"""
+    while True:
+        try:
+            with open("/sys/power/wake_lock", "w") as f:
+                f.write("%s %d" % (WAKE_LOCK, WAKE_HOLD * 10 ** 9))
+        except OSError as e:
+            say("wake_lock: %s" % e)
+            return
+        time.sleep(WAKE_HOLD / 3)
+
+
+def release_wake_lock():
+    try:
+        with open("/sys/power/wake_unlock", "w") as f:
+            f.write(WAKE_LOCK)
+    except OSError:
+        pass
+
+
+def main():
+    os.makedirs(STATE, exist_ok=True)
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))      # so finally runs
+    threading.Thread(target=keep_awake, daemon=True).start()
+    load_iono()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    running = [True]
+    while running[0]:
+        pos = position()
+        if pos is None:
+            say("no %s/position (\"lat lon\", within some tens of km): waiting" % STATE)
+            time.sleep(60)
+            continue
+        eph = ephemeris()
+        if not eph:
+            say("no usable ephemeris (offline?): waiting")
+            time.sleep(60)
+            continue
+        session(eph, pos[0], pos[1], sock)
+        time.sleep(GAP)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        release_wake_lock()

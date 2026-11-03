@@ -92,6 +92,9 @@ extern int mtk_gnss_get_measurement(void *gps, void *glonass, void *beidou, void
 				    void *m5, void *m6, void *f1, void *f2, void *f3,
 				    void *f4, void *f5, void *f6);
 extern int mtk_gnss_get_clock(void *clock);
+/* Android's GnssNavigationMessage: one event (a decoded subframe) for a
+ * satellite; stock mnld calls it for GPS PRNs 1-32 with type 1 */
+extern int mtk_gnss_get_navigation_event(void *event, u8 svid, int type);
 extern int mtk_gps_set_debug_type(u8 type);
 
 /* ---- logging (stderr: the journal) ---- */
@@ -260,6 +263,8 @@ static void *callbacks[17] = {
 static int dsp_fd = -1;
 static int running;
 static void drop_setup(void);
+static void flip_setup(void);
+static void wflip_setup(void);
 
 static int engine_start(void)
 {
@@ -277,6 +282,8 @@ static int engine_start(void)
 	memcpy(drv, driver_cfg_default, sizeof drv);
 	config_probe(dsp_fd, init, drv);
 	drop_setup();
+	flip_setup();
+	wflip_setup();
 	r = mtk_gps_mnl_run(init, drv);
 	if (r != MNL_RUN_OK) {
 		say("titan-mnld: mtk_gps_mnl_run failed (%d)", r);
@@ -407,13 +414,35 @@ static void drop_filter(u8 *p, ssize_t n)
 	}
 }
 
+static int flip_byte = -1;
+static void flip_filter(u8 *p, ssize_t n);
+
 ssize_t read(int fd, void *buf, size_t n)
 {
 	ssize_t r = syscall(__NR_read, fd, buf, n);
 
 	if (drop_any && fd == dsp_fd && r > 0)
 		drop_filter(buf, r);
+	if (flip_byte >= 0 && fd == dsp_fd && r > 0)
+		flip_filter(buf, r);
 	return r;
+}
+
+#define __NR_write 4
+static int wflip_type = -1;
+static ssize_t wflip_rewrite(const u8 *p, size_t n, u8 *out);
+
+/* libmnl imports write() too: the host side of TITAN_MNLD_WFLIP (below) */
+ssize_t write(int fd, const void *buf, size_t n)
+{
+	static u8 out[4096];
+	ssize_t m, r;
+
+	if (wflip_type < 0 || fd != dsp_fd || n > 2048)
+		return syscall(__NR_write, fd, buf, n);
+	m = wflip_rewrite(buf, n, out);
+	r = syscall(__NR_write, fd, out, m);
+	return r == m ? (ssize_t)n : r;
 }
 
 static void drop_setup(void)
@@ -456,6 +485,351 @@ MEAS_BUF(meas_gps, 0x18fc); MEAS_BUF(meas_glo, 0xf60); MEAS_BUF(meas_bds, 0x285c
 MEAS_BUF(meas_gal, 0x1710); MEAS_BUF(meas_m5, 0xc2c); MEAS_BUF(meas_m6, 0x8f8);
 MEAS_BUF(meas_flags[6], 64); MEAS_BUF(meas_clock, 0x58);
 static int meas_fd = -1;
+/* TITAN_MNLD_NAV=/path: the navigation events too, beside the measurements:
+ *   N <realtime ms> <svid> <return> <first 0x60 bytes hex>
+ * for decoding the chip's 2B frames (docs/gnss.md) */
+static int nav_fd = -1;
+static u8 nav_buf[0x200] __attribute__((aligned(8)));
+
+/* ---- flipping bits of 29 records (TITAN_MNLD_FLIP=byte:mask) ----
+ * Another experiment: XORs payload byte `byte` (0 = the first after FE, as
+ * docs/gnss.md numbers them) of the 29 records of one satellite
+ * (TITAN_MNLD_FLIP_B2 = byte 2, TITAN_MNLD_FLIP_ID = bits 11-16) with `mask`,
+ * during alternate TITAN_MNLD_FLIP_PERIOD-second windows, and fixes the
+ * checksum, so libmnl's response to that bit shows in its measurements.
+ * A record whose byte or checksum would change length through escaping is
+ * left alone or, if only the checksum can't be fixed, dropped by libmnl.
+ * TITAN_MNLD_FLIP_SATS=id=byte:mask,... instead gives each satellite (bits
+ * 11-16, with FLIP_B2) its own byte and mask, so one run tests several bits.
+ * Each change is logged to the measurement log:
+ *   F <realtime ms> <byte 1> <byte 2> <old byte> <new byte> <byte index>
+ * (bytes after the 0xCA XOR) */
+static u8 flip_mask, flip_cur_mask;
+static int flip_cur_byte;
+static signed char flip_sat_byte[64];
+static u8 flip_sat_mask[64];
+static int flip_sats;
+static int flip_b2 = -1, flip_id = -1, flip_period = 10;
+static i64 flip_from;
+static int flip_state, flip_esc, flip_pos, flip_len, flip_mod, flip_delta, flip_carry;
+static u8 flip_b1, flip_b2v;
+/* TITAN_MNLD_FLIP2B=prn=byte:mask,...: the same for the 2B navigation
+ * subframes, by PRN (header byte 2 >> 3); payload bytes 8-45 are the
+ * subframe (not XORed). Logged as F lines with byte 1 = 0x2B, byte 2 = PRN */
+static signed char flip2b_byte[33], flip2b_end[33];	/* byte range a-b */
+static u8 flip2b_mask[33];
+static int flip2b, flip_is2b, flip2b_last;
+static void hex_line(char tag, i64 ms, int arr, int idx, const u8 *p, u32 n);
+
+static void flip_log(u8 b1, u8 b2, u8 old, u8 new, int byte)
+{
+	struct { long s, ns; } ts;
+	char line[64];
+
+	if (meas_fd < 0)
+		return;
+	clock_gettime(0, &ts);
+	write(meas_fd, line, snprintf(line, sizeof line, "F %lld %02x %02x %02x %02x %d\n",
+				      (i64)ts.s * 1000 + ts.ns / 1000000, b1, b2, old, new, byte));
+}
+
+/* the new value of an unescaped stream byte, if it needs no escaping */
+static int flip_ok(int was_esc, int v)
+{
+	return !was_esc && v != 0xAA && v != 0xDE;
+}
+
+static void flip_filter(u8 *p, ssize_t n)
+{
+	ssize_t i;
+
+	for (i = 0; i < n; i++) {
+		u8 b = p[i];
+		int v, was_esc;
+
+		if (flip_state == 0) {
+			flip_state = b == 0xAA;
+			continue;
+		}
+		if (flip_state == 1) {
+			flip_state = b == 0xF0 ? 2 : b == 0xAA;
+			continue;
+		}
+		if (b == 0xDE && !flip_esc) {
+			flip_esc = 1;
+			continue;
+		}
+		was_esc = flip_esc;
+		v = was_esc ? (b == 0xDF ? 0xAA : 0xDE) : b;
+		flip_esc = 0;
+		switch (flip_state) {
+		case 2:
+			flip_len = v;
+			flip_state = 3;
+			break;
+		case 3:
+			flip_len |= (v & 0x0F) << 8;
+			flip_state = 4;
+			break;
+		case 4:
+			flip_is2b = v == 0x2B && flip2b;
+			if ((v == 0x29 && flip_byte >= 0 && !flip2b) || flip_is2b) {
+				i64 t = mono_ms() - flip_from;
+				flip_mod = t >= 0 && (t / (flip_period * 1000)) % 2 == 1;
+			} else
+				flip_mod = 0;
+			flip_state = 5;
+			break;
+		case 5:
+			flip_state = v == 0xFE && flip_len > 4 ? 6 : 0;
+			flip_pos = 0;
+			flip_delta = 0;
+			break;
+		case 6:			/* payload byte flip_pos */
+			if (flip_pos == 1)
+				flip_b1 = v ^ 0xCA;
+			if (flip_pos == 2)
+				flip_b2v = v ^ 0xCA;
+			if (flip_pos == 2 && flip_is2b) {
+				int prn = (v ^ 0xCA) >> 3;
+
+				flip_b1 = 0x2B;
+				flip_b2v = prn;
+				flip_cur_byte = prn <= 32 ? flip2b_byte[prn] : -1;
+				flip2b_last = prn <= 32 ? flip2b_end[prn] : -1;
+				flip_cur_mask = prn <= 32 ? flip2b_mask[prn] : 0;
+			} else if (flip_pos == 2) {
+				int id = (flip_b1 >> 3) | ((v ^ 0xCA) & 1) << 5;
+
+				if ((flip_b2 >= 0 && (v ^ 0xCA) != flip_b2) ||
+				    (flip_id >= 0 && id != flip_id))
+					flip_mod = 0;
+				flip_cur_byte = flip_sats ? flip_sat_byte[id] : flip_byte;
+				flip_cur_mask = flip_sats ? flip_sat_mask[id] : flip_mask;
+			}
+			if (flip_mod && flip_pos > 2 && flip_cur_byte >= 0 &&
+			    (flip_is2b ? flip_pos >= flip_cur_byte && flip_pos <= flip2b_last
+			     : flip_pos == flip_cur_byte) &&
+			    flip_ok(was_esc, v ^ flip_cur_mask)) {
+				p[i] = v ^ flip_cur_mask;
+				flip_delta += p[i] - v;
+				flip_log(flip_b1, flip_b2v, flip_is2b ? v : v ^ 0xCA,
+					 flip_is2b ? v ^ flip_cur_mask : v ^ 0xCA ^ flip_cur_mask, flip_pos);
+			}
+			if (++flip_pos == flip_len - 4)
+				flip_state = 7;
+			break;
+		case 7:			/* checksum, low byte */
+			if (flip_delta) {
+				int s = v + flip_delta;
+				flip_carry = s >> 8;	/* -1, 0 or 1 (arithmetic shift) */
+				if (flip_ok(was_esc, s & 0xFF))
+					p[i] = s & 0xFF;
+			}
+			flip_state = 8;
+			break;
+		case 8:			/* checksum, high byte */
+			if (flip_delta && flip_carry && flip_ok(was_esc, (v + flip_carry) & 0xFF))
+				p[i] = (v + flip_carry) & 0xFF;
+			flip_state = 0;
+			break;
+		}
+	}
+}
+
+static void flip_setup(void)
+{
+	const char *f = getenv("TITAN_MNLD_FLIP");
+	const char *sats = getenv("TITAN_MNLD_FLIP_SATS");
+	char *end;
+	int i;
+
+	for (i = 0; i < 64; i++)
+		flip_sat_byte[i] = -1;
+	for (i = 0; i < 33; i++)
+		flip2b_byte[i] = -1;
+	{
+		const char *nb = getenv("TITAN_MNLD_FLIP2B");	/* prn=byte:mask,... */
+		while (nb && *nb) {
+			long prn = strtol(nb, &end, 10);
+			if (*end != '=' || prn < 1 || prn > 32)
+				break;
+			flip2b_byte[prn] = strtol(end + 1, &end, 10);
+			flip2b_end[prn] = *end == '-' ? strtol(end + 1, &end, 10) : flip2b_byte[prn];
+			flip2b_mask[prn] = *end == ':' ? strtol(end + 1, &end, 16) : 1;
+			flip2b = 1;
+			nb = *end ? end + 1 : end;
+		}
+	}
+	while (sats && *sats) {		/* id=byte:mask,... */
+		long id = strtol(sats, &end, 10);
+		if (*end != '=' || id < 0 || id > 63)
+			break;
+		flip_sat_byte[id] = strtol(end + 1, &end, 10);
+		flip_sat_mask[id] = *end == ':' ? strtol(end + 1, &end, 16) : 1;
+		flip_sats = 1;
+		sats = *end ? end + 1 : end;
+	}
+	if (!f && !flip_sats && !flip2b)
+		return;
+	flip_byte = f ? strtol(f, &end, 10) : 0;
+	flip_mask = f && *end == ':' ? strtol(end + 1, 0, 16) : 1;
+	if (getenv("TITAN_MNLD_FLIP_B2"))
+		flip_b2 = strtol(getenv("TITAN_MNLD_FLIP_B2"), 0, 16);
+	if (getenv("TITAN_MNLD_FLIP_ID"))
+		flip_id = strtol(getenv("TITAN_MNLD_FLIP_ID"), 0, 10);
+	if (getenv("TITAN_MNLD_FLIP_PERIOD"))
+		flip_period = strtol(getenv("TITAN_MNLD_FLIP_PERIOD"), 0, 10);
+	flip_from = mono_ms();
+	if (flip2b)
+		say("titan-mnld: flipping 2B subframe bits %s, %d s on/off",
+		    getenv("TITAN_MNLD_FLIP2B"), flip_period);
+	else
+		say("titan-mnld: flipping %s of 29 records (b2 %d id %d), %d s on/off",
+		    flip_sats ? getenv("TITAN_MNLD_FLIP_SATS") : f, flip_b2, flip_id, flip_period);
+}
+
+/* ---- changing what libmnl sends (TITAN_MNLD_WFLIP=type:offset:width:delta) ----
+ * The host side of the flip experiments: in host frames of `type` (hex),
+ * adds `delta` to the little-endian field of `width` (1, 2 or 4) bytes at
+ * payload offset `offset` (0 = the first byte after FE), during alternate
+ * TITAN_MNLD_WFLIP_PERIOD-second windows (default 10; 0 = always), then fixes the sum
+ * and the escaping. TITAN_MNLD_WFLIP_SV / _CON (hex) keep only frames with
+ * that payload byte 0 / 1 (02's satellite and constellation). libmnl writes
+ * whole frames, so each write is rebuilt frame by frame; anything that
+ * doesn't parse is passed on as it is. Each change is logged to the
+ * measurement log:  W <realtime ms> <type> <byte 0> <byte 1> <old> <new> */
+static int wflip_off, wflip_width, wflip_sv = -1, wflip_con = -1, wflip_period = 10;
+static long wflip_delta;
+static i64 wflip_from;
+
+static u8 *wflip_put(u8 *o, u8 b)
+{
+	if (b == 0xAA || b == 0xDE) {
+		*o++ = 0xDE;
+		*o++ = b == 0xAA ? 0xDF : 0xE0;
+	} else
+		*o++ = b;
+	return o;
+}
+
+/* one escaped byte at p[*i] (advancing *i), or -1 past the end */
+static int wflip_get(const u8 *p, size_t n, size_t *i)
+{
+	u8 b;
+
+	if (*i >= n)
+		return -1;
+	b = p[(*i)++];
+	if (b != 0xDE)
+		return b;
+	if (*i >= n)
+		return -1;
+	b = p[(*i)++];
+	return b == 0xDF ? 0xAA : 0xDE;
+}
+
+static void wflip_change(u8 *pay, u32 len)
+{
+	u32 old = 0, new, k;
+	i64 t = mono_ms() - wflip_from;
+	struct { long s, ns; } ts;
+	char line[96];
+
+	if (t < 0 || (wflip_period && (t / (wflip_period * 1000)) % 2 == 0) ||
+	    (u32)(wflip_off + wflip_width) > len ||
+	    (wflip_sv >= 0 && pay[0] != wflip_sv) || (wflip_con >= 0 && pay[1] != wflip_con))
+		return;
+	for (k = 0; k < (u32)wflip_width; k++)
+		old |= (u32)pay[wflip_off + k] << 8 * k;
+	new = old + (u32)wflip_delta;
+	for (k = 0; k < (u32)wflip_width; k++)
+		pay[wflip_off + k] = new >> 8 * k;
+	if (wflip_width < 4)
+		new &= (1u << 8 * wflip_width) - 1;
+	if (meas_fd < 0)
+		return;
+	clock_gettime(0, &ts);
+	write(meas_fd, line, snprintf(line, sizeof line, "W %lld %02x %02x %02x %u %u\n",
+				      (i64)ts.s * 1000 + ts.ns / 1000000, wflip_type,
+				      pay[0], pay[1], old, new));
+}
+
+static ssize_t wflip_rewrite(const u8 *p, size_t n, u8 *out)
+{
+	u8 body[2048], *o = out;
+	size_t i = 0, start;
+
+	while (i + 1 < n && p[i] == 0xAA && p[i + 1] == 0xF0) {
+		int l0, l1, b;
+		u32 len, k, sum;
+
+		start = i;
+		i += 2;
+		l0 = wflip_get(p, n, &i);
+		l1 = wflip_get(p, n, &i);
+		if (l1 < 0)
+			goto rest;
+		len = l0 | (l1 & 0x0F) << 8;
+		if (len < 4 || len > sizeof body)
+			goto rest;
+		for (k = 0; k < len; k++) {
+			if ((b = wflip_get(p, n, &i)) < 0)
+				goto rest;
+			body[k] = b;
+		}
+		if (i + 1 >= n || p[i] != 0xAA || p[i + 1] != 0x0F)
+			goto rest;
+		i += 2;
+		if (body[0] == wflip_type && body[1] == 0xFE) {
+			wflip_change(body + 2, len - 4);
+			for (sum = l0 + l1, k = 0; k < len - 2; k++)
+				sum += body[k];
+			body[len - 2] = sum;
+			body[len - 1] = sum >> 8;
+		}
+		*o++ = 0xAA;
+		*o++ = 0xF0;
+		o = wflip_put(o, l0);
+		o = wflip_put(o, l1);
+		for (k = 0; k < len; k++)
+			o = wflip_put(o, body[k]);
+		*o++ = 0xAA;
+		*o++ = 0x0F;
+		continue;
+rest:
+		i = start;
+		break;
+	}
+	memcpy(o, p + i, n - i);	/* what didn't parse, as it was */
+	return o - out + (n - i);
+}
+
+static void wflip_setup(void)
+{
+	const char *f = getenv("TITAN_MNLD_WFLIP");
+	char *end;
+
+	if (!f)
+		return;
+	wflip_type = strtol(f, &end, 16);
+	wflip_off = *end == ':' ? strtol(end + 1, &end, 10) : 0;
+	wflip_width = *end == ':' ? strtol(end + 1, &end, 10) : 1;
+	wflip_delta = *end == ':' ? strtol(end + 1, &end, 10) : 1;
+	if (wflip_width != 1 && wflip_width != 2 && wflip_width != 4) {
+		wflip_type = -1;
+		return;
+	}
+	if (getenv("TITAN_MNLD_WFLIP_SV"))
+		wflip_sv = strtol(getenv("TITAN_MNLD_WFLIP_SV"), 0, 16);
+	if (getenv("TITAN_MNLD_WFLIP_CON"))
+		wflip_con = strtol(getenv("TITAN_MNLD_WFLIP_CON"), 0, 16);
+	if (getenv("TITAN_MNLD_WFLIP_PERIOD"))
+		wflip_period = strtol(getenv("TITAN_MNLD_WFLIP_PERIOD"), 0, 10);
+	wflip_from = mono_ms();
+	say("titan-mnld: adding %ld to host %02x frames at %d (%d bytes), sv %d con %d, %d s on/off",
+	    wflip_delta, wflip_type, wflip_off, wflip_width, wflip_sv, wflip_con, wflip_period);
+}
 
 static void hex_line(char tag, i64 ms, int arr, int idx, const u8 *p, u32 n)
 {
@@ -526,7 +900,7 @@ static void meas_log(void)
 	int a;
 	u32 i;
 
-	if (meas_fd < 0 || !running)
+	if ((meas_fd < 0 && nav_fd < 0) || !running)
 		return;
 	clock_gettime(0, &ts);		/* CLOCK_REALTIME, as strace -ttt */
 	ms = (i64)ts.s * 1000 + ts.ns / 1000000;
@@ -540,6 +914,22 @@ static void meas_log(void)
 			mem_dump(ms);
 		}
 	}
+	if (nav_fd >= 0) {
+		int sv;
+		for (sv = 1; sv <= 32; sv++) {
+			int r;
+			memset(nav_buf, 0, sizeof nav_buf);
+			r = mtk_gnss_get_navigation_event(nav_buf, (u8)sv, 1);
+			if (r) {
+				int fd = meas_fd;
+				meas_fd = nav_fd;
+				hex_line('N', ms, sv, r, nav_buf, 0x60);
+				meas_fd = fd;
+			}
+		}
+	}
+	if (meas_fd < 0)
+		return;
 	for (a = 0; a < 6; a++)
 		memset(arrays[a], 0, sizes[a]);
 	memset(meas_clock, 0, sizeof meas_clock);
@@ -584,6 +974,8 @@ int main(void)
 	setsockopt(rx, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 	if (getenv("TITAN_MNLD_DBG"))
 		dbg_fd = open(getenv("TITAN_MNLD_DBG"), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (getenv("TITAN_MNLD_NAV"))
+		nav_fd = open(getenv("TITAN_MNLD_NAV"), O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (getenv("TITAN_MNLD_MEAS")) {
 		meas_fd = open(getenv("TITAN_MNLD_MEAS"), O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		say("titan-mnld: measurement log %s%s", getenv("TITAN_MNLD_MEAS"),

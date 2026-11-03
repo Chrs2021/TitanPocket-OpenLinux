@@ -18,6 +18,10 @@ use crate::frame;
 
 /// the libmnl that ships with the phone (titan-mnld's chroot)
 pub const LIBMNL: &str = "/opt/android-gps/vendor/lib/libmnl.so";
+/// the patch once extracted from it (`titan-gps-probe --extract-patch`):
+/// the 8-byte header and the image, kept on the phone only; with it, libmnl
+/// is not needed at all
+pub const FIRMWARE: &str = "/lib/firmware/titan/mt6631-gnss-patch.bin";
 /// the image the MT6631 in this phone takes (61440 bytes)
 pub const IMAGE_CRC32: u32 = 0x5A78_74A9;
 /// where it was in the libmnl this was worked out on (searched if it moved)
@@ -72,6 +76,13 @@ impl Patch {
             std::io::Error::new(std::io::ErrorKind::NotFound,
                                 format!("{path}: no MT6631 GNSS patch (CRC {IMAGE_CRC32:08x})"))
         })
+    }
+
+    /// the firmware file's bytes: the header and the image
+    pub fn to_file_bytes(&self) -> Vec<u8> {
+        let mut v = self.header.to_vec();
+        v.extend_from_slice(&self.image);
+        v
     }
 
     /// the 0x0C frames' payloads, in order

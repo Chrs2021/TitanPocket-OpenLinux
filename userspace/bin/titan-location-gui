@@ -2,8 +2,9 @@
 """
 titan-location-gui: Location for the Titan Pocket (GTK 4, titan_ui4).
 
-A switch for the GPS receiver (titan-location: titan-gnss + MediaTek's
-mnld; off by default because it drains the battery) and its live status from
+A switch for the GPS receiver (titan-location: our own titan-gnss-open by
+default, or MediaTek's libmnl engine; off by default because it drains the
+battery) and its live status from
 gpsd: fix, satellites, position, altitude, speed, accuracy.
 """
 import json

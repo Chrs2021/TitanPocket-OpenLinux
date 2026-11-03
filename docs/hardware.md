@@ -34,7 +34,7 @@ From the stock dtbo. "Driver" is the driver that binds in our kernel.
 
 | Bus | Addr | Compatible | Device | Driver |
 |---|---|---|---|---|
-| i2c0 | 0x5d | `mediatek,cap_touch` | Goodix GT1151QM touchscreen | `drivers/input/touchscreen/mediatek/GT1151` |
+| i2c0 | 0x5d | `mediatek,cap_touch` | Goodix GT1151QM touchscreen (on 6.12 it answers at 0x14; power switch GPIO 153, INT GPIO 1, reset GPIO 18) | `drivers/input/touchscreen/mediatek/GT1151` |
 | i2c1 | 0x0c | `mediatek,msensor` | magnetometer | BSP |
 | i2c1 | 0x51 | `mediatek,alsps` | ambient light / proximity: nothing answers here; the sensor hub drives them ([below](#light-and-proximity-sensors)) | none |
 | i2c1 | 0x77 | `mediatek,barometer` | **not fitted**: nothing answers at 0x77 or 0x76 (2026-10-29), the stock kernel builds no barometer driver, the hub has no barometer | none |
@@ -172,6 +172,12 @@ it off), `GyroBias` (learns the offset whenever the phone lies still) and
 only when tight, and used only when it explains the field better than the
 raw readings). Both are saved in `~/.local/share/titan-sensors/`.
 **Maze** and **Compass** use it (desktop.md).
+
+On Linux 6.12 our `mt6771-scp` driver runs the same hub and gives each
+sensor as an IIO device (`scp-accel`, `scp-gyro`, `scp-magn`, `scp-light`,
+`scp-proximity`); `titan_sensors.py` reads those there
+([mainline.md](mainline.md), subsystem table). The SCP's log names the
+chips: a Senodia SH3001 accelerometer/gyroscope.
 
 ## Light and proximity sensors
 

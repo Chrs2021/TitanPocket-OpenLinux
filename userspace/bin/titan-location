@@ -1,11 +1,32 @@
 #!/bin/sh
-# titan-location on|off|toggle|status: the GPS receiver (titan-gnss and
-# MediaTek's mnld). Off by default: it drains the battery while on.
-# Positions come from gpsd (cgps, gpspipe, any gpsd client).
+# titan-location on|off|toggle|status|engine [open|libmnl]: the GPS
+# receiver. Off by default: it drains the battery while on. Positions come
+# from gpsd (cgps, gpspipe, any gpsd client).
+#
+# Two engines can feed gpsd (docs/gnss-open.md):
+#   open    titan-gnss-open: our own receiver code, no MediaTek library
+#           (the default)
+#   libmnl  titan-gnss + titan-mnld hosting MediaTek's closed libmnl
+# The choice is ENGINE= in /etc/titan-location.conf; `titan-location engine
+# NAME` sets it (and restarts the receiver if it's on).
+CONF=/etc/titan-location.conf
+ENGINE=open
+[ -r "$CONF" ] && . "$CONF"
+
+unit() { if [ "$ENGINE" = libmnl ]; then echo titan-gnss; else echo titan-gnss-open; fi; }
+active() { systemctl -q is-active titan-gnss-open || systemctl -q is-active titan-gnss; }
+
 case "${1:-status}" in
-on)	systemctl start titan-gnss ;;
-off)	systemctl stop titan-gnss titan-mnld ;;
-toggle)	if systemctl -q is-active titan-gnss; then "$0" off; else "$0" on; fi ;;
-status)	if systemctl -q is-active titan-gnss; then echo on; else echo off; fi ;;
-*)	echo "usage: titan-location on|off|toggle|status" >&2; exit 1 ;;
+on)	systemctl start "$(unit)" ;;
+off)	systemctl stop titan-gnss-open titan-gnss titan-mnld ;;
+toggle)	if active; then "$0" off; else "$0" on; fi ;;
+status)	if active; then echo on; else echo off; fi ;;
+engine)	case "$2" in
+	"")	echo "$ENGINE" ;;
+	open|libmnl)
+		echo "ENGINE=$2" > "$CONF"
+		if active; then "$0" off; ENGINE=$2; "$0" on; fi ;;
+	*)	echo "usage: titan-location engine [open|libmnl]" >&2; exit 1 ;;
+	esac ;;
+*)	echo "usage: titan-location on|off|toggle|status|engine [open|libmnl]" >&2; exit 1 ;;
 esac

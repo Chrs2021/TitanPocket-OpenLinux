@@ -1,4 +1,6 @@
 [Unit]
+# not on Linux 6.12 (card titanpocket): ASoC powers the amp there (91-titan-audio.rules)
+ConditionPathExists=!/proc/asound/titanpocket
 Description=Loudspeaker power while audio plays (I2S clock + FS1860 amp)
 
 [Service]

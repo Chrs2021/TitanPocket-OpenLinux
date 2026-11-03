@@ -3,8 +3,10 @@
 titan-powerkey: power button → screen off + suspend to RAM, volume keys →
 speaker volume (Titan Pocket).
 
-Volume keys (screen on only) step the FS1860 amp ("Speaker Amp Volume",
-0-255) by VOL_STEP, capped at VOL_MAX so it never goes full blast. Volume
+Volume keys (screen on only) step the speaker level (0-VOL_MAX) by
+VOL_STEP; the FS1860 amp ("Speaker Amp Volume", 0-255, 0.5 dB a step) is set
+on a dB curve from it (amp_value), capped at VOL_MAX so it never goes full
+blast. Volume
 keys are read from every input device that has them: the side rocker
 (mtk-kpd) and a headset's buttons (ACCDET).
 
@@ -20,11 +22,13 @@ While an app owns the volume keys (titan-remote sends a TV's volume), it
 writes its PID into VOL_KEYS_GRABBED; the grab is ignored once that process
 is gone, so a crashed app can't leave the keys dead.
 
-  awake      short press → blank the panel, suspend ("mem", deep)
+  awake      short press → lock, blank the panel, suspend ("mem", deep)
              if the kernel refuses (e.g. USB cable connected): stay
              "screen off" and retry every RETRY_S seconds; while a
-             charger or computer is plugged in it doesn't try at all,
-             it looks again every RETRY_S seconds
+             charger or computer is plugged in, or a userspace wakelock
+             is held, it doesn't try at all, it looks again every
+             RETRY_S seconds
+  awake      held 3 s, unlocked → the power menu (the shell's)
   screen off short press → panel on
   asleep     the power key wakes the SoC; its press is swallowed and the
              panel comes back. Any other wake source (RTC alarm, cable
@@ -40,10 +44,30 @@ where Photos finds it; the backlight dips for a moment as a shutter. Volume
 up doesn't change the volume while the red key is held, and a step made just
 before the red key joined it is undone.
 
+Locking: before blanking, the Weston session is asked to lock (the file
+LOCK_REQUEST, which the compositor takes and deletes) and the panel goes
+dark once the lock screen is up (LOCKED_FLAG, at most LOCK_WAIT_S), so the
+lock screen is what's there when it comes back on. The compositor has no
+power key binding of its own.
+
+The power menu: the key held HOLD_MENU_S while the screen is on and the
+session unlocked (no LOCKED_FLAG) clicks the vibration motor and asks the
+Weston shell for its power menu (the file POWER_MENU_REQUEST, which the
+compositor takes and deletes). If it's still there after POWER_MENU_WAIT_S
+(no shell that has one), the titan-power-menu app starts instead. Let go
+after that, the key does nothing more. Held on the lock screen it does
+nothing.
+
 The compositor asks for the screen off too: when the session goes idle
 ([core] idle-time, the Display app's Screen timeout) it locks and writes
 "off" into the FIFO CTL_FIFO, which does what a short press does while the
 screen is on (and nothing while it's off).
+
+Wakelocks: writing "mem" to /sys/power/state doesn't look at them (that
+needs the wakeup_count handshake), so the ones userspace holds
+(/sys/power/wake_lock) are checked here. titan-gnss-open holds one while
+the GPS runs: the chip wakes the SoC about once a second then, and a resume
+with the GPS running can crash the CONNSYS chip (docs/power.md).
 
 TITAN_SLEEP_WIFI=off takes Wi-Fi down while asleep (experimental): while
 associated, the CONNSYS chip wakes the SoC within ~0.5 s even with the
@@ -52,8 +76,12 @@ systemd-networkd reconnect when the link comes back up.
 
 The panel is blanked through mtkfb (fb0 blank = FB_BLANK_POWERDOWN), which
 runs MediaTek's display suspend (panel + backlight off, display wakelock
-released). Long presses are left alone: the PMIC resets the phone after
-holding the key for ~10 s.
+released). On Linux 6.12 (no lcd-backlight LED) Weston holds the DRM card,
+so an fbdev blank does nothing; the backlight's level is set to 0 instead
+(the PWM off, which is dark on this board) and the display pipeline stays
+on until suspend, which turns it off. Its bl_power doesn't hold: the panel
+is linked to the backlight, so every panel enable sets bl_power back to on. Presses between SHORT_PRESS_S and HOLD_MENU_S are left alone;
+the PMIC resets the phone after holding the key for ~10 s.
 """
 import errno
 import os
@@ -75,8 +103,17 @@ KEY_RED = 250                       # the red key on the left (mtk-kpd 0xfa)
 SHOT_DIR = "/root/Pictures/Screenshots"
 FBGRAB = "/usr/local/bin/fbgrab"     # the panned 720x720 XRGB area of fb0
 SHOT_W = SHOT_H = 720
-BACKLIGHT = "/sys/class/leds/lcd-backlight/brightness"
+BACKLIGHT_LED = "/sys/class/leds/lcd-backlight/brightness"
+# Linux 6.12: upstream pwm-backlight, the same PWM high time out of 1023
+BACKLIGHT_612 = "/sys/class/backlight/backlight/brightness"
+ON_612 = not os.path.exists(BACKLIGHT_LED)
+BACKLIGHT = BACKLIGHT_612 if ON_612 else BACKLIGHT_LED
 VOL_CONTROL = "Speaker Amp Volume"
+# the amp's volume is 0.5 dB a step (fs1860.c): the level spreads over
+# AMP_RANGE_DB below VOL_MAX (1.5 dB a key step) instead of one to one, which
+# put 40 % 82 dB down. Same curve in titan-mixer and titan-speakerd.
+AMP_RANGE_DB = 42.0
+AMP_STEP_DB = 0.5
 VOL_FILE = "/var/lib/titan-audio/volume"
 VOL_DEFAULT = 160
 VOL_STEP = 8
@@ -86,15 +123,38 @@ VOL_MAX = 224
 VOL_KEYS_GRABBED = "/run/titan-volume-keys.grab"
 # PipeWire runs in root's user session; its sinks stay at 100 %
 PIPEWIRE_RUNTIME = "/run/user/0"
+# the volume keys' tones (userspace/debian/sounds/gen-sounds.py): a rising
+# major arpeggio up, a falling minor one down, at the level just set. A
+# sleeping speaker (the PCM closed) takes ~250 ms to wake (titan-speakerd),
+# so then the copy with silence in front (-cold) plays.
+SOUNDS = "/usr/local/share/titan/sounds"
+SPEAKER_PCM = ("/proc/asound/card0/pcm0p/sub0/status"     # 6.12: DL1
+               if os.path.exists("/proc/asound/titanpocket")
+               else "/proc/asound/card0/pcm7p/sub0/status")
 PIPEWIRE_SINKS = ("titan-speaker-limited", "titan-speaker")
 PIN_INTERVAL_S = 10
 SHORT_PRESS_S = 1.5
+HOLD_MENU_S = 3.0
+POWER_MENU = "/usr/local/bin/titan-power-menu"     # if the shell has none
+# to the compositor: the power menu (it deletes the file)
+POWER_MENU_REQUEST = "/run/titan-power-menu.request"
+POWER_MENU_WAIT_S = 1.0
+VIBRATE = "/usr/local/bin/titan-vibrate"
+# the Weston session (titan-desktop.service, root's)
+WAYLAND_DISPLAY = "wayland-1"
+# from the compositor: exists while the lock screen is up
+LOCKED_FLAG = "/run/titan-locked"
+# to the compositor: lock now (it deletes the file)
+LOCK_REQUEST = "/run/titan-lock.request"
+LOCK_WAIT_S = 0.6
+LOCK_SETTLE_S = 0.08                # a frame or two for the lock screen
 RETRY_S = 30
 WAKE_WINDOW_S = 1.5                  # wait for the waking key press after resume
 FB_BLANK = "/sys/class/graphics/fb0/blank"
 # exists while the screen is off (titan-kbd keeps the keyboard backlight dark)
 SCREEN_OFF_FLAG = "/run/titan-screen.off"
 WLAN_CMD = "/usr/local/bin/titan-wlan-cmd"
+WAKE_LOCKS = "/sys/power/wake_lock"     # the userspace wakelocks held now
 CTL_FIFO = "/run/titan-powerkey.ctl"   # "off" from the compositor (idle)
 WIFI_IF = "wlan0"
 # off by default: taking wlan0 down before suspend (with Bluetooth on) hung
@@ -153,18 +213,51 @@ def keys_grabbed():
     return False
 
 
+def amp_value(level):
+    """the amp's volume for a speaker level (0 mutes)"""
+    if level <= 0:
+        return 0
+    return round(VOL_MAX - AMP_RANGE_DB * (1 - level / VOL_MAX) / AMP_STEP_DB)
+
+
 def write(path, value):
     with open(path, "w") as f:
         f.write(value)
 
 
-def background(cmd):
+def background(cmd, env=None):
     """run without waiting (the screen-on path must stay instant)"""
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+                         start_new_session=True, env=env)
     except OSError as e:
         log("%s: %s" % (cmd[0], e))
+
+
+class Tones:
+    """one tone at a time: a new step cuts the last one short (a held key)"""
+    def __init__(self):
+        self.proc = None
+
+    def play(self, name):
+        try:
+            awake = open(SPEAKER_PCM).read().strip() != "closed"
+        except OSError:
+            awake = True
+        path = os.path.join(SOUNDS, name + ("" if awake else "-cold") + ".wav")
+        if not os.path.exists(path):
+            return
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+        try:
+            self.proc = subprocess.Popen(
+                ["pw-play", path], env=dict(os.environ, XDG_RUNTIME_DIR=PIPEWIRE_RUNTIME),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            log("pw-play: %s" % e)
+
+
+TONES = Tones()
 
 
 def wifi_suspend_mode(on):
@@ -205,7 +298,10 @@ def panel(on):
     except OSError:
         pass
     try:
-        write(FB_BLANK, "0" if on else "4")
+        if not ON_612:
+            write(FB_BLANK, "0" if on else "4")
+        elif not on:
+            write(BACKLIGHT_612, "0")   # on: brightness() below restores it
     except OSError as e:
         log("panel %s: %s" % ("on" if on else "off", e))
     if on:
@@ -229,11 +325,11 @@ def brightness():
     PWM comes back with EN=0 while the driver still thinks it is enabled, so
     any level stayed dark. Level 0 clears the enable bit in the driver; the
     next level sets it again in the hardware."""
-    led = "/sys/class/leds/lcd-backlight/brightness"
-    try:
-        write(led, "0")
-    except OSError:
-        pass
+    if not ON_612:
+        try:
+            write(BACKLIGHT_LED, "0")
+        except OSError:
+            pass
     try:
         subprocess.run(["/usr/local/bin/titan-brightness", "apply"], timeout=5,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -266,7 +362,8 @@ class Volume:
             pass
 
     def apply(self):
-        os.system("tinymix -D 0 set '%s' %d >/dev/null 2>&1" % (VOL_CONTROL, self.level))
+        os.system("tinymix -D 0 set '%s' %d >/dev/null 2>&1" % (VOL_CONTROL,
+                                                             amp_value(self.level)))
 
     def pin_pipewire(self):
         """keep PipeWire's sinks at 100 %, unmuted (in the background)"""
@@ -361,6 +458,57 @@ def screenshot():
     brightness()
 
 
+def session_up():
+    return os.path.exists(os.path.join(PIPEWIRE_RUNTIME, WAYLAND_DISPLAY))
+
+
+def lock_session():
+    """ask Weston to lock and wait until its lock screen is up, so that's
+    what the panel shows when it comes back on"""
+    if os.path.exists(LOCKED_FLAG) or not session_up():
+        return
+    try:
+        open(LOCK_REQUEST, "w").close()
+    except OSError as e:
+        log("lock: %s" % e)
+        return
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while not os.path.exists(LOCKED_FLAG):
+        if time.monotonic() > deadline:
+            log("lock: no lock screen after %.1f s" % LOCK_WAIT_S)
+            return
+        time.sleep(0.02)
+    time.sleep(LOCK_SETTLE_S)
+
+
+def power_menu():
+    """the key held while the screen is on: the power menu, unless locked"""
+    if os.path.exists(LOCKED_FLAG):
+        log("power key held on the lock screen: ignored")
+        return
+    if not session_up():
+        log("power key held: no Weston session")
+        return
+    log("power key held: power menu")
+    background([VIBRATE, "click"])
+    try:
+        open(POWER_MENU_REQUEST, "w").close()
+    except OSError as e:
+        log("power menu: %s" % e)
+        return
+
+    def fallback():
+        """the shell didn't take it: the app"""
+        try:
+            os.unlink(POWER_MENU_REQUEST)
+        except OSError:
+            return              # taken
+        log("power menu: no shell menu, starting %s" % POWER_MENU)
+        background([POWER_MENU], env=dict(os.environ, XDG_RUNTIME_DIR=PIPEWIRE_RUNTIME,
+                                          WAYLAND_DISPLAY=WAYLAND_DISPLAY, HOME="/root"))
+    threading.Timer(POWER_MENU_WAIT_S, fallback).start()
+
+
 def plugged():
     """A charger or computer on the USB port: the kernel refuses suspend then
     (the cable-detect interrupt aborts it at the noirq stage)."""
@@ -372,6 +520,15 @@ def plugged():
         except OSError:
             pass
     return False
+
+
+def wake_locks():
+    """the names of the userspace wakelocks held now"""
+    try:
+        with open(WAKE_LOCKS) as f:
+            return f.read().split()
+    except OSError:
+        return []
 
 
 def suspend():
@@ -417,6 +574,7 @@ class PowerKey:
             except OSError as e:
                 log("volume keys: %s: %s" % (p, e))
         self.pressed_at = None
+        self.on_hold = None         # called once the key is held HOLD_MENU_S
         self.volume = volume        # stepped on volume keys while set
         # the screenshot chord: red key + volume up
         self.red_down = False
@@ -441,8 +599,12 @@ class PowerKey:
                 return
         if self.volume and value in (1, 2) and not keys_grabbed():   # press, autorepeat
             before = self.volume.level
-            if self.volume.step(code == KEY_VOLUMEUP) and code == KEY_VOLUMEUP:
-                self.last_up = (time.monotonic(), before)
+            up = code == KEY_VOLUMEUP
+            if self.volume.step(up):
+                if self.screen_on and self.volume.level > 0:   # muted: nothing to hear
+                    TONES.play("vol-up" if up else "vol-down")
+                if up:
+                    self.last_up = (time.monotonic(), before)
 
     def red_event(self, value):
         self.red_down = value != 0
@@ -456,14 +618,26 @@ class PowerKey:
         screenshot()
 
     def wait_press(self, timeout=None):
-        """Wait for a short press (on release); False on timeout."""
+        """Wait for a short press (on release); False on timeout. A key held
+        HOLD_MENU_S calls on_hold (if set) and its release is ignored."""
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            left = None if deadline is None else max(0.0, deadline - time.monotonic())
+            now = time.monotonic()
+            left = None if deadline is None else max(0.0, deadline - now)
+            hold = None
+            if self.on_hold and self.pressed_at is not None:
+                hold = max(0.0, self.pressed_at + HOLD_MENU_S - now)
+                left = hold if left is None else min(left, hold)
             fds = [self.fd] + self.volume_fds + ([self.ctl] if self.ctl is not None else [])
             r, _, _ = select.select(fds, [], [], left)
             if not r:
-                return False
+                if hold is not None and time.monotonic() >= self.pressed_at + HOLD_MENU_S:
+                    self.pressed_at = None      # the release does nothing
+                    self.on_hold()
+                    continue
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
+                continue
             if self.ctl is not None and self.ctl in r:
                 try:
                     msg = os.read(self.ctl, 256)
@@ -525,17 +699,29 @@ def main():
     while True:
         key.volume = volume         # screen on: volume keys work
         key.screen_on = True
+        key.on_hold = power_menu
         key.wait_press()
+        key.on_hold = None
         key.volume = None
         key.screen_on = False
+        lock_session()
         log("screen off, suspending")
         panel(False)
         wifi(False)
+        held_before = []
         while True:
             # plugged in: don't even try (each refused attempt froze every
             # process, suspended every device and, before WoWLAN was set,
             # dropped the Wi-Fi connection); look again every RETRY_S
             if plugged():
+                if key.wait_press(RETRY_S):
+                    break
+                continue
+            held = wake_locks()
+            if held:
+                if held != held_before:
+                    log("not suspending: wakelock %s" % " ".join(held))
+                held_before = held
                 if key.wait_press(RETRY_S):
                     break
                 continue

@@ -56,6 +56,40 @@ Phone cameras are unreliable for checking IR (most iPhone rear cameras filter
 it); a Flipper Zero in *Infrared → Learn New Remote* shows exactly what was
 received.
 
+### On Linux 6.12
+
+The 6.12 kernel has its own driver for the same hardware path:
+`drivers/media/rc/mtk-pwm-ir-tx.c` (`mediatek,mt6771-pwm-ir`, node
+`ir-tx@11006000` in the board dts). It programs PWM channel 0's memory mode
+as the vendor driver did, and registers an rc device, `/dev/lirc0`:
+- `CK_26M_SEL` 1 (26 MHz); `CON` memory source (bit 5), stop bit 31;
+  `HDURATION` = `LDURATION` = bit length - 1 in 26 MHz clocks; `BUF0` the
+  DMA buffer (32-bit), its size in words - 1; `WAVE_NUM` 1; then the
+  channel's bit in `PWM_EN`. The driver sleeps for the buffer's length and
+  turns the channel off.
+- A carrier period is 3 bits (228 clocks each at 38 kHz); a mark is the
+  carrier's high bits (1 of 3 at the default 33 % duty), a space is zero
+  bits. Edges are placed at absolute bit positions, so rounding does not
+  add up over a frame. A zero word at the end leaves the line low.
+- Userspace: `LIRC_SET_SEND_CARRIER`, `LIRC_SET_SEND_DUTY_CYCLE`, then a
+  write of mark/space durations in µs (odd count; lirc limits one write to
+  500 ms of signal).
+- LED supply: the MT6370 LDO (upstream name `mt6370-vibldo`) at 2.8 V,
+  `led-supply`, enabled only while sending.
+
+Measured on 2026-11-01 by polling GPIO 90's input register (0.7 µs per
+sample) during NEC frames: marks 561 µs on average (562), spaces 563 and
+1693 µs (562, 1687), the frame 0.2 % long, the same in every frame. A
+Flipper Zero decodes NEC address 0x04, command 0x08.
+
+Upstream `pwm-ir-tx` over `pwm-mediatek` was tried first. That PWM driver
+may sleep, so `pwm-ir-tx` switches the PWM per edge from a sleeping loop;
+marks after a space started up to 400 µs late (the CPU waking from deep
+idle), and the Flipper showed only raw samples. Holding CPU latency at 0
+helped but left one mark per frame 100-150 µs long.
+
+`titan-ir` still needs a lirc backend.
+
 ## The library: Flipper-IRDB
 
 [Flipper-IRDB](https://github.com/Lucaslhm/Flipper-IRDB) (community

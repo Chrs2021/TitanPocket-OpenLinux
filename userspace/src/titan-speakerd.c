@@ -90,6 +90,11 @@
 #define HP_DELAY_MS	300
 #define HP_MAX_DB	-8.0	/* level VOL_MAX */
 #define HP_RANGE_DB	42.0	/* level 0+ .. VOL_MAX: 1.5 dB per key step of 8 */
+/* the speaker: the amp's volume is 0.5 dB a step (fs1860.c), so the level is
+ * spread over SPK_RANGE_DB below VOL_MAX, not mapped one to one (that put
+ * 40 % 82 dB down: silent); level 0 mutes. As titan-powerkey, titan-mixer. */
+#define SPK_RANGE_DB	42.0
+#define SPK_STEP_DB	0.5
 #define HP_PGA_MIN	-10	/* the codec's lowest step above -40 dB */
 #define PACTL_ENV	"XDG_RUNTIME_DIR=/run/user/0"	/* PipeWire runs in root's session */
 #define JACK_NAME	"ACCDET"
@@ -382,6 +387,14 @@ static long long file_mtime(const char *path)
 	return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
 }
 
+/* the amp's volume for a speaker level: even dB steps */
+static int amp_value(int level)
+{
+	if (level <= 0)
+		return 0;
+	return (int)lround(VOL_MAX - SPK_RANGE_DB * (1.0 - (double)level / VOL_MAX) / SPK_STEP_DB);
+}
+
 /* set the amp to the shared speaker level */
 static void apply_level(void)
 {
@@ -401,7 +414,7 @@ static void apply_level(void)
 	if (!mixer)
 		return;
 	ctl = mixer_get_ctl_by_name(mixer, VOL_CONTROL);
-	if (!ctl || mixer_ctl_set_value(ctl, 0, level))
+	if (!ctl || mixer_ctl_set_value(ctl, 0, amp_value(level)))
 		fprintf(stderr, "titan-speakerd: cannot set %s\n", VOL_CONTROL);
 	mixer_close(mixer);
 }
