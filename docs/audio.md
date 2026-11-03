@@ -92,7 +92,7 @@ toggled with the clock present. Fixed in the codec driver.
 
 Apps play through **PipeWire** (0.3.65, with WirePlumber and the PulseAudio
 layer `pipewire-pulse`), running in root's user session, which the desktop
-session starts (desktop.md):
+session starts ([desktop.md](desktop.md)):
 
 ```
 app (Chromium via PulseAudio API, pw-play, ...)
@@ -100,6 +100,34 @@ app (Chromium via PulseAudio API, pw-play, ...)
   -> "Loudspeaker (direct)"   ALSA hw:0,7, read/write access (mmap disabled), 48 kHz, 4 x 1024 frames
   -> DL1 -> I2S3 -> FS1860    powered on demand by titan-speakerd
 ```
+
+On Linux 6.12 the same chain plays through the `titanpocket` card's DL1
+(`hw:CARD=titanpocket,DEV=0`) instead of device 7 (2026-11-01). The sink
+config lists both, each with `flags = [ nofail ]`, so each kernel creates
+the one its card has (without `nofail`, the missing device stopped
+PipeWire from starting at all). `/etc/udev/rules.d/91-titan-audio.rules`
+switches the `I2S3_CH1/2 DL1_CH1/2` routes on when the card's control
+device appears, after `90-alsa-restore.rules` (whose restore of the saved
+state switched them off again when the rule ran first). ASoC's DAPM powers
+the amp, so `titan-speaker.service` doesn't run there
+(`ConditionPathExists=!/proc/asound/titanpocket`). Verified: a tone through
+`pw-play` ran DL1 at 48 kHz S16_LE and was heard from the speaker. Not yet
+on 6.12: headphones (no jack detection).
+
+**FM on 6.12 goes through PipeWire** (the Radio app, `titan-radio-gui`):
+the udev rule also routes the CONNSYS I2S to UL2 (`UL2_CH1/2
+CONNSYS_I2S_CH1/2`), and while the radio is on the app pipes `arecord` from
+`hw:CARD=titanpocket,DEV=3` (WAV, 48 kHz S16 stereo) into `pw-cat`, a
+playback stream on the default sink (limiter, speaker). Both ends run on the
+AFE clock, so they don't drift. The volume slider (-48..0 dB) sets that
+stream's node `volume` with `pw-cli set-param` and holds its
+`channelVolumes` at 1.0: the two multiply, and `pactl`'s dB setting changes
+only the channel volumes (asked for -24 dB, it read back -18 dB with the
+node volume at -4 dB). The stream is found by `application.name` "Radio":
+`pw-cat` names the stream after its input file, `-`. Measured: 99.5 MHz
+captured at -13.3 dBFS RMS (peak 25974); heard, slider working. 4.14 keeps
+the hostless route (device 21, `spk-hold`, AFE FM gain). The command-line
+`titan-radio` is still 4.14-only.
 
 | Piece | Where | Why |
 |---|---|---|
@@ -232,7 +260,7 @@ daemon applies the level itself, whenever the file changes:
 - Headphones start at level 107 (about −30 dB).
 - The top bar shows a headphone icon while they're in use, and the volume
   indicator shows headphones instead of a speaker
-  (desktop.md).
+  ([desktop.md](desktop.md#top-bar-indicators)).
 
 ## Microphones
 
@@ -258,8 +286,87 @@ mic; the vibration motor running lifts the main mic by 20 dB. A 1 kHz tone
 from the speaker did not show up in a capture taken at the same time (not
 investigated: the speaker may not run while the uplink starts).
 
-**Recorder** (`titan-recorder`, desktop.md)
+**Recorder** (`titan-recorder`, [desktop.md](desktop.md#recorder-titan-recorder))
 records the main mic at PGA 30 dB.
+
+**On Linux 6.12** the uplink is upstream's MT6358 codec under DAPM:
+`titan-mic` sets `Mic Type Mux` (DCC), `PGA L/R Mux` (AIN0 for the main mic,
+AIN2 for the back one), `ADC L/R Mux` (the preamplifiers), `PGA Volume`
+(0-24 dB in 6 dB steps) and the AFE's `UL1_CH1/CH2 ADDA_UL_CH1/CH2`
+routes; capture is UL1 (`hw:0,2`), and the codec powers the uplink while
+that device is open. Both inputs were recorded this way on 2026-11-01;
+the script's 6.12 branch is from 2026-11-02, not yet run.
+
+## Modem voice (PCM 2)
+
+On Linux 6.12 the card has the modem's voice links (2026-11-03): the
+`Hostless_Speech` front end (`hw:0,5`) and the `PCM 2` back end, the
+AFE's internal modem PCM interface. Upstream's routes connect the modem's
+downlink to the codec DAC and I2S3 (`ADDA_DL_CH1/2 PCM_2_CAP_CH1/2`,
+`I2S3_CH1/2 ...`) and the codec's ADC to its uplink (`PCM_2_PB_CH1/2
+ADDA_UL_CH1/2`); `PCM_2_PB_CH1 DL2_CH1` lets an AP stream into the
+uplink. Two changes to upstream's MT8183 AFE driver:
+
+- **UL2 can record the modem's downlink** (`UL2_CH1/2 PCM_2_CAP_CH1/2`,
+  interconnect bits I14/I21 in `AFE_CONN5/6`), for testing and for
+  recording a call.
+- **PCM interface rates.** `mt8183_rate_transform()` gave the PCM DAIs the
+  general rate code (32 kHz = 8), which shifted into `PCM2_INTF_CON` set
+  the FIFO bit and left the mode at 0: 8 kHz whatever was asked. It now
+  uses the PCM codes (8, 16, 32, 48 kHz = 0-3), as MT8192's driver does.
+  An upstream bug, worth sending.
+
+Measured (`tools/modem/sphloop.sh`, silent: DL2 -> modem -> UL2): with the
+modem looping at its PCM interface a -20 dBFS tone comes back unchanged
+at 8 and 32 kHz. What the modem needs for real voice is in
+[modem.md](modem.md#speech-voice-audio).
+
+## All paths on Linux 6.12 (2026-11-03)
+
+| Path | Route | State |
+|---|---|---|
+| Loudspeaker | DL1 -> I2S3 -> FS1860 | works (PipeWire sink) |
+| Earpiece | DL1 -> ADDA -> `RCV Mux` Voice Playback, `Handset Volume` | works: a -20 dBFS tone at -6 dB reached the main mic at -77 dBFS (-98 without), the back mic at -70 (-94) |
+| Main / back mic | AIN0 / AIN2 -> PGA -> ADC -> UL1 (`titan-mic`, hw:0,2) | work; floor about -72 dBFS at 18 dB PGA after a 100-200 ms power-on thump at the start of each capture |
+| Headset mic | AIN1 | not yet tested (needs a headset) |
+| Headphones | DL1 -> ADDA -> `HPL/HPR Mux` Audio Playback, `Headphone Volume` | works: a 3-pole plug detected as headphones; 440 Hz left and 660 Hz right tones (-22.5 dBFS at -6 dB) heard each in its own ear |
+| FM | CONNSYS I2S -> UL2 | works |
+| BT SCO | BTCVSD | works (earlier) |
+| Modem voice | PCM 2 <-> ADDA / I2S3 | links and routes in; see "Modem voice" |
+
+**UCM.** `alsa-ucm-conf` is installed and the card has a profile of its own
+(`/usr/share/alsa/ucm2/conf.d/titanpocket/`, `Unihertz/titan-pocket/`, from
+the Debian overlay): verb `HiFi` with Speaker, Earpiece, Headphones, Mic
+(main), Mic2 (back) and Headset devices, and verb `Voice Call` with the
+PCM 2 routes (Earpiece, Speaker, Headphones, Mic: main + back for the
+modem's noise reduction, Headset). Checked with `alsaucm`: enabling and
+disabling Earpiece and Mic sets and clears their controls, and a capture
+works with Mic on. PipeWire does not use it yet (its ALSA monitor is off
+and the speaker sink is hand-made, see above); the udev rule still turns
+the speaker routes on.
+
+**Jack detection** (kernel #99): a driver of our own,
+`sound/soc/codecs/mt6358-accdet.c`, after the vendor's MT6358 ACCDET
+sequence (4.14 `accdet/mt6358`) with upstream's MT6359 binding: the PMIC's
+EINT0 (level, low active; polarity flipped after each edge) sees the plug,
+then ACCDET's comparator says headphones (A/B 00), headset (01) or the
+hook button (00 with a headset in). The machine driver makes a `Headset
+Jack` (`snd_soc_jack`: ALSA controls `Headphones Jack` and `Headset Mic
+Jack`, input device "titanpocket Headset Jack", KEY_PLAYPAUSE). Settings
+from the stock dtbo (mic bias 6, mode 1, PWM and debounces). The 4-key
+detection (AUXADC) is not ported. Measured with headphones (3-pole), unplugged and
+replugged twice: `SW_HEADPHONE_INSERT` 0 and 1 on the input device for
+each, the jack controls following. On the second removal the comparator
+read 01 (a headset) for 0.2 s before EINT0 saw the plug go: the plug's
+ring passing the mic contact on the way out. The end state was right each
+time; a short settle delay before reporting a headset would hide it. Not yet tried: a headset (mic, hook).
+
+Getting it running turned up an upstream bug: the MT6358's top-level
+interrupt status has XPP at bit 6, AUD at 7 and MISC at 8, but
+`mt6358_irq_top_status_shift` had no XPP, so AUD and MISC interrupts (the
+jack, the RTC alarm) were never dispatched and, once enabled, the PMIC's
+level interrupt stormed (340398 times in a few minutes). Fixed by adding
+`MT6358_XPP_TOP`; worth sending upstream, as is the AFE's PCM rate fix.
 
 ## Known limitations / TODO
 
@@ -272,6 +379,5 @@ records the main mic at PGA 30 dB.
   read/write access; fixing the driver's mmap is still open.
 - Volume scale of `Speaker Amp Volume` (0.5 dB/step) is inferred, not verified.
 - Only 44.1/48 kHz preset values are replayed; 16/32 kHz need preset index 1.
-- No ALSA UCM profile yet (titan-speakerd does the mixer steps instead).
-- The earpiece path is untested.
+- UCM profile in place but not used by PipeWire yet.
 - Speaker protection coefficients are this unit's (see the FS1860 doc).

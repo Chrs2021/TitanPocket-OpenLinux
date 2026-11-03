@@ -30,7 +30,7 @@ tree in `modules/connectivity/linux612/`, built with
 | 0001 soc-mediatek | MCDI (CPU power-down with the SSPM), SPM (resource requests, suspend through the SPM firmware), SCP sensor hub (IIO), LK framebuffer handover |
 | 0002 cpu-power | MT6771 CPU and CCI frequency tables |
 | 0003 pmdomain | the CONN power domain stays on through suspend |
-| 0004 pmic | MT6358 VA09 regulator; MT6397 RTC reboot modes as LK reads them |
+| 0004 pmic | MT6358 VA09 regulator; MT6397 RTC reboot modes as LK reads them; MT6358 AUD/MISC interrupts dispatched (XPP bit); accdet cell |
 | 0005 ufs | MT6771 UFS host (UniPro 1.6) |
 | 0006 usb | forced VBUS session that follows the Type-C role; USB set up again after a deep-sleep reset |
 | 0007 watchdog | the watchdog stops in suspend when the bootloader left it running |
@@ -39,7 +39,7 @@ tree in `modules/connectivity/linux612/`, built with
 | 0010 power-supply | OZ8806 fuel gauge; MT6370 charging policy |
 | 0011 display | firmware-framebuffer handover, DSI interrupt order, Synaptics R63308 panel |
 | 0012 ir | IR transmitter on the PWM block |
-| 0013 audio | machine driver, FS1860 amplifier, AFE hardware gain and FM paths |
+| 0013 audio | machine driver, FS1860 amplifier, AFE hardware gain and FM paths, modem voice links (PCM 2), PCM rate fix, MT6358 jack detection |
 | 0014 dts | `mt6771.dtsi` and `mt6771-unihertz-titan-pocket.dts` |
 | 0015 config | `titanpocket.config`, a fragment over arm64 `defconfig` |
 

@@ -3,16 +3,18 @@ From: Topher Campbell <chrs2021@gmail.com>
 Subject: [PATCH 15/15] arm64: configs: add titanpocket.config
 
 A fragment on top of defconfig: make defconfig titanpocket.config.
+The media core stays modular for the out-of-tree camera driver; udmabuf
+is built in for libcamera.
 ---
- arch/arm64/configs/titanpocket.config | 137 ++++++++++++++++++++++++++
- 1 file changed, 137 insertions(+)
+ arch/arm64/configs/titanpocket.config | 144 +++++++++++++++++++++++++++++++++
+ 1 file changed, 144 insertions(+)
 
 diff --git a/arch/arm64/configs/titanpocket.config b/arch/arm64/configs/titanpocket.config
 new file mode 100644
-index 0000000000000000000000000000000000000000..9ad76243031facaf8eda861af80c8d844783bedc
+index 0000000..feaaa6d
 --- /dev/null
 +++ b/arch/arm64/configs/titanpocket.config
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,144 @@
 +# Titan Pocket on top of arm64 defconfig:
 +#   make defconfig titanpocket.config
 +CONFIG_LOCALVERSION="-titanpocket"
@@ -99,6 +101,8 @@ index 0000000000000000000000000000000000000000..9ad76243031facaf8eda861af80c8d84
 +CONFIG_SND_SOC=y
 +CONFIG_SND_SOC_MT8183=y
 +CONFIG_SND_SOC_MT6771_TITANPOCKET=y
++# the 3.5 mm jack (MT6358 ACCDET)
++CONFIG_SND_SOC_MT6358_ACCDET=y
 +# Bluetooth SCO audio (and the BT CVSD interrupt mask CONNSYS needs set)
 +CONFIG_SND_SOC_MTK_BTCVSD=y
 +# cpuidle core/cluster power-down: SSPM's MCDI must know the online CPUs
@@ -150,3 +154,8 @@ index 0000000000000000000000000000000000000000..9ad76243031facaf8eda861af80c8d84
 +CONFIG_CHARGER_MT6370=y
 +CONFIG_LEDS_CLASS_MULTICOLOR=y
 +CONFIG_LEDS_MT6370_RGB=y
++
++# Cameras: the out-of-tree driver (modules/camera/linux612) runs on the
++# media core, built as modules; libcamera's software ISP shares buffers
++# through udmabuf
++CONFIG_UDMABUF=y

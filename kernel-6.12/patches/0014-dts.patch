@@ -3,19 +3,20 @@ From: Topher Campbell <chrs2021@gmail.com>
 Subject: [PATCH 14/15] arm64: dts: mediatek: add the MT6771 and the Unihertz Titan Pocket
 
 The MT6771 described on MT8183 bindings (same clocks, pinctrl, power
-domains and display blocks), and the Titan Pocket board: display and
-panel, keyboard, touchpad, touchscreen, PMICs, Type-C, charger, gauge,
-UFS, USB, audio, connectivity, sensors. The LK dtbo labels let the
-bootloader's overlay apply.
+domains, display and camera subsystems, IOMMU larbs), and the Titan
+Pocket board: display and panel, keyboard, touchpad, touchscreen, PMICs,
+Type-C, charger, gauge, UFS, USB, audio, connectivity, sensors, cameras
+(CAMSV1, ISP pass 2, the sensors' supplies and pins). The LK dtbo labels
+let the bootloader's overlay apply.
 ---
- arch/arm64/boot/dts/mediatek/Makefile         |    3 +
- .../dts/mediatek/mt6771-lk-dtbo-labels.dtsi   |  210 ++
- .../mediatek/mt6771-unihertz-titan-pocket.dts |  870 +++++++++
- arch/arm64/boot/dts/mediatek/mt6771.dtsi      | 1689 +++++++++++++++++
- 4 files changed, 2772 insertions(+)
+ arch/arm64/boot/dts/mediatek/Makefile              |    3 +
+ .../boot/dts/mediatek/mt6771-lk-dtbo-labels.dtsi   |  210 +++
+ .../dts/mediatek/mt6771-unihertz-titan-pocket.dts  |  955 ++++++++++
+ arch/arm64/boot/dts/mediatek/mt6771.dtsi           | 1849 +++++++++++++++++++
+ 4 files changed, 3017 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
-index 8fd7b2bb7a1590341e7bb4ea1ecf039ae3e8eb0d..d80f5fd16f5664930365fc17045cbe226c32fd4a 100644
+index 8fd7b2b..d80f5fd 100644
 --- a/arch/arm64/boot/dts/mediatek/Makefile
 +++ b/arch/arm64/boot/dts/mediatek/Makefile
 @@ -1,6 +1,7 @@
@@ -36,7 +37,7 @@ index 8fd7b2bb7a1590341e7bb4ea1ecf039ae3e8eb0d..d80f5fd16f5664930365fc17045cbe22
  DTC_FLAGS_mt7986a-bananapi-bpi-r3-mini := -@
 diff --git a/arch/arm64/boot/dts/mediatek/mt6771-lk-dtbo-labels.dtsi b/arch/arm64/boot/dts/mediatek/mt6771-lk-dtbo-labels.dtsi
 new file mode 100644
-index 0000000000000000000000000000000000000000..152fa0a724a2e7e71716a5e3622ae029e61f3354
+index 0000000..152fa0a
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771-lk-dtbo-labels.dtsi
 @@ -0,0 +1,210 @@
@@ -252,10 +253,10 @@ index 0000000000000000000000000000000000000000..152fa0a724a2e7e71716a5e3622ae029
 +};
 diff --git a/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts b/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts
 new file mode 100644
-index 0000000000000000000000000000000000000000..f0989fc9fbeeba9a56cbb73ed2a125fd3c5f7b11
+index 0000000..5169b8a
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts
-@@ -0,0 +1,870 @@
+@@ -0,0 +1,955 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Unihertz Titan Pocket (MT6771, 720x720 DSI panel, QWERTY keyboard).
@@ -366,6 +367,7 @@ index 0000000000000000000000000000000000000000..f0989fc9fbeeba9a56cbb73ed2a125fd
 +		compatible = "unihertz,titan-pocket-sound";
 +		mediatek,platform = <&afe>;
 +		mediatek,btcvsd = <&btcvsd>;
++		mediatek,accdet = <&mt6358accdet>;
 +		pinctrl-names = "default";
 +		pinctrl-0 = <&aud_pins>;
 +	};
@@ -813,6 +815,16 @@ index 0000000000000000000000000000000000000000..f0989fc9fbeeba9a56cbb73ed2a125fd
 +/* PMIC interrupt: EINT 182, as in the vendor tree */
 +&pmic {
 +	interrupts-extended = <&pctl 182 IRQ_TYPE_LEVEL_HIGH>;
++
++	/* the 3.5 mm jack; settings from the stock dtbo's accdet node */
++	mt6358accdet: accdet {
++		compatible = "mediatek,mt6358-accdet";
++		mediatek,mic-vol = <6>;
++		mediatek,mic-mode = <1>;
++		mediatek,pwm-deb-setting = <0x500 0x500 0x1 0x1f0
++					    0x800 0x800 0x20 0x44>;
++		mediatek,eint-level-pol = <IRQ_TYPE_LEVEL_LOW>;
++	};
 +};
 +
 +/* "reboot bootloader" stops in LK's fastboot, as on 4.14 */
@@ -1126,12 +1138,86 @@ index 0000000000000000000000000000000000000000..f0989fc9fbeeba9a56cbb73ed2a125fd
 +&scp_tinysys {
 +	status = "okay";
 +};
++
++/*
++ * Cameras (stock dtbo kd_camera_hw states and the vendor imgsensor power
++ * sequence): the rear OV16880 on i2c_2 at 0x36 with its AK7371 focus
++ * motor at 0x0c, CSI port 0, MCLK 0 (GPIO 99); the front OV8865 on i2c_4
++ * at 0x10, CSI port 1, MCLK 1 (GPIO 100). Reset and power-down pins are
++ * low while the sensor is off. The rear AVDD is an LDO switched by GPIO
++ * 160 (cam0_ldo_vcama), the front one VCAMA1; both share VCAMIO and VCAMD.
++ * The sensor modes and register tables are in the driver
++ * (modules/camera/linux612/titan_camera.c).
++ */
++&{/} {
++	camera_rear_avdd: regulator-camera-rear-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "camera-rear-avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&pctl 160 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++};
++
++&pctl {
++	camera_mclk_pins: camera-mclk-pins {
++		pins-mclk {
++			pinmux = <PINMUX_GPIO99__FUNC_CMMCLK0>,
++				 <PINMUX_GPIO100__FUNC_CMMCLK1>;
++			drive-strength = <MTK_DRIVE_4mA>;
++		};
++	};
++};
++
++&i2c_2 {
++	clock-frequency = <400000>;
++	status = "okay";
++};
++
++&camsv1 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&camera_mclk_pins>;
++	/* the SoC's cam_sel (as in mt6771.dtsi), then 24 MHz sensor clocks */
++	assigned-clocks = <&topckgen CLK_TOP_MUX_CAM>,
++			  <&topckgen CLK_TOP_MUX_CAMTG>,
++			  <&topckgen CLK_TOP_MUX_CAMTG2>;
++	assigned-clock-parents = <&topckgen CLK_TOP_SYSPLL_D3>,
++				 <&topckgen CLK_TOP_UNIVP_192M_D8>,
++				 <&topckgen CLK_TOP_UNIVP_192M_D8>;
++	status = "okay";
++
++	rear {
++		i2c-bus = <&i2c_2>;
++		clocks = <&topckgen CLK_TOP_MUX_CAMTG>;
++		dovdd-supply = <&mt6358_vcamio_reg>;
++		avdd-supply = <&camera_rear_avdd>;
++		dvdd-supply = <&mt6358_vcamd_reg>;
++		afvdd-supply = <&mt6358_vldo28_reg>;
++		reset-gpios = <&pctl 101 GPIO_ACTIVE_LOW>;
++		powerdown-gpios = <&pctl 97 GPIO_ACTIVE_LOW>;
++	};
++
++	front {
++		i2c-bus = <&i2c_4>;
++		clocks = <&topckgen CLK_TOP_MUX_CAMTG2>;
++		dovdd-supply = <&mt6358_vcamio_reg>;
++		avdd-supply = <&mt6358_vcama1_reg>;
++		dvdd-supply = <&mt6358_vcamd_reg>;
++		reset-gpios = <&pctl 102 GPIO_ACTIVE_LOW>;
++		powerdown-gpios = <&pctl 98 GPIO_ACTIVE_LOW>;
++	};
++};
++
++&dip {
++	status = "okay";
++};
 diff --git a/arch/arm64/boot/dts/mediatek/mt6771.dtsi b/arch/arm64/boot/dts/mediatek/mt6771.dtsi
 new file mode 100644
-index 0000000000000000000000000000000000000000..7b99c84b8506fdb9dc77c5e5beb9a786606437ab
+index 0000000..f34f9d3
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771.dtsi
-@@ -0,0 +1,1689 @@
+@@ -0,0 +1,1849 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * MediaTek MT6771 (Helio P60/P70).
@@ -1922,8 +2008,8 @@ index 0000000000000000000000000000000000000000..7b99c84b8506fdb9dc77c5e5beb9a786
 +
 +		/*
 +		 * SCPSYS, as on the MT8183 (same control registers), with only
-+		 * the domains a driver here uses: audio, CONN, the GPU's and
-+		 * the display's.
++		 * the domains a driver here uses: audio, CONN, the GPU's, the
++		 * display's and, under it, the camera's (CAM, ISP).
 +		 */
 +		scpsys: syscon@10006000 {
 +			compatible = "mediatek,mt6771-scpsys",
@@ -1975,7 +2061,38 @@ index 0000000000000000000000000000000000000000..7b99c84b8506fdb9dc77c5e5beb9a786
 +						      "mm-8", "mm-9";
 +					mediatek,infracfg = <&infracfg>;
 +					mediatek,smi = <&smi_common>;
-+					#power-domain-cells = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++					#power-domain-cells = <1>;
++
++					power-domain@MT8183_POWER_DOMAIN_CAM {
++						reg = <MT8183_POWER_DOMAIN_CAM>;
++						clocks = <&topckgen CLK_TOP_MUX_CAM>,
++							 <&camsys CLK_CAM_LARB6>,
++							 <&camsys CLK_CAM_LARB3>,
++							 <&camsys CLK_CAM_SENINF>,
++							 <&camsys CLK_CAM_CAMSV0>,
++							 <&camsys CLK_CAM_CAMSV1>,
++							 <&camsys CLK_CAM_CAMSV2>,
++							 <&camsys CLK_CAM_CCU>;
++						clock-names = "cam", "cam-0", "cam-1",
++							      "cam-2", "cam-3", "cam-4",
++							      "cam-5", "cam-6";
++						mediatek,infracfg = <&infracfg>;
++						mediatek,smi = <&smi_common>;
++						#power-domain-cells = <0>;
++					};
++
++					power-domain@MT8183_POWER_DOMAIN_ISP {
++						reg = <MT8183_POWER_DOMAIN_ISP>;
++						clocks = <&topckgen CLK_TOP_MUX_IMG>,
++							 <&imgsys CLK_IMG_LARB5>,
++							 <&imgsys CLK_IMG_LARB2>;
++						clock-names = "isp", "isp-0", "isp-1";
++						mediatek,infracfg = <&infracfg>;
++						mediatek,smi = <&smi_common>;
++						#power-domain-cells = <0>;
++					};
 +				};
 +
 +				mfg_async: power-domain@MT8183_POWER_DOMAIN_MFG_ASYNC {
@@ -2048,8 +2165,11 @@ index 0000000000000000000000000000000000000000..7b99c84b8506fdb9dc77c5e5beb9a786
 +			      <0 0x105d4000 0 0x6000>;
 +			reg-names = "sram", "cfg", "clkctrl", "scpsys";
 +			interrupts = <GIC_SPI 174 IRQ_TYPE_LEVEL_HIGH>;
-+			clocks = <&infracfg CLK_INFRA_SCPSYS>;
-+			clock-names = "main";
++			/* scp-sel and the PMIC: for its sleep (mt6771_scp.sleep) */
++			clocks = <&infracfg CLK_INFRA_SCPSYS>,
++				 <&topckgen CLK_TOP_MUX_SCP>;
++			clock-names = "main", "scp-sel";
++			mediatek,pwrap = <&pwrap>;
 +			memory-region = <&scp_sensor_mem>, <&scp_log_mem>;
 +			status = "disabled";
 +		};
@@ -2067,15 +2187,17 @@ index 0000000000000000000000000000000000000000..7b99c84b8506fdb9dc77c5e5beb9a786
 +
 +		/*
 +		 * Multimedia IOMMU (M4U), as MT8183's: same address, interrupt
-+		 * and larb 0 port order (vendor m4u_port.h). Only larb 0 (the
-+		 * display) is described so far; the IOMMU binds only once all
-+		 * listed larbs have probed.
++		 * and larb port order (vendor m4u_port.h). Described: larb 0
++		 * (display), 5 (ISP pass 2) and 6 (camera input); the IOMMU
++		 * binds only once all listed larbs have probed. All masters
++		 * share one address space, so a buffer mapped for one device
++		 * is at the same address for every port.
 +		 */
 +		iommu: iommu@10205000 {
 +			compatible = "mediatek,mt6771-m4u", "mediatek,mt8183-m4u";
 +			reg = <0 0x10205000 0 0x1000>;
 +			interrupts = <GIC_SPI 166 IRQ_TYPE_LEVEL_LOW>;
-+			mediatek,larbs = <&larb0>;
++			mediatek,larbs = <&larb0>, <&larb5>, <&larb6>;
 +			#iommu-cells = <1>;
 +		};
 +
@@ -2170,6 +2292,23 @@ index 0000000000000000000000000000000000000000..7b99c84b8506fdb9dc77c5e5beb9a786
 +			 * sleep
 +			 */
 +			mediatek,secure-channel-id = <4>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++		};
++
++		/* the rear camera's bus, shared like i2c_4 (the vendor's id 2) */
++		i2c_2: i2c@11009000 {
++			compatible = "mediatek,mt6771-i2c", "mediatek,mt8183-i2c";
++			reg = <0 0x11009100 0 0x1000>,
++			      <0 0x11000280 0 0x80>;
++			interrupts = <GIC_SPI 83 IRQ_TYPE_LEVEL_LOW>;
++			clocks = <&infracfg CLK_INFRA_I2C2>,
++				 <&infracfg CLK_INFRA_AP_DMA>,
++				 <&infracfg CLK_INFRA_I2C2_ARBITER>;
++			clock-names = "main", "dma", "arb";
++			clock-div = <1>;
++			mediatek,secure-channel-id = <2>;
 +			#address-cells = <1>;
 +			#size-cells = <0>;
 +			status = "disabled";
@@ -2762,6 +2901,113 @@ index 0000000000000000000000000000000000000000..7b99c84b8506fdb9dc77c5e5beb9a786
 +				 <&mmsys CLK_MM_GALS_COMM1>;
 +			clock-names = "apb", "smi", "gals0", "gals1";
 +			power-domains = <&spm MT8183_POWER_DOMAIN_DISP>;
++		};
++
++		/*
++		 * Camera subsystems, as MT8183's: same clock gates (imgsys,
++		 * camsys) and larbs at the same addresses.
++		 */
++		imgsys: syscon@15020000 {
++			compatible = "mediatek,mt6771-imgsys",
++				     "mediatek,mt8183-imgsys", "syscon";
++			reg = <0 0x15020000 0 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		larb5: larb@15021000 {
++			compatible = "mediatek,mt6771-smi-larb",
++				     "mediatek,mt8183-smi-larb";
++			reg = <0 0x15021000 0 0x1000>;
++			mediatek,smi = <&smi_common>;
++			mediatek,larb-id = <5>;
++			clocks = <&imgsys CLK_IMG_LARB5>, <&imgsys CLK_IMG_LARB5>,
++				 <&mmsys CLK_MM_GALS_IMG2MM>;
++			clock-names = "apb", "smi", "gals";
++			power-domains = <&spm MT8183_POWER_DOMAIN_ISP>;
++		};
++
++		/*
++		 * ISP pass 2 (DIP). Its DMA ports are on larb 5; the camera
++		 * driver programs it (camsv1's mediatek,dip).
++		 */
++		dip: dip@15022000 {
++			compatible = "mediatek,mt6771-dip";
++			reg = <0 0x15022000 0 0x6000>;
++			interrupts = <GIC_SPI 268 IRQ_TYPE_LEVEL_LOW>;
++			clocks = <&imgsys CLK_IMG_DIP>;
++			clock-names = "dip";
++			/*
++			 * 364 MHz, where 4.14 ran it: MediaTek's mmdvfs sets
++			 * cam_sel and img_sel at late init (its lowest step,
++			 * without a camera request); nothing does on 6.12
++			 */
++			assigned-clocks = <&topckgen CLK_TOP_MUX_IMG>;
++			assigned-clock-parents = <&topckgen CLK_TOP_SYSPLL_D3>;
++			power-domains = <&spm MT8183_POWER_DOMAIN_ISP>;
++			iommus = <&iommu M4U_PORT_CAM_IMGI>,
++				 <&iommu M4U_PORT_CAM_IMG2O>,
++				 <&iommu M4U_PORT_CAM_IMG3O>;
++			status = "disabled";
++		};
++
++		camsys: syscon@1a000000 {
++			compatible = "mediatek,mt6771-camsys",
++				     "mediatek,mt8183-camsys", "syscon";
++			reg = <0 0x1a000000 0 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		larb6: larb@1a001000 {
++			compatible = "mediatek,mt6771-smi-larb",
++				     "mediatek,mt8183-smi-larb";
++			reg = <0 0x1a001000 0 0x1000>;
++			mediatek,smi = <&smi_common>;
++			mediatek,larb-id = <6>;
++			clocks = <&camsys CLK_CAM_LARB6>, <&camsys CLK_CAM_LARB6>,
++				 <&mmsys CLK_MM_GALS_CAM2MM>;
++			clock-names = "apb", "smi", "gals";
++			power-domains = <&spm MT8183_POWER_DOMAIN_CAM>;
++		};
++
++		/*
++		 * Camera input: CAMSV1, the raw DMA engine, with the blocks
++		 * that feed it: CAM A (ISP pass 1, run for its statistics),
++		 * seninf (CSI-2 receivers and muxes) and the MIPI RX ports.
++		 * Its DMA ports are on larb 6.
++		 */
++		camsv1: camsv@1a050000 {
++			compatible = "mediatek,mt6771-camsv";
++			reg = <0 0x1a050000 0 0x1000>,
++			      <0 0x1a004000 0 0x2000>,
++			      <0 0x1a040000 0 0x8000>,
++			      <0 0x11c80000 0 0x6000>;
++			reg-names = "camsv", "cam-a", "seninf", "mipi-rx";
++			interrupts = <GIC_SPI 258 IRQ_TYPE_LEVEL_LOW>;
++			clocks = <&topckgen CLK_TOP_MUX_SENINF>,
++				 <&camsys CLK_CAM_CAM>,
++				 <&camsys CLK_CAM_CAMTG>,
++				 <&camsys CLK_CAM_SENINF>,
++				 <&camsys CLK_CAM_CAMSV0>,
++				 <&camsys CLK_CAM_CAMSV1>,
++				 <&camsys CLK_CAM_CAMSV2>,
++				 <&apmixedsys CLK_APMIXED_MIPIC0_26M>,
++				 <&apmixedsys CLK_APMIXED_MIPIC1_26M>;
++			/*
++			 * The MIPI RX ports' 26 MHz: on as LK leaves them, and
++			 * nothing else holds them once unused clocks are gated
++			 */
++			clock-names = "seninf-sel", "cam", "camtg", "seninf",
++				      "camsv0", "camsv1", "camsv2",
++				      "mipi-c0-26m", "mipi-c1-26m";
++			/* 364 MHz, as dip's img_sel */
++			assigned-clocks = <&topckgen CLK_TOP_MUX_CAM>;
++			assigned-clock-parents = <&topckgen CLK_TOP_SYSPLL_D3>;
++			power-domains = <&spm MT8183_POWER_DOMAIN_CAM>;
++			iommus = <&iommu M4U_PORT_CAM_AAO>,
++				 <&iommu M4U_PORT_CAM_AFO>,
++				 <&iommu M4U_PORT_CAM_SOCO>;
++			mediatek,dip = <&dip>;
++			status = "disabled";
 +		};
 +	};
 +

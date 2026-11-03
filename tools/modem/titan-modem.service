@@ -1,0 +1,25 @@
+# The modem (MD1): titan_modem boots it from the image LK loaded, and
+# mdd.py serves its NVRAM files from a RAM copy of the phone's own NVRAM
+# (nvcopy.sh; the partitions are never written, the modem's writes are
+# lost at stop). Once the modem's AT layer is up, mdd.py puts it in
+# flight mode (CFUN=4: the SIM on, nothing transmitted; at CFUN=0 the SIM
+# stays busy and ModemManager fails), then hands the AT channel to the
+# driver's WWAN port, /dev/wwan0at0, for ModemManager. The modem stays in
+# flight mode until it is enabled. Speech for a call: SIGUSR1 to mdd.py
+# (speech on, with the parameters in /var/lib/titan-modem/sph-params.bin,
+# made by tools/modem/sphparam.py from the vendor XML), SIGUSR2 (off). Holds a wake lock while it runs (the modem
+# across suspend is untested). Not enabled: start it by hand.
+[Unit]
+Description=Modem (MD1): boot and NVRAM file service
+After=local-fs.target
+Before=ModemManager.service
+
+[Service]
+Environment=FS_ROOT=/run/titan-modem NV_QUIET=1 AT_PORT=1 AT_INIT=AT+CFUN=4 SPH_PARAM=/var/lib/titan-modem/sph-params.bin
+ExecStartPre=/bin/sh /usr/local/lib/titan-modem/nvcopy.sh /run/titan-modem
+ExecStartPre=/bin/sh -c 'echo titan-modem > /sys/power/wake_lock'
+ExecStartPre=/sbin/modprobe titan_modem
+ExecStart=/usr/bin/python3 /usr/local/lib/titan-modem/mdd.py 0
+ExecStopPost=-/sbin/modprobe -r titan_modem
+ExecStopPost=/bin/rm -rf /run/titan-modem
+ExecStopPost=-/bin/sh -c 'echo titan-modem > /sys/power/wake_unlock'
