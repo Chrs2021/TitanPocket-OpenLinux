@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 13/15] ASoC: mediatek: mt8183: Titan Pocket audio; codecs: add FS1860, MT6358 accdet
+Subject: [PATCH 13/16] ASoC: mediatek: mt8183: Titan Pocket audio; codecs: add FS1860, MT6358 accdet
 
 The MT6771's AFE is the MT8183's; this adds the Titan Pocket machine
 driver, the FS1860 speaker amplifier, the AFE's hardware gain and the

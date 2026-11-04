@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 01/15] soc: mediatek: add MT6771 MCDI, SPM, SCP and LK framebuffer drivers
+Subject: [PATCH 01/16] soc: mediatek: add MT6771 MCDI, SPM, SCP and LK framebuffer drivers
 
 mtk-mcdi: keeps the SSPM's available-CPU mask in step with the online
 CPUs and pauses MCDI (and cpuidle) across hotplug as MediaTek's kernel

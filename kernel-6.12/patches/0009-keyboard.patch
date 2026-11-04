@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 09/15] pinctrl: aw9523, Input: matrix_keypad: fix locking for I2C expanders
+Subject: [PATCH 09/16] pinctrl: aw9523, Input: matrix_keypad: fix locking for I2C expanders
 
 pinctrl-aw9523 deferred interrupt mask writes by putting the whole
 regmap in cache-only mode while the GPIO calls kept using it under

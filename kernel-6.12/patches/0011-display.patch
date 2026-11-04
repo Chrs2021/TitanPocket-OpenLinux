@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 11/15] drm/mediatek: hand the firmware framebuffer over; drm/panel: add the Synaptics R63308 panel
+Subject: [PATCH 11/16] drm/mediatek: hand the firmware framebuffer over; drm/panel: add the Synaptics R63308 panel
 
 mediatek-drm removes a firmware framebuffer (the bootloader's, through
 simplefb) before registering. The MT6771's DSI interrupt is requested

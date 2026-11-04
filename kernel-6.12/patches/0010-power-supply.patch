@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 10/15] power: supply: add the OZ8806 gauge; mt6370-charger: charging policy
+Subject: [PATCH 10/16] power: supply: add the OZ8806 gauge; mt6370-charger: charging policy
 
 oz8806_battery: the Titan Pocket's O2Micro fuel gauge (coulomb counter,
 voltage, current, NTC temperature).

@@ -1,0 +1,131 @@
+#!/usr/bin/python3
+"""
+titan-call-audio: a phone call's sound on Linux 6.12 (docs/modem.md,
+"Phone apps").
+
+    titan-call-audio run DEVICE   earpiece, speaker, headphones or headset:
+                                  until SIGTERM or SIGINT
+    titan-call-audio mute on|off  the microphone into the modem's uplink
+
+The modem's voice never passes the CPU: the AFE's modem PCM interface (PCM
+2) links the codec's ADC to the modem's uplink and its downlink to the
+earpiece or headphone DAC, or to the loudspeaker's I2S3. `run` switches
+those routes with the cset lines of the UCM profile's Voice Call devices
+(ucm2/Unihertz/titan-pocket/VoiceCall.conf, so the routes live in one
+place), opens the Hostless_Speech PCM both ways (the links only carry sound
+while it runs), and turns the modem's speech on through mdd.py
+(titan-modem.service: SIGUSR1 on, SIGUSR2 off). At the end it undoes all
+three in reverse. Untested in a real call: the modem's speech DSP returned
+silence in loopback (docs/modem.md, "Speech").
+"""
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+CARD = "titanpocket"
+UCM = "/usr/share/alsa/ucm2/Unihertz/titan-pocket/VoiceCall.conf"
+HOSTLESS = "hw:CARD=%s,DEV=5" % CARD
+RATE = "32000"                       # PCM 2 at the modem's 32 kHz speech
+DEVICES = {"earpiece": ("Earpiece", "Mic"), "speaker": ("Speaker", "Mic"),
+           "headphones": ("Headphones", "Mic"), "headset": ("Headphones", "Headset")}
+UPLINK = ("PCM_2_PB_CH1 ADDA_UL_CH1", "PCM_2_PB_CH2 ADDA_UL_CH2")
+
+
+def log(msg):
+    print("titan-call-audio: " + msg, file=sys.stderr, flush=True)
+
+
+def sequences():
+    """{device: (enable csets, disable csets)} from the UCM file: each cset
+    as (control name, value)"""
+    text = open(UCM).read()
+    out = {}
+    for m in re.finditer(r'SectionDevice\."([^"]+)"\s*\{(.*?)\n\}', text, re.S):
+        body = m.group(2)
+
+        def seq(kind):
+            s = re.search(kind + r"\s*\[(.*?)\]", body, re.S)
+            return [(n, v) for n, v in re.findall(r"cset \"name='([^']+)' ([^\"]+)\"",
+                                                  s.group(1) if s else "")]
+        out[m.group(1)] = (seq("EnableSequence"), seq("DisableSequence"))
+    return out
+
+
+def cset(name, value):
+    r = subprocess.run(["amixer", "-q", "-c", CARD, "cset", "name=" + name, value],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if r.returncode:
+        log("%s = %s: %s" % (name, value, r.stderr.strip()))
+
+
+def speech(on):
+    """the modem's speech through mdd.py, the service's main process"""
+    try:
+        pid = int(subprocess.run(["systemctl", "show", "-p", "MainPID", "--value",
+                                  "titan-modem"], capture_output=True, text=True).stdout)
+        if pid > 0:
+            os.kill(pid, signal.SIGUSR1 if on else signal.SIGUSR2)
+            return
+    except (ValueError, OSError) as e:
+        log("speech: %s" % e)
+        return
+    log("speech: titan-modem is not running")
+
+
+def hostless():
+    """the Hostless_Speech PCM open both ways (no data flows through it)"""
+    fmt = ["-q", "-D", HOSTLESS, "-f", "S16_LE", "-r", RATE, "-c", "2", "-t", "raw"]
+    procs = []
+    for cmd in (["aplay"] + fmt + ["/dev/zero"], ["arecord"] + fmt + ["/dev/null"]):
+        try:
+            procs.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL))
+        except OSError as e:
+            log("%s: %s" % (cmd[0], e))
+    return procs
+
+
+def run(device):
+    names = DEVICES[device]
+    seqs = sequences()
+    for n in names:
+        for name, value in seqs[n][0]:
+            cset(name, value)
+    procs = hostless()
+    speech(True)
+    log("on: " + " + ".join(names))
+    done = []
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, lambda *a: done.append(1))
+    while not done:
+        time.sleep(0.2)
+        if any(p.poll() is not None for p in procs):
+            log("the hostless PCM closed")
+            break
+    speech(False)
+    for p in procs:
+        if p.poll() is None:
+            p.terminate()
+    for p in procs:
+        p.wait()
+    for n in reversed(names):
+        for name, value in seqs[n][1]:
+            cset(name, value)
+    log("off")
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "run" and sys.argv[2] in DEVICES:
+        run(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "mute" and sys.argv[2] in ("on", "off"):
+        for name in UPLINK:
+            cset(name, "off" if sys.argv[2] == "on" else "on")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

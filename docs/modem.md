@@ -1,12 +1,11 @@
 # Modem (MD1, LTE)
 
-Status (2026-11-03, Linux 6.12): **the modem boots to handshake 2 and
-ModemManager drives it** over a WWAN AT port (`/dev/wwan0at0`), as the
-`titan-modem` service, on a RAM copy of the phone's own NVRAM served by
-`tools/modem/mdd.py` (see "File service" and "AT port and
-ModemManager"). It reports `MOLY.LR12A.R3.MP.V162` and is kept in flight
-mode (`+CFUN: 4`: the SIM up, the radio off; nothing has been
-transmitted). ModemManager sees it `disabled`, power state `low`.
+Status (2026-11-04, Linux 6.12): **the modem registers on LTE and mobile data works.** ModemManager drives it
+over a 27.010 mux on WWAN AT ports (`wwan0at0` = `cmd1`), and it is `registered`, `home` on 310260 within 2-3 s of
+enabling (see "Radio on with a valid SIM"). `tools/modem/ltedata.py` brings up IPv6 data on `ccmni0` over CLDMA (see "Mobile
+data"). Calls, SMS and USSD have not run. It runs as the `titan-modem` service, on a RAM copy of the phone's own NVRAM
+served by `tools/modem/mdd.py` (see "File service" and "AT port and ModemManager"). It reports `MOLY.LR12A.R3.MP.V162`.
+ModemManager sees it `disabled`, with the SIM up and the radio off, until it is enabled.
 
 The driver is a proper platform driver (kernel #94+): it binds to a DT
 node `modem@10209000` (`mediatek,mt6771-modem`) and takes every register
@@ -126,11 +125,11 @@ only re-applies the value LK left, and the modem sets its own voltage.
   record is how each step below was found.
 - **RPC.** The modem's first packet is an RPC (channel 32): the SIM
   hot-plug interrupt of each of four SIM slots, three attributes each
-  (`IPC_RPC_GET_EINT_ATTR_OP`, 0x4005). The board's vendor DT has no
-  hot-plug nodes, so the vendor kernel answers
-  `ERR_SIM_HOT_PLUG_QUERY_STRING` (-15); `mdd.py` does the same (the
-  reply: op | 0xffff0000, its parameters, on channel 33 with the request's
-  buffer index kept in the reserved word), and the modem goes on.
+  (`IPC_RPC_GET_EINT_ATTR_OP`, 0x4005). Android's kernel answers SIMs 1 and 2 from its
+  device tree and `ERR_SIM_HOT_PLUG_QUERY_STRING` (-15) for 3 and 4; `mdd.py` does
+  the same with the values measured there (the reply: op | 0xffff0000, its
+  parameters, on channel 33 with the request's buffer index kept in the
+  reserved word). The modem also went on booting when all four got the error.
 - **File service.** Then the modem's file requests start (channel 14,
   the vendor `ccci_fs` port served by Android's `ccci_fsd`): same
   framing as RPC, UTF-16 paths on drive `Z:`. A reply with the wrong
@@ -305,12 +304,13 @@ ring's pointers (`tools/modem/rings.py`) after each run.
 ## AT port and ModemManager
 
 When the daemon asks (`TITAN_MD_AT_PORT`, `_IO('t', 1)` on
-`/dev/titan-modem`, after handshake 2) the driver registers the AT
-channel with the kernel's WWAN framework (`wwan_create_port`,
-`WWAN_PORT_AT`, parent the modem's platform device): `/dev/wwan0at0`.
-Until then the AT channel goes to the daemon like any other. Writes go out as CCCI packets on
-UART2_TX (12), at most 1 KB of text each; UART2_RX (10) packets lose
-their header and go to the port, or are dropped while it is closed.
+`/dev/titan-modem`, after handshake 2) the driver starts the mux on the AT
+channel and registers each DLCI with the kernel's WWAN framework
+(`wwan_create_port`, `WWAN_PORT_AT`, parent the modem's platform device):
+`/dev/wwan0at0` to `wwan0at23` (see "The AT channels on Linux"). Until then the AT
+channel goes to the daemon like any other. Frames go out as CCCI packets on UART2_TX
+(12); UART2_RX (10) packets lose their header and go through the mux to the ports,
+or are dropped while a port is closed.
 That channel no longer reaches `/dev/titan-modem`. The WWAN core is
 `wwan.ko` from the same kernel build (`CONFIG_WWAN=m`; `build612.sh`
 copies it).
@@ -322,10 +322,9 @@ with its file server), `mdd.py` and `nvcopy.sh` in
 it takes a wake lock, copies the NVRAM to `/run/titan-modem`, loads the
 driver (which boots the modem) and runs `mdd.py` until stopped; stopping
 unloads the driver, which powers the modem off, and drops the copy. With
-`AT_PORT=1 AT_INIT=AT+CFUN=4` (the unit's), `mdd.py` waits for the
-modem's AT layer (`+EIND: 128`, about 1 s after handshake 2; a command
-sent at handshake 2 is ignored), sends `AT+CFUN=4`, waits for its `OK`,
-then asks for the WWAN port (after 10 s at the latest).
+`AT_PORT=1` (the unit's), `mdd.py` waits for the modem's AT layer (`+EIND: 128`, about
+1 s after handshake 2; a command sent at handshake 2 is ignored), then asks for the ports
+(after 10 s at the latest), and `radioinit.py` brings the SIM up with the radio off.
 
 Debian's ModemManager 1.20.4 (`apt install --no-install-recommends
 modemmanager`; no NetworkManager, so nothing enables the modem) takes the
@@ -337,7 +336,8 @@ ModemManager was installed needed `udevadm trigger` once. Measured over
 the port by hand first: `ATE0`, `ATI`, `AT+CFUN?` (0), `AT+CSQ` (99,99),
 `AT+GCAP` (`+CGSM`).
 
-At `CFUN=0` the SIM stays down: `AT+CPIN?` gives `+CME ERROR: 14` (SIM
+The measurements in the next paragraphs are from before the mux, when `AT+CFUN=4` was the first
+command. At `CFUN=0` the SIM stays down: `AT+CPIN?` gives `+CME ERROR: 14` (SIM
 busy) and ModemManager gave up after six tries (`failed`, reason
 `sim-missing`). `AT+CFUN=4` (flight mode) brings it up within the
 command: the modem answers with a burst of SIM URCs (`+EUSIM`,
@@ -485,6 +485,298 @@ restarting the service (flight mode). For a call, `mdd.py` turns speech
 on and off on SIGUSR1/SIGUSR2 (application 0, parameters from
 `/var/lib/titan-modem/sph-params.bin`); untested.
 
+## Radio on with a valid SIM
+
+It registers now; the end of this section says why. Most of the section is the search, in order, and
+its earlier theories are kept as they were measured.
+
+2026-11-03, kernel #101, an activated Tello SIM (T-Mobile's network,
+`310260`), measured with ModemManager stopped and AT commands by hand on
+`/dev/wwan0at0`, cell IDs masked:
+
+- **Receive works:** camped at RSRP index 55-58 (about -86 to -83 dBm), RSRQ
+  index 16-25; `AT+COPS=?` lists four LTE networks, this one included.
+- **It does not attach:** `AT+COPS=0` or a manual `AT+COPS=1,2,"310260"`
+  ends after 48-70 s in `+CME ERROR: 100` with `+CEER: 0,NONE`, `CGATT` 0.
+- **`AT+EDALLOW=1` changes it.** Without it registration goes 2 to 0; with it
+  (the vendor RIL's string: "Single SIM project, send EDALLOW=1 at boot
+  time") the modem reports `+CEREG: 3` (denied) with `cause_type` and
+  `reject_cause` 0, `nwk_existence` 0 in `+EREG`. A network reject would
+  carry a cause. ModemManager's generic plugin sends no MediaTek commands.
+- **No effect:** the deep-sleep image against `regulator_ignore_unused` with
+  no low-power table; a profile (`AT+CGDCONT=1,"IPV4V6"[,"wholesale"]`,
+  `AT+EIAAPN="wholesale",3`); `AT+EGTYPE=4`; `AT+CEMODE=2`; `AT+EOPS=0`.
+- **Ruled out:** network and SIM locks (`AT+CLCK` 0), the SIM's forbidden list
+  (only `310830`), the file service: over one modem boot and attach, about
+  1300 requests of which 1050 are compact reads, the only failures are a stale
+  `.log` attribute check and one missing `NVD_DATA/SP81_046`, asked for by a
+  delete and a compact read. `CALIBRAT` holds its 173 files. `mdd.py` now logs a
+  failed compact read by name (its reply is hidden in the quiet log).
+- **Supplies:** `VFE28`, `VRF18` and `VRF12` switch under the modem's control
+  (status c000/0000 with `SRCLKEN1`, software enable off). **`VPA` reads 0 in
+  `CON0`, `DBG0` and `DBG1` in all 164221 sweeps (0.55 ms each) of a camped
+  attempt.** Either nothing was transmitted or this board's PA does not use it:
+  not known which.
+
+- **No RRC connection:** with `AT+CSCON=1` only `+CSCON: 0` ever arrives,
+  several at the end of an attempt. RRC connected needs a round trip with the
+  cell, so the network's reject is not what ends it. The denial comes about 40 s
+  after the attempt starts, every time (the first radio-on's assert was at 43
+  s): the standard's 5 attach attempts 10 s apart (T3411) would take that long,
+  each failing below EMM. That timing is an inference.
+- **The modem is meant to drive `VPA`:** its symbols include
+  `EL1D_RF_VPA_ENABLE`, `MML1_RF_VPA_Enable`, `MML1_RF_VPA_VOSEL_CWGen` and
+  `MML1_RF_PMIC_VPA_Status_Check` (names only, from `DbgInfo`). The vendor kernel
+  leaves the rail off (`pmic_buck_vpa_lp(SW, 1, SW_OFF)`, no consumer).
+- **Also checked, no fault:** RF pins (`BPI_ANT*`, `BPI_BUS3-10`, `MIPI0/1`,
+  `RFIC0_BSI`) in mode 1 with nothing claiming them (mode is the low 3 bits of
+  each nibble at `GPIO_BASE + 0x300`); bands 2, 4, 12, 66 enabled (`AT+EPBSE?`);
+  the vendor driver's `mdcldma_pinctrl` is never selected; channel 34
+  (`res 80000003`, `AP_IPC_WMT`, probably one-way coexistence info) and 38 come
+  at radio on and off, not at the 40 s mark. The wrapper's `HPRIO_ARB_EN` reads
+  0x3fa75 (the vendor kernel's own init would write 0x3fa65; not explained,
+  and our driver does not write it unless it initialises the wrapper).
+
+- **`VPA` forced on makes no difference:** `modules/modem/vpatest` (a one-off,
+  75 s limit) held it at 3.4 V (status 3, `DA_VOSEL` 0x3a) through an attempt:
+  denied at 40.4 s, no RRC connection. The voltage select never moved in
+  96802 sweeps, so the modem wrote nothing to it. It is not the missing
+  supply; the modem stops before driving the PA, or its PMIC writes do not arrive.
+- **Also no difference:** `AT+EBOOT=1`, `AT+EMODCFG=1`, `AT+EFUN=1`; the SPM
+  firmware running with all rails on (`deep=1` with `regulator_ignore_unused`,
+  image `boot-6.12-radio-spm.img`), with `EDALLOW`: `SPM_DVS_LEVEL` and
+  `SPM_SW_DEBUG` unchanged, so no DVFS event served.
+- **The same as the vendor:** the power-up (`md_cd_power_on`, the MD PLLs, the
+  26 MHz request); the RPC `IPC_RPC_DTSI_QUERY_OP`: LK's `md_attr_node` holds
+  `0f0f0f0f`, which the vendor returns too, and this firmware asked only for
+  `md_product_name_model_id`. Whether LK writes the same under Android is not
+  measured.
+
+**Under stock Android (same phone, same SIM, 2026-11-03, the phone's Magisk boot
+image, `userdata` formatted): it registers.** So the hardware, the SIM and the
+carrier work, and the gap is on the Linux side. From the radio log (filtered on
+the phone: commands only, identities masked):
+
+- Android never sends `AT+CFUN=1`. Radio on is `AT+EGTP=1`, `EMPPCH=1`,
+  `EDSDA=1`, `ESADM=3`, `EBOOT=0`, `EDSBP=1`, `EPOC`, `EFUN=0`, `ESLOTSINFO=1`,
+  `EFUN=1`, `ERAT=6,4` on one channel, 0.4 s in all.
+- 31 s later: nine `AT+EAPNSET`, then `AT+EIAAPN` (APN `fast.t-mobile.com`, id 0,
+  for this MVNO SIM too); `+EIAREG: ME ATTACH` follows 1.3 s after it.
+  `EDALLOW` comes after the attach.
+- Android has two sets of AT channels, one per protocol stack, and its URCs on
+  their own channels; Linux has one port.
+- It gets the same `CME ERROR 100` as Linux for `CSCON=3` and `ECAMPUI=1`. It
+  gets `OK` for `ESADM=3`, where the Linux port gets `ERROR`.
+
+**Android's AT channels are a 3GPP 27.010 mux** on CCCI UART2, the channel the
+WWAN port carries: `gsm0710muxd -s /dev/ttyC0` (`ttyC0` is `CCCI_UART2`,
+`port_cfg.c`), `AT+CMUX=%d,%d,%d,%d`. The daemon's table entries are
+`{dlci, mtu, name}`, and the DLCIs are not sequential:
+
+| Channel | SIM 1 | SIM 2 |
+|---|---|---|
+| `cmd4`, `noti`, `cmd1`-`cmd3` | 1-5 | 6-10 |
+| `atci` | 26 | 27 |
+| `cmd7` (RIL `RT_7`), `cmd8` (`NRT_8`) | 61, 60 | 57, 56 |
+| `cmd9` (`RADIO_9`), `cmd10` (`DATA2_10`), `cmd11` | 59, 58, 43 | 55, 54, 42 |
+| `nwcmd`, `nwurc` | 45, 44 | shared |
+
+Measured: `/proc/ccci_dump` under Android shows `AT+ESBP` going out in a frame with
+address `0xED`, DLCI 59. Under Linux `tools/modem/muxtest.py` opens all 24, and the
+stacks are as the table says: `AT+CPIN?` is `READY` on DLCI 3 and `CME ERROR 10`
+on 8. DLCI 11 and up are the third SIM's (refused, as this phone has two).
+
+**The kernel side matches Android's where compared.** Android's `ccci_dump` (root,
+filtered on the phone) has `sbp=0x0, wmid[63]`, `c2k_flags 0x4`, and the runtime data at
+`0x4000e800` (AP) and `0x4000f000` (MD): what `titan_modem` sends. `+ESBPID: 0,8`
+under Android is the modem's own choice after `EDSBP=1`, not boot data.
+`ccci_mdinit` sends the modem only this boot data; its other strings are start,
+stop and supervision.
+
+**A real gap, closed, not the cause.** The modem asks for the SIM hot-plug interrupts
+(`IPC_RPC_GET_EINT_ATTR_OP`, about 0.3 s after release). `mdd.py` answered all of them
+with an error; Android's kernel returns values from its device tree. `mdd.py` now returns
+those measured under Android: SIM 1 source pin 1, interrupt 0, dedicated 0, debounce
+100 ms, polarity 0, sensitivity 0, socket type 0; SIM 2 source pin 2, interrupt 1. The
+modem then makes the same follow-up queries as under Android (types 0, 0, 1, 2, 3, 4,
+about 1.2 s later), which the errors had stopped.
+
+**Attach under Android does not depend on the APN commands.** On later boots
+`+EIAREG: ME ATTACH` comes 1.3 s and 1.7 s after `EFUN=1`, before any `EDALLOW`,
+`EAPNSET` or `EIAAPN`. (The 31 s above was the first boot on a formatted `userdata`.)
+
+**`AT+CFUN=4` as the modem's first command was the wrong state.** `titan-modem` sent
+it as soon as the modem's AT layer came up, so every test above started there. Without it,
+in Android's order on the right channels, the differences go: `AT+ESIMS` is `OK` with
+`+ESIMS: 1`, `AT+ESADM=3` is `OK`, and `+ESIMS: 1,29`, `+EUSIM`, `+ESBPID: 0,8` and
+`+EIND: 32, 2, 1` arrive. `tools/modem/radioinit.py` now does this start-up on `cmd9`: `ESIMS=1`,
+`ESIMS`, `EGTP=1`, `EMPPCH=1`, `ESADM=3`, `EBOOT=0`, `EDSBP=1`, `EPOC`, `EFUN=0`.
+
+**The modem now makes an RRC connection (2026-11-03).** `+CSCON: 1` within a second of
+`AT+EFUN=1`, and within 3 s of ModemManager's enable (`AT+CFUN=1`). `VPA` switches on from about
+0.7 s after `EFUN=1`, as under Android (`VPA_CON0` bit 0, on in about 4% of samples for the
+15 s connected). Under `CFUN=4`-first, in the same replay, it never switched on in 62 s.
+
+**It still does not attach.** The connection lasts 15 s, the length of the attach timer T3410,
+then `+CEREG: 3` (denied), cause 0, `+ECCAUSE: 0,1,0`, `+CSCON: 0`. The reports Android gets
+just before its attach (`+CEN1`, `+CEN2`, `+CIREPI`, `+CNEMS1`, `+EPDN`, `+EIAREG: ME ATTACH`) never
+arrive. So the attach request gets no acceptance; whether the network answers at all is not
+known. Tested, with the same result: `AT+EDALLOW=1` (no effect), `AT+EIAAPN` before radio-on (still
+connects, still 15 s).
+
+**`AT+EIAAPN` with no APN table causes the older symptom:** sent after `EFUN=1` with the table unset, in
+the short or the seven-argument form, there is no RRC connection, and `+CEREG: 3` comes about 40 s after
+radio-on.
+
+**The APN table needs a lock.** From the RIL's `requestSyncApnTable` (`libmtk-ril.so`, read as
+reference): `AT+EAPNLOCK=1`; `AT+EAPNSET` (clears the table); for each APN `AT+EAPNSET="apn",1,"user","pwd"`
+and `AT+EAPNSET="apn",2,"type=a,b;protocol=P;roaming_protocol=P;authtype=N;carrier_enabled=1;max_conns=0;max_conns_time=0;wait_time=0;bearer_bitmask=N;inactive_timer=0"`;
+`AT+EAPNLOCK=0`. Then `AT+EIAAPN`. Without the lock `EAPNSET` gets `CME ERROR 5841`. Measured, with
+`fast.t-mobile.com` and `ims`: all `OK`, and `+CSCON: 1` within 0.5 s, sent before or just after `EFUN=1`, so
+with the table set `EIAAPN` no longer stops the connection. **The attach still times out at 15 s, cause 0.** The
+values used for the type list and `bearer_bitmask` are not Android's (masked in its log). On Android's first boot it
+did not attach for 31 s, until it set the table; on later boots it attaches 1.3-1.7 s after `EFUN=1`
+without it. Why is not known.
+
+Under Android, compared during an attach, with `mt_gpio` and `pmic_access` (root):
+
+- Pin modes differ on 14 pins: camera clocks and audio or I2S lines that Linux has claimed.
+- DCXO registers match except two live status registers and one bit each in two others. The
+  capacitor trim (`0xd4`) is the same.
+- `VMODEM` is 0x18 under Android, 0x20 under Linux. Not tested as a cause.
+- LK's `md_attr_node` gives `0x0f0f0f0f` for `md_drdi_rf_set_idx` under Android too.
+- `VPA_DBG0` reaches higher values under Android during its attach (`090e`, `111e`, `1d16`, `3c28`).
+  In about 15 s under Linux: mostly `0506`, then `0f0a`, a few `090e` and `1d16`.
+
+Android's calls to `AT+EGMR` before its attach are all reads (`0,4`, `0,5`, `0,9`, `0,13`, from the raw
+frames in `/proc/ccci_dump`), and `ccci_mdinit` sends only the boot data compared above.
+
+Not yet compared: the modem's NVRAM files under the two systems. `nvcopy.sh` mounts the partitions
+read-only with `noload`, so a journal left by Android's unclean reboot is not replayed into the
+copy, and `NVD_DATA/SP81_046` is missing in the copy. Android's first boot
+may have written files the attach depends on. The NVRAM partitions from before that boot are in
+`/root/android-test-backup` on the phone, with checksums: per-phone data, never copied off.
+
+### The AT channels on Linux
+
+`titan_modem` runs the mux itself (`mux=0` gives the one raw port, for testing). When `mdd.py` asks
+(`TITAN_MD_AT_PORT`) it sends `AT+CMUX=0,0,5,512`, opens all DLCIs and makes a WWAN AT port for each:
+measured 24 of 24. It answers the modem's MSC; the modem's flow control bit is not obeyed.
+`81-titan-modem.rules` names them `/dev/radio/<channel>` and leaves ModemManager two: `cmd1`, the first
+port (`wwan0at0`, its primary), and `noti` for URCs. With `noti` as primary, the modem's disable timed
+out. `tools/modem/atreplay.py` replays a command list over the ports.
+
+**Without CLDMA running, the modem asserts about 50 s after radio-on, when the attach has failed:**
+`errc_chm_main.c:8825`, params 0, 1, 0, the same assert as on the earlier SIM. All channels then go
+silent. It needs no disable: measured with the modem left enabled (ModemManager still says
+`searching`). So enable, disable, enable after that point cannot work, and a restart of
+`titan-modem` is needed. In one run the phone also stopped answering over USB and had rebooted when it
+came back; the journal is not kept across boots, so why is not known.
+
+Also ruled out as the attach's cause: Android's boot id `0xf0000` (a logger wait time, tested with
+`boot_id=`), the journal (`nvdata`, `protect1` and `protect2` are clean, and a replayed copy matches
+`nvcopy.sh`'s file for file), and the file service during the attach (all requests answered; the only
+failure since boot is `SP81_046`). Android sends no AT command between `EFUN=1` and its attach.
+The modem sends packets on channels 34 and 38 as it connects, and nothing on Linux reads them. Under
+Android, 34 goes to `AP_IPC_WMT`, the kernel's bridge to Wi-Fi/BT coexistence (`mtk_conn_md_bridge_send_msg`), and
+38 is `ttyC2`, held by `mtk_agpsd`. Neither looks necessary for an attach; not tested.
+
+**Starting CLDMA fixed the attach (2026-11-04).** The vendor resets it before the modem's power-on and
+starts it after the release (`md_cldma_hw_reset`; `cldma_reset` and `cldma_start`, from `ccci_md_hif_start`);
+`titan_modem` had only enabled its clock. The driver now does the same: four idle uplink queues, one downlink queue of
+64 buffers, no interrupts. With that alone, `+CGATT: 1` about 2 s after enabling, and ModemManager reports `registered`,
+`home`, LTE. No APN commands were sent. Measured: five enables, four of them after a disable, registered in 2-3 s each
+where timed, disables all clean, registered after 90 s, and no modem assert or exception in the boot. The modem wrote nothing to
+the downlink buffers (0 of 64). Why it needs CLDMA running for an attach is not known. So the earlier "attach timeout" and
+the `errc_chm_main.c:8825` assert were this, and the second enable's failure was that assert. The `VPA`, DCXO, SBP, journal,
+`EDALLOW` and channel 34/38 comparisons above were not the cause; `AT+CFUN=4` as the first command and the mux are
+separate: with `CFUN=4` first it did not reach an RRC connection at all.
+
+ModemManager's signal quality read 60 on the first enable and 0 after later ones; not looked at.
+
+The driver used to report CCIF channel 20 (the vendor's `AP_MD_PEER_WAKEUP`, for which it only takes a
+wake lock) as a modem exception: the modem raises it about every 2 ms from a second after radio-on until
+the assert (22403 times in 45 s). Exceptions are channels 16-19.
+
+## Mobile data
+
+Measured 2026-11-04 with the Tello SIM on 310260: 9 of 9 pings to a public IPv6 address (36-156 ms) and a TCP
+connection in 53 ms, through a host route, with the phone's Wi-Fi routes untouched. No CLDMA errors. Not measured:
+throughput, long runs, and data across suspend.
+
+**The driver.** `titan_modem` runs CLDMA as the vendor's order has it: reset before the modem's power-on (the infra reset
+registers), then after its release the MTU, the receive DMA enable (`SO_CFG` bit 0), the queues' start addresses, the start
+command, and the interrupts (`GIC_SPI 173`, in the device tree with the `cldma-ao` and `cldma-pdn` registers). Uplink queue 0
+has a ring of 128 descriptors and the other three an idle one. The downlink queue has 256 buffers of 3584 bytes. NAPI does
+receive and transmit completion. An uplink descriptor names the interface (`netif`), and a downlink buffer starts
+with a 4-byte `lhif_header` that does (bits 0-4 of its last byte); the payload is raw IP. `ccmni0` to `ccmni7` are plain
+network devices (`ARPHRD_NONE`). The modem's request to move an interface to another uplink queue
+(`IPC_RPC_CCCI_LHIF_MAPPING`, 0x400d) gets success from `mdd.py`, and every interface stays on queue 0. The vendor gives IMS
+queue 3; not done here. debugfs `titan-modem/cldma` shows the registers and counters.
+
+**The commands (`ltedata.py`), from the RIL (`libmtk-ril.so`, read as reference) and Android's log:**
+
+1. `AT+EDALLOW=1`: without it `AT+EAPNACT` gets `CME ERROR 5745`.
+2. The APN table (see "Radio on with a valid SIM").
+3. `AT+EAPNACT=1,"apn","default",0`: `+CGEV: ME PDN ACT 0`, then `AT+CGACT?` shows context 0 active.
+4. On `nwurc`, `+EIF: 100, ifup, 2, <link-local address>/64, 0`: interface 100 is `ccmni0`, type 2 is IPv6. The AP brings the
+   interface up with that address and answers on `nwcmd`: `AT+EIF=100, "ifst", "up", 2`. Then `+EIF: 100, mtu, 1428`.
+5. The network's router advertisement gives the global address (`accept_ra=2`, `autoconf=1`).
+
+Before step 4's answer no packet came back (13 sent, 0 received). `AT+CGCONTRDP=0` gives the APN (`wholesale...`) and
+two IPv6 DNS servers; it gives no address on this network, which is IPv6 only. The carrier's DNS server does not answer ping.
+
+Not done: IPv4 (needs 464XLAT), DNS setup, routing (`--default` sets a default route; otherwise nothing changes),
+ModemManager knowing about the bearer (it stays `registered`, not `connected`), and a clean way down.
+`AT+CGACT=0,0` on the only PDN takes the modem off the network (`searching`, then `CME ERROR 5873`), so `ltedata.py` has no
+"down": restart `titan-modem`. An already active PDN gets no second `ifup`: restart it too. The APN is `fast.t-mobile.com` by default.
+NetAgent's other `+EIF` reports (`ipupdate`, `ipchg`, `ra`, `ifdown`) are not handled, and `ltedata.py` exits once data is up.
+
+## Phone apps
+
+Two apps on ModemManager's D-Bus API, sharing `titan_mm.py` (plain Gio
+proxies, no libmm-glib; it follows ModemManager, the modem, its SIM and
+calls as they come and go). Measured against the modem in flight mode
+(2026-11-03, no SIM change, radio left off): ModemManager's generic plugin
+exports `Modem3gpp`, `Modem3gpp.Ussd`, `Voice`, `Messaging` and `Signal`,
+and one mode set only (`4G/3G/2G`, no preference), so the mode picker has
+one entry. The network search works (four networks found); calls, USSD and
+the APN were not run then: the modem had not registered yet (see "Radio on with a
+valid SIM").
+
+- `titan-dialer` (drawer: Phone): a keypad; a number is a voice call
+  (`Voice.CreateCall`, `Call.Start`), a code that starts with `*` or `#`
+  and ends with `#` is USSD (`Ussd.Initiate`, the answer on screen, `Respond`
+  when the network asks for a reply). `*#06#` shows the IMEI locally. In a
+  call: hang up, mute, loudspeaker, DTMF; an incoming call rings (a quiet
+  tone, -30 dBFS, and the motor) with answer and decline. When the radio is
+  off it says so and offers to turn it on (that tap is the go-ahead).
+- `titan-phone-settings` (drawer: Phone settings): **Modem** (the service on
+  or off, the radio on or off, a restart after changing the SIM); **SIM**
+  (unlock with the PIN, or the PUK and a new PIN, require or drop the PIN,
+  change it); **Network** (what's registered, modes, a search with a manual
+  choice, automatic); **APN** (`SetInitialEpsBearerSettings`, for attaching
+  to LTE; there is no mobile data yet). Identities are masked to their
+  last four digits until "Show identities" is ticked.
+- `titan-call-audio run DEVICE`: a call's sound while it is active. It
+  takes the cset lines of the UCM profile's Voice Call devices, opens
+  `Hostless_Speech` (`hw:CARD=titanpocket,DEV=5`, 32 kHz) both ways, and
+  signals `mdd.py` (SIGUSR1, SIGUSR2). Earpiece by default, the wired
+  devices follow the jack controls (`Headset Mic Jack`, `Headphones Jack`).
+  Mute switches the uplink's two PCM 2 mixers off. Untested in a call: the
+  speech DSP still returned silence in loopback (see "Speech").
+- `titan-call-watch.service` (enabled): on a ringing call, one pulse of the
+  motor and starts the dialer in the Weston session. It does not turn the
+  screen on. The modem's wake lock keeps the phone from suspending, so a
+  call can only come in while the modem service runs, and that costs the
+  awake current.
+
+A new SIM: Phone settings, Modem: Restart modem (or Modem on); SIM: unlock if
+locked; Modem: Radio on; Network: check the registration; APN if the carrier
+needs one. **Never screenshot the SIM or Modem pages for debugging**: the
+debug screenshots go off the phone. A harness of ours once did, with a
+masking bug that showed identities in full (fixed, 2026-11-03).
+
 ## Modem debug data
 
 MediaTek ships three debug files with the modem build (in the firmware
@@ -523,8 +815,9 @@ need the firmware disassembled, which this project does not do.
 
 ## Next steps
 
-1. Enabling the modem in ModemManager (`CFUN=1`: the radio on, network
-   registration): outward facing, ask first.
+1. Registration (see "Radio on with a valid SIM"), then the apps on a real
+   network. T-Mobile has no 3G, so voice needs IMS, whose channels are not
+   served yet. Outward facing: ask first.
    Voice: the speech parameters are in (see "Speech"), but the modem's
    speech DSP still returns silence in loopback, and its log cannot be
    decoded (see "Modem debug data"); a real call would show whether the
@@ -535,8 +828,8 @@ need the firmware disassembled, which this project does not do.
    modem's writes should survive a reboot: the user's call).
 3. The modem's other channels: IPC (34), IMS (57/59/169), Wi-Fi offload
    (171), the status channel, and what they need answered.
-4. Data (CCMNI on CLDMA, as a WWAN net link for ModemManager), SMS and
-   voice. Each is outward facing: ask first.
+4. SMS and voice (the apps are there, see "Phone apps"), and data through
+   ModemManager rather than `ltedata.py`. Each is outward facing: ask first.
 5. Later: a modem logger on the CCB (what `mdlogger` sends to start
    logging) and decoding the DHL log, the driver in tree with MD1
    as a power domain, the modem's exception handshake, its cost in

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 12/15] media: rc: add the MT6771 PWM IR transmitter
+Subject: [PATCH 12/16] media: rc: add the MT6771 PWM IR transmitter
 
 An IR transmitter on the MT6771's PWM block (carrier and duty from the
 PWM, the pulse train from the CPU), as a lirc device.

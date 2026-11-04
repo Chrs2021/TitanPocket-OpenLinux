@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 07/15] watchdog: mtk_wdt: stop in suspend when only the kernel pings it
+Subject: [PATCH 07/16] watchdog: mtk_wdt: stop in suspend when only the kernel pings it
 
 The bootloader leaves the watchdog running (WDOG_HW_RUNNING) and the
 kernel pings it; nothing pings it while the system sleeps, so a suspend

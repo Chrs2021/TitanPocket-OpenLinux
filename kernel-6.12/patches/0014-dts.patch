@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 14/15] arm64: dts: mediatek: add the MT6771 and the Unihertz Titan Pocket
+Subject: [PATCH 14/16] arm64: dts: mediatek: add the MT6771 and the Unihertz Titan Pocket
 
 The MT6771 described on MT8183 bindings (same clocks, pinctrl, power
 domains, display and camera subsystems, IOMMU larbs), and the Titan
@@ -11,9 +11,9 @@ let the bootloader's overlay apply.
 ---
  arch/arm64/boot/dts/mediatek/Makefile         |    3 +
  .../dts/mediatek/mt6771-lk-dtbo-labels.dtsi   |  210 ++
- .../mediatek/mt6771-unihertz-titan-pocket.dts |  989 +++++++++
- arch/arm64/boot/dts/mediatek/mt6771.dtsi      | 1897 +++++++++++++++++
- 4 files changed, 3099 insertions(+)
+ .../mediatek/mt6771-unihertz-titan-pocket.dts | 1019 +++++++++
+ arch/arm64/boot/dts/mediatek/mt6771.dtsi      | 1901 +++++++++++++++++
+ 4 files changed, 3133 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
 index 8fd7b2bb7a1590341e7bb4ea1ecf039ae3e8eb0d..d80f5fd16f5664930365fc17045cbe226c32fd4a 100644
@@ -253,10 +253,10 @@ index 0000000000000000000000000000000000000000..152fa0a724a2e7e71716a5e3622ae029
 +};
 diff --git a/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts b/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts
 new file mode 100644
-index 0000000000000000000000000000000000000000..d3d633907793e28861cfaa192668803a27c2d906
+index 0000000000000000000000000000000000000000..65d39a0fe64d48969bac2b653ee4bb581e4b2945
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts
-@@ -0,0 +1,989 @@
+@@ -0,0 +1,1019 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Unihertz Titan Pocket (MT6771, 720x720 DSI panel, QWERTY keyboard).
@@ -424,7 +424,7 @@ index 0000000000000000000000000000000000000000..d3d633907793e28861cfaa192668803a
 + * port controller interrupt GPIO 41). Only its Type-C port is used: TCPM
 + * tells mtu3 whether a cable is there (the role switch), since the SoC's
 + * USB PHY doesn't see VBUS. The backlight node only turns the boost off
-+ * and on (its settings are LK's); the flash stays disabled.
++ * and on (its settings are LK's).
 + * Sink only at 5 V and device only: no VBUS output, no PD voltage change.
 + */
 +&i2c_5 {
@@ -492,9 +492,39 @@ index 0000000000000000000000000000000000000000..d3d633907793e28861cfaa192668803a
 +			power-supplies = <&mt6370_tcpc>;
 +		};
 +
++		/*
++		 * The rear flash: a dual-tone pair, channel 1 the white (cool) LED,
++		 * channel 2 the yellowish (warm) one (docs/camera.md). Two LED class
++		 * devices, not one joint one, so the tones mix. Currents: 400 mA
++		 * torch is the 4.14 flashlight driver's maximum, strobe 1200/1000 mA
++		 * the vendor device tree's (2.2 A together, under the chip's 2.5 A
++		 * for both). The strobe timeout register is shared; 1184 ms is what
++		 * the vendor's second LED left in it.
++		 */
 +		flashlight {
 +			compatible = "mediatek,mt6370-flashlight";
-+			status = "disabled";
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			led@0 {
++				reg = <0>;
++				led-sources = <0>;
++				function = LED_FUNCTION_FLASH;
++				color = <LED_COLOR_ID_WHITE>;
++				led-max-microamp = <400000>;
++				flash-max-microamp = <1200000>;
++				flash-max-timeout-us = <1184000>;
++			};
++
++			led@1 {
++				reg = <1>;
++				led-sources = <1>;
++				function = LED_FUNCTION_FLASH;
++				color = <LED_COLOR_ID_YELLOW>;
++				led-max-microamp = <400000>;
++				flash-max-microamp = <1000000>;
++				flash-max-timeout-us = <1184000>;
++			};
 +		};
 +
 +		/*
@@ -1248,10 +1278,10 @@ index 0000000000000000000000000000000000000000..d3d633907793e28861cfaa192668803a
 +};
 diff --git a/arch/arm64/boot/dts/mediatek/mt6771.dtsi b/arch/arm64/boot/dts/mediatek/mt6771.dtsi
 new file mode 100644
-index 0000000000000000000000000000000000000000..93b40f13dcf7db53d3c174b8d9a133bfdfd26558
+index 0000000000000000000000000000000000000000..7ca0d052e2e475ca67dd6ddf589588707e9b3efe
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771.dtsi
-@@ -0,0 +1,1897 @@
+@@ -0,0 +1,1901 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * MediaTek MT6771 (Helio P60/P70).
@@ -2233,12 +2263,16 @@ index 0000000000000000000000000000000000000000..93b40f13dcf7db53d3c174b8d9a133bf
 +			      <0 0x20150000 0 0x1000>,
 +			      <0 0x200f0100 0 0x10>,
 +			      <0 0x20000000 0 0x100>,
-+			      <0 0x1020e300 0 0x8>;
++			      <0 0x1020e300 0 0x8>,
++			      <0 0x10014000 0 0x1000>,
++			      <0 0x1021b000 0 0x1000>;
 +			reg-names = "ap-ccif", "md-ccif", "md-pll", "md-clksw",
-+				    "md-rgu", "md-boot", "md-cfg";
++				    "md-rgu", "md-boot", "md-cfg",
++				    "cldma-ao", "cldma-pdn";
 +			interrupts = <GIC_SPI 151 IRQ_TYPE_LEVEL_LOW>,
-+				     <GIC_SPI 152 IRQ_TYPE_LEVEL_LOW>;
-+			interrupt-names = "ccif", "ccif-ex";
++				     <GIC_SPI 152 IRQ_TYPE_LEVEL_LOW>,
++				     <GIC_SPI 173 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "ccif", "ccif-ex", "cldma";
 +			clocks = <&infracfg CLK_INFRA_CLDMA_BCLK>,
 +				 <&infracfg CLK_INFRA_CCIF_AP>,
 +				 <&infracfg CLK_INFRA_CCIF_MD>,

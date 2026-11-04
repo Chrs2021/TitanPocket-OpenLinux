@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 04/15] regulator: mt6358: add VA09; rtc: mt6397: LK reboot modes; mfd: mt6358: AUD interrupts, accdet
+Subject: [PATCH 04/16] regulator: mt6358: add VA09; rtc: mt6397: LK reboot modes; mfd: mt6358: AUD interrupts, accdet
 
 mt6358-regulator gains ldo_va09, the external 0.9 V supply that the
 MT6358's EXT_PMIC_EN2 pin switches (USB and UFS PHYs). rtc-mt6397 records

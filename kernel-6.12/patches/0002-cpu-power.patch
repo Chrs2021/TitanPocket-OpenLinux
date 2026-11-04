@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 02/15] cpufreq, cpuidle, devfreq: mediatek: support the MT6771
+Subject: [PATCH 02/16] cpufreq, cpuidle, devfreq: mediatek: support the MT6771
 
 mediatek-cpufreq and mtk-cci-devfreq gain MT6771 data (MediaTek's V5_T
 table: A53 to 1989 MHz, A73 to 1924 MHz, CCI to 1196 MHz), cpufreq-dt

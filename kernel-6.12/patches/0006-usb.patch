@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 06/15] usb: mtu3, phy: mediatek: VBUS session follows the role switch; set the IP up after a reset in suspend
+Subject: [PATCH 06/16] usb: mtu3, phy: mediatek: VBUS session follows the role switch; set the IP up after a reset in suspend
 
 phy-mtk-tphy: a port with mediatek,force-vbus forces the VBUS-valid and
 session signals the PHY's comparator cannot see on this board, and ends

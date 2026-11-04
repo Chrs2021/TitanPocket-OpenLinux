@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 05/15] scsi: ufs: mediatek: support the MT6771
+Subject: [PATCH 05/16] scsi: ufs: mediatek: support the MT6771
 
 The MT6771's controller is UniPro 1.6: skip PA_TXHSADAPTTYPE (a 1.8
 attribute) when the host version is below 3, and treat the reset

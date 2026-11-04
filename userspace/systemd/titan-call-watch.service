@@ -1,0 +1,11 @@
+[Unit]
+Description=Incoming calls: start the phone app (titan-dialer)
+After=ModemManager.service titan-desktop.service
+
+[Service]
+ExecStart=/usr/local/sbin/titan-call-watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

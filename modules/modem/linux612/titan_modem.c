@@ -26,15 +26,17 @@
  * daemon (the file server, RPC). The kernel keeps the control channel's
  * boot and exception messages and forwards the other packets, except
  * the AT channel once the daemon asks (TITAN_MD_AT_PORT, after its own
- * start-up commands): from then it is a WWAN AT port (wwan0at0) for
- * ModemManager.
+ * start-up commands): from then it is a 27.010 mux, as on Android, with a
+ * WWAN AT port for each channel (at_dlci).
  *
  * Load by hand; unloading powers the modem off again.
  */
 #include <linux/clk.h>
+#include <linux/completion.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/if_arp.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -42,11 +44,14 @@
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/netdevice.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/poll.h>
 #include <linux/random.h>
+#include <linux/rtnetlink.h>
 #include <linux/regmap.h>
+#include <linux/seq_file.h>
 #include <linux/skbuff.h>
 #include <linux/timekeeping.h>
 #include <linux/vmalloc.h>
@@ -206,6 +211,11 @@ struct rt_feature {
 #define RB_BUF			24
 #define RINGBUF_CTL_LEN		(8 + RB_BUF + 8)
 #define QUEUE_NUM		8
+/* the modem's exception channels (ccif_hif_platform.h, RINGQ_EXP_BASE 15). Channel 20
+ * is its peer wake-up, raised every 2 ms or so once its radio is up: no exception
+ */
+#define CCIF_EX_MASK		GENMASK(19, 16)
+#define CCIF_SEQ_ERROR		21
 
 static const int rx_queue_size[QUEUE_NUM] = {
 	80 * 1024, 80 * 1024, 40 * 1024, 80 * 1024,
@@ -316,6 +326,161 @@ struct lk_info_v2 {
 /* /dev/titan-modem: hand the AT channel to a WWAN port (after handshake 2) */
 #define TITAN_MD_AT_PORT	_IO('t', 0x01)
 
+/*
+ * The AT channels: 3GPP 27.010 basic mode on CCCI UART2, as Android's
+ * gsm0710muxd, one WWAN port per channel in this order. The modem's stacks each have
+ * their own commands and URCs: DLCIs from the daemon's table for two SIMs, checked
+ * against the modem under Android (DLCI 59 carries the RIL's radio commands). cmd1
+ * comes first: ModemManager takes the first port as its primary, and noti, where the
+ * URCs arrive, does not take commands well.
+ */
+static const u8 at_dlci[] = {
+	3, 2, 1, 4, 5, 26, 61, 60, 59, 58, 43,	/* SIM 1: cmd1 noti cmd4 cmd2 cmd3
+						 * atci cmd7 cmd8 cmd9 cmd10 cmd11 */
+	8, 7, 6, 9, 10, 27, 57, 56, 55, 54, 42,	/* SIM 2, the same */
+	45, 44,					/* nwcmd nwurc */
+};
+#define AT_CHANS	ARRAY_SIZE(at_dlci)
+
+#define MUX_FLAG	0xf9
+#define MUX_EA		0x01
+#define MUX_CR		0x02
+#define MUX_PF		0x10
+#define MUX_SABM	0x2f
+#define MUX_UA		0x63
+#define MUX_DM		0x0f
+#define MUX_DISC	0x43
+#define MUX_UIH		0xef
+#define MUX_MSC		0xe3	/* modem status, on DLCI 0: type with C/R and EA */
+#define MUX_N1		512	/* AT+CMUX's frame size */
+#define MUX_RX_SIZE	(2 * MUX_N1 + 16)
+
+struct titan_md;
+
+struct at_chan {
+	struct titan_md *md;
+	struct wwan_port *port;
+	u8 dlci;		/* 0: the raw channel (mux=0) */
+	bool up;		/* the modem accepted the DLCI */
+	bool open;		/* userspace has the port */
+};
+
+enum at_state {
+	AT_DAEMON,		/* UART2 goes to the daemon, on /dev/titan-modem */
+	AT_CMUX,		/* waiting for AT+CMUX's answer */
+	AT_MUX,			/* UART2 carries frames */
+	AT_RAW,			/* one port on the raw channel (mux=0) */
+};
+
+/*
+ * CLDMA, the modem's network data path (hif/ccci_hif_cldma.c, mt6771/cldma_reg.h),
+ * on AP memory: this modem generation has four uplink queues and one downlink. A
+ * descriptor's flags are bit 0 owned by the hardware, bit 7 interrupt when done. Data
+ * is raw IP: uplink descriptors name the interface, and a downlink buffer starts with
+ * a struct lhif_header that does.
+ */
+#define CLDMA_INFRA_RST0_AO	0x140
+#define CLDMA_INFRA_RST1_AO	0x144
+#define CLDMA_INFRA_RST0_PD	0x150
+#define CLDMA_INFRA_RST1_PD	0x154
+#define CLDMA_RST_AO		BIT(6)
+#define CLDMA_RST_PD		BIT(2)
+/* AO */
+#define CLDMA_UL_START_BK(i)	(0x004 + 4 * (i))
+#define CLDMA_SO_CFG		0x400
+#define CLDMA_SO_START(i)	(0x404 + 4 * (i))
+#define CLDMA_SO_STATUS		0x414
+#define CLDMA_DL_MTU		0x418
+#define CLDMA_L2RIMCR0		0x804
+#define CLDMA_L2RIMSR0		0x808
+/* PDN */
+#define CLDMA_UL_START(i)	(0x000 + 4 * (i))
+#define CLDMA_UL_START_CMD	0x030
+#define CLDMA_UL_RESUME_CMD	0x034
+#define CLDMA_SO_START_CMD	0x404
+#define CLDMA_SO_RESUME_CMD	0x408
+#define CLDMA_L2TISAR0		0x800
+#define CLDMA_L2TIMCR0		0x808
+#define CLDMA_L2TIMSR0		0x80c
+#define CLDMA_L3TIMCR0		0x820
+#define CLDMA_L3TIMCR1		0x824
+#define CLDMA_L2RISAR0		0x830
+#define CLDMA_L3RIMCR0		0x848
+#define CLDMA_L3RIMCR1		0x84c
+#define CLDMA_IP_BUSY		0x860
+
+#define CLDMA_ALL_QUEUES	0x0f
+#define CLDMA_TX_DONE		0x00f
+#define CLDMA_TX_ALL		0xfff		/* done, queue empty, error */
+#define CLDMA_TX_ERROR		0xf00
+#define CLDMA_RX_DONE		0x1
+#define CLDMA_RX_ALL		0x7		/* done, queue empty, error */
+#define CLDMA_RX_ERROR		0x4
+#define CLDMA_GPD_HWO		0x01
+#define CLDMA_GPD_IOC		0x80
+
+#define CLDMA_TXQ		4
+#define CLDMA_TX_GPDS		128		/* queue 0; the others idle */
+#define CLDMA_RX_GPDS		256
+#define CLDMA_RX_BUF		3584		/* SKB_4K */
+#define CCMNI_COUNT		8
+#define CCMNI_NAPI_BUDGET	64
+
+struct cldma_tgpd {
+	u8 flags;
+	u8 debug;
+	u8 msb;
+	u8 netif;
+	u32 next;
+	u32 data;
+	u16 len;
+	u16 psn;
+} __packed;
+
+struct cldma_rgpd {
+	u8 flags;
+	u8 unused;
+	u16 allow_len;
+	u32 next;
+	u32 data;
+	u16 len;
+	u8 msb;
+	u8 unused2;
+} __packed;
+
+struct lhif_header {
+	u16 pdcp_count;
+	u8 flow_f;
+	u8 netif_type;		/* interface in bits 0-4 */
+} __packed;
+
+struct cldma {
+	void __iomem *ao, *pdn;
+	int irq;
+	struct cldma_tgpd *tgpd;
+	struct cldma_rgpd *rgpd;
+	dma_addr_t tgpd_dma, rgpd_dma;
+
+	struct sk_buff *tx_skb[CLDMA_TX_GPDS];
+	dma_addr_t tx_dma[CLDMA_TX_GPDS];
+	u32 tx_head, tx_tail;	/* free-running */
+	spinlock_t tx_lock;
+	bool tx_started;
+
+	struct sk_buff *rx_skb[CLDMA_RX_GPDS];
+	dma_addr_t rx_dma[CLDMA_RX_GPDS];
+	u32 rx_next;
+
+	struct net_device *napi_dev;
+	struct napi_struct napi;
+	struct net_device *net[CCMNI_COUNT];
+};
+
+struct ccmni {
+	struct titan_md *md;
+	u8 id;
+};
+
 struct titan_md {
 	struct device *dev;
 	struct regmap *spm, *infra, *topck, *apmixed;
@@ -350,10 +515,17 @@ struct titan_md {
 	wait_queue_head_t rx_wait;
 	atomic_t open;
 
-	/* the AT channel as a WWAN port, from TITAN_MD_AT_PORT */
+	struct cldma cl;
+
+	/* the AT channels as WWAN ports, from TITAN_MD_AT_PORT */
 	struct work_struct at_work;
-	struct wwan_port *at_port;
-	bool at_open;
+	struct at_chan at[AT_CHANS];
+	enum at_state at_state;
+	u8 mux_rx[MUX_RX_SIZE];
+	u32 mux_rx_len;
+	struct completion mux_done;
+	u8 mux_wait_dlci;
+	bool mux_ok;
 };
 
 static struct titan_md *tmd;
@@ -372,6 +544,16 @@ static bool ccb = true;
 module_param(ccb, bool, 0444);
 static uint ccb_users = CCB_USERS_SIZE;
 module_param(ccb_users, uint, 0444);
+
+/* cldma=0: leave it stopped and add no network interfaces, for testing (the modem
+ * will not attach)
+ */
+static bool cldma = true;
+module_param(cldma, bool, 0444);
+
+/* mux=0: one WWAN port on the raw channel, for testing */
+static bool mux = true;
+module_param(mux, bool, 0444);
 
 /* optional features to answer "not supported" (bit = feature id), to test */
 static unsigned long long decline;
@@ -774,7 +956,8 @@ static irqreturn_t ccif_ex_isr(int irq, void *data)
 
 	writel(ch & ~0x7fffU, md->ap_ccif + APCCIF_ACK);
 	set_mask_bits(&md->rchnum, 0, ch & ~0x7fffU);
-	mod_delayed_work(system_wq, &md->watch, 0);
+	if (ch & (CCIF_EX_MASK | BIT(CCIF_SEQ_ERROR)))
+		mod_delayed_work(system_wq, &md->watch, 0);
 	return IRQ_HANDLED;
 }
 
@@ -1107,6 +1290,320 @@ static void control_rx(struct titan_md *md, struct ccci_header *h, u32 len)
 	}
 }
 
+/* ---- the AT channels ---- */
+
+static int at_send_raw(struct titan_md *md, const u8 *d, u32 len)
+{
+	struct ccci_header *h;
+	u32 off, n;
+	int ret = 0;
+
+	h = kmalloc(sizeof(*h) + AT_TX_MAX, GFP_KERNEL);
+	if (!h)
+		return -ENOMEM;
+	for (off = 0; off < len && !ret; off += n) {
+		n = min_t(u32, len - off, AT_TX_MAX);
+		memset(h, 0, sizeof(*h));
+		h->data[1] = sizeof(*h) + n;
+		h->channel = CCCI_UART2_TX;
+		memcpy(h + 1, d + off, n);
+		ret = md_send(md, h, sizeof(*h) + n);
+	}
+	kfree(h);
+	return ret;
+}
+
+/* 27.010's frame check, over the header: CRC-8, reflected, complemented */
+static u8 mux_fcs(const u8 *b, int n)
+{
+	u8 f = 0xff;
+	int i;
+
+	while (n--) {
+		f ^= *b++;
+		for (i = 0; i < 8; i++)
+			f = f & 1 ? (f >> 1) ^ 0xe0 : f >> 1;
+	}
+	return 0xff - f;
+}
+
+static int mux_send(struct titan_md *md, u8 dlci, u8 ctrl, const u8 *d, u32 n)
+{
+	u8 f[MUX_N1 + 7], *p = f;
+	u32 hdr;
+
+	*p++ = MUX_FLAG;
+	*p++ = (dlci << 2) | MUX_CR | MUX_EA;
+	*p++ = ctrl;
+	if (n < 128) {
+		*p++ = (n << 1) | MUX_EA;
+	} else {
+		*p++ = n << 1;
+		*p++ = n >> 7;
+	}
+	hdr = p - f - 1;
+	if (n)
+		memcpy(p, d, n);
+	p += n;
+	*p++ = mux_fcs(f + 1, hdr);
+	*p++ = MUX_FLAG;
+	return at_send_raw(md, f, p - f);
+}
+
+static void mux_frame(struct titan_md *md, u8 dlci, u8 ctrl, u8 *d, u32 n)
+{
+	struct sk_buff *skb;
+	int i;
+
+	switch (ctrl & ~MUX_PF) {
+	case MUX_UA:
+	case MUX_DM:
+		if (dlci == md->mux_wait_dlci) {
+			md->mux_ok = (ctrl & ~MUX_PF) == MUX_UA;
+			complete(&md->mux_done);
+		}
+		return;
+	case MUX_UIH:
+		break;
+	default:
+		return;
+	}
+	if (!dlci) {
+		/* the modem's modem status: answered, with C/R clear. Its flow
+		 * control bit is not obeyed: AT text is short and acknowledged.
+		 */
+		if (n && d[0] == MUX_MSC) {
+			d[0] &= ~MUX_CR;
+			mux_send(md, 0, MUX_UIH, d, n);
+		}
+		return;
+	}
+	for (i = 0; i < AT_CHANS; i++) {
+		struct at_chan *c = &md->at[i];
+
+		if (c->dlci != dlci)
+			continue;
+		/* dropped before the port exists, and while nobody has it open */
+		if (!READ_ONCE(c->port) || !READ_ONCE(c->open))
+			return;
+		skb = alloc_skb(n, GFP_KERNEL);
+		if (skb) {
+			skb_put_data(skb, d, n);
+			wwan_port_rx(c->port, skb);
+		}
+		return;
+	}
+}
+
+/* frames from the stream: CCCI packets do not keep to their boundaries */
+static void mux_rx(struct titan_md *md, const u8 *d, u32 len)
+{
+	u8 *b = md->mux_rx;
+	u32 have, off, n, used;
+
+	if (len > MUX_RX_SIZE - md->mux_rx_len) {
+		dev_err_ratelimited(md->dev, "mux: receive overflow\n");
+		md->mux_rx_len = 0;
+		if (len > MUX_RX_SIZE)
+			return;
+	}
+	memcpy(b + md->mux_rx_len, d, len);
+	have = md->mux_rx_len + len;
+	used = 0;
+	for (;;) {
+		/* to a flag, and past repeated ones (frames may share one) */
+		while (used < have && b[used] != MUX_FLAG)
+			used++;
+		while (used + 1 < have && b[used + 1] == MUX_FLAG)
+			used++;
+		if (have - used < 5)
+			break;
+		if (b[used + 3] & MUX_EA) {
+			n = b[used + 3] >> 1;
+			off = 4;
+		} else {
+			n = (b[used + 3] >> 1) | (b[used + 4] << 7);
+			off = 5;
+		}
+		if (n > MUX_N1) {
+			used++;
+			continue;
+		}
+		if (have - used < off + n + 2)
+			break;
+		if (b[used + off + n + 1] != MUX_FLAG ||
+		    b[used + off + n] != mux_fcs(b + used + 1, off - 1)) {
+			used++;
+			continue;
+		}
+		mux_frame(md, b[used + 1] >> 2, b[used + 2], b + used + off, n);
+		/* the closing flag may open the next frame */
+		used += off + n + 1;
+	}
+	md->mux_rx_len = have - used;
+	memmove(b, b + used, md->mux_rx_len);
+}
+
+static void at_rx(struct titan_md *md, struct sk_buff *skb)
+{
+	struct at_chan *c = &md->at[0];
+
+	switch (md->at_state) {
+	case AT_CMUX: {
+		u32 n = min_t(u32, skb->len, MUX_RX_SIZE - 1 - md->mux_rx_len);
+
+		memcpy(md->mux_rx + md->mux_rx_len, skb->data, n);
+		md->mux_rx_len += n;
+		md->mux_rx[md->mux_rx_len] = 0;
+		if (strstr((char *)md->mux_rx, "+CMUX: READY")) {
+			/* frames from here on */
+			md->mux_ok = true;
+			md->mux_rx_len = 0;
+			WRITE_ONCE(md->at_state, AT_MUX);
+			complete(&md->mux_done);
+		} else if (strstr((char *)md->mux_rx, "ERROR")) {
+			complete(&md->mux_done);
+		}
+		break;
+	}
+	case AT_MUX:
+		mux_rx(md, skb->data, skb->len);
+		break;
+	default:
+		/* dropped while nobody has the port open */
+		if (READ_ONCE(c->open)) {
+			wwan_port_rx(c->port, skb);
+			return;
+		}
+	}
+	kfree_skb(skb);
+}
+
+static int at_start(struct wwan_port *port)
+{
+	struct at_chan *c = wwan_port_get_drvdata(port);
+
+	WRITE_ONCE(c->open, true);
+	return 0;
+}
+
+static void at_stop(struct wwan_port *port)
+{
+	struct at_chan *c = wwan_port_get_drvdata(port);
+
+	WRITE_ONCE(c->open, false);
+}
+
+/* AT text to the modem, in frames or as it is */
+static int at_tx(struct wwan_port *port, struct sk_buff *skb)
+{
+	struct at_chan *c = wwan_port_get_drvdata(port);
+	u32 off, n;
+	int ret = 0;
+
+	if (!c->dlci) {
+		ret = at_send_raw(c->md, skb->data, skb->len);
+	} else if (!c->up) {
+		ret = -EIO;
+	} else {
+		for (off = 0; off < skb->len && !ret; off += n) {
+			n = min_t(u32, skb->len - off, MUX_N1);
+			ret = mux_send(c->md, c->dlci, MUX_UIH, skb->data + off, n);
+		}
+	}
+	if (!ret)
+		consume_skb(skb);
+	return ret;
+}
+
+static const struct wwan_port_ops at_ops = {
+	.start = at_start,
+	.stop = at_stop,
+	.tx = at_tx,
+};
+
+static int mux_open_dlci(struct titan_md *md, u8 dlci)
+{
+	reinit_completion(&md->mux_done);
+	md->mux_ok = false;
+	WRITE_ONCE(md->mux_wait_dlci, dlci);
+	mux_send(md, dlci, MUX_SABM | MUX_PF, NULL, 0);
+	if (!wait_for_completion_timeout(&md->mux_done, HZ) || !md->mux_ok)
+		return -EIO;
+	return 0;
+}
+
+/* mux mode on the raw channel, and every DLCI, as gsm0710muxd */
+static int mux_start(struct titan_md *md)
+{
+	static const char cmux[] = "AT+CMUX=0,0,5,512\r";
+	int i, up = 0;
+	u8 msc[4];
+
+	reinit_completion(&md->mux_done);
+	md->mux_ok = false;
+	md->mux_rx_len = 0;
+	WRITE_ONCE(md->at_state, AT_CMUX);
+	at_send_raw(md, (const u8 *)cmux, sizeof(cmux) - 1);
+	if (!wait_for_completion_timeout(&md->mux_done, 3 * HZ) || !md->mux_ok) {
+		dev_err(md->dev, "mux: AT+CMUX not accepted\n");
+		return -EIO;
+	}
+	msleep(50);		/* the OK after READY is not a frame */
+	if (mux_open_dlci(md, 0)) {
+		dev_err(md->dev, "mux: the control channel did not open\n");
+		return -EIO;
+	}
+	for (i = 0; i < AT_CHANS; i++) {
+		struct at_chan *c = &md->at[i];
+
+		if (mux_open_dlci(md, c->dlci)) {
+			dev_err(md->dev, "mux: DLCI %d did not open\n", c->dlci);
+			continue;
+		}
+		c->up = true;
+		up++;
+		/* our status: flow control off, ready, DTR and RTS */
+		msc[0] = MUX_MSC;
+		msc[1] = (2 << 1) | MUX_EA;
+		msc[2] = (c->dlci << 2) | MUX_CR | MUX_EA;
+		msc[3] = 0x0d;
+		mux_send(md, 0, MUX_UIH, msc, sizeof(msc));
+	}
+	dev_info(md->dev, "mux: %d of %zu channels\n", up, AT_CHANS);
+	return 0;
+}
+
+static void at_work(struct work_struct *w)
+{
+	struct titan_md *md = container_of(w, struct titan_md, at_work);
+	int i, n = mux ? AT_CHANS : 1;
+
+	if (md->at[0].port)
+		return;
+	if (mux) {
+		if (mux_start(md)) {
+			WRITE_ONCE(md->at_state, AT_DAEMON);
+			return;
+		}
+	}
+	/* a channel that did not open keeps its port: the numbers stay the table's */
+	for (i = 0; i < n; i++) {
+		struct at_chan *c = &md->at[i];
+		struct wwan_port *port;
+
+		c->md = md;
+		port = wwan_create_port(md->dev, WWAN_PORT_AT, &at_ops, NULL, c);
+		if (IS_ERR(port)) {
+			dev_err(md->dev, "AT port %d: %pe\n", i, port);
+			return;
+		}
+		WRITE_ONCE(c->port, port);
+	}
+	if (!mux)
+		WRITE_ONCE(md->at_state, AT_RAW);
+}
+
 static void rx_work(struct work_struct *w)
 {
 	struct titan_md *md = container_of(w, struct titan_md, rx_work);
@@ -1130,13 +1627,10 @@ static void rx_work(struct work_struct *w)
 			h = (struct ccci_header *)skb->data;
 			if (h->channel == CCCI_CONTROL_RX)
 				control_rx(md, h, n);
-			if (h->channel == CCCI_UART2_RX && md->at_port) {
-				/* dropped while nobody has the port open */
+			if (h->channel == CCCI_UART2_RX &&
+			    READ_ONCE(md->at_state) != AT_DAEMON) {
 				skb_pull(skb, sizeof(*h));
-				if (READ_ONCE(md->at_open))
-					wwan_port_rx(md->at_port, skb);
-				else
-					kfree_skb(skb);
+				at_rx(md, skb);
 				continue;
 			}
 			if (skb_queue_len(&md->rxq) >= RX_QUEUE_MAX)
@@ -1148,67 +1642,6 @@ static void rx_work(struct work_struct *w)
 			dev_err_ratelimited(md->dev,
 					    "queue %d: bad packet\n", q);
 	}
-}
-
-static int at_start(struct wwan_port *port)
-{
-	struct titan_md *md = wwan_port_get_drvdata(port);
-
-	WRITE_ONCE(md->at_open, true);
-	return 0;
-}
-
-static void at_stop(struct wwan_port *port)
-{
-	struct titan_md *md = wwan_port_get_drvdata(port);
-
-	WRITE_ONCE(md->at_open, false);
-}
-
-/* AT text to the modem, as CCCI packets on UART2_TX */
-static int at_tx(struct wwan_port *port, struct sk_buff *skb)
-{
-	struct titan_md *md = wwan_port_get_drvdata(port);
-	struct ccci_header *h;
-	u32 off, n;
-	int ret = 0;
-
-	h = kmalloc(sizeof(*h) + AT_TX_MAX, GFP_KERNEL);
-	if (!h)
-		return -ENOMEM;
-	for (off = 0; off < skb->len && !ret; off += n) {
-		n = min_t(u32, skb->len - off, AT_TX_MAX);
-		memset(h, 0, sizeof(*h));
-		h->data[1] = sizeof(*h) + n;
-		h->channel = CCCI_UART2_TX;
-		memcpy(h + 1, skb->data + off, n);
-		ret = md_send(md, h, sizeof(*h) + n);
-	}
-	kfree(h);
-	if (!ret)
-		consume_skb(skb);
-	return ret;
-}
-
-static const struct wwan_port_ops at_ops = {
-	.start = at_start,
-	.stop = at_stop,
-	.tx = at_tx,
-};
-
-static void at_work(struct work_struct *w)
-{
-	struct titan_md *md = container_of(w, struct titan_md, at_work);
-	struct wwan_port *port;
-
-	if (md->at_port)
-		return;
-	port = wwan_create_port(md->dev, WWAN_PORT_AT, &at_ops, NULL, md);
-	if (IS_ERR(port)) {
-		dev_err(md->dev, "AT port: %pe\n", port);
-		return;
-	}
-	md->at_port = port;
 }
 
 static int md_open(struct inode *inode, struct file *f)
@@ -1275,9 +1708,9 @@ static long md_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		return -ENOTTY;
 	if (!md->ready)
 		return -EAGAIN;
+	/* not waited for: the daemon has files to serve meanwhile */
 	schedule_work(&md->at_work);
-	flush_work(&md->at_work);
-	return md->at_port ? 0 : -EIO;
+	return 0;
 }
 
 static __poll_t md_poll(struct file *f, poll_table *wait)
@@ -1380,7 +1813,7 @@ static void watch_work(struct work_struct *w)
 	struct titan_md *md = container_of(w, struct titan_md, watch.work);
 	u32 trace[6], s0, s1;
 
-	if (md->rchnum & ~0xffffUL) {
+	if (md->rchnum & CCIF_EX_MASK) {
 		sram_read(md->sram_copy, md->ap_ccif + APCCIF_CHDATA,
 			  CCIF_SRAM_SIZE);
 		dev_err(md->dev, "modem exception: CCIF %#lx\n", md->rchnum);
@@ -1388,6 +1821,10 @@ static void watch_work(struct work_struct *w)
 		set_mask_bits(&md->rchnum, ~0xffffUL, 0);
 		return;
 	}
+	/* not exceptions: acknowledged, as the vendor does */
+	if (test_and_clear_bit(CCIF_SEQ_ERROR, &md->rchnum))
+		dev_err_ratelimited(md->dev, "the modem saw a sequence error\n");
+	set_mask_bits(&md->rchnum, ~0xffffUL, 0);
 	if (test_and_clear_bit(CCIF_SRAM, &md->rchnum) && !md->hs1_done) {
 		md->hs1_done = !send_runtime_data(md);
 		return;
@@ -1402,6 +1839,432 @@ static void watch_work(struct work_struct *w)
 		schedule_delayed_work(&md->watch, HZ / 2);
 	else
 		dev_warn(md->dev, "no HS1 after 20 s\n");
+}
+
+/* ---- CLDMA and the network interfaces ---- */
+
+static void cldma_hw_reset(struct titan_md *md)
+{
+	regmap_write(md->infra, CLDMA_INFRA_RST0_AO, CLDMA_RST_AO);
+	regmap_write(md->infra, CLDMA_INFRA_RST1_AO, CLDMA_RST_AO);
+	regmap_write(md->infra, CLDMA_INFRA_RST0_PD, CLDMA_RST_PD);
+	regmap_write(md->infra, CLDMA_INFRA_RST1_PD, CLDMA_RST_PD);
+}
+
+/* this modem generation's mask registers need the opposite one cleared first */
+static void cldma_rx_mask(struct cldma *cl, u32 reg, u32 other, u32 val)
+{
+	writel(readl(cl->ao + other) & ~val, cl->ao + other);
+	writel(val, cl->ao + reg);
+}
+
+static void ccmni_wake_all(struct cldma *cl)
+{
+	int i;
+
+	for (i = 0; i < CCMNI_COUNT; i++)
+		if (cl->net[i] && netif_queue_stopped(cl->net[i]))
+			netif_wake_queue(cl->net[i]);
+}
+
+static void cldma_tx_clean(struct titan_md *md)
+{
+	struct cldma *cl = &md->cl;
+	unsigned long flags;
+
+	spin_lock_irqsave(&cl->tx_lock, flags);
+	while (cl->tx_tail != cl->tx_head) {
+		u32 i = cl->tx_tail % CLDMA_TX_GPDS;
+		struct sk_buff *skb = cl->tx_skb[i];
+
+		if (READ_ONCE(cl->tgpd[i].flags) & CLDMA_GPD_HWO)
+			break;
+		dma_rmb();
+		dma_unmap_single(md->dev, cl->tx_dma[i], skb->len, DMA_TO_DEVICE);
+		dev_sw_netstats_tx_add(skb->dev, 1, skb->len);
+		cl->tx_skb[i] = NULL;
+		cl->tx_tail++;
+		dev_consume_skb_any(skb);
+	}
+	if (cl->tx_head - cl->tx_tail < CLDMA_TX_GPDS - 1)
+		ccmni_wake_all(cl);
+	spin_unlock_irqrestore(&cl->tx_lock, flags);
+}
+
+static int cldma_rx_fill(struct titan_md *md, u32 i)
+{
+	struct cldma *cl = &md->cl;
+	struct sk_buff *skb;
+	dma_addr_t dma;
+
+	skb = napi_alloc_skb(&cl->napi, CLDMA_RX_BUF);
+	if (!skb)
+		return -ENOMEM;
+	dma = dma_map_single(md->dev, skb->data, CLDMA_RX_BUF, DMA_FROM_DEVICE);
+	if (dma_mapping_error(md->dev, dma)) {
+		dev_kfree_skb_any(skb);
+		return -ENOMEM;
+	}
+	cl->rx_skb[i] = skb;
+	cl->rx_dma[i] = dma;
+	return 0;
+}
+
+/* a descriptor back to the hardware, with its buffer as it stands */
+static void cldma_rx_give(struct cldma *cl, u32 i)
+{
+	struct cldma_rgpd *g = &cl->rgpd[i];
+
+	g->data = lower_32_bits(cl->rx_dma[i]);
+	g->allow_len = CLDMA_RX_BUF;
+	g->len = 0;
+	dma_wmb();
+	WRITE_ONCE(g->flags, CLDMA_GPD_IOC | CLDMA_GPD_HWO);
+}
+
+static void cldma_rx_one(struct titan_md *md, struct sk_buff *skb, u32 len)
+{
+	struct cldma *cl = &md->cl;
+	struct lhif_header *h;
+	struct net_device *dev;
+	u8 id;
+
+	skb_put(skb, min_t(u32, len, CLDMA_RX_BUF));
+	if (skb->len <= sizeof(*h))
+		goto drop;
+	h = (struct lhif_header *)skb->data;
+	id = h->netif_type & 0x1f;
+	skb_pull(skb, sizeof(*h));
+	dev = id < CCMNI_COUNT ? cl->net[id] : NULL;
+	if (!dev || !netif_running(dev))
+		goto drop;
+	switch (skb->data[0] >> 4) {
+	case 4:
+		skb->protocol = htons(ETH_P_IP);
+		break;
+	case 6:
+		skb->protocol = htons(ETH_P_IPV6);
+		break;
+	default:
+		goto drop;
+	}
+	skb->dev = dev;
+	skb_reset_mac_header(skb);
+	skb_reset_network_header(skb);
+	dev_sw_netstats_rx_add(dev, skb->len);
+	napi_gro_receive(&cl->napi, skb);
+	return;
+drop:
+	dev_kfree_skb_any(skb);
+}
+
+static int cldma_poll(struct napi_struct *napi, int budget)
+{
+	struct cldma *cl = container_of(napi, struct cldma, napi);
+	struct titan_md *md = container_of(cl, struct titan_md, cl);
+	int done = 0;
+
+	cldma_tx_clean(md);
+	while (done < budget) {
+		u32 i = cl->rx_next % CLDMA_RX_GPDS;
+		struct sk_buff *skb = cl->rx_skb[i];
+		dma_addr_t dma = cl->rx_dma[i];
+
+		if (READ_ONCE(cl->rgpd[i].flags) & CLDMA_GPD_HWO)
+			break;
+		dma_rmb();
+		/* out of memory: the packet is lost, the buffer stays */
+		if (cldma_rx_fill(md, i)) {
+			dma_sync_single_for_device(md->dev, dma, CLDMA_RX_BUF,
+						   DMA_FROM_DEVICE);
+		} else {
+			dma_unmap_single(md->dev, dma, CLDMA_RX_BUF,
+					 DMA_FROM_DEVICE);
+			cldma_rx_one(md, skb, READ_ONCE(cl->rgpd[i].len));
+		}
+		cldma_rx_give(cl, i);
+		cl->rx_next++;
+		done++;
+	}
+	wmb();
+	/* the hardware stops at a descriptor it does not own */
+	if (done && !(readl(cl->ao + CLDMA_SO_STATUS) & 1))
+		writel(1, cl->pdn + CLDMA_SO_RESUME_CMD);
+	if (done < budget && napi_complete_done(napi, done)) {
+		writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMCR0);
+		cldma_rx_mask(cl, CLDMA_L2RIMCR0, CLDMA_L2RIMSR0, CLDMA_RX_ALL);
+	}
+	return done;
+}
+
+static irqreturn_t cldma_isr(int irq, void *data)
+{
+	struct titan_md *md = data;
+	struct cldma *cl = &md->cl;
+	u32 tx = readl(cl->pdn + CLDMA_L2TISAR0);
+	u32 rx = readl(cl->pdn + CLDMA_L2RISAR0);
+
+	if (!tx && !rx)
+		return IRQ_NONE;
+	writel(tx, cl->pdn + CLDMA_L2TISAR0);
+	writel(rx, cl->pdn + CLDMA_L2RISAR0);
+	writel(readl(cl->pdn + CLDMA_IP_BUSY), cl->pdn + CLDMA_IP_BUSY);
+	if ((tx & CLDMA_TX_ERROR) || (rx & CLDMA_RX_ERROR))
+		dev_err_ratelimited(md->dev, "CLDMA error: %08x %08x\n", tx, rx);
+	writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMSR0);
+	cldma_rx_mask(cl, CLDMA_L2RIMSR0, CLDMA_L2RIMCR0, CLDMA_RX_ALL);
+	napi_schedule(&cl->napi);
+	return IRQ_HANDLED;
+}
+
+static netdev_tx_t ccmni_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct ccmni *n = netdev_priv(dev);
+	struct titan_md *md = n->md;
+	struct cldma *cl = &md->cl;
+	unsigned long flags;
+	dma_addr_t dma;
+	u32 i;
+
+	if (skb_linearize(skb) || skb->len > CLDMA_RX_BUF)
+		goto drop;
+	dma = dma_map_single(md->dev, skb->data, skb->len, DMA_TO_DEVICE);
+	if (dma_mapping_error(md->dev, dma))
+		goto drop;
+	spin_lock_irqsave(&cl->tx_lock, flags);
+	if (cl->tx_head - cl->tx_tail >= CLDMA_TX_GPDS) {
+		netif_stop_queue(dev);
+		spin_unlock_irqrestore(&cl->tx_lock, flags);
+		dma_unmap_single(md->dev, dma, skb->len, DMA_TO_DEVICE);
+		return NETDEV_TX_BUSY;
+	}
+	i = cl->tx_head++ % CLDMA_TX_GPDS;
+	cl->tx_skb[i] = skb;
+	cl->tx_dma[i] = dma;
+	cl->tgpd[i].data = lower_32_bits(dma);
+	cl->tgpd[i].len = skb->len;
+	cl->tgpd[i].netif = n->id;
+	cl->tgpd[i].debug = 1;
+	dma_wmb();
+	WRITE_ONCE(cl->tgpd[i].flags, CLDMA_GPD_IOC | CLDMA_GPD_HWO);
+	wmb();
+	if (cl->tx_started) {
+		writel(1, cl->pdn + CLDMA_UL_RESUME_CMD);
+	} else {
+		writel(CLDMA_ALL_QUEUES, cl->pdn + CLDMA_UL_START_CMD);
+		cl->tx_started = true;
+	}
+	readl(cl->pdn + CLDMA_UL_RESUME_CMD);
+	if (cl->tx_head - cl->tx_tail >= CLDMA_TX_GPDS)
+		netif_stop_queue(dev);
+	spin_unlock_irqrestore(&cl->tx_lock, flags);
+	return NETDEV_TX_OK;
+drop:
+	dev_core_stats_tx_dropped_inc(dev);
+	dev_kfree_skb_any(skb);
+	return NETDEV_TX_OK;
+}
+
+static const struct net_device_ops ccmni_ops = {
+	.ndo_start_xmit = ccmni_xmit,
+	.ndo_get_stats64 = dev_get_tstats64,
+};
+
+static void ccmni_setup(struct net_device *dev)
+{
+	dev->netdev_ops = &ccmni_ops;
+	dev->type = ARPHRD_NONE;
+	dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
+	dev->mtu = 1500;
+	dev->min_mtu = 68;
+	dev->max_mtu = CCMNI_MTU;
+	dev->tx_queue_len = 1000;
+	dev->needs_free_netdev = false;
+	dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+}
+
+static void ccmni_remove(struct titan_md *md)
+{
+	int i;
+
+	for (i = 0; i < CCMNI_COUNT; i++) {
+		if (!md->cl.net[i])
+			continue;
+		unregister_netdev(md->cl.net[i]);
+		free_netdev(md->cl.net[i]);
+		md->cl.net[i] = NULL;
+	}
+}
+
+static int ccmni_add(struct titan_md *md)
+{
+	int i, ret;
+
+	for (i = 0; i < CCMNI_COUNT; i++) {
+		struct net_device *dev;
+		struct ccmni *n;
+
+		dev = alloc_netdev(sizeof(*n), "ccmni%d", NET_NAME_ENUM, ccmni_setup);
+		if (!dev) {
+			ret = -ENOMEM;
+			goto err;
+		}
+		SET_NETDEV_DEV(dev, md->dev);
+		n = netdev_priv(dev);
+		n->md = md;
+		n->id = i;
+		ret = register_netdev(dev);
+		if (ret) {
+			free_netdev(dev);
+			goto err;
+		}
+		md->cl.net[i] = dev;
+	}
+	return 0;
+err:
+	ccmni_remove(md);
+	return ret;
+}
+
+static int cldma_show(struct seq_file *m, void *unused)
+{
+	struct titan_md *md = dev_get_drvdata(m->private);
+	struct cldma *cl = &md->cl;
+
+	seq_printf(m, "SO_CFG %08x SO_STATUS %08x, rx %u, tx %u, tx in flight %u\n",
+		   readl(cl->ao + CLDMA_SO_CFG), readl(cl->ao + CLDMA_SO_STATUS),
+		   cl->rx_next, cl->tx_head, cl->tx_head - cl->tx_tail);
+	return 0;
+}
+
+/* the rings, once, before the modem runs */
+static int cldma_alloc(struct titan_md *md)
+{
+	struct cldma *cl = &md->cl;
+	struct platform_device *pdev = to_platform_device(md->dev);
+	u32 i, n = CLDMA_TX_GPDS + CLDMA_TXQ - 1;
+	int ret = 0;
+
+	cl->ao = devm_platform_ioremap_resource_byname(pdev, "cldma-ao");
+	if (IS_ERR(cl->ao))
+		return PTR_ERR(cl->ao);
+	cl->pdn = devm_platform_ioremap_resource_byname(pdev, "cldma-pdn");
+	if (IS_ERR(cl->pdn))
+		return PTR_ERR(cl->pdn);
+	cl->irq = platform_get_irq_byname(pdev, "cldma");
+	if (cl->irq < 0)
+		return cl->irq;
+	spin_lock_init(&cl->tx_lock);
+	cl->napi_dev = alloc_netdev_dummy(0);
+	if (!cl->napi_dev)
+		return -ENOMEM;
+	netif_napi_add(cl->napi_dev, &cl->napi, cldma_poll);
+
+	cl->tgpd = dmam_alloc_coherent(md->dev, n * sizeof(*cl->tgpd),
+				       &cl->tgpd_dma, GFP_KERNEL);
+	cl->rgpd = dmam_alloc_coherent(md->dev, CLDMA_RX_GPDS * sizeof(*cl->rgpd),
+				       &cl->rgpd_dma, GFP_KERNEL);
+	if (!cl->tgpd || !cl->rgpd)
+		return -ENOMEM;
+	/* uplink: queue 0's ring, then an empty one each for the others */
+	for (i = 0; i < CLDMA_TX_GPDS; i++) {
+		cl->tgpd[i].flags = CLDMA_GPD_IOC;
+		cl->tgpd[i].next = cl->tgpd_dma +
+				   ((i + 1) % CLDMA_TX_GPDS) * sizeof(*cl->tgpd);
+	}
+	for (; i < n; i++) {
+		cl->tgpd[i].flags = CLDMA_GPD_IOC;
+		cl->tgpd[i].next = cl->tgpd_dma + i * sizeof(*cl->tgpd);
+	}
+	/* downlink: a ring of buffers, the hardware's to fill */
+	local_bh_disable();
+	for (i = 0; i < CLDMA_RX_GPDS; i++) {
+		cl->rgpd[i].next = cl->rgpd_dma +
+				   ((i + 1) % CLDMA_RX_GPDS) * sizeof(*cl->rgpd);
+		ret = cldma_rx_fill(md, i);
+		if (ret)
+			break;
+		cldma_rx_give(cl, i);
+	}
+	local_bh_enable();
+	if (ret)
+		return ret;
+	ret = devm_request_irq(md->dev, cl->irq, cldma_isr, IRQF_NO_AUTOEN,
+			       "titan-modem-cldma", md);
+	if (ret)
+		return ret;
+	debugfs_create_devm_seqfile(md->dev, "cldma", md->debugfs, cldma_show);
+	return ccmni_add(md);
+}
+
+static void cldma_free(struct titan_md *md)
+{
+	struct cldma *cl = &md->cl;
+	u32 i;
+
+	ccmni_remove(md);
+	if (cl->napi_dev) {
+		netif_napi_del(&cl->napi);
+		free_netdev(cl->napi_dev);
+		cl->napi_dev = NULL;
+	}
+	for (i = 0; i < CLDMA_RX_GPDS; i++) {
+		if (!cl->rx_skb[i])
+			continue;
+		dma_unmap_single(md->dev, cl->rx_dma[i], CLDMA_RX_BUF,
+				 DMA_FROM_DEVICE);
+		dev_kfree_skb_any(cl->rx_skb[i]);
+		cl->rx_skb[i] = NULL;
+	}
+	for (i = 0; i < CLDMA_TX_GPDS; i++) {
+		if (!cl->tx_skb[i])
+			continue;
+		dma_unmap_single(md->dev, cl->tx_dma[i], cl->tx_skb[i]->len,
+				 DMA_TO_DEVICE);
+		dev_kfree_skb_any(cl->tx_skb[i]);
+		cl->tx_skb[i] = NULL;
+	}
+}
+
+/* cldma_reset and cldma_start */
+static void cldma_start(struct titan_md *md)
+{
+	struct cldma *cl = &md->cl;
+	int i;
+
+	writel(CLDMA_RX_BUF, cl->ao + CLDMA_DL_MTU);
+	writel(readl(cl->ao + CLDMA_SO_CFG) | 1, cl->ao + CLDMA_SO_CFG);
+	for (i = 0; i < CLDMA_TXQ; i++) {
+		u32 a = cl->tgpd_dma +
+			(i ? CLDMA_TX_GPDS + i - 1 : 0) * sizeof(*cl->tgpd);
+
+		writel(a, cl->pdn + CLDMA_UL_START(i));
+		writel(a, cl->ao + CLDMA_UL_START_BK(i));
+	}
+	writel(cl->rgpd_dma, cl->ao + CLDMA_SO_START(0));
+	wmb();
+	writel(CLDMA_ALL_QUEUES, cl->pdn + CLDMA_SO_START_CMD);
+	readl(cl->pdn + CLDMA_SO_START_CMD);
+	napi_enable(&cl->napi);
+	enable_irq(cl->irq);
+	writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMCR0);
+	cldma_rx_mask(cl, CLDMA_L2RIMCR0, CLDMA_L2RIMSR0, CLDMA_RX_ALL);
+	writel(~0U, cl->pdn + CLDMA_L3TIMCR0);
+	writel(~0U, cl->pdn + CLDMA_L3TIMCR1);
+	writel(~0U, cl->pdn + CLDMA_L3RIMCR0);
+	writel(~0U, cl->pdn + CLDMA_L3RIMCR1);
+	dev_info(md->dev, "CLDMA started: SO_CFG %08x\n",
+		 readl(cl->ao + CLDMA_SO_CFG));
+}
+
+static void cldma_stop(struct titan_md *md)
+{
+	struct cldma *cl = &md->cl;
+
+	disable_irq(cl->irq);
+	napi_disable(&cl->napi);
+	writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMSR0);
+	cldma_rx_mask(cl, CLDMA_L2RIMSR0, CLDMA_L2RIMCR0, CLDMA_RX_ALL);
 }
 
 /* ---- MD1 power and boot (md_sys1_platform.c, clk-mt6771-pg.c) ---- */
@@ -1637,7 +2500,7 @@ static int titan_md_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct titan_md *md;
-	int ret;
+	int i, ret;
 
 	md = devm_kzalloc(dev, sizeof(*md), GFP_KERNEL);
 	if (!md)
@@ -1647,6 +2510,9 @@ static int titan_md_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&md->watch, watch_work);
 	INIT_WORK(&md->rx_work, rx_work);
 	INIT_WORK(&md->at_work, at_work);
+	init_completion(&md->mux_done);
+	for (i = 0; i < AT_CHANS; i++)
+		md->at[i].dlci = mux ? at_dlci[i] : 0;
 	spin_lock_init(&md->tx_lock);
 	skb_queue_head_init(&md->rxq);
 	init_waitqueue_head(&md->rx_wait);
@@ -1697,17 +2563,29 @@ static int titan_md_probe(struct platform_device *pdev)
 		debugfs_create_blob("dsp", 0400, md->debugfs, &md->dsp_blob);
 	}
 
+	if (cldma) {
+		ret = cldma_alloc(md);
+		if (ret)
+			goto err_cldma;
+		cldma_hw_reset(md);
+	}
 	ret = md_power_on(md);
 	if (ret)
 		goto err_misc;
 	ret = md_let_go(md);
 	dev_info(dev, "modem released (%d)\n", ret);
+	if (cldma)
+		cldma_start(md);
 	tmd = md;			/* the misc device's single instance */
 	schedule_delayed_work(&md->watch, HZ / 2);
 	return 0;
 
 err_misc:
-	md_power_off(md);
+	if (md->powered)
+		md_power_off(md);
+err_cldma:
+	if (cldma)
+		cldma_free(md);
 	debugfs_remove_recursive(md->debugfs);
 	misc_deregister(&md->misc);
 err_smem:
@@ -1720,17 +2598,23 @@ err_smem:
 static void titan_md_remove(struct platform_device *pdev)
 {
 	struct titan_md *md = platform_get_drvdata(pdev);
+	int i;
 
 	/* stop new events, flush pending work, then bring the modem down */
+	if (cldma)
+		cldma_stop(md);
 	disable_irq(md->irq);
 	disable_irq(md->irq_ex);
 	cancel_delayed_work_sync(&md->watch);
 	cancel_work_sync(&md->rx_work);
 	cancel_work_sync(&md->at_work);
-	if (md->at_port)
-		wwan_remove_port(md->at_port);
+	for (i = 0; i < AT_CHANS; i++)
+		if (md->at[i].port)
+			wwan_remove_port(md->at[i].port);
 	if (md->powered)
 		md_power_off(md);
+	if (cldma)
+		cldma_free(md);
 	tmd = NULL;
 	misc_deregister(&md->misc);
 	debugfs_remove_recursive(md->debugfs);

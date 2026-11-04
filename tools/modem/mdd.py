@@ -22,7 +22,16 @@ CCCI_RPC_RX, CCCI_RPC_TX = 32, 33
 RPC_API_RESP_ID = 0xFFFF0000
 IPC_RPC_GET_EINT_ATTR_OP = 0x4005
 ERR_SIM_HOT_PLUG_QUERY_STRING = -15     # no hot-plug node in the board's DT
+# The SIM hot-plug interrupts, by query type (port_rpc.h: number, debounce in
+# ms, polarity, sensitivity, socket type, dedicated, source pin), as Android's
+# kernel answers them on this phone (measured: ccci_dump's md_eint lines). The
+# modem asks SIM 2 only for types 6, 0 and 5; the others are taken from SIM 1.
+SIM_EINT = {
+    "MD1_SIM1_HOT_PLUG_EINT": (0, 100, 0, 0, 0, 0, 1),
+    "MD1_SIM2_HOT_PLUG_EINT": (1, 100, 0, 0, 0, 0, 2),
+}
 IPC_RPC_DTSI_QUERY_OP = 0x400e
+IPC_RPC_CCCI_LHIF_MAPPING = 0x400d       # a net interface's uplink queue
 # LK's /md_attr_node gives 0x0f0f0f0f for both properties the modem asks
 # (md_product_name_model_id, md_drdi_rf_set_idx): the vendor's "unset" fill
 MD_ATTR_VALUE = b"\x0f" * 68           # ccci_rpc_md_dtsi_output
@@ -77,9 +86,22 @@ def handle_rpc(fd, pkt):
     if op == IPC_RPC_GET_EINT_ATTR_OP:
         name = params[0].rstrip(b"\0").decode(errors="replace")
         err = struct.pack("<i", ERR_SIM_HOT_PLUG_QUERY_STRING)
-        print("rpc %#x eint %s type %s: none" % (op, name,
-              params[2].hex() if len(params) > 2 else "?"))
+        qtype = struct.unpack("<I", params[2][:4])[0] if len(params) > 2 else 99
+        attrs = SIM_EINT.get(name)
+        if attrs and qtype < len(attrs):
+            print("rpc %#x eint %s type %d: %d" % (op, name, qtype, attrs[qtype]))
+            for r in rpc_reply(pkt[:16], op, [i32(0), i32(attrs[qtype])]):
+                os.write(fd, r)
+            return
+        print("rpc %#x eint %s type %d: none" % (op, name, qtype))
         for r in rpc_reply(pkt[:16], op, [err, err]):
+            os.write(fd, r)
+        return
+    if op == IPC_RPC_CCCI_LHIF_MAPPING:
+        # (net interface, queue): the vendor moves IMS to its own queue; here every
+        # interface shares uplink queue 0
+        print("rpc %#x uplink queue: %s" % (op, params[0].hex() if params else "?"))
+        for r in rpc_reply(pkt[:16], op, [i32(0), i32(0)]):
             os.write(fd, r)
         return
     if op == IPC_RPC_DTSI_QUERY_OP:     # (req, index, name[64]) -> output
@@ -255,6 +277,8 @@ def cmpt_read(path, block):
         return reply(FS_GENERAL_FAILURE)
     h = fs_open(path, flags)
     if h < 0:
+        # the name only: a failed read here is invisible in the quiet log
+        print("fs cmpt read failed: %s: %d" % (os.path.relpath(path, ROOT), h))
         return reply(h)
     f = handles.pop(h)
     done |= CMPT_OPEN
@@ -520,7 +544,7 @@ def main():
     at_cmds = [c for c in os.environ.get("AT_CMDS", "").split(";") if c]
     at_next = None
     # AT_PORT=1: once the modem's AT layer is up (+EIND: 128), send the
-    # AT_INIT commands ("AT+CFUN=4"), each answered, then hand the AT
+    # AT_INIT commands (the unit sends none), each answered, then hand the AT
     # channel to the driver's WWAN port for ModemManager (after 10 s at
     # the latest)
     at_port = os.environ.get("AT_PORT") == "1"

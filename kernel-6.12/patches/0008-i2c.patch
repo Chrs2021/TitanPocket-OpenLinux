@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 08/15] i2c: mt65xx: restore a multi-channel controller's mode through ATF
+Subject: [PATCH 08/16] i2c: mt65xx: restore a multi-channel controller's mode through ATF
 
 The MT6771's i2c at 0x11008000 is shared between channels; the AP's
 channel needs the controller's multi-channel DMA mode, a secure register

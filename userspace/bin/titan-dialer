@@ -1,0 +1,631 @@
+#!/usr/bin/python3
+"""
+titan-dialer: the phone (GTK 4, titan_ui4): a keypad, voice calls and
+USSD codes, through ModemManager (titan_mm; docs/modem.md, "Phone apps").
+
+  - A number calls it (ModemManager's Voice interface: CreateCall, Start);
+    a code that starts with * or # and ends with # is USSD (balance,
+    top-up, operator menus): the network's answer is shown, and when it
+    asks for a reply (a menu) the reply goes back in the same session.
+    *#06# shows the phone's IMEI, on the screen only.
+  - Calls: hang up, answer or decline an incoming one, mute, the
+    loudspeaker, DTMF tones from the keypad. The sound is
+    titan-call-audio's, for as long as the call is active.
+  - Incoming calls ring here (a quiet tone and the vibration motor);
+    titan-call-watch starts the app when one comes in.
+
+The modem has to be up (titan-modem.service) with its radio on: the header
+says what is missing, and Phone settings (titan-phone-settings) turns it
+on, unlocks the SIM and chooses the network.
+"""
+import math
+import os
+import re
+import struct
+import subprocess
+import sys
+import time
+import wave
+
+import titan_mm as mm
+import titan_ui4 as ui
+from gi.repository import Gdk, GLib, Gtk
+
+try:
+    import titan_vibrator
+except ImportError:                     # the app runs without it
+    titan_vibrator = None
+
+SETTINGS = "/usr/local/bin/titan-phone-settings"
+CALL_AUDIO = "/usr/local/bin/titan-call-audio"
+RING = "/run/user/0/titan-ring.wav"
+RING_EVERY_MS = 2500
+KEYS = ("1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#")
+LETTERS = {"2": "ABC", "3": "DEF", "4": "GHI", "5": "JKL", "6": "MNO", "7": "PQRS",
+           "8": "TUV", "9": "WXYZ", "0": "+"}
+USSD_RE = re.compile(r"[*#][0-9*#]*#")
+PHONE_ICON = ("M6.5 3.5h3l1.5 4.5-2 1.5a11 11 0 0 0 5.5 5.5l1.5-2 4.5 1.5v3a2 2 0 0 1-2 2"
+              "A16 16 0 0 1 4.5 5.5a2 2 0 0 1 2-2z")
+BACKSPACE_ICON = "M9 6h11v12H9l-6-6zM12 9.5l5 5M17 9.5l-5 5"
+KEYPAD_ICON = ("M6 5h.01M12 5h.01M18 5h.01M6 10h.01M12 10h.01M18 10h.01M6 15h.01M12 15h.01"
+               "M18 15h.01M12 20h.01")
+
+CSS = """
+.number { font-size: 44px; font-weight: bold; color: white; }
+.number-hint { font-size: 18px; color: rgba(255, 255, 255, 0.72); }
+.call-number { font-size: 40px; font-weight: bold; color: white; }
+.call-state { font-size: 22px; color: #9FE3FF; }
+.call-time { font-size: 30px; color: white; font-family: "IBM Plex Mono", monospace; }
+.ussd-code { font-size: 18px; color: rgba(255, 255, 255, 0.72); }
+.ussd-text { font-size: 22px; color: white; }
+.err { color: #FF6B7A; }
+entry { min-height: 52px; font-size: 22px; }
+"""
+
+
+def ring_file():
+    """a quiet two-tone ring (-30 dBFS, 0.4 s on, 0.2 s off, twice), made once"""
+    if os.path.exists(RING):
+        return RING
+    rate, amp = 16000, 1036
+    frames = bytearray()
+    for burst in range(2):
+        for i in range(int(0.4 * rate)):
+            t = i / rate
+            v = amp * (math.sin(2 * math.pi * 440 * t) + math.sin(2 * math.pi * 480 * t)) / 2
+            frames += struct.pack("<h", int(v))
+        frames += b"\0\0" * int(0.2 * rate)
+    try:
+        os.makedirs(os.path.dirname(RING), exist_ok=True)
+        with wave.open(RING, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(bytes(frames))
+    except OSError:
+        return None
+    return RING
+
+
+def jack(name):
+    """a jack's switch (the MT6358 ACCDET driver's controls)"""
+    r = subprocess.run(["amixer", "-c", "titanpocket", "cget", "iface=CARD,name=" + name],
+                       capture_output=True, text=True)
+    return ": values=on" in r.stdout
+
+
+def wired_device():
+    """where a call's sound goes without the loudspeaker"""
+    if jack("Headset Mic Jack"):
+        return "headset"
+    return "headphones" if jack("Headphones Jack") else "earpiece"
+
+
+class Keypad(Gtk.Grid):
+    """twelve glass keys; pressed(key) for each, and 0 held for +"""
+
+    def __init__(self, pressed, height=86):
+        super().__init__(row_spacing=8, column_spacing=8, column_homogeneous=True)
+        self.held = False
+        for i, k in enumerate(KEYS):
+            b = ui.GlassButton(k, height=height, size=28)
+            b.set_hexpand(True)
+            b.connect("clicked", self.on_click, k, pressed)
+            if k == "0":
+                hold = Gtk.GestureLongPress()
+                hold.connect("pressed", lambda g, x, y: self.on_hold(pressed))
+                b.add_controller(hold)
+            self.attach(b, i % 3, i // 3, 1, 1)
+
+    def on_click(self, button, key, pressed):
+        if self.held:                       # the release after a long press on 0
+            self.held = False
+            return
+        pressed(key)
+
+    def on_hold(self, pressed):
+        self.held = True
+        pressed("+")
+
+
+class Dialer(ui.AppWindow):
+    def __init__(self, app):
+        self.settings_btn = ui.RoundButton("more", tooltip="Phone settings")
+        super().__init__(app, "Phone", "…", on_back=self.on_back,
+                         actions=(self.settings_btn,))
+        ui.add_css(self.get_display(), CSS)
+        self.settings_btn.connect("clicked", lambda b: open_settings())
+        self.connect("close-request", self.on_quit)
+
+        self.mm = mm.Client()
+        self.number = ""
+        self.call_path = None           # the call on screen
+        self.call_started = None        # monotonic time it went active
+        self.audio = None               # titan-call-audio run
+        self.device = "earpiece"
+        self.muted = False
+        self.ring_id = 0
+        self.tick_id = 0
+        self.ussd_code = ""
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_vexpand(True)
+        self.body.append(self.stack)
+        self.stack.add_named(self.build_dial(), "dial")
+        self.stack.add_named(self.build_call(), "call")
+        self.stack.add_named(self.build_ussd(), "ussd")
+        self.body.set_margin_bottom(12)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_typed)
+        self.add_controller(keys)
+
+        self.mm.connect("changed", lambda c: self.refresh())
+        self.mm.connect("call-added", lambda c, p: self.on_call_added(p))
+        self.mm.connect("call-state", lambda c, p, o, n: self.on_call_state(p, n))
+        self.mm.connect("call-removed", lambda c, p: self.on_call_removed(p))
+        self.refresh()
+
+    # ---- pages ----
+
+    def build_dial(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        top = ui.water.panel((10, 18, 10, 18), spacing=2)
+        self.num_label = ui.label("", "number", xalign=0.5)
+        self.num_label.set_ellipsize(1)             # Pango.EllipsizeMode.START
+        top.inner.append(self.num_label)
+        self.hint = ui.label("", "number-hint", xalign=0.5, wrap=True)
+        top.inner.append(self.hint)
+        page.append(top)
+        page.append(Keypad(self.press))
+        row = Gtk.Box(spacing=10)
+        self.fix = ui.GlassButton("Turn radio on", height=58, size=18)
+        self.fix.connect("clicked", lambda b: self.fix_action())
+        self.fix.set_visible(False)
+        row.append(self.fix)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        row.append(spacer)
+        back = ui.RoundButton(BACKSPACE_ICON, size=58, tooltip="Delete")
+        back.connect("clicked", lambda b: self.delete())
+        row.append(back)
+        self.call_btn = ui.GlassButton("Call", icon=PHONE_ICON, kind="suggested", height=58,
+                                       size=22)
+        self.call_btn.connect("clicked", lambda b: self.go())
+        row.append(self.call_btn)
+        page.append(row)
+        return page
+
+    def build_call(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        card = ui.water.panel((16, 18, 14, 18), spacing=4)
+        self.call_number = ui.label("", "call-number", xalign=0.5, ellipsize=True)
+        card.inner.append(self.call_number)
+        self.call_state = ui.label("", "call-state", xalign=0.5, wrap=True)
+        card.inner.append(self.call_state)
+        self.call_time = ui.label("", "call-time", xalign=0.5)
+        card.inner.append(self.call_time)
+        page.append(card)
+
+        self.dtmf = Keypad(self.send_dtmf, height=50)
+        self.dtmf.set_visible(False)
+        page.append(self.dtmf)
+        spacer = Gtk.Box()
+        spacer.set_vexpand(True)
+        page.append(spacer)
+
+        self.toggles = Gtk.Box(spacing=8, homogeneous=True)
+        self.mute_btn = ui.GlassButton("Mute", icon=ui.ICONS["mic"], toggle=True, height=56)
+        self.mute_btn.connect("toggled", lambda b, on: self.set_mute(on))
+        self.speaker_btn = ui.GlassButton("Speaker", icon=ui.ICONS["sound"], toggle=True,
+                                          height=56)
+        self.speaker_btn.connect("toggled", lambda b, on: self.set_speaker(on))
+        self.keypad_btn = ui.GlassButton("Keypad", icon=KEYPAD_ICON, toggle=True, height=56)
+        self.keypad_btn.connect("toggled", lambda b, on: self.dtmf.set_visible(on))
+        for b in (self.mute_btn, self.speaker_btn, self.keypad_btn):
+            self.toggles.append(b)
+        page.append(self.toggles)
+
+        row = Gtk.Box(spacing=10, homogeneous=True)
+        self.answer_btn = ui.GlassButton("Answer", icon=PHONE_ICON, kind="suggested", height=64,
+                                         size=22)
+        self.answer_btn.connect("clicked", lambda b: self.answer())
+        self.hangup_btn = ui.GlassButton("Hang up", icon=PHONE_ICON, kind="destructive",
+                                         height=64, size=22)
+        self.hangup_btn.connect("clicked", lambda b: self.hang_up())
+        row.append(self.answer_btn)
+        row.append(self.hangup_btn)
+        page.append(row)
+        return page
+
+    def build_ussd(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        card = ui.water.panel((12, 18, 12, 18), spacing=6)
+        card.set_vexpand(True)
+        self.ussd_code_label = ui.label("", "ussd-code", wrap=True)
+        card.inner.append(self.ussd_code_label)
+        self.ussd_text = ui.label("", "ussd-text", wrap=True)
+        self.ussd_text.set_valign(Gtk.Align.START)
+        card.inner.set_vexpand(True)
+        card.inner.append(ui.scroll(self.ussd_text))
+        page.append(card)
+        self.reply_row = Gtk.Box(spacing=10)
+        self.reply = Gtk.Entry()
+        self.reply.set_hexpand(True)
+        self.reply.set_input_purpose(Gtk.InputPurpose.PHONE)
+        self.reply.set_placeholder_text("reply")
+        self.reply.connect("activate", lambda e: self.ussd_respond())
+        self.reply_row.append(self.reply)
+        send = ui.GlassButton("Send", kind="suggested", height=56)
+        send.connect("clicked", lambda b: self.ussd_respond())
+        self.reply_row.append(send)
+        page.append(self.reply_row)
+        close = ui.GlassButton("Close", height=56)
+        close.set_halign(Gtk.Align.CENTER)
+        close.connect("clicked", lambda b: self.ussd_close())
+        page.append(close)
+        return page
+
+    # ---- the modem's state ----
+
+    def ready(self):
+        st = self.mm.state()
+        return st is not None and st >= mm.STATE_ENABLED
+
+    def refresh(self):
+        self.header.set_subtitle(self.mm.status_line())
+        if self.stack.get_visible_child_name() == "dial":
+            self.show_number()
+        if self.mm.prop(mm.I_USSD, "State", mm.USSD_IDLE) == mm.USSD_USER_RESPONSE:
+            req = self.mm.prop(mm.I_USSD, "NetworkRequest", "")
+            if req and self.stack.get_visible_child_name() == "ussd":
+                self.ussd_text.set_text(req)
+                self.reply_row.set_visible(True)
+
+    def fix_needed(self):
+        """what stops a call, as (hint, button label) or None"""
+        if not self.mm.present():
+            return ("The modem is off", "Phone settings")
+        st = self.mm.state()
+        if st == mm.STATE_LOCKED:
+            return ("The SIM is locked", "Unlock SIM")
+        if st == mm.STATE_FAILED:
+            return (self.mm.status_line(), "Phone settings")
+        if st is not None and st < mm.STATE_ENABLED:
+            return ("Flight mode: the radio is off", "Turn radio on")
+        return None
+
+    def fix_action(self):
+        need = self.fix_needed()
+        if need and need[1] == "Turn radio on":
+            self.hint.set_text("turning the radio on…")
+            self.mm.call(mm.I_MODEM, "Enable", "(b)", (True,),
+                         lambda r, e: self.hint.set_text(e or "radio on"), timeout=120000)
+        else:
+            open_settings()
+
+    # ---- dialing ----
+
+    def show_number(self):
+        self.num_label.set_text(self.number or " ")
+        need = self.fix_needed()
+        self.fix.set_visible(bool(need))
+        if need:
+            self.fix.set_label(need[1])
+            self.hint.set_text(need[0])
+        elif USSD_RE.fullmatch(self.number):
+            self.hint.set_text("USSD code: the answer comes from the network")
+        else:
+            self.hint.set_text("")
+        self.call_btn.set_label("Send" if USSD_RE.fullmatch(self.number) else "Call")
+
+    def press(self, key):
+        if self.stack.get_visible_child_name() != "dial":
+            return
+        self.number = (self.number + key)[:40]
+        self.show_number()
+
+    def delete(self):
+        self.number = self.number[:-1]
+        self.show_number()
+
+    def on_typed(self, ctl, keyval, code, state):
+        if state & (Gdk.ModifierType.CONTROL_MASK):
+            return False
+        name = Gdk.keyval_name(keyval) or ""
+        ch = chr(Gdk.keyval_to_unicode(keyval) or 0)
+        page = self.stack.get_visible_child_name()
+        if page == "call" and ch in KEYS:
+            self.send_dtmf(ch)
+            return True
+        if page != "dial":
+            return False
+        if ch in KEYS or ch == "+":
+            self.press(ch)
+        elif name == "BackSpace":
+            self.delete()
+        elif name in ("Return", "KP_Enter"):
+            self.go()
+        else:
+            return False
+        return True
+
+    def go(self):
+        n = self.number.strip()
+        if not n:
+            return
+        if n == "*#06#":
+            imei = (self.mm.prop(mm.I_3GPP, "Imei", "")
+                    or self.mm.prop(mm.I_MODEM, "EquipmentIdentifier", ""))
+            self.show_ussd(n, "IMEI\n" + (imei or "not available (the modem is off)"))
+            return
+        need = self.fix_needed()
+        if need:
+            self.hint.set_text(need[0])
+            return
+        if USSD_RE.fullmatch(n):
+            self.ussd_start(n)
+        else:
+            self.dial(n)
+
+    def dial(self, n):
+        if not self.mm.has(mm.I_VOICE):
+            self.hint.set_text("this modem offers no voice calls to ModemManager")
+            return
+        self.call_path = None
+        self.show_call_page(n, "calling…", incoming=False)
+
+        def started(path, err):
+            if err:
+                self.call_state.set_text("call failed: " + err)
+                self.call_state.add_css_class("err")
+                GLib.timeout_add(3000, self.back_to_dial)
+                if path:
+                    self.delete_call(path)
+                return
+            self.call_path = path
+            self.update_call()
+        self.mm.dial(n, started)
+
+    # ---- calls ----
+
+    def show_call_page(self, number, state, incoming):
+        self.call_number.set_text(number or "unknown number")
+        self.call_state.set_text(state)
+        self.call_state.remove_css_class("err")
+        self.call_time.set_text("")
+        self.answer_btn.set_visible(incoming)
+        self.hangup_btn.set_label("Decline" if incoming else "Hang up")
+        self.toggles.set_visible(not incoming)
+        self.mute_btn.active = self.speaker_btn.active = self.keypad_btn.active = False
+        for b in (self.mute_btn, self.speaker_btn, self.keypad_btn):
+            b.queue_draw()
+        self.dtmf.set_visible(False)
+        self.muted = False
+        self.stack.set_visible_child_name("call")
+        self.present()
+
+    def on_call_added(self, path):
+        direction = self.mm.call_prop(path, "Direction", 0)
+        state = self.mm.call_prop(path, "State", 0)
+        if direction != mm.CALL_INCOMING or state not in (mm.CALL_RINGING_IN, mm.CALL_WAITING):
+            return
+        if self.call_path:
+            # a second call while one is on screen: no call waiting yet
+            return
+        self.call_path = path
+        self.show_call_page(self.mm.call_prop(path, "Number", ""), "incoming call",
+                            incoming=True)
+        self.start_ringing()
+
+    def on_call_state(self, path, new):
+        if path == self.call_path:
+            self.update_call()
+
+    def on_call_removed(self, path):
+        if path == self.call_path:
+            self.end_call("call ended")
+
+    def update_call(self):
+        st = self.mm.call_prop(self.call_path, "State", 0)
+        if st == mm.CALL_TERMINATED:
+            self.end_call("call ended")
+            return
+        if st == mm.CALL_ACTIVE:
+            self.stop_ringing()
+            self.answer_btn.set_visible(False)
+            self.hangup_btn.set_label("Hang up")
+            self.toggles.set_visible(True)
+            if self.call_started is None:
+                self.call_started = time.monotonic()
+                self.tick_id = GLib.timeout_add(500, self.tick)
+                self.start_audio()
+        self.call_state.set_text(mm.CALL_STATES.get(st, ""))
+
+    def tick(self):
+        if self.call_started is None:
+            return False
+        s = int(time.monotonic() - self.call_started)
+        self.call_time.set_text("%d:%02d" % (s // 60, s % 60))
+        return True
+
+    def answer(self):
+        if self.call_path:
+            self.call_state.set_text("answering…")
+            self.mm.call_method(self.call_path, "Accept",
+                                done=lambda r, e: e and self.call_state.set_text(e))
+
+    def hang_up(self):
+        path = self.call_path
+        if not path:
+            self.end_call("call ended")
+            return
+        self.call_state.set_text("hanging up…")
+        self.mm.call_method(path, "Hangup",
+                            done=lambda r, e: self.end_call(e or "call ended"))
+
+    def end_call(self, why):
+        path, self.call_path = self.call_path, None
+        self.stop_ringing()
+        self.stop_audio()
+        if self.tick_id:
+            GLib.source_remove(self.tick_id)
+            self.tick_id = 0
+        self.call_started = None
+        if self.stack.get_visible_child_name() == "call":
+            self.call_state.set_text(why)
+            GLib.timeout_add(1500, self.back_to_dial)
+        if path:
+            self.delete_call(path)
+
+    def delete_call(self, path):
+        self.mm.call(mm.I_VOICE, "DeleteCall", "(o)", (path,))
+
+    def back_to_dial(self):
+        if self.call_path is None and self.stack.get_visible_child_name() == "call":
+            self.stack.set_visible_child_name("dial")
+            self.show_number()
+        return False
+
+    def send_dtmf(self, key):
+        if self.call_path and self.mm.call_prop(self.call_path, "State") == mm.CALL_ACTIVE:
+            self.mm.call_method(self.call_path, "SendDtmf", "(s)", (key,))
+
+    # ---- the call's sound ----
+
+    def start_audio(self):
+        self.stop_audio()
+        if self.device != "speaker":
+            self.device = wired_device()
+        try:
+            self.audio = subprocess.Popen([CALL_AUDIO, "run", self.device],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            self.call_state.set_text("no call audio: %s" % e)
+        if self.muted:
+            self.set_mute(True)
+
+    def stop_audio(self):
+        if self.audio and self.audio.poll() is None:
+            self.audio.terminate()
+            try:
+                self.audio.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.audio.kill()
+        self.audio = None
+
+    def set_mute(self, on):
+        self.muted = on
+        subprocess.Popen([CALL_AUDIO, "mute", "on" if on else "off"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def set_speaker(self, on):
+        self.device = "speaker" if on else "earpiece"
+        if self.call_started is not None:
+            self.start_audio()
+
+    # ---- ringing ----
+
+    def start_ringing(self):
+        self.stop_ringing()
+        self.ring_once()
+        self.ring_id = GLib.timeout_add(RING_EVERY_MS, self.ring_once)
+
+    def ring_once(self):
+        if titan_vibrator:
+            titan_vibrator.pulse(700)
+        path = ring_file()
+        if path:
+            subprocess.Popen(["pw-play", "--volume", "0.5", path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        return True
+
+    def stop_ringing(self):
+        if self.ring_id:
+            GLib.source_remove(self.ring_id)
+            self.ring_id = 0
+
+    # ---- USSD ----
+
+    def show_ussd(self, code, text):
+        self.ussd_code = code
+        self.ussd_code_label.set_text(code)
+        self.ussd_text.set_text(text)
+        self.ussd_text.remove_css_class("err")
+        self.reply_row.set_visible(False)
+        self.stack.set_visible_child_name("ussd")
+
+    def ussd_start(self, code):
+        if not self.mm.has(mm.I_USSD):
+            self.hint.set_text("this modem offers no USSD to ModemManager")
+            return
+        self.show_ussd(code, "waiting for the network…")
+
+        def initiate():
+            self.mm.call(mm.I_USSD, "Initiate", "(s)", (code,), self.ussd_answer, timeout=90000)
+        if self.mm.prop(mm.I_USSD, "State", mm.USSD_IDLE) != mm.USSD_IDLE:
+            self.mm.call(mm.I_USSD, "Cancel", done=lambda r, e: initiate())
+        else:
+            initiate()
+
+    def ussd_answer(self, res, err):
+        if err:
+            self.ussd_text.set_text(err)
+            self.ussd_text.add_css_class("err")
+            self.reply_row.set_visible(False)
+            return
+        self.ussd_text.remove_css_class("err")
+        self.ussd_text.set_text(res[0] or "(no text)")
+        waiting = self.mm.prop(mm.I_USSD, "State", mm.USSD_IDLE) == mm.USSD_USER_RESPONSE
+        self.reply_row.set_visible(waiting)
+        if waiting:
+            self.reply.set_text("")
+            self.reply.grab_focus()
+
+    def ussd_respond(self):
+        text = self.reply.get_text().strip()
+        if not text:
+            return
+        self.ussd_code_label.set_text("%s  →  %s" % (self.ussd_code, text))
+        self.ussd_text.set_text("waiting for the network…")
+        self.reply_row.set_visible(False)
+        self.mm.call(mm.I_USSD, "Respond", "(s)", (text,), self.ussd_answer, timeout=90000)
+
+    def ussd_close(self):
+        if self.mm.prop(mm.I_USSD, "State", mm.USSD_IDLE) != mm.USSD_IDLE:
+            self.mm.call(mm.I_USSD, "Cancel")
+        self.number = ""
+        self.stack.set_visible_child_name("dial")
+        self.show_number()
+
+    # ---- leaving ----
+
+    def on_back(self):
+        page = self.stack.get_visible_child_name()
+        if page == "ussd":
+            self.ussd_close()
+        elif page == "call":
+            if self.call_path is None:
+                self.back_to_dial()
+            # a call stays on screen until it ends
+        else:
+            self.close()
+
+    def on_quit(self, *a):
+        if self.call_path:
+            return True                     # not while a call is up
+        self.stop_ringing()
+        self.stop_audio()
+        return False
+
+
+def open_settings():
+    try:
+        subprocess.Popen([SETTINGS], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    sys.exit(ui.run("org.titanpocket.dialer", Dialer, lock="titan-dialer"))

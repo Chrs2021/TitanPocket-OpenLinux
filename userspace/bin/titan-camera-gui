@@ -53,6 +53,10 @@ GPU, auto exposure, auto white balance).
   a 6 s hardware timeout backs it up), Torch (both at 175 mA while the app
   runs). The driver's default "coupled" scenario only switches anything on
   once both channels have a state, so both get a level and an on/off.
+  Linux 6.12 has no /dev/flashlight: the LEDs are LED class flash devices
+  (leds-mt6370-flash), and a metered photo gets a real strobe pulse, fired
+  when the still stream's first frame arrives. The tones mix there: hold
+  the flash button or press C for Neutral, Warm, Cool.
 - Flash exposure (rear camera): libcamera's software AE starts a still
   capture from the dark-scene settings and moves 10-15 % a frame, so with
   the flash every frame used to be blown out. Instead the app meters with a
@@ -90,9 +94,10 @@ GPU, auto exposure, auto white balance).
   code stays in view).
 
 Keys: Space/Enter take a photo, F switch camera, R rotate, A autofocus,
-T flash mode.
+T flash mode, C flash tone (Linux 6.12).
 """
 import ctypes
+import errno
 import fcntl
 import glob
 import json
@@ -195,14 +200,24 @@ FLASH_SET_DUTY = (2 << 30) | (4 << 16) | (_FL << 8) | 110
 FLASH_SET_ONOFF = (2 << 30) | (4 << 16) | (_FL << 8) | 115
 FLASH_SET_SCENARIO = (3 << 30) | (4 << 16) | (_FL << 8) | 215
 FLASH_SCENARIO_CAMERA = 1           # coupled (both channels together)
-FLASH_PHOTO_LEVEL = 15              # 400 mA per LED (torch maximum)
+# A flash level is 25 mA x (level + 1) per LED on both kernels
+FLASH_PRE_LEVEL = 15                # 400 mA per LED (torch maximum)
 FLASH_TORCH_LEVEL = 6               # 175 mA per LED
 FLASH_PHOTO_TIMEOUT_MS = 6000    # a full-resolution capture takes ~4 s
 FLASH_AUTO_GAIN = 512               # analogue gain code, 128 = 1x
 FLASH_MODES = ["off", "auto", "on", "torch"]
-# MediaTek's flashlight driver (4.14); Linux 6.12 has no flash driver yet,
-# so there the control is hidden and the flash stays off
-FLASH_OK = os.path.exists("/dev/flashlight")
+# MediaTek's flashlight driver on 4.14, the LED flash class on Linux 6.12
+LED_WHITE = "/sys/class/leds/white:flash"
+LED_WARM = "/sys/class/leds/yellow:flash"
+FLASH_LEDS = os.path.exists(LED_WHITE) and os.path.exists(LED_WARM)
+FLASH_OK = FLASH_LEDS or os.path.exists("/dev/flashlight")
+# 4.14: the torch maximum, a still takes too long for a strobe. 6.12: the
+# strobe at 1000 mA per LED, the device tree's limit for the warm one.
+FLASH_PHOTO_LEVEL = 39 if FLASH_LEDS else FLASH_PRE_LEVEL
+FLASH_PULSE_MS = 1184               # the strobe's hardware timeout (device tree)
+# white and warm current as a share of the level's; the metering runs with
+# the same mix, so it sees the light the photo will get
+FLASH_TONES = {"neutral": (1.0, 1.0), "warm": (0.25, 1.0), "cool": (1.0, 0.25)}
 AF_ASSIST_LEVEL = FLASH_TORCH_LEVEL
 # flash metering, in units of the AF statistics' pixel sums (word 3 per
 # block, over STAT_NPIX pixels): raw/8, black ~8, clipping at ~119
@@ -318,9 +333,14 @@ class QrScanner:
 
 class Flash:
     """both rear flash LEDs through /dev/flashlight"""
+    has_strobe = False                  # lit for the whole capture
 
     def __init__(self):
         self.fd = None
+
+    @property
+    def lit(self):
+        return self.fd is not None
 
     def _io(self, req, ct, arg):
         fcntl.ioctl(self.fd, req, struct.pack("=iii", 1, ct, arg))
@@ -353,6 +373,123 @@ class Flash:
             pass
         os.close(self.fd)
         self.fd = None
+
+
+class LedFlash:
+    """both rear flash LEDs through the LED flash class (Linux 6.12).
+    brightness is the torch, in the driver's 12.5 mA steps from 25 mA;
+    flash_brightness (uA) and flash_strobe the strobe, which the PMIC switches
+    off by itself. Only one of the two can run: the driver refuses the other
+    with EBUSY until it is off, and it hears of a torch change a moment later
+    (a workqueue). The torch has no timeout of its own and nothing closes on
+    exit here, so a small shell watches it: it switches the LEDs off when this
+    process dies or the timeout runs out."""
+    has_strobe = True
+
+    def __init__(self, tone="neutral"):
+        self.tone = tone
+        self.mode = None                # None, "torch" or "strobe"
+        self.guard = None
+        self.lock = threading.Lock()    # pulse() runs on the streaming thread
+
+    @property
+    def lit(self):
+        return self.mode is not None
+
+    @staticmethod
+    def _write(led, attr, value):
+        with open(os.path.join(led, attr), "w") as f:
+            f.write(str(value))
+
+    def _currents(self, level):
+        """(LED, mA) for each LED this tone uses"""
+        return [(led, 25.0 * (level + 1) * k)
+                for led, k in zip((LED_WHITE, LED_WARM), FLASH_TONES[self.tone])]
+
+    def _torch(self, level, timeout_ms):
+        wait = "timeout %.3f cat" % (timeout_ms / 1000.0) if timeout_ms else "cat"
+        self.guard = subprocess.Popen(
+            ["sh", "-c", "%s > /dev/null; echo 0 > '%s/brightness'; echo 0 > '%s/brightness'"
+             % (wait, LED_WHITE, LED_WARM)],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.mode = "torch"
+        for led, ma in self._currents(level):
+            # 25 mA is brightness 1; the core stops at the device tree's maximum
+            self._write(led, "brightness", max(1, round((ma - 25) / 12.5) + 1))
+
+    def _strobe(self, level, timeout_ms):
+        currents = self._currents(level)
+        self.mode = "strobe"
+        for led, ma in currents:
+            self._write(led, "flash_timeout", timeout_ms * 1000)
+            self._write(led, "flash_brightness", int(ma * 1000))
+        for i in range(10):
+            try:
+                for led, ma in currents:
+                    self._write(led, "flash_strobe", 1)
+                return
+            except OSError as e:        # the torch's off is still on its way
+                if e.errno != errno.EBUSY or i == 9:
+                    raise
+                time.sleep(0.01)
+
+    def on(self, level, timeout_ms=0):
+        """the torch"""
+        with self.lock:
+            self._off()
+            try:
+                self._torch(min(level, FLASH_PRE_LEVEL), timeout_ms)
+                return True
+            except OSError as e:
+                print("flash: %s" % e, file=sys.stderr, flush=True)
+                self._off()
+                return False
+
+    def pulse(self, level, timeout_ms=FLASH_PULSE_MS):
+        """the flash proper. The strobe starts at 50 mA, so a very close
+        subject's dimmer levels stay on the torch."""
+        with self.lock:
+            self._off()
+            try:
+                if min(ma for _, ma in self._currents(level)) < 50:
+                    self._torch(min(level, FLASH_PRE_LEVEL), timeout_ms)
+                else:
+                    self._strobe(level, timeout_ms)
+                return True
+            except OSError as e:
+                print("flash: %s" % e, file=sys.stderr, flush=True)
+                self._off()
+                return False
+
+    def _off(self):
+        if self.mode == "strobe":
+            for led in (LED_WHITE, LED_WARM):
+                try:
+                    with open(os.path.join(led, "flash_fault")) as f:
+                        fault = f.read().strip()
+                    # a strobe that ran into its timeout is reported as a fault
+                    if fault and fault != "led-timeout":
+                        print("flash: %s %s" % (led, fault), file=sys.stderr, flush=True)
+                    self._write(led, "flash_strobe", 0)
+                except OSError:
+                    pass
+        elif self.mode == "torch":
+            for led in (LED_WHITE, LED_WARM):
+                try:
+                    self._write(led, "brightness", 0)
+                except OSError:
+                    pass
+        if self.guard:
+            self.guard.stdin.close()
+            self.guard.wait()
+            self.guard = None
+        self.mode = None
+
+    def off(self):
+        with self.lock:
+            self._off()
+
+
 V4L2_CID_CAMERA_SENSOR_ROTATION = 0x009a0923   # degrees, counter-clockwise
 FOCUS_MAX = 1023
 
@@ -670,7 +807,11 @@ class CameraApp(ui.AppWindow):
         self.flash_saved = self.flash_mode     # kept for the other kernel
         if not FLASH_OK:
             self.flash_mode = "off"
-        self.flash = Flash()
+        self.flash_tone = st.get("flash_tone", "neutral")
+        if self.flash_tone not in FLASH_TONES:
+            self.flash_tone = "neutral"
+        self.flash = LedFlash(self.flash_tone) if FLASH_LEDS else Flash()
+        self.flash_held = False     # the release after a long press
 
         self.preview = None         # Gst.Pipeline
         self.still = None
@@ -769,7 +910,11 @@ class CameraApp(ui.AppWindow):
         left.append(self.rotate_btn)
         self.flash_btn = ui.GlassButton("Off", icon=FLASH, height=60, size=16)
         self.flash_btn.set_valign(Gtk.Align.CENTER)
-        self.flash_btn.connect("clicked", lambda b: self.cycle_flash())
+        self.flash_btn.connect("clicked", self.on_flash_clicked)
+        if FLASH_LEDS:
+            hold = Gtk.GestureLongPress()
+            hold.connect("pressed", self.on_flash_held)
+            self.flash_btn.add_controller(hold)
         left.append(self.flash_btn)
         bar.set_start_widget(left)
         # the shutter: a big bead of lit water
@@ -837,6 +982,7 @@ class CameraApp(ui.AppWindow):
                if self.rotation[c["id"]] != self.driver_rotation(c)}
         st = {"camera": self.cam, "rotation": rot, "focus": self.focus,
               "flash": self.flash_mode if FLASH_OK else self.flash_saved,
+              "flash_tone": self.flash_tone,
               "last_photo": self.last_photo}
         try:
             os.makedirs(STATE_DIR, exist_ok=True)
@@ -964,8 +1110,10 @@ class CameraApp(ui.AppWindow):
     def show_flash(self):
         rear = CAMERAS[self.cam]["focus"]
         self.flash_btn.set_visible(rear and FLASH_OK)
-        self.flash_btn.set_label({"off": "Off", "auto": "Auto", "on": "On",
-                                  "torch": "Torch"}[self.flash_mode])
+        label = {"off": "Off", "auto": "Auto", "on": "On", "torch": "Torch"}[self.flash_mode]
+        if FLASH_LEDS and self.flash_tone != "neutral" and self.flash_mode != "off":
+            label += " " + self.flash_tone
+        self.flash_btn.set_label(label)
         self.flash_btn.set_kind("suggested" if self.flash_mode != "off" else "")
 
     def cycle_flash(self):
@@ -976,10 +1124,32 @@ class CameraApp(ui.AppWindow):
         self.apply_torch()
         self.show_flash()
 
+    def on_flash_clicked(self, button):
+        if self.flash_held:
+            self.flash_held = False
+            return
+        self.cycle_flash()
+
+    def on_flash_held(self, gesture, x, y):
+        self.flash_held = True
+        self.cycle_tone()
+
+    def cycle_tone(self):
+        """Neutral, Warm, Cool: how the two LEDs mix (Linux 6.12)"""
+        if self.busy or not FLASH_LEDS:
+            return
+        tones = list(FLASH_TONES)
+        self.flash_tone = tones[(tones.index(self.flash_tone) + 1) % len(tones)]
+        self.flash.tone = self.flash_tone
+        self.save_state()
+        if self.flash.lit and self.flash_mode == "torch":
+            self.flash.on(FLASH_TORCH_LEVEL)
+        self.show_flash()
+
     def apply_torch(self):
         """the torch is on while the rear camera runs in torch mode"""
         if self.flash_mode == "torch" and CAMERAS[self.cam]["focus"]:
-            if self.flash.fd is None:
+            if not self.flash.lit:
                 self.flash.on(FLASH_TORCH_LEVEL)
             self.assist = False
         elif not self.busy:
@@ -1238,9 +1408,9 @@ class CameraApp(ui.AppWindow):
         centre = (abs(xx - (nx - 1) / 2) <= nx / 4) & (abs(yy - (ny - 1) / 2) <= ny / 4)
         self.meter = {"ambient": amb[1] / (e * g / 128.0),   # per line x gain
                       "weights": np.where(centre, 3.0, 1.0),
-                      "us": METER_START_US, "level": FLASH_PHOTO_LEVEL,
+                      "us": METER_START_US, "level": FLASH_PRE_LEVEL,
                       "t0": time.monotonic()}
-        self.flash.on(FLASH_PHOTO_LEVEL, FLASH_PHOTO_TIMEOUT_MS)
+        self.flash.on(FLASH_PRE_LEVEL, FLASH_PHOTO_TIMEOUT_MS)
         self.meter_set(METER_START_US)
         GLib.timeout_add(15, self.meter_tick)
         return True
@@ -1310,7 +1480,7 @@ class CameraApp(ui.AppWindow):
 
     def meter_result(self, lv):
         """(flash level, (exposure lines, gain)) for the photo from the
-        pre-flash levels (flash at FLASH_PHOTO_LEVEL, gain 1x)"""
+        pre-flash levels (flash at FLASH_PRE_LEVEL or dimmer, gain 1x)"""
         m = self.meter
         if lv is None:
             return FLASH_PHOTO_LEVEL, None
@@ -1406,15 +1576,25 @@ class CameraApp(ui.AppWindow):
         bus.add_signal_watch()
         bus.connect("message::error", self.on_still_error)
         self.still_timeout = GLib.timeout_add_seconds(10, self.on_still_timeout)
+        self.still_pulse = None
         if flash_level is not None:
-            # lit for the whole capture (a continuous light, not a strobe);
-            # the hardware timeout switches it off if we die
-            self.flash.on(flash_level, FLASH_PHOTO_TIMEOUT_MS)
+            if exposure and HW_ISP and self.flash.has_strobe:
+                # the strobe's timeout is short: on_still_buffer fires it
+                self.flash.off()
+                self.still_pulse = flash_level
+            else:
+                # lit for the whole capture (a continuous light, not a strobe);
+                # the timeout switches it off if we die
+                self.flash.on(flash_level, FLASH_PHOTO_TIMEOUT_MS)
         if self.still.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             self.finish_photo(None, "Camera not available")
 
     def on_still_buffer(self, pad, info):
-        """let through the STILL_BURST frames after the settle frames"""
+        """let through the STILL_BURST frames after the settle frames; the
+        settle frames count from the flash pulse, fired on the first frame"""
+        if self.still_pulse is not None:
+            level, self.still_pulse = self.still_pulse, None
+            self.flash.pulse(level)
         self.still_frames += 1
         if (self.still_frames <= self.still_settle or
                 self.still_frames > self.still_settle + STILL_BURST):
@@ -1712,6 +1892,8 @@ class CameraApp(ui.AppWindow):
             self.rotate()
         elif name in ("t", "T"):
             self.cycle_flash()
+        elif name in ("c", "C"):
+            self.cycle_tone()
         elif name in ("a", "A"):
             self.autofocus((0.5, 0.5))
         else:

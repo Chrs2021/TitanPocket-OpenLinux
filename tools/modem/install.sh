@@ -13,7 +13,8 @@ O=${SSH_OPTS:-}
 L=/usr/local/lib/titan-modem
 K=$(ssh $O "$HOST" uname -r)
 ssh $O "$HOST" "mkdir -p $L /lib/modules/$K/updates /lib/modules/$K/kernel/drivers/net/wwan"
-scp -q $O tools/modem/mdd.py tools/modem/nvcopy.sh "$HOST:$L/"
+scp -q $O tools/modem/mdd.py tools/modem/nvcopy.sh tools/modem/radioinit.py tools/modem/ltedata.py "$HOST:$L/"
+scp -q $O userspace/debian/overlay/etc/udev/rules.d/81-titan-modem.rules "$HOST:/etc/udev/rules.d/"
 scp -q $O modules/modem/out612/titan_modem.ko "$HOST:/lib/modules/$K/updates/"
 scp -q $O modules/modem/out612/wwan.ko "$HOST:/lib/modules/$K/kernel/drivers/net/wwan/"
 scp -q $O tools/modem/titan-modem.service "$HOST:/etc/systemd/system/"

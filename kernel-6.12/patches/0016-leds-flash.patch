@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 16/16] leds: flash: mt6370: write the strobe timeout at probe
+
+The strobe timeout register is shared between the channels. Without
+this it holds the reset value, not the value sysfs reports.
+---
+ drivers/leds/flash/leds-mt6370-flash.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/leds/flash/leds-mt6370-flash.c b/drivers/leds/flash/leds-mt6370-flash.c
+index 912d9d6223207f85961b36c9fdd6d32432af574e..e84ff9bbe3f62c0da24b212b17c3ae699b0329ca 100644
+--- a/drivers/leds/flash/leds-mt6370-flash.c
++++ b/drivers/leds/flash/leds-mt6370-flash.c
+@@ -500,6 +500,11 @@ static int mt6370_init_flash_properties(struct device *dev, struct mt6370_led *l
+ 	s->step = MT6370_STRBTO_STEP_US;
+ 	s->val = s->max = val;
+ 
++	/* The register is shared; without this it holds the reset value, not what sysfs reports. */
++	ret = mt6370_timeout_set(flash, s->val);
++	if (ret)
++		return ret;
++
+ 	flash->ops = &mt6370_flash_ops;
+ 
+ 	return 0;

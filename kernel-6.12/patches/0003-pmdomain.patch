@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 03/15] pmdomain: mediatek: mt8183: keep CONN on through system suspend
+Subject: [PATCH 03/16] pmdomain: mediatek: mt8183: keep CONN on through system suspend
 
 The connectivity subsystem keeps running while the AP sleeps (its
 firmware, the Wi-Fi association). With MTK_SCPD_ACTIVE_WAKEUP the CONN

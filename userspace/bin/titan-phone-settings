@@ -1,0 +1,469 @@
+#!/usr/bin/python3
+"""
+titan-phone-settings: the modem, the SIM and the mobile network (GTK 4,
+titan_ui4), through ModemManager (titan_mm; docs/modem.md, "Phone apps").
+
+  Modem    the modem on or off (titan-modem.service: it holds the phone
+           awake while it runs), the radio on or off (flight mode), a
+           restart (after changing the SIM), what the modem reports
+  SIM      unlock with the PIN, or the PUK and a new PIN, the PIN
+           required or not, a new PIN; the SIM's identities (shown masked
+           until asked)
+  Network  the network found, the preferred modes (4G/3G/2G), a search
+           for networks and a manual choice, or automatic
+  APN      the access point the modem attaches to LTE with (ModemManager's
+           initial EPS bearer); mobile data itself is not there yet
+
+Turning the radio on makes the phone transmit; every change is the user's
+tap. Identities stay on the screen: never logged.
+"""
+import sys
+
+import titan_mm as mm
+import titan_ui4 as ui
+import titan_water4 as water
+from gi.repository import GLib, Gtk
+
+SIGNAL_ICON = "M5 19v-3M9.5 19v-6M14 19v-9M18.5 19V6"
+SIM_ICON = "M7 3.5h7l4 4v13H7zM10 12h5v5h-5z"
+GLOBE_ICON = ("M12 3.5a8.5 8.5 0 1 0 0 17a8.5 8.5 0 1 0 0-17zM3.5 12h17M12 3.5c2.5 2.5 3.5 5.3 "
+              "3.5 8.5c0 3.2-1 6-3.5 8.5M12 3.5c-2.5 2.5-3.5 5.3-3.5 8.5c0 3.2 1 6 3.5 8.5")
+PHONE_ICON = ("M6.5 3.5h3l1.5 4.5-2 1.5a11 11 0 0 0 5.5 5.5l1.5-2 4.5 1.5v3a2 2 0 0 1-2 2"
+              "A16 16 0 0 1 4.5 5.5a2 2 0 0 1 2-2z")
+TABS = (("Modem", PHONE_ICON), ("SIM", SIM_ICON), ("Network", SIGNAL_ICON), ("APN", GLOBE_ICON))
+
+CSS = """
+.big { font-size: 24px; font-weight: bold; color: white; }
+.value { font-size: 19px; color: rgba(255, 255, 255, 0.85); }
+.note { font-size: 17px; color: #9FE3FF; }
+.err { color: #FF6B7A; }
+entry { min-height: 50px; font-size: 21px; }
+"""
+
+
+def value_row(text):
+    """a row with a value label at its end; returns (row, value label)"""
+    v = ui.label("", "value", xalign=1.0, ellipsize=True)
+    v.set_hexpand(True)
+    return ui.row(text, v), v
+
+
+def entry(placeholder, secret=False, digits=True):
+    e = Gtk.Entry()
+    e.set_hexpand(True)
+    e.set_placeholder_text(placeholder)
+    if secret:
+        e.set_visibility(False)
+    if digits:
+        e.set_input_purpose(Gtk.InputPurpose.PIN if secret else Gtk.InputPurpose.DIGITS)
+    return e
+
+
+class Settings(ui.AppWindow):
+    def __init__(self, app):
+        super().__init__(app, "Phone settings", "…")
+        ui.add_css(self.get_display(), CSS)
+        self.mm = mm.Client()
+        self.reveal = False                 # identities shown in full
+        self.busy = False
+
+        self.nav = water.NavSlider(list(TABS))
+        self.nav.connect("changed", lambda n, i: self.stack.set_visible_child_name(TABS[i][0]))
+        self.body.append(self.nav)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_vexpand(True)
+        self.body.append(self.stack)
+        for name, build in (("Modem", self.build_modem), ("SIM", self.build_sim),
+                            ("Network", self.build_network), ("APN", self.build_apn)):
+            self.stack.add_named(ui.scroll(build()), name)
+        self.body.set_margin_bottom(10)
+
+        self.mm.connect("changed", lambda c: self.refresh())
+        self.refresh()
+        GLib.timeout_add_seconds(5, self.poll_service)
+
+    # ---- the pages ----
+
+    def page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_bottom(12)
+        return box
+
+    def build_modem(self):
+        page = self.page()
+        p = water.panel((10, 18, 10, 18), spacing=6)
+        self.status = ui.label("", "big", wrap=True)
+        p.inner.append(self.status)
+        self.message = ui.label("", "note", wrap=True)
+        p.inner.append(self.message)
+        page.append(p)
+
+        p = water.panel((4, 8, 4, 8), spacing=0)
+        self.modem_on = water.WaterCheck("Modem on", "holds the phone awake while it runs")
+        self.modem_on.connect("toggled", lambda w, on: self.set_modem(on))
+        p.inner.append(self.modem_on)
+        self.radio_on = water.WaterCheck("Radio on", "off: flight mode, nothing transmitted")
+        self.radio_on.connect("toggled", lambda w, on: self.set_radio(on))
+        p.inner.append(self.radio_on)
+        page.append(p)
+
+        restart = ui.GlassButton("Restart modem", icon=ui.ICONS["refresh"], height=54)
+        restart.set_halign(Gtk.Align.START)
+        restart.connect("clicked", lambda b: self.restart_modem())
+        page.append(ui.row("After changing the SIM", restart))
+
+        p = water.panel((10, 18, 10, 18), spacing=6)
+        p.inner.append(ui.section("Modem"))
+        self.info = {}
+        for key in ("Model", "Firmware", "IMEI", "Phone number"):
+            r, v = value_row(key)
+            self.info[key] = v
+            p.inner.append(r)
+        self.show_ids = water.WaterCheck("Show identities",
+                                          "IMEI, number, ICCID and IMSI in full")
+        self.show_ids.connect("toggled", lambda w, on: self.set_reveal(on))
+        p.inner.append(self.show_ids)
+        page.append(p)
+        return page
+
+    def build_sim(self):
+        page = self.page()
+        p = water.panel((10, 18, 10, 18), spacing=6)
+        self.sim_state = ui.label("", "big", wrap=True)
+        p.inner.append(self.sim_state)
+        self.sim_msg = ui.label("", "note", wrap=True)
+        p.inner.append(self.sim_msg)
+        self.sim_info = {}
+        for key in ("Operator", "ICCID", "IMSI"):
+            r, v = value_row(key)
+            self.sim_info[key] = v
+            p.inner.append(r)
+        page.append(p)
+
+        # unlocking: the PIN, or the PUK and a new PIN
+        self.unlock = water.panel((10, 18, 10, 18), spacing=8)
+        self.unlock.inner.append(ui.section("Unlock"))
+        self.puk = entry("PUK", secret=True)
+        self.unlock.inner.append(self.puk)
+        self.pin = entry("PIN", secret=True)
+        self.pin.connect("activate", lambda e: self.do_unlock())
+        self.unlock.inner.append(self.pin)
+        b = ui.GlassButton("Unlock", icon=ui.ICONS["lock"], kind="suggested", height=54)
+        b.set_halign(Gtk.Align.END)
+        b.connect("clicked", lambda b: self.do_unlock())
+        self.unlock.inner.append(b)
+        page.append(self.unlock)
+
+        # the PIN itself
+        self.pin_panel = water.panel((10, 18, 10, 18), spacing=8)
+        self.pin_panel.inner.append(ui.section("PIN"))
+        self.cur_pin = entry("current PIN", secret=True)
+        self.pin_panel.inner.append(self.cur_pin)
+        self.new_pin = entry("new PIN (to change it)", secret=True)
+        self.pin_panel.inner.append(self.new_pin)
+        row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        req_on = ui.GlassButton("Require PIN", height=52)
+        req_on.connect("clicked", lambda b: self.require_pin(True))
+        req_off = ui.GlassButton("Don't require", height=52)
+        req_off.connect("clicked", lambda b: self.require_pin(False))
+        change = ui.GlassButton("Change PIN", kind="suggested", height=52)
+        change.connect("clicked", lambda b: self.change_pin())
+        for w in (req_on, req_off, change):
+            row.append(w)
+        self.pin_panel.inner.append(row)
+        page.append(self.pin_panel)
+        return page
+
+    def build_network(self):
+        page = self.page()
+        p = water.panel((10, 18, 10, 18), spacing=6)
+        self.net = {}
+        for key in ("Network", "Registration", "Technology", "Signal"):
+            r, v = value_row(key)
+            self.net[key] = v
+            p.inner.append(r)
+        page.append(p)
+
+        p = water.panel((10, 18, 10, 18), spacing=8)
+        p.inner.append(ui.section("Preferred"))
+        self.modes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        p.inner.append(self.modes_box)
+        self.modes = None
+        self.modes_quiet = False
+        page.append(p)
+
+        p = water.panel((10, 18, 10, 18), spacing=8)
+        p.inner.append(ui.section("Network operator"))
+        row = Gtk.Box(spacing=8)
+        scan = ui.GlassButton("Search", icon=ui.ICONS["search"], height=52)
+        scan.connect("clicked", lambda b: self.scan())
+        auto = ui.GlassButton("Automatic", height=52)
+        auto.connect("clicked", lambda b: self.register(""))
+        row.append(scan)
+        row.append(auto)
+        p.inner.append(row)
+        self.scan_msg = ui.label("", "note", wrap=True)
+        p.inner.append(self.scan_msg)
+        self.found = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        p.inner.append(self.found)
+        page.append(p)
+        return page
+
+    def build_apn(self):
+        page = self.page()
+        p = water.panel((10, 18, 10, 18), spacing=8)
+        p.inner.append(ui.section("Access point (LTE attach)"))
+        r, self.apn_now = value_row("Now")
+        p.inner.append(r)
+        self.apn = entry("APN, e.g. the carrier's \"internet\"", digits=False)
+        p.inner.append(self.apn)
+        save = ui.GlassButton("Save", kind="suggested", height=52)
+        save.set_halign(Gtk.Align.END)
+        save.connect("clicked", lambda b: self.save_apn())
+        p.inner.append(save)
+        self.apn_msg = ui.label("Mobile data is not working on this phone yet: the APN "
+                                "only matters for attaching to LTE (and later for data).",
+                                "note", wrap=True)
+        p.inner.append(self.apn_msg)
+        page.append(p)
+        return page
+
+    # ---- showing the state ----
+
+    def ident(self, value):
+        if not value:
+            return "—"
+        return value if self.reveal else mm.mask(value)
+
+    def poll_service(self):
+        # the service starts slowly; ModemManager only sees the modem after
+        if not self.busy:
+            self.refresh()
+        return True
+
+    def refresh(self):
+        c = self.mm
+        self.header.set_subtitle(c.status_line())
+        running = mm.service_active()
+        self.modem_on.set_active(running)
+        st = c.state()
+        self.radio_on.set_sensitive(c.present() and st not in (mm.STATE_LOCKED, mm.STATE_FAILED))
+        self.radio_on.set_active(st is not None and st >= mm.STATE_ENABLED)
+        self.status.set_text(c.status_line())
+
+        self.info["Model"].set_text(" ".join(x for x in (c.prop(mm.I_MODEM, "Manufacturer", ""),
+                                                         c.prop(mm.I_MODEM, "Model", "")) if x)
+                                    or "—")
+        self.info["Firmware"].set_text((c.prop(mm.I_MODEM, "Revision", "") or "—").split(",")[0])
+        self.info["IMEI"].set_text(self.ident(c.prop(mm.I_3GPP, "Imei", "")
+                                              or c.prop(mm.I_MODEM, "EquipmentIdentifier", "")))
+        own = c.prop(mm.I_MODEM, "OwnNumbers", []) or []
+        self.info["Phone number"].set_text(", ".join(self.ident(n) for n in own) or "—")
+
+        # the SIM
+        lock = c.prop(mm.I_MODEM, "UnlockRequired", 0)
+        retries = dict(c.prop(mm.I_MODEM, "UnlockRetries", {}) or {})
+        if not c.present():
+            sim = "no modem: turn it on (Modem)"
+        elif st == mm.STATE_FAILED:
+            sim = c.status_line()
+        elif c.sim is None:
+            sim = "no SIM"
+        elif lock not in (mm.LOCK_NONE, 0):
+            sim = "locked: %s" % mm.LOCKS.get(lock, "?")
+        else:
+            sim = "ready"
+        self.sim_state.set_text("SIM " + sim)
+        locked = lock in (mm.LOCK_SIM_PIN, mm.LOCK_SIM_PUK) and c.present()
+        self.unlock.set_visible(locked)
+        self.puk.set_visible(lock == mm.LOCK_SIM_PUK)
+        self.pin.set_placeholder_text("new PIN" if lock == mm.LOCK_SIM_PUK else "PIN")
+        if locked and lock in retries:
+            self.sim_msg.set_text("%d tries left" % retries[lock])
+        elif not self.busy:
+            self.sim_msg.set_text("")
+        self.pin_panel.set_visible(c.sim is not None and not locked)
+        self.sim_info["Operator"].set_text(c.prop(mm.I_SIM, "OperatorName", "")
+                                           or c.prop(mm.I_SIM, "OperatorIdentifier", "") or "—")
+        self.sim_info["ICCID"].set_text(self.ident(c.prop(mm.I_SIM, "SimIdentifier", "")))
+        self.sim_info["IMSI"].set_text(self.ident(c.prop(mm.I_SIM, "Imsi", "")))
+
+        # the network
+        enabled = st is not None and st >= mm.STATE_ENABLED
+        op = c.prop(mm.I_3GPP, "OperatorName", "")
+        code = c.prop(mm.I_3GPP, "OperatorCode", "")
+        self.net["Network"].set_text(" ".join(x for x in (op, "(%s)" % code if code else "") if x)
+                                     or "—")
+        self.net["Registration"].set_text(
+            mm.REGISTRATION.get(c.prop(mm.I_3GPP, "RegistrationState", 4), "—")
+            if enabled else "radio off")
+        self.net["Technology"].set_text(mm.access_text(c.prop(mm.I_MODEM, "AccessTechnologies", 0))
+                                        or "—")
+        self.net["Signal"].set_text("%d %%" % c.signal_quality() if enabled else "—")
+        self.fill_modes()
+
+        bearer = c.prop(mm.I_3GPP, "InitialEpsBearerSettings", {}) or {}
+        self.apn_now.set_text(bearer.get("apn", "") or "—")
+
+    def fill_modes(self):
+        supported = self.mm.prop(mm.I_MODEM, "SupportedModes", []) or []
+        current = tuple(self.mm.prop(mm.I_MODEM, "CurrentModes", (0, 0)) or (0, 0))
+        # the useful ones: each set of allowed modes, preferring its best
+        options = []
+        for allowed, preferred in supported:
+            if (allowed, preferred) not in options:
+                options.append((allowed, preferred))
+        options.sort(key=lambda o: (-o[0], -o[1]))
+        if options == getattr(self, "_options", None):
+            if self.modes and current in options:
+                i = options.index(current)
+                if self.modes.selected != i:    # from the modem, not a tap
+                    self.modes_quiet = True
+                    self.modes.select(i)
+                    self.modes_quiet = False
+            return
+        self._options = options
+        while self.modes_box.get_first_child():
+            self.modes_box.remove(self.modes_box.get_first_child())
+        if not options:
+            self.modes = None
+            self.modes_box.append(ui.label("—", "value"))
+            return
+        labels = [mm.modes_text(a) + (", prefer %s" % mm.modes_text(p) if p else "")
+                  for a, p in options]
+        self.modes = water.WaterRadio("Modes", [(t, "") for t in labels],
+                                      options.index(current) if current in options else 0)
+        self.modes.connect("changed", lambda w, i: self.modes_quiet or self.set_modes(options[i]))
+        self.modes_box.append(self.modes)
+
+    def set_reveal(self, on):
+        self.reveal = on
+        self.refresh()
+
+    def say(self, label, text, error=False):
+        label.set_text(text)
+        (label.add_css_class if error else label.remove_css_class)("err")
+
+    # ---- doing ----
+
+    def set_modem(self, on):
+        self.busy = True
+        self.say(self.message, "starting the modem…" if on else "stopping the modem…")
+
+        def done(rc, out):
+            self.busy = False
+            self.say(self.message, ("modem started: ModemManager takes a few seconds"
+                                    if on else "modem off") if rc == 0 else out, rc != 0)
+            self.refresh()
+        mm.run_async(["systemctl", "start" if on else "stop", mm.MODEM_SERVICE], done)
+
+    def restart_modem(self):
+        self.busy = True
+        self.say(self.message, "restarting the modem…")
+
+        def done(rc, out):
+            self.busy = False
+            self.say(self.message, "modem restarted (flight mode)" if rc == 0 else out, rc != 0)
+            self.refresh()
+        mm.run_async(["systemctl", "restart", mm.MODEM_SERVICE], done)
+
+    def set_radio(self, on):
+        self.say(self.message, "turning the radio on…" if on else "turning the radio off…")
+        self.mm.call(mm.I_MODEM, "Enable", "(b)", (on,),
+                     lambda r, e: (self.say(self.message, e or ("radio on" if on else
+                                                                 "radio off (flight mode)"),
+                                            bool(e)), self.refresh()),
+                     timeout=120000)
+
+    def do_unlock(self):
+        lock = self.mm.prop(mm.I_MODEM, "UnlockRequired", 0)
+        pin = self.pin.get_text().strip()
+        if not pin:
+            return
+        done = self.after_pin("SIM unlocked")
+        if lock == mm.LOCK_SIM_PUK:
+            puk = self.puk.get_text().strip()
+            if not puk:
+                return
+            self.mm.call(mm.I_SIM, "SendPuk", "(ss)", (puk, pin), done)
+        else:
+            self.mm.call(mm.I_SIM, "SendPin", "(s)", (pin,), done)
+        self.say(self.sim_msg, "unlocking…")
+
+    def after_pin(self, ok):
+        def done(res, err):
+            for e in (self.pin, self.puk, self.cur_pin, self.new_pin):
+                e.set_text("")
+            self.say(self.sim_msg, err or ok, bool(err))
+            self.refresh()
+        return done
+
+    def require_pin(self, on):
+        pin = self.cur_pin.get_text().strip()
+        if not pin:
+            self.say(self.sim_msg, "enter the current PIN first", True)
+            return
+        self.mm.call(mm.I_SIM, "EnablePin", "(sb)", (pin, on),
+                     self.after_pin("PIN required" if on else "PIN no longer required"))
+
+    def change_pin(self):
+        old, new = self.cur_pin.get_text().strip(), self.new_pin.get_text().strip()
+        if not old or not new:
+            self.say(self.sim_msg, "enter the current and the new PIN", True)
+            return
+        self.mm.call(mm.I_SIM, "ChangePin", "(ss)", (old, new), self.after_pin("PIN changed"))
+
+    def set_modes(self, modes):
+        self.mm.call(mm.I_MODEM, "SetCurrentModes", "((uu))", (tuple(modes),),
+                     lambda r, e: self.say(self.scan_msg, e or "modes set", bool(e)))
+
+    def scan(self):
+        st = self.mm.state()
+        if st is None or st < mm.STATE_ENABLED:
+            self.say(self.scan_msg, "turn the radio on first (Modem)", True)
+            return
+        self.say(self.scan_msg, "searching: this takes a minute or two…")
+        while self.found.get_first_child():
+            self.found.remove(self.found.get_first_child())
+        self.mm.call(mm.I_3GPP, "Scan", done=self.scanned, timeout=300000)
+
+    def scanned(self, res, err):
+        if err:
+            self.say(self.scan_msg, err, True)
+            return
+        nets = res[0]
+        self.say(self.scan_msg, "%d networks found: tap one to use it" % len(nets)
+                 if nets else "no networks found")
+        for n in nets:
+            name = n.get("operator-long") or n.get("operator-short") or n.get("operator-code", "?")
+            tech = mm.access_text(n.get("access-technology", 0))
+            avail = mm.AVAILABILITY.get(n.get("status", 0), "")
+            b = ui.GlassButton("%s  %s  (%s)" % (name, tech, avail), height=50, size=17,
+                               kind="lit" if n.get("status") == 2 else "")
+            b.set_sensitive(n.get("status") != 3)
+            b.connect("clicked", lambda b, code=n.get("operator-code", ""): self.register(code))
+            self.found.append(b)
+
+    def register(self, code):
+        st = self.mm.state()
+        if st is None or st < mm.STATE_ENABLED:
+            self.say(self.scan_msg, "turn the radio on first (Modem)", True)
+            return
+        self.say(self.scan_msg, "registering%s…" % ((" with " + code) if code else
+                                                     " automatically"))
+        self.mm.call(mm.I_3GPP, "Register", "(s)", (code,),
+                     lambda r, e: self.say(self.scan_msg, e or "registered", bool(e)),
+                     timeout=180000)
+
+    def save_apn(self):
+        apn = self.apn.get_text().strip()
+        self.say(self.apn_msg, "saving…")
+        self.mm.call(mm.I_3GPP, "SetInitialEpsBearerSettings", "(a{sv})",
+                     ({"apn": GLib.Variant("s", apn)},),
+                     lambda r, e: (self.say(self.apn_msg, e or "saved: the modem attaches with "
+                                            "it next time it registers on LTE", bool(e)),
+                                   self.refresh()))
+
+
+if __name__ == "__main__":
+    sys.exit(ui.run("org.titanpocket.phonesettings", Settings, lock="titan-phone-settings"))

@@ -45,6 +45,7 @@ modules (`videodev`, `mc`, `videobuf2-*`): install those with it.
 | 0013 audio | machine driver, FS1860 amplifier, AFE hardware gain and FM paths, modem voice links (PCM 2), PCM rate fix, MT6358 jack detection |
 | 0014 dts | `mt6771.dtsi` and `mt6771-unihertz-titan-pocket.dts` |
 | 0015 config | `titanpocket.config`, a fragment over arm64 `defconfig` |
+| 0016 leds-flash | MT6370 flash: strobe timeout written at probe |
 
 ## Building
 
@@ -116,10 +117,10 @@ logs what the kernel found and returns to fastboot.
 | IR transmitter | `mtk-pwm-ir-tx` | ✅ `/dev/lirc0` |
 | Vibration motor | `regulator-haptic` | ✅ |
 | Suspend to idle | | ✅ ~120 mA with the screen off |
-| Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; 43.5 mA so far (4.14 reached 12 mA); the SCP sensor hub stays awake unless `mt6771_scp.sleep=1` (untested); what the SPM firmware does: `docs/spm-firmware.md` |
+| Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; about 31 mA (4.14 reached 12 mA); the SCP sensor hub stays awake unless `mt6771_scp.sleep=1` (untested); what the SPM firmware does: `docs/spm-firmware.md` |
 | Cameras (OV16880, OV8865) | `modules/camera/linux612/` (CAMSV, CAM A statistics, the DIP) | ✅ both at 30 fps through the hardware ISP, auto exposure and white balance, libcamera; the flash is not enabled |
 | NFC (ST21NFC) | `modules/nfc/linux612/` (`/dev/st21nfc`) | ✅ tags read; the controller and its 26 MHz clock buffer are off while the device is closed |
-| Cellular modem | `modules/modem/linux612/` (`titan_modem`) | ⚠️ boots and answers AT through a WWAN port (ModemManager) in flight mode; radio not on yet |
+| Cellular modem | `modules/modem/linux612/` (`titan_modem`) | ✅ registers on LTE under ModemManager, IPv6 data over CLDMA (`tools/modem/ltedata.py`); calls, SMS, USSD and IPv4 not done |
 
 ## Firmware
 

@@ -1,0 +1,53 @@
+#!/usr/bin/python3
+"""
+titan-call-watch: incoming calls when the phone app is not open (docs/modem.md,
+"Phone apps"). Follows ModemManager's calls (titan_mm); when one rings in,
+it gives one vibration pulse and starts titan-dialer in the Weston
+session, which finds the ringing call, shows it and rings. A dialer that
+is already open handles the call itself (it runs one at a time). Runs as
+titan-call-watch.service; idle while the modem is off.
+"""
+import os
+import subprocess
+import sys
+
+import titan_mm as mm
+from gi.repository import GLib
+
+try:
+    import titan_vibrator
+except ImportError:
+    titan_vibrator = None
+
+DIALER = "/usr/local/bin/titan-dialer"
+# the Weston session (titan-desktop.service, root's)
+SESSION_ENV = {"WAYLAND_DISPLAY": "wayland-1", "XDG_RUNTIME_DIR": "/run/user/0"}
+
+
+def log(msg):
+    print("titan-call-watch: " + msg, file=sys.stderr, flush=True)
+
+
+def main():
+    client = mm.Client()
+
+    def added(c, path):
+        direction = c.call_prop(path, "Direction", 0)
+        state = c.call_prop(path, "State", 0)
+        if direction != mm.CALL_INCOMING or state not in (mm.CALL_RINGING_IN, mm.CALL_WAITING):
+            return
+        log("incoming call: starting the dialer")      # never the number: it stays on screen
+        if titan_vibrator:
+            titan_vibrator.pulse(500)
+        try:
+            subprocess.Popen([DIALER], env=dict(os.environ, **SESSION_ENV),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError as e:
+            log("%s: %s" % (DIALER, e))
+    client.connect("call-added", added)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

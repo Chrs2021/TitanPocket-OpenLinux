@@ -1,20 +1,20 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 15/15] arm64: configs: add titanpocket.config
+Subject: [PATCH 15/16] arm64: configs: add titanpocket.config
 
 A fragment on top of defconfig: make defconfig titanpocket.config.
 The media core stays modular for the out-of-tree camera driver; udmabuf
 is built in for libcamera.
 ---
- arch/arm64/configs/titanpocket.config | 149 ++++++++++++++++++++++++++
- 1 file changed, 149 insertions(+)
+ arch/arm64/configs/titanpocket.config | 152 ++++++++++++++++++++++++++
+ 1 file changed, 152 insertions(+)
 
 diff --git a/arch/arm64/configs/titanpocket.config b/arch/arm64/configs/titanpocket.config
 new file mode 100644
-index 0000000000000000000000000000000000000000..0453ac30fd03c0b8e5f6e8334c712086609dd039
+index 0000000000000000000000000000000000000000..9578876e94673e41e3a45198df8ddce09b7ea587
 --- /dev/null
 +++ b/arch/arm64/configs/titanpocket.config
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,152 @@
 +# Titan Pocket on top of arm64 defconfig:
 +#   make defconfig titanpocket.config
 +CONFIG_LOCALVERSION="-titanpocket"
@@ -159,6 +159,9 @@ index 0000000000000000000000000000000000000000..0453ac30fd03c0b8e5f6e8334c712086
 +CONFIG_CHARGER_MT6370=y
 +CONFIG_LEDS_CLASS_MULTICOLOR=y
 +CONFIG_LEDS_MT6370_RGB=y
++# The rear flash (LED flash class; the Camera app drives it through sysfs)
++CONFIG_LEDS_CLASS_FLASH=y
++CONFIG_LEDS_MT6370_FLASH=y
 +
 +# Cameras: the out-of-tree driver (modules/camera/linux612) runs on the
 +# media core, built as modules; libcamera's software ISP shares buffers
