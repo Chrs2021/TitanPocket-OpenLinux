@@ -3,10 +3,12 @@
 # radio off, ready for ModemManager (or AT+EFUN=1). It replaces AT+CFUN=4 as the first
 # command: from that state the modem refuses AT+ESIMS and AT+ESADM=3. Runs once the
 # mux's ports exist; a command it refuses is logged and the next one still goes.
+# AT+CEMODE=2 is ours, not Android's: the modem starts voice-centric, and with no IMS
+# registered it leaves LTE 60 s after radio on (measured). It forgets this when restarted.
 import os, select, sys, time
 PORT, LAST = "/dev/wwan0at8", "/dev/wwan0at23"      # cmd9, the table's last
 SEQ = ("ATE0Q0V1", "AT+CMEE=1", "AT+ESIMS=1", "AT+ESIMS", "AT+EGTP=1", "AT+EMPPCH=1",
-       "AT+ESADM=3", "AT+EBOOT=0", "AT+EDSBP=1", "AT+EPOC", "AT+EFUN=0")
+       "AT+ESADM=3", "AT+EBOOT=0", "AT+EDSBP=1", "AT+EPOC", "AT+EFUN=0", "AT+CEMODE=2")
 end = time.time() + 60
 while not os.path.exists(LAST):
     if time.time() > end:

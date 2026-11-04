@@ -1,0 +1,66 @@
+#!/usr/bin/python3
+"""
+titan-signal: the LTE signal for the status bar (docs/modem.md, "Phone apps").
+Follows ModemManager (titan_mm) and writes the bars, 0 to 4, to /run/titan-signal; the
+panel draws them. The file is absent while the modem is off. RSRP from ModemManager's
+extended signal interface: its plain quality reads 0 on LTE after a re-enable. Runs as
+titan-signal.service; idle while the modem is off.
+"""
+import os
+
+import titan_mm as mm
+from gi.repository import GLib
+
+OUT = "/run/titan-signal"
+RATE = 15                   # seconds between ModemManager's readings
+REGISTERED = 8              # MM_MODEM_STATE_REGISTERED and up: connecting, connected
+ENABLED = mm.STATE_ENABLED
+# dBm for each bar; the modem's own view of a usable cell ends near -120
+LEVELS = (-110, -100, -90)
+
+
+def bars(rsrp):
+    return 1 + sum(rsrp >= level for level in LEVELS)
+
+
+class Signal:
+    def __init__(self):
+        self.client = mm.Client()
+        self.path = None
+        self.value = None
+        self.client.connect("changed", lambda c: self.update())
+        self.update()
+
+    def write(self, value):
+        if value == self.value:
+            return
+        self.value = value
+        if value is None:
+            try:
+                os.unlink(OUT)
+            except FileNotFoundError:
+                pass
+            return
+        tmp = OUT + ".new"
+        with open(tmp, "w") as f:
+            f.write("%d\n" % value)
+        os.rename(tmp, OUT)
+
+    def update(self):
+        c = self.client
+        state = c.state()
+        if state is None or state < ENABLED or not c.has(mm.I_SIGNAL):
+            self.path = None
+            self.write(None)
+            return
+        # the reading stops when the modem is disabled: ask again on each enable
+        if self.path != c.path or c.prop(mm.I_SIGNAL, "Rate", 0) == 0:
+            self.path = c.path
+            c.call(mm.I_SIGNAL, "Setup", "(u)", (RATE,))
+        rsrp = c.prop(mm.I_SIGNAL, "Lte", {}).get("rsrp")
+        self.write(bars(rsrp) if state >= REGISTERED and rsrp is not None else 0)
+
+
+if __name__ == "__main__":
+    Signal()
+    GLib.MainLoop().run()

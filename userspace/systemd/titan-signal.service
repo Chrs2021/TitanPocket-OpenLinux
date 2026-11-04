@@ -1,0 +1,11 @@
+[Unit]
+Description=LTE signal for the status bar
+After=ModemManager.service
+
+[Service]
+ExecStart=/usr/local/sbin/titan-signal
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1648 @@
+#!/usr/bin/python3
+"""
+titan-ims: an IMS client for voice over LTE (docs/modem.md, "IMS").
+
+The modem gives this the IMS PDN (a ccmni interface and the P-CSCF's addresses) and the
+SIM's ISIM. SIP, IPsec and registration are here: TS 24.229 with AKA (RFC 3310) and
+sec-agree (RFC 3329, TS 33.203).
+
+Identities, keys, addresses and SIP bodies are never logged: only status lines, and
+the few headers in SAFE_HEADERS.
+
+  titan-ims run             bring up the IMS PDN, register, take calls (titan-ims.service)
+
+The dialer talks to it on a Unix socket, /run/titan-ims.sock, in JSON lines:
+  {"cmd": "dial", "number": ...}, {"cmd": "answer"|"hangup", "id": n}, {"cmd": "dtmf", "digit": ...},
+  {"cmd": "mute", "on": bool}, {"cmd": "route", "device": "earpiece"|"speaker"|"headphones"},
+  {"cmd": "status"}; it sends {"ev": "registered"|"call"|"status"|"error", ...}.
+"""
+import audioop
+import base64
+import ctypes
+import hashlib
+import ipaddress
+import json
+import os
+import random
+import re
+import secrets
+import select
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+APN_DATA = "fast.t-mobile.com"
+APN_CONF = ("protocol=IPV4V6;roaming_protocol=IPV4V6;authtype=0;carrier_enabled=1;max_conns=0;"
+            "max_conns_time=0;wait_time=0;bearer_bitmask=0;inactive_timer=0")
+ISIM_AID = "A0000000871004"
+ICSI_MMTEL = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
+USER_AGENT = "Titan-Pocket-Linux/1.0"
+CTL = "/run/titan-ims.sock"
+CARD = "titanpocket"
+UCM = "/usr/share/alsa/ucm2/Unihertz/titan-pocket/HiFi.conf"
+PLAY_PCM = "plughw:CARD=titanpocket,DEV=0"
+REC_PCM = "plughw:CARD=titanpocket,DEV=2"
+SPEAKER_GAIN = 0.5  # 6 dB of margin: this bypasses PipeWire's limiter for the loudspeaker
+ALLOW = "INVITE,ACK,OPTIONS,CANCEL,BYE,UPDATE,INFO,REFER,NOTIFY,MESSAGE,PRACK"
+MAX_REGISTER_TRIES = 3      # a carrier remembers failed attempts: stop early
+SAFE_HEADERS = ("warning", "retry-after", "min-expires", "server", "reason", "expires")
+# strongest first; the network picks
+OFFER = (("hmac-sha-1-96", "aes-cbc"), ("hmac-md5-96", "aes-cbc"))
+
+
+def log(s):
+    print(s, flush=True)
+
+
+def run(*c, timeout=15):
+    try:
+        p = subprocess.run(c, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+
+
+class At:
+    """One AT channel, with the replies to a command and other channels' reports kept apart."""
+
+    def __init__(self, name):
+        self.fd = os.open("/dev/radio/" + name, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        self.buf = ""
+        self.cmd("ATE0", 3)
+
+    def close(self):
+        os.close(self.fd)
+
+    def lines(self, secs):
+        out, end = [], time.time() + secs
+        while time.time() < end:
+            if select.select([self.fd], [], [], 0.1)[0]:
+                try:
+                    self.buf += os.read(self.fd, 8192).decode(errors="replace")
+                except BlockingIOError:
+                    continue
+            while "\r\n" in self.buf:
+                line, self.buf = self.buf.split("\r\n", 1)
+                if line.strip():
+                    out.append(line.strip())
+            if out and (out[-1] == "OK" or "ERROR" in out[-1]):
+                break
+        return out
+
+    def cmd(self, c, secs=8):
+        os.write(self.fd, (c + "\r").encode())
+        return self.lines(secs)
+
+    def ok(self, c, secs=8):
+        return self.cmd(c, secs)[-1:] == ["OK"]
+
+
+class Isim:
+    """The SIM's IMS application over AT+CGLA. Everything read here is an identity or a key."""
+
+    def __init__(self, at):
+        self.at = at
+        r = at.cmd('AT+CCHO="%s"' % ISIM_AID)
+        m = [re.search(r"\d+", x) for x in r if re.fullmatch(r"(\+CCHO: *)?\d+", x)]
+        if not m:
+            raise RuntimeError("no ISIM")
+        self.ch = int(m[0].group(0))
+
+    def close(self):
+        self.at.cmd("AT+CCHC=%d" % self.ch)
+
+    def apdu(self, hexstr):
+        """(data, sw) with the channel in the class byte; follows T=0 GET RESPONSE"""
+        cla = "%02X" % (self.ch if self.ch < 4 else 0x40 + self.ch - 4)
+        a = cla + hexstr
+        for _ in range(4):
+            r = self.at.cmd('AT+CGLA=%d,%d,"%s"' % (self.ch, len(a), a))
+            m = [re.search(r'"([0-9A-Fa-f]+)"', x) for x in r if x.startswith("+CGLA")]
+            if not m or not m[0]:
+                raise RuntimeError("the SIM refused a command")
+            out = m[0].group(1).upper()
+            data, sw = out[:-4], out[-4:]
+            if sw[:2] == "61":
+                a = cla + "C00000" + sw[2:]
+            elif sw[:2] == "6C":
+                a = a[:-2] + sw[2:]
+            else:
+                return bytes.fromhex(data), sw
+        raise RuntimeError("the SIM did not answer")
+
+    def select(self, fid):
+        return self.apdu("A4000402" + fid)[1][:2] in ("90", "91")
+
+    @staticmethod
+    def tlv80(data):
+        if len(data) < 2 or data[0] != 0x80:
+            return None
+        return data[2:2 + data[1]].decode(errors="replace")
+
+    def read_binary(self, fid):
+        if not self.select(fid):
+            return None
+        d, sw = self.apdu("B0000000")
+        return self.tlv80(d) if sw == "9000" else None
+
+    def read_record(self, fid, n=1):
+        if not self.select(fid):
+            return None
+        d, sw = self.apdu("B2%02X0400" % n)
+        return self.tlv80(d) if sw == "9000" else None
+
+    def auth(self, rand, autn):
+        """(res, ck, ik, None), (None, None, None, auts) to resynchronise, or None if refused"""
+        body = bytes((16,)) + rand + bytes((16,)) + autn
+        d, sw = self.apdu("880081%02X" % len(body) + body.hex().upper())
+        if sw != "9000" or not d:
+            log("SIM authentication: status %s" % sw)     # a status word identifies nothing
+            return None
+        if d[0] == 0xDB:
+            n = d[1]
+            res = d[2:2 + n]
+            i = 2 + n
+            ck = d[i + 1:i + 1 + d[i]]
+            i += 1 + d[i]
+            ik = d[i + 1:i + 1 + d[i]]
+            return res, ck, ik, None
+        if d[0] == 0xDC:
+            return None, None, None, d[2:2 + d[1]]
+        return None
+
+
+def dotted(s):
+    """AT's dotted-decimal IPv6 address, or None"""
+    p = s.split(".")
+    if len(p) != 16:
+        return None
+    try:
+        return ipaddress.IPv6Address(bytes(int(x) for x in p))
+    except ValueError:
+        return None
+
+
+class Pdn:
+    """The IMS PDN: a ccmni interface with a global address, and the P-CSCFs."""
+
+    def __init__(self):
+        self.dev = None
+        self.addr = None
+        self.pcscf = []
+        self.cid = None
+
+    def up(self):
+        cmd = At("cmd4")
+        urc = At("nwurc")
+        nw = At("nwcmd")
+        ims3 = At("cmd10")
+        cfg = At("cmd8")
+        try:
+            for c in ("AT+CMEE=1", "AT+EDALLOW=1", "AT+EAPNLOCK=1", "AT+EAPNSET",
+                      'AT+EAPNSET="%s",1,"",""' % APN_DATA,
+                      'AT+EAPNSET="%s",2,"type=default,mms,supl,hipri,ia;%s"' % (APN_DATA, APN_CONF),
+                      'AT+EAPNSET="ims",1,"",""', 'AT+EAPNSET="ims",2,"type=ims;%s"' % APN_CONF,
+                      "AT+EAPNLOCK=0"):
+                if not cmd.ok(c):
+                    raise RuntimeError("APN table: %s" % c.split("=")[0])
+            ims3.ok('AT+EIMSPDN= "onoff", 1')
+            for c in ("AT+EWFCP=2", "AT+EIMSRCS=0,0", "AT+EIMSCFG=1,0,1,1,1,1"):
+                if not cfg.ok(c):
+                    raise RuntimeError("IMS configuration: %s" % c.split("=")[0])
+            time.sleep(3)
+            r = cmd.cmd('AT+EAPNACT=1,"ims","ims",0', 20)
+            if "5847" in "".join(r[-1:]) and not self.reuse():
+                # up already, from before this run, and no interface for it: down and up again
+                self.find_pcscf(cmd)
+                self.pcscf = []
+                cmd.cmd("AT+CGACT=0,%s" % self.cid, 15)
+                time.sleep(2)
+                r = cmd.cmd('AT+EAPNACT=1,"ims","ims",0', 20)
+            elif "5847" in "".join(r[-1:]):
+                r = ["OK"]
+            if r[-1:] != ["OK"]:
+                raise RuntimeError("IMS PDN: %s" % r[-1:])
+            end = time.time() + 10
+            while time.time() < end and self.dev is None:
+                for line in urc.lines(1):
+                    m = re.match(r"\+EIF: (\d+), *ifup, *(\d)", line)
+                    if m:
+                        self.dev = "ccmni%d" % (int(m.group(1)) % 100)
+                        for k, v in (("accept_ra", 2), ("autoconf", 1), ("disable_ipv6", 0)):
+                            run("sysctl", "-qw", "net.ipv6.conf.%s.%s=%d" % (self.dev, k, v))
+                        run("ip", "link", "set", self.dev, "up")
+                        nw.cmd('AT+EIF=%s, "ifst", "up", %s' % m.groups(), 3)
+            if self.dev is None:
+                raise RuntimeError("no interface for the IMS PDN")
+            self.find_pcscf(cmd)
+            end = time.time() + 15
+            while time.time() < end and self.addr is None:
+                time.sleep(0.5)
+                m = re.search(r"inet6 ([0-9a-f:]+)/64", run("ip", "-6", "-o", "addr", "show", "dev", self.dev, "scope", "global")[1])
+                self.addr = ipaddress.IPv6Address(m.group(1)) if m else None
+            if self.addr is None:
+                raise RuntimeError("no address on the IMS PDN")
+            # sockets bound to this device take this route; other traffic keeps its own
+            run("ip", "-6", "route", "replace", "default", "dev", self.dev, "metric", "4096")
+            log("IMS PDN up on %s: %d P-CSCF" % (self.dev, len(self.pcscf)))
+        finally:
+            for a in (cmd, urc, nw, ims3, cfg):
+                a.close()
+
+    def reuse(self):
+        """The interface of an IMS PDN that is already up: ours has this route"""
+        for i in range(8):
+            dev = "ccmni%d" % i
+            if os.path.exists("/sys/class/net/" + dev) and "metric 4096" in run("ip", "-6", "route", "show", "default", "dev", dev)[1]:
+                self.dev = dev
+                return True
+        return False
+
+    def find_pcscf(self, cmd):
+        for line in cmd.cmd("AT+CGACT?"):
+            m = re.match(r"\+CGACT: (\d+),1", line)
+            if not m:
+                continue
+            for row in cmd.cmd("AT+CGCONTRDP=%s" % m.group(1)):
+                if not row.startswith("+CGCONTRDP"):
+                    continue
+                f = [v.strip().strip('"') for v in row.split(":", 1)[1].split(",")]
+                if len(f) > 8 and f[2].startswith("ims"):
+                    self.cid = m.group(1)
+                    for v in f[7:9]:
+                        a = dotted(v)
+                        if a and a not in self.pcscf:
+                            self.pcscf.append(a)
+        if not self.pcscf:
+            raise RuntimeError("the network gave no P-CSCF")
+
+
+class Identity:
+    def __init__(self, at):
+        sim = Isim(at)
+        try:
+            self.impi = sim.read_binary("6F02")
+            self.domain = sim.read_binary("6F03")
+            self.impu = sim.read_record("6F04")
+            self.sim = sim
+        except RuntimeError:
+            sim.close()
+            raise
+        imsi = [x for x in at.cmd("AT+CIMI") if re.fullmatch(r"\d{14,15}", x)]
+        imei = [x for x in at.cmd("AT+CGSN") if re.fullmatch(r"\d{15}", x)]
+        if not imsi or not imei:
+            raise RuntimeError("no IMSI or IMEI")
+        self.mccmnc = imsi[0][:6]
+        mcc, mnc = imsi[0][:3], imsi[0][3:6]
+        home = "ims.mnc%s.mcc%s.3gppnetwork.org" % (mnc, mcc)
+        self.domain = self.domain or home
+        self.impi = self.impi or "%s@%s" % (imsi[0], home)
+        self.impu = self.impu or "sip:%s@%s" % (imsi[0], home)
+        self.instance = "urn:gsma:imei:%s-%s-0" % (imei[0][:8], imei[0][8:14])
+        self.user = re.sub(r"^sips?:|^tel:|@.*$", "", self.impu)
+        log("identity: ISIM read, domain %s" % ("from the SIM" if self.domain != home else "from the IMSI"))
+
+    def cell_info(self, at):
+        """The network's own view of where the phone is: goes to the network, never to a log"""
+        at.cmd("AT+CEREG=2", 3)
+        for line in at.cmd("AT+CEREG?", 3):
+            m = re.match(r'\+CEREG: \d,\d,"?([0-9A-Fa-f]+)"?,"?([0-9A-Fa-f]+)"?', line)
+            if m:
+                return "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=%s%04X%07X" % (self.mccmnc, int(m.group(1), 16), int(m.group(2), 16))
+        return None
+
+
+class Msg:
+    def __init__(self, raw):
+        head, _, self.body = raw.partition(b"\r\n\r\n")
+        lines = head.decode(errors="replace").split("\r\n")
+        self.first = lines[0]
+        self.h = []
+        for x in lines[1:]:
+            if x[:1] in (" ", "\t") and self.h:
+                self.h[-1] = (self.h[-1][0], self.h[-1][1] + " " + x.strip())
+            elif ":" in x:
+                k, v = x.split(":", 1)
+                self.h.append((k.strip().lower(), v.strip()))
+        m = re.match(r"SIP/2.0 (\d+) (.*)", self.first)
+        self.status = int(m.group(1)) if m else None
+        self.reason = m.group(2) if m else None
+
+    def get(self, name):
+        for k, v in self.h:
+            if k == name:
+                return v
+        return None
+
+    def all(self, name):
+        return [v for k, v in self.h if k == name]
+
+    def describe(self):
+        safe = ["%s: %s" % (k, v[:70]) for k, v in self.h if k in SAFE_HEADERS]
+        return self.first[:60] + (" | " + " | ".join(safe) if safe else "")
+
+
+def frame(buf):
+    """(one whole SIP message, the rest), or (None, buf) for a stream"""
+    i = buf.find(b"\r\n\r\n")
+    if i < 0:
+        return None, buf
+    m = re.search(rb"(?im)^(?:content-length|l)\s*:\s*(\d+)", buf[:i + 2])
+    n = int(m.group(1)) if m else 0
+    if len(buf) < i + 4 + n:
+        return None, buf
+    return buf[:i + 4 + n], buf[i + 4 + n:]
+
+
+def params(s):
+    out = {}
+    for m in re.finditer(r'([\w-]+)=("[^"]*"|[^,;\s]+)', s):
+        out[m.group(1).lower()] = m.group(2).strip('"')
+    return out
+
+
+class Xfrm:
+    """The four ESP SAs of TS 33.203, transport mode, between our two ports and the P-CSCF's."""
+    AUTH = {"hmac-sha-1-96": "hmac(sha1)", "hmac-md5-96": "hmac(md5)"}
+    ENC = {"aes-cbc": "cbc(aes)", "des-ede3-cbc": "cbc(des3_ede)", "null": "ecb(cipher_null)"}
+
+    def __init__(self):
+        self.reqids = []
+
+    def clear(self):
+        for r in self.reqids:
+            run("ip", "xfrm", "state", "deleteall", "reqid", str(r))
+        run("ip", "xfrm", "policy", "flush")
+        self.reqids = []
+
+    @staticmethod
+    def keys(alg, ealg, ck, ik):
+        a = ik + bytes(4) if alg == "hmac-sha-1-96" else ik
+        if ealg == "aes-cbc":
+            e = ck
+        elif ealg == "des-ede3-cbc":
+            e = ck[:8] + ck[8:16] + ck[:8]
+        else:
+            e = b""
+        return a, e
+
+    def sa(self, src, dst, spi, sport, dport, direction, alg, ealg, ak, ek):
+        reqid = random.randrange(1000, 1 << 30)
+        self.reqids.append(reqid)
+        enc = ["enc", self.ENC[ealg], "0x" + ek.hex() if ek else ""]
+        c = ["ip", "xfrm", "state", "add", "src", str(src), "dst", str(dst), "proto", "esp", "spi", str(spi),
+             "mode", "transport", "reqid", str(reqid), "auth-trunc", self.AUTH[alg], "0x" + ak.hex(), "96"] + enc
+        if run(*c)[0]:
+            raise RuntimeError("cannot add an IPsec SA")
+        for proto in ("tcp", "udp"):
+            c = ["ip", "xfrm", "policy", "add", "src", "%s/128" % src, "dst", "%s/128" % dst,
+                 "proto", proto, "sport", str(sport), "dport", str(dport), "dir", direction,
+                 "tmpl", "src", str(src), "dst", str(dst), "proto", "esp", "mode", "transport", "reqid", str(reqid)]
+            if run(*c)[0]:
+                raise RuntimeError("cannot add an IPsec policy")
+
+
+class Codec:
+    """AMR and AMR-WB through opencore-amr and vo-amrwbenc. Their frames are storage format:
+    one byte (FT << 3 | Q << 2), then the speech bits, padded to a byte."""
+    NB_BITS = (95, 103, 118, 134, 148, 159, 204, 244, 39)
+    WB_BITS = (132, 177, 253, 285, 317, 365, 397, 461, 477, 40)
+    NO_DATA = 15
+
+    def __init__(self, name, mode=None):
+        self.wb = name == "AMR-WB"
+        self.rate = 16000 if self.wb else 8000
+        self.samples = self.rate // 50
+        self.bits = self.WB_BITS if self.wb else self.NB_BITS
+        self.mode = mode if mode is not None else (2 if self.wb else 7)  # 12.65 and 12.2 kbit/s
+        self.pcm = ctypes.c_short * self.samples
+        if self.wb:
+            self.enc_lib = ctypes.CDLL("libvo-amrwbenc.so.0")
+            self.dec_lib = ctypes.CDLL("libopencore-amrwb.so.0")
+            self.enc_lib.E_IF_init.restype = ctypes.c_void_p
+            self.dec_lib.D_IF_init.restype = ctypes.c_void_p
+            self.enc = self.enc_lib.E_IF_init()
+            self.dec = self.dec_lib.D_IF_init()
+        else:
+            self.enc_lib = self.dec_lib = ctypes.CDLL("libopencore-amrnb.so.0")
+            self.enc_lib.Encoder_Interface_init.restype = ctypes.c_void_p
+            self.enc_lib.Decoder_Interface_init.restype = ctypes.c_void_p
+            self.enc = self.enc_lib.Encoder_Interface_init(0)
+            self.dec = self.dec_lib.Decoder_Interface_init()
+
+    def encode(self, pcm):
+        """(FT, speech bytes) of one 20 ms frame of S16 samples"""
+        out = (ctypes.c_ubyte * 64)()
+        s = self.pcm.from_buffer_copy(pcm)
+        if self.wb:
+            n = self.enc_lib.E_IF_encode(ctypes.c_void_p(self.enc), self.mode, s, out, 0)
+        else:
+            n = self.enc_lib.Encoder_Interface_Encode(ctypes.c_void_p(self.enc), self.mode, s, out, 0)
+        return (out[0] >> 3) & 15, bytes(out[1:n])
+
+    def decode(self, ft, speech):
+        """S16 samples of a frame; ft NO_DATA conceals a lost one"""
+        data = bytes(((ft << 3) | 4,)) + speech + bytes(64)
+        s = self.pcm()
+        buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        if self.wb:
+            self.dec_lib.D_IF_decode(ctypes.c_void_p(self.dec), buf, s, 0)
+        else:
+            self.dec_lib.Decoder_Interface_Decode(ctypes.c_void_p(self.dec), buf, s, 0)
+        return bytes(s)
+
+    def nbits(self, ft):
+        return self.bits[ft] if ft < len(self.bits) else 0
+
+    def pack(self, ft, speech, octet):
+        """An RTP payload (RFC 4867) with one frame, no rate request"""
+        if octet:
+            return bytes((0xF0, (ft << 3) | 4)) + speech
+        n = self.nbits(ft)
+        v = (15 << 6) | (ft << 1) | 1     # CMR, F=0, FT, Q
+        v = (v << n) | (int.from_bytes(speech, "big") >> (len(speech) * 8 - n)) if n else v
+        total = 10 + n
+        pad = -total % 8
+        return (v << pad).to_bytes((total + pad) // 8, "big")
+
+    def unpack(self, p, octet):
+        """[(FT, speech bytes)] of an RTP payload"""
+        out = []
+        if octet:
+            i, tocs = 1, []
+            while i < len(p):
+                t = p[i]
+                i += 1
+                tocs.append((t >> 3) & 15)
+                if not t & 0x80:
+                    break
+            for ft in tocs:
+                n = (self.nbits(ft) + 7) // 8
+                out.append((ft, p[i:i + n]))
+                i += n
+            return out
+        v, total = int.from_bytes(p, "big"), len(p) * 8
+        pos, tocs = 4, []
+        while pos + 6 <= total:
+            t = (v >> (total - pos - 6)) & 63
+            pos += 6
+            tocs.append((t >> 1) & 15)
+            if not t & 32:
+                break
+        for ft in tocs:
+            n = self.nbits(ft)
+            if pos + n > total:
+                break
+            bits = (v >> (total - pos - n)) & ((1 << n) - 1) if n else 0
+            pos += n
+            pad = -n % 8
+            out.append((ft, (bits << pad).to_bytes((n + pad) // 8, "big")))
+        return out
+
+
+def csets(device, enable=True):
+    """The csets of a HiFi device in our UCM profile, so routes live in one place"""
+    try:
+        with open(UCM) as f:
+            conf = f.read()
+    except OSError:
+        return
+    m = re.search(r'SectionDevice\."%s"\s*\{(.*?)\n\}' % device, conf, re.S)
+    if not m:
+        return
+    seq = re.search(r"%sSequence \[(.*?)\]" % ("Enable" if enable else "Disable"), m.group(1), re.S)
+    for name, val in re.findall(r"""cset "name='([^']+)' ([^"]+)\"""", seq.group(1) if seq else ""):
+        run("amixer", "-q", "-c", CARD, "cset", "name=%s" % name, val)
+
+
+def pipewire_output(suspend):
+    """Every sink: the default one is a filter, and another below it holds the device"""
+    for line in run("pactl", "list", "short", "sinks", timeout=3)[1].splitlines():
+        run("pactl", "suspend-sink", line.split()[0], "1" if suspend else "0", timeout=3)
+
+
+class Media:
+    """RTP on the IMS interface, and the phone's own earpiece and microphone"""
+    DEVICES = {"earpiece": "Earpiece", "speaker": "Speaker", "headphones": "Headphones"}
+
+    def __init__(self, dev, addr):
+        self.addr = addr
+        self.rtp = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        self.rtp.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, dev.encode())
+        self.rtp.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_TCLASS, 0xb8)     # EF, for the voice bearer
+        for _ in range(50):
+            self.port = random.randrange(30000, 39000) & ~1
+            try:
+                self.rtp.bind((str(addr), self.port))
+                break
+            except OSError:
+                continue
+        self.remote = None
+        self.codec = None
+        self.octet = False
+        self.pt = None
+        self.dtmf_pt = None
+        self.muted = False
+        self.device = "earpiece"
+        self.gain = 1.0
+        self.running = False
+        self.threads = []
+        self.play = self.rec = None
+        self.seq = secrets.randbelow(65536)
+        self.ts = secrets.randbelow(1 << 31)
+        self.ssrc = secrets.randbits(32)
+        self.tx_lock = threading.Lock()
+        self.stats = {"tx": 0, "rx": 0, "bad": 0}
+
+    def configure(self, remote, name, pt, octet, dtmf_pt, mode=None):
+        self.remote = remote
+        if self.codec is None or self.pt != pt:
+            self.codec, self.pt, self.octet = Codec(name, mode), pt, octet
+        self.dtmf_pt = dtmf_pt
+
+    def route(self, device):
+        name = self.DEVICES.get(device)
+        if not name:
+            return
+        if self.running:
+            csets(self.DEVICES[self.device], False)
+            csets(name)
+        self.device = device
+        self.gain = SPEAKER_GAIN if device == "speaker" else 1.0
+
+    def start(self):
+        if self.running or not self.remote or not self.codec:
+            return
+        self.running = True
+        # DL1 feeds the loudspeaker as well, and normal sound leaves that on
+        csets("Speaker", False)
+        csets(self.DEVICES[self.device])
+        csets("Mic")
+        run("amixer", "-q", "-c", CARD, "cset", "name=PGA Volume", "4,4")   # 24 dB, the preamplifier's top
+        fmt = ["-q", "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", str(self.codec.rate)]
+        self.fmt = fmt
+        # PipeWire holds the output for seconds after a sound, such as the ringtone, ends
+        pipewire_output(True)
+        self.open_play()
+        self.rec = subprocess.Popen(["arecord", "-D", REC_PCM, "--buffer-time=120000"] + fmt,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        for f in (self.rx_loop, self.tx_loop):
+            t = threading.Thread(target=f, daemon=True)
+            t.start()
+            self.threads.append(t)
+        log("audio started: %s, %s" % (self.codec.rate, "octet-aligned" if self.octet else "bandwidth-efficient"))
+
+    def open_play(self):
+        self.play_retry = time.time() + 0.25
+        self.play = subprocess.Popen(["aplay", "-D", PLAY_PCM, "--buffer-time=120000"] + self.fmt,
+                                     stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def write_play(self, pcm):
+        """To the earpiece. The player can fail while another program has the device: it
+        gets tried again, and the sound meanwhile is lost rather than the call's."""
+        p = self.play
+        if p is None or p.poll() is not None:
+            if p is not None:
+                why = p.stderr.read(200).decode(errors="replace").strip().split("\n")[0]
+                self.stats["replay"] = self.stats.get("replay", 0) + 1
+                if self.stats["replay"] <= 3:
+                    log("playback stopped: %s" % why[:70])
+                self.play = None
+            if time.time() < self.play_retry:
+                return
+            self.open_play()
+            p = self.play
+        if self.gain != 1.0:
+            pcm = audioop.mul(pcm, 2, self.gain)
+        try:
+            p.stdin.write(pcm)
+            p.stdin.flush()
+            self.stats["played"] = self.stats.get("played", 0) + 1
+        except OSError:
+            pass
+
+    def stop(self):
+        was = self.running
+        self.running = False
+        for p in (self.rec, self.play):
+            if p:
+                p.terminate()
+        for t in self.threads:
+            t.join(2)
+        self.threads = []
+        self.rtp.close()
+        if was:
+            csets(self.DEVICES[self.device], False)
+            csets("Mic", False)
+            csets("Speaker")        # back to how normal sound expects it
+            pipewire_output(False)
+            log("audio stopped: %d sent, %d received, %d played, %d bad, %d player restarts" % (
+                self.stats["tx"], self.stats["rx"], self.stats.get("played", 0), self.stats["bad"], self.stats.get("replay", 0)))
+
+    def send_rtp(self, pt, marker, ts, payload):
+        with self.tx_lock:
+            self.seq = (self.seq + 1) & 0xffff
+            h = struct.pack("!BBHII", 0x80, pt | (0x80 if marker else 0), self.seq, ts & 0xffffffff, self.ssrc)
+            try:
+                self.rtp.sendto(h + payload, self.remote)
+                self.stats["tx"] += 1
+            except OSError:
+                pass
+
+    def tx_loop(self):
+        n = self.codec.samples * 2
+        first = True
+        while self.running:
+            pcm = self.rec.stdout.read(n)
+            if len(pcm) < n:
+                break
+            if self.muted:
+                pcm = bytes(n)
+            ft, speech = self.codec.encode(pcm)
+            self.send_rtp(self.pt, first, self.ts, self.codec.pack(ft, speech, self.octet))
+            first = False
+            self.ts += self.codec.samples
+
+    def rx_loop(self):
+        self.rtp.settimeout(0.5)
+        while self.running:
+            try:
+                d = self.rtp.recv(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if len(d) < 12 or d[0] >> 6 != 2:
+                self.stats["bad"] += 1
+                continue
+            cc = d[0] & 15
+            off = 12 + cc * 4
+            if d[0] & 0x10 and len(d) >= off + 4:
+                off += 4 + 4 * struct.unpack_from("!H", d, off + 2)[0]
+            if d[1] & 0x7f != self.pt:
+                self.stats["other_pt"] = self.stats.get("other_pt", 0) + 1
+                continue
+            self.stats["rx"] += 1
+            for ft, speech in self.codec.unpack(d[off:], self.octet):
+                self.write_play(self.codec.decode(ft, speech))
+
+    def dtmf(self, digit):
+        """RFC 4733, in a thread: three of each packet's end, for loss"""
+        code = "0123456789*#".find(digit)
+        if code < 0 or not self.dtmf_pt or not self.running:
+            return
+
+        def send():
+            rate = self.codec.rate
+            ts = self.ts
+            step = rate // 50
+            for i in range(1, 9):
+                self.send_rtp(self.dtmf_pt, i == 1, ts, struct.pack("!BBH", code, 10, step * i))
+                time.sleep(0.02)
+            for _ in range(3):
+                self.send_rtp(self.dtmf_pt, False, ts, struct.pack("!BBH", code, 0x80 | 10, step * 8))
+        threading.Thread(target=send, daemon=True).start()
+
+
+def parse_sdp(body):
+    """{addr, port, codecs: [(pt, name, rate, fmtp)], dtmf: {rate: pt}, qos, curr, ptime}"""
+    out = {"addr": None, "port": None, "codecs": [], "dtmf": {}, "qos": False, "sendrecv": True, "curr_remote": None}
+    names, fmtps, order = {}, {}, []
+    for line in body.decode(errors="replace").split("\r\n"):
+        if line.startswith("c=IN IP6 "):
+            out["addr"] = line[9:].strip()
+        elif line.startswith("m=audio "):
+            f = line.split()
+            out["port"] = int(f[1])
+            order = [int(x) for x in f[3:] if x.isdigit()]
+        elif line.startswith("a=rtpmap:"):
+            pt, rest = line[9:].split(" ", 1)
+            names[int(pt)] = rest.split("/")
+        elif line.startswith("a=fmtp:"):
+            pt, rest = line[7:].split(" ", 1) if " " in line[7:] else (line[7:], "")
+            fmtps[int(pt)] = rest
+        elif line.startswith("a=des:qos") or line.startswith("a=curr:qos"):
+            out["qos"] = True
+            if line.startswith("a=curr:qos local"):
+                out["curr_remote"] = line.split()[-1]     # their local is our remote
+        elif line in ("a=inactive", "a=sendonly", "a=recvonly"):
+            out["sendrecv"] = False
+    for pt in order:
+        n = names.get(pt)
+        if n and n[0].lower() == "telephone-event":
+            out["dtmf"][int(n[1])] = pt
+        elif n:
+            out["codecs"].append((pt, n[0], int(n[1]), fmtps.get(pt, "")))
+    return out
+
+
+def pick_codec(sdp):
+    for want in ("AMR-WB", "AMR"):
+        for pt, name, rate, fmtp in sdp["codecs"]:
+            if name.upper() == want:
+                return pt, want, rate, fmtp
+    return None
+
+
+class Call:
+    def __init__(self, cid, incoming, number):
+        self.id, self.incoming, self.number = cid, incoming, number
+        self.state = "dialing"
+        self.call_id = None
+        self.local_tag = secrets.token_hex(5)
+        self.remote_tag = None
+        self.local_uri = self.remote_uri = self.target = None
+        self.routes = []
+        self.cseq = 1
+        self.remote_cseq = 0
+        self.branch = None
+        self.invite = None        # the incoming INVITE
+        self.media = None
+        self.offer = None         # the SDP we sent or received
+        self.qos_required = False
+        self.qos_local = False
+        self.update_sent = False
+        self.rseq_seen = 0
+        self.prack_wait = False
+        self.answered = False
+        self.conn = None
+        self.final_invite = False
+        self.ringing = False
+        self.refresh_at = None
+        self.session_expires = 0
+
+
+class Reregister(Exception):
+    pass
+
+
+class Ua:
+    def __init__(self, pdn, ident, at):
+        self.pdn, self.id, self.at = pdn, ident, at
+        self.addr = pdn.addr
+        self.pcscf = pdn.pcscf[0]
+        self.xfrm = Xfrm()
+        self.call_id = secrets.token_hex(12)
+        self.cseq = 0
+        self.tag = secrets.token_hex(5)
+        self.port_c = random.randrange(40000, 50000) & ~1
+        self.port_s = self.port_c + 1
+        self.spi_c = random.randrange(0x10000000, 0x7fffffff)
+        self.spi_s = random.randrange(0x10000000, 0x7fffffff)
+        self.server = None
+        self.pcscf_port_s = 5060
+        self.pcscf_port_c = None
+        self.auth_hdr = 'Digest username="%s",realm="%s",nonce="",algorithm=AKAv1-MD5,uri="sip:%s",response=""' % (
+            ident.impi, ident.domain, ident.domain)
+        self.udp = []
+        self.conn = None          # our TCP connection to the P-CSCF
+        self.bufs = {}            # every TCP connection, and what it has buffered
+        self.listener = None
+        self.ctl = None
+        self.ctl_clients = {}
+        self.calls = {}
+        self.by_call_id = {}
+        self.next_id = 1
+        self.expires = 0
+        self.next_refresh = 0
+        self.routes = []
+        self.tel = None
+        self.sip = None
+        self.registered = False
+        self.reg_cseq = 0
+        self.sub_call_id = secrets.token_hex(12)
+        self.sub_cseq = 0
+        self.next_subscribe = 0
+        self.next_ping = 0
+
+    # ---- transport ----
+
+    def udp_sock(self, port):
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, self.pdn.dev.encode())
+        s.bind((str(self.addr), port))
+        self.udp.append(s)
+        return s
+
+    def connect(self):
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, self.pdn.dev.encode())
+        s.bind((str(self.addr), self.port_c))
+        s.settimeout(8)
+        s.connect((str(self.pcscf), self.pcscf_port_s))
+        s.setblocking(False)
+        self.bufs[s] = b""
+        self.conn = s
+        return s
+
+    def listen(self):
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, self.pdn.dev.encode())
+        s.bind((str(self.addr), self.port_s))
+        s.listen(4)
+        s.setblocking(False)
+        self.listener = s
+
+    def send(self, data, conn=None):
+        conn = conn if conn in self.bufs else None
+        c = conn or self.conn
+        try:
+            if c is None:
+                c = self.connect()
+            c.setblocking(True)
+            c.settimeout(5)
+            c.sendall(data)
+            c.setblocking(False)
+        except OSError:
+            self.drop(c)
+            if conn is not None:
+                raise Reregister("a connection failed")
+            c = self.connect()          # once more on a new one
+            c.setblocking(True)
+            c.settimeout(5)
+            c.sendall(data)
+            c.setblocking(False)
+
+    def drop(self, c):
+        if c in self.bufs:
+            del self.bufs[c]
+        if c is self.conn:
+            self.conn = None
+        if c is not None:
+            c.close()
+
+    # ---- registration ----
+
+    def security_client(self):
+        return ", ".join("ipsec-3gpp;prot=esp;mod=trans;spi-c=%d;spi-s=%d;port-c=%d;port-s=%d;alg=%s;ealg=%s" % (
+            self.spi_c, self.spi_s, self.port_c, self.port_s, a, e) for a, e in OFFER)
+
+    def contact(self, port=None):
+        return '<sip:%s@[%s]:%d>;+sip.instance="<%s>";+g.3gpp.icsi-ref="%s";audio' % (
+            self.id.user, self.addr, port or self.port_s, self.id.instance, ICSI_MMTEL)
+
+    def pani(self):
+        p = self.id.cell_info(self.at)
+        return ["P-Access-Network-Info: %s" % p] if p else []
+
+    def register_msg(self, protected, expires=3600):
+        self.cseq += 1
+        self.reg_cseq = self.cseq
+        port = self.port_s if protected else 5060
+        h = ["REGISTER sip:%s SIP/2.0" % self.id.domain,
+             "Via: SIP/2.0/%s [%s]:%d;branch=z9hG4bK%s%s" % ("TCP" if protected else "UDP", self.addr, port, secrets.token_hex(8), "" if protected else ";rport"),
+             "Max-Forwards: 70",
+             "From: <%s>;tag=%s" % (self.id.impu, self.tag),
+             "To: <%s>" % self.id.impu,
+             "Call-ID: %s" % self.call_id,
+             "CSeq: %d REGISTER" % self.cseq,
+             "Contact: %s" % self.contact(port),
+             "Expires: %d" % expires,
+             "Allow: %s" % ALLOW,
+             "Supported: path,gruu,sec-agree",
+             "Require: sec-agree",
+             "Proxy-Require: sec-agree",
+             "User-Agent: %s" % USER_AGENT,
+             "Authorization: %s" % self.auth_hdr] + self.pani()
+        h.append("Security-Client: %s" % self.security_client())
+        if self.server:
+            h.append("Security-Verify: %s" % self.server)
+        h.append("Content-Length: 0")
+        return ("\r\n".join(h) + "\r\n\r\n").encode()
+
+    def challenge(self, m):
+        """Answer a 401: the SIM's AKA, the digest and the SAs. True when SAs are up."""
+        p = params(m.get("www-authenticate") or "")
+        nonce = base64.b64decode(p.get("nonce", ""))
+        if len(nonce) < 32 or "aka" not in p.get("algorithm", "").lower():
+            raise RuntimeError("not an AKA challenge")
+        realm = p.get("realm", self.id.domain)
+        got = self.id.sim.auth(nonce[:16], nonce[16:32])
+        if got is None:
+            raise RuntimeError("the SIM refused the challenge")
+        res, ck, ik, auts = got
+        uri = "sip:%s" % self.id.domain
+        if auts is not None:
+            log("AKA: the SIM asks to resynchronise")
+            self.auth_hdr = 'Digest username="%s",realm="%s",nonce="%s",uri="%s",response="",algorithm=%s,auts="%s"' % (
+                self.id.impi, realm, p["nonce"], uri, p["algorithm"], base64.b64encode(auts).decode())
+            return False
+        qop = "auth" if "auth" in p.get("qop", "") else None
+        cnonce, nc = secrets.token_hex(8), "00000001"
+        ha1 = hashlib.md5(("%s:%s:" % (self.id.impi, realm)).encode() + res).hexdigest()
+        ha2 = hashlib.md5(("REGISTER:%s" % uri).encode()).hexdigest()
+        if qop:
+            resp = hashlib.md5(("%s:%s:%s:%s:%s:%s" % (ha1, p["nonce"], nc, cnonce, qop, ha2)).encode()).hexdigest()
+        else:
+            resp = hashlib.md5(("%s:%s:%s" % (ha1, p["nonce"], ha2)).encode()).hexdigest()
+        self.auth_hdr = 'Digest username="%s",realm="%s",nonce="%s",uri="%s",response="%s",algorithm=%s' % (
+            self.id.impi, realm, p["nonce"], uri, resp, p["algorithm"])
+        if qop:
+            self.auth_hdr += ',cnonce="%s",qop=%s,nc=%s' % (cnonce, qop, nc)
+        best, bq = None, -1.0
+        for o in (m.get("security-server") or "").split(","):
+            q = float(params(o).get("q", 0))
+            if q > bq and o.strip().startswith("ipsec-3gpp"):
+                best, bq = o.strip(), q
+        if best is None:
+            raise RuntimeError("no IPsec offer")
+        self.server = best
+        s = params(best)
+        alg, ealg = s.get("alg"), s.get("ealg", "null")
+        log("security: %s, %s" % (alg, ealg))
+        ak, ek = Xfrm.keys(alg, ealg, ck, ik)
+        self.pcscf_port_s, self.pcscf_port_c = int(s["port-s"]), int(s["port-c"])
+        me, them = self.addr, self.pcscf
+        self.xfrm.clear()
+        self.xfrm.sa(me, them, int(s["spi-s"]), self.port_c, self.pcscf_port_s, "out", alg, ealg, ak, ek)
+        self.xfrm.sa(me, them, int(s["spi-c"]), self.port_s, self.pcscf_port_c, "out", alg, ealg, ak, ek)
+        self.xfrm.sa(them, me, self.spi_s, self.pcscf_port_c, self.port_s, "in", alg, ealg, ak, ek)
+        self.xfrm.sa(them, me, self.spi_c, self.pcscf_port_s, self.port_c, "in", alg, ealg, ak, ek)
+        return True
+
+    def wait_status(self, secs):
+        """the next final response on our connection, for the registration before the main loop"""
+        end = time.time() + secs
+        while time.time() < end:
+            if not select.select([self.conn], [], [], max(0, end - time.time()))[0]:
+                continue
+            d = self.conn.recv(65535)
+            if not d:
+                return None
+            self.bufs[self.conn] += d
+            while True:
+                raw, self.bufs[self.conn] = frame(self.bufs[self.conn])
+                if not raw:
+                    break
+                m = Msg(raw)
+                if m.status is not None and m.status >= 200:
+                    return m
+        return None
+
+    def register(self):
+        plain = self.udp_sock(5060)
+        client = self.udp_sock(self.port_c)
+        server = self.udp_sock(self.port_s)
+        self.listen()
+        for attempt in range(MAX_REGISTER_TRIES):
+            plain.sendto(self.register_msg(False), (str(self.pcscf), 5060))
+            log("REGISTER sent")
+            if not select.select([plain], [], [], 15)[0]:
+                log("no answer")
+                continue
+            m = Msg(plain.recv(65535))
+            log(m.describe())
+            if m.status != 401:
+                return False
+            if self.challenge(m):
+                break
+        else:
+            return False
+        try:
+            self.connect()
+        except OSError as e:
+            log("TCP through IPsec: %s" % (e.strerror or "failed"))
+            return False
+        self.send(self.register_msg(True))
+        log("REGISTER sent (protected)")
+        m = self.wait_status(20)
+        if m is None:
+            log("no answer to the protected REGISTER")
+            return False
+        log(m.describe())
+        if m.status != 200:
+            return False
+        self.registered_ok(m)
+        for s in (client, plain):
+            s.close()
+            self.udp.remove(s)
+        self.udp = [server]
+        return True
+
+    def registered_ok(self, m):
+        e = None
+        for c in m.all("contact"):
+            e = e or params(c).get("expires")
+        self.expires = int(e or m.get("expires") or 600)
+        self.routes = []
+        for r in m.all("service-route"):
+            self.routes += [x.strip() for x in r.split(",")]
+        for a in m.all("p-associated-uri"):
+            for u in re.findall(r"<([^>]+)>", a):
+                if u.startswith("tel:"):
+                    self.tel = self.tel or u
+                elif u.startswith("sip:"):
+                    self.sip = self.sip or u
+        self.next_refresh = time.time() + max(60, self.expires * 0.6)
+        self.registered = True
+        log("REGISTERED: %d s, tel %s, service routes %d" % (self.expires, "yes" if self.tel else "no", len(self.routes)))
+        self.emit({"ev": "registered", "on": True})
+
+    def my_uri(self):
+        return self.tel or self.sip or self.id.impu
+
+    def subscribe(self):
+        self.sub_cseq += 1
+        tag = hashlib.md5(self.sub_call_id.encode()).hexdigest()[:10]
+        h = ["SUBSCRIBE %s SIP/2.0" % self.id.impu, self.via(), "Max-Forwards: 70",
+             "Route: %s" % ", ".join(self.first_route() + self.routes),
+             "From: <%s>;tag=%s" % (self.id.impu, tag), "To: <%s>" % self.id.impu,
+             "Call-ID: %s" % self.sub_call_id, "CSeq: %d SUBSCRIBE" % self.sub_cseq,
+             "Contact: %s" % self.contact(), "Event: reg", "Accept: application/reginfo+xml", "Expires: 3600",
+             "P-Preferred-Identity: <%s>" % self.id.impu, "Security-Verify: %s" % self.server,
+             "Require: sec-agree", "Proxy-Require: sec-agree", "User-Agent: %s" % USER_AGENT] + self.pani() + ["Content-Length: 0"]
+        self.send(("\r\n".join(h) + "\r\n\r\n").encode())
+        self.next_subscribe = time.time() + 2000
+
+    def first_route(self):
+        return ["<sip:[%s]:%d;lr>" % (self.pcscf, self.pcscf_port_s)]
+
+    def via(self, branch=None):
+        return "Via: SIP/2.0/TCP [%s]:%d;branch=%s" % (self.addr, self.port_s, branch or "z9hG4bK" + secrets.token_hex(8))
+
+    # ---- calls: requests ----
+
+    @staticmethod
+    def number_uri(num, domain):
+        n = re.sub(r"[^\d+*#]", "", num)
+        if n in ("911", "112"):
+            return "urn:service:sos"    # untested, and no emergency registration: the dialer warns
+        if re.fullmatch(r"\d{10}", n):
+            n = "+1" + n
+        elif re.fullmatch(r"1\d{10}", n):
+            n = "+" + n
+        if n.startswith("+"):
+            return "tel:%s" % n
+        return "sip:%s;phone-context=%s@%s;user=phone" % (n, domain, domain)
+
+    def sdp(self, call, body_for=None):
+        m = call.media
+        a = str(self.addr)
+        lines = ["v=0", "o=- %d %d IN IP6 %s" % (call.id + 1000, call.cseq, a), "s=-", "c=IN IP6 %s" % a,
+                 "b=AS:49", "b=RS:600", "b=RR:2000", "t=0 0"]
+        if body_for:     # an answer: only what was chosen
+            pts = [m.pt] + ([m.dtmf_pt] if m.dtmf_pt else [])
+            lines.append("m=audio %d RTP/AVP %s" % (m.port, " ".join(map(str, pts))))
+            lines.append("a=rtpmap:%d %s/%d/1" % (m.pt, "AMR-WB" if m.codec.wb else "AMR", m.codec.rate))
+            lines.append("a=fmtp:%d mode-change-capability=2;max-red=0%s" % (m.pt, ";octet-align=1" if m.octet else ""))
+            if m.dtmf_pt:
+                lines.append("a=rtpmap:%d telephone-event/%d" % (m.dtmf_pt, m.codec.rate))
+                lines.append("a=fmtp:%d 0-15" % m.dtmf_pt)
+        else:            # our offer
+            lines.append("m=audio %d RTP/AVP 104 102 100 101" % m.port)
+            lines += ["a=rtpmap:104 AMR-WB/16000/1", "a=fmtp:104 mode-change-capability=2;max-red=0",
+                      "a=rtpmap:102 AMR/8000/1", "a=fmtp:102 mode-change-capability=2;max-red=0",
+                      "a=rtpmap:100 telephone-event/16000", "a=fmtp:100 0-15",
+                      "a=rtpmap:101 telephone-event/8000", "a=fmtp:101 0-15"]
+        lines += ["a=ptime:20", "a=maxptime:40"]
+        if call.qos_required or not body_for:
+            lines += ["a=curr:qos local %s" % ("sendrecv" if call.qos_local else "none"),
+                      "a=curr:qos remote %s" % ("sendrecv" if call.state == "qos-remote" else "none"),
+                      "a=des:qos mandatory local sendrecv", "a=des:qos mandatory remote sendrecv"]
+            if body_for and not call.qos_local:
+                lines.append("a=conf:qos remote sendrecv")
+        lines.append("a=sendrecv")
+        return ("\r\n".join(lines) + "\r\n").encode()
+
+    def request(self, call, method, body=None, extra=(), branch=None, cseq=None):
+        if cseq is None:
+            call.cseq += 1
+            cseq = call.cseq
+        to = "<%s>" % call.remote_uri + (";tag=%s" % call.remote_tag if call.remote_tag else "")
+        h = ["%s %s SIP/2.0" % (method, call.target), self.via(branch), "Max-Forwards: 70"]
+        if call.routes:
+            h.append("Route: %s" % ", ".join(call.routes))
+        h += ["From: <%s>;tag=%s" % (call.local_uri, call.local_tag), "To: %s" % to,
+              "Call-ID: %s" % call.call_id, "CSeq: %d %s" % (cseq, method),
+              "Contact: %s" % self.contact(), "Security-Verify: %s" % self.server,
+              "Require: sec-agree", "Proxy-Require: sec-agree", "User-Agent: %s" % USER_AGENT] + list(extra) + self.pani()
+        if body:
+            h.append("Content-Type: application/sdp")
+        h.append("Content-Length: %d" % (len(body) if body else 0))
+        self.send(("\r\n".join(h) + "\r\n\r\n").encode() + (body or b""), call.conn)
+
+    def dial(self, number):
+        if not self.registered:
+            self.emit({"ev": "error", "text": "not registered"})
+            return
+        if any(c.state != "ended" for c in self.calls.values()):
+            self.emit({"ev": "error", "text": "already in a call"})
+            return
+        call = Call(self.next_id, False, number)
+        self.next_id += 1
+        call.call_id = secrets.token_hex(12)
+        call.local_uri = self.my_uri()
+        call.remote_uri = call.target = self.number_uri(number, self.id.domain)
+        call.routes = self.first_route() + self.routes
+        call.media = Media(self.pdn.dev, self.addr)
+        call.branch = "z9hG4bK" + secrets.token_hex(8)
+        call.cseq = 1
+        self.calls[call.id] = call
+        self.by_call_id[call.call_id] = call
+        self.set_state(call, "dialing")
+        body = self.sdp(call)
+        self.request(call, "INVITE", body, branch=call.branch, cseq=1, extra=(
+            "P-Preferred-Identity: <%s>" % self.my_uri(),
+            "P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel",
+            'Accept-Contact: *;+g.3gpp.icsi-ref="%s"' % ICSI_MMTEL,
+            "Supported: 100rel,precondition,replaces", "Allow: %s" % ALLOW,
+            "Accept: application/sdp"))
+        log("call %d: INVITE sent" % call.id)
+
+    def set_state(self, call, state, reason=None):
+        call.state = state
+        ev = {"ev": "call", "id": call.id, "state": state, "dir": "in" if call.incoming else "out", "number": call.number}
+        if reason:
+            ev["reason"] = reason
+        self.emit(ev)
+        if state not in ("dialing",):
+            log("call %d: %s%s" % (call.id, state, " (%s)" % reason if reason else ""))
+
+    def end(self, call, reason=None):
+        if call.state == "ended":
+            return
+        if call.media:
+            call.media.stop()
+            call.media = None
+        self.set_state(call, "ended", reason)
+
+    def use_answer(self, call, sdp):
+        """Their SDP, in answer to our offer or in their offer: set up the media"""
+        c = pick_codec(sdp)
+        if not c or not sdp["addr"] or not sdp["port"]:
+            return False
+        pt, name, rate, fmtp = c
+        m = re.search(r"mode-set=([\d,]+)", fmtp)
+        mode = max(int(x) for x in m.group(1).split(",")) if m else None
+        limit = 8 if name == "AMR-WB" else 7
+        if mode is not None and mode > limit:
+            mode = limit
+        call.media.configure((sdp["addr"], sdp["port"]), name, pt, "octet-align=1" in fmtp.replace(" ", ""), sdp["dtmf"].get(rate), mode)
+        return True
+
+    def hangup(self, cid):
+        call = self.calls.get(cid)
+        if not call or call.state == "ended":
+            return
+        if call.incoming and not call.final_invite:
+            self.final_response(call, 486 if call.state != "ending" else 487, "Busy Here")
+            self.end(call, "declined")
+        elif call.state == "active" or (call.final_invite and call.incoming):
+            self.request(call, "BYE", extra=('Reason: SIP;cause=200;text="User hangup"',))
+            self.end(call, "hung up")
+        else:
+            # our INVITE: CANCEL it, same branch and CSeq, no To tag
+            h = ["CANCEL %s SIP/2.0" % call.target, self.via(call.branch), "Max-Forwards: 70",
+                 "Route: %s" % ", ".join(self.first_route() + self.routes),
+                 "From: <%s>;tag=%s" % (call.local_uri, call.local_tag), "To: <%s>" % call.remote_uri,
+                 "Call-ID: %s" % call.call_id, "CSeq: 1 CANCEL", "Security-Verify: %s" % self.server,
+                 "Require: sec-agree", "Proxy-Require: sec-agree",
+                 'Reason: SIP;cause=487;text="User hangup"', "Content-Length: 0"]
+            self.send(("\r\n".join(h) + "\r\n\r\n").encode(), call.conn)
+            self.end(call, "cancelled")
+
+    def answer(self, cid):
+        call = self.calls.get(cid)
+        if not call or not call.incoming or call.final_invite or call.state == "ended":
+            return
+        call.answered = True
+        body = self.sdp(call, True)
+        self.response(call.invite, 200, "OK", call, body=body, conn=call.conn, extra=("Allow: %s" % ALLOW,))
+        call.final_invite = True
+        call.media.start()
+        self.set_state(call, "active")
+
+    def final_response(self, call, code, reason):
+        self.response(call.invite, code, reason, call, conn=call.conn)
+        call.final_invite = True
+
+    # ---- responses and requests from the network ----
+
+    def response(self, req, code, reason, call=None, body=None, extra=(), conn=None):
+        h = ["SIP/2.0 %d %s" % (code, reason)]
+        h += ["Via: %s" % v for v in req.all("via")]
+        h += ["Record-Route: %s" % v for v in req.all("record-route")]
+        to = req.get("to") or ""
+        if call and ";tag=" not in to and code > 100:
+            to += ";tag=%s" % call.local_tag
+        h += ["From: %s" % (req.get("from") or ""), "To: %s" % to, "Call-ID: %s" % (req.get("call-id") or ""),
+              "CSeq: %s" % (req.get("cseq") or "")]
+        if call and code > 100 and code < 300:
+            h.append("Contact: %s" % self.contact())
+        h += list(extra)
+        if body:
+            h.append("Content-Type: application/sdp")
+        h.append("Content-Length: %d" % (len(body) if body else 0))
+        self.send(("\r\n".join(h) + "\r\n\r\n").encode() + (body or b""), conn)
+
+    def on_status(self, m):
+        cseq = (m.get("cseq") or "0 X").split()
+        method, n = cseq[1], int(cseq[0])
+        if method == "REGISTER":
+            log(m.describe())
+            if m.status == 200:
+                self.registered_ok(m)
+            elif m.status == 401:
+                raise Reregister("the network wants new keys")
+            elif m.status >= 300:
+                raise Reregister("refresh refused")
+            return
+        if method == "SUBSCRIBE":
+            log("SUBSCRIBE: %d" % m.status)
+            return
+        call = self.by_call_id.get(m.get("call-id"))
+        if not call:
+            return
+        if method == "INVITE":
+            self.on_invite_status(call, m, n)
+        elif method == "PRACK" and m.status == 200 and call.qos_required and not call.update_sent:
+            self.send_qos_update(call)
+        elif method == "UPDATE":
+            log("call %d: UPDATE %d" % (call.id, m.status))
+            if m.status == 200 and m.body:
+                self.use_answer(call, parse_sdp(m.body))
+        elif method == "BYE":
+            log("call %d: BYE %d" % (call.id, m.status))
+
+    def send_qos_update(self, call):
+        """TS 24.229's preconditions: our resources are ready"""
+        call.update_sent = True
+        call.qos_local = True
+        self.request(call, "UPDATE", self.sdp(call, True))
+
+    def on_invite_status(self, call, m, n):
+        log("call %d: %d %s" % (call.id, m.status, (m.reason or "")[:40]))
+        to = params(m.get("to") or "")
+        if to.get("tag"):
+            call.remote_tag = to["tag"]
+        if m.status < 200 and m.status > 100:
+            self.dialog_from(call, m)
+            if m.body:
+                sdp = parse_sdp(m.body)
+                if self.use_answer(call, sdp):
+                    call.qos_required = sdp["qos"]
+                    call.media.start()      # early media and the bearer's gate
+            if m.get("rseq"):
+                rs = int(m.get("rseq"))
+                if rs > call.rseq_seen:
+                    call.rseq_seen = rs
+                    self.request(call, "PRACK", extra=("RAck: %d %d INVITE" % (rs, n),))
+            if m.status == 180 and call.state != "ringing":
+                self.set_state(call, "ringing")
+            return
+        if m.status == 100:
+            return
+        if m.status < 300:
+            self.dialog_from(call, m)
+            if m.body:
+                self.use_answer(call, parse_sdp(m.body))
+            self.ack(call, n)
+            call.final_invite = True
+            self.session_timer(call, m)
+            call.media.start()
+            if call.state != "ended":
+                self.set_state(call, "active")
+            return
+        # refused: the ACK belongs to the INVITE's transaction
+        h = ["ACK %s SIP/2.0" % call.remote_uri, self.via(call.branch), "Max-Forwards: 70",
+             "Route: %s" % ", ".join(self.first_route() + self.routes),
+             "From: <%s>;tag=%s" % (call.local_uri, call.local_tag), "To: %s" % (m.get("to") or ""),
+             "Call-ID: %s" % call.call_id, "CSeq: %d ACK" % n, "Content-Length: 0"]
+        self.send(("\r\n".join(h) + "\r\n\r\n").encode(), call.conn)
+        self.end(call, "%d %s" % (m.status, (m.reason or "")[:40]))
+
+    def dialog_from(self, call, m):
+        rr = []
+        for r in m.all("record-route"):
+            rr += [x.strip() for x in r.split(",")]
+        if rr:
+            call.routes = list(reversed(rr))
+        c = re.search(r"<([^>]+)>", m.get("contact") or "")
+        if c:
+            call.target = c.group(1)
+
+    def ack(self, call, n):
+        self.request(call, "ACK", cseq=n)
+
+    def session_timer(self, call, m):
+        se = m.get("session-expires")
+        if se:
+            call.session_expires = int(re.match(r"\d+", se).group(0))
+            if "refresher=uac" in se and not call.incoming or "refresher=uas" in se and call.incoming:
+                call.refresh_at = time.time() + call.session_expires * 0.5
+
+    def on_request(self, m, conn):
+        method = m.first.split(" ")[0]
+        cid = m.get("call-id")
+        call = self.by_call_id.get(cid)
+        if method == "INVITE" and call is None:
+            self.on_incoming(m, conn)
+        elif method == "INVITE":        # within a call: hold, resume, a session refresh
+            call.conn = conn
+            if m.body:
+                sdp = parse_sdp(m.body)
+                self.use_answer(call, sdp)
+            self.response(m, 200, "OK", call, body=self.sdp(call, True), conn=conn)
+        elif method == "ACK":
+            if call and call.state != "active" and call.state != "ended" and call.answered:
+                self.set_state(call, "active")
+        elif method == "PRACK":
+            self.response(m, 200, "OK", call, conn=conn)
+            if call and call.incoming:
+                call.prack_wait = False
+                if not call.qos_required and not call.ringing:
+                    self.ring(call, conn)
+        elif method == "UPDATE":
+            if call and m.body:
+                sdp = parse_sdp(m.body)
+                self.use_answer(call, sdp)
+                call.qos_local = True
+                self.response(m, 200, "OK", call, body=self.sdp(call, True), conn=conn)
+                if call.incoming and not call.ringing and sdp["curr_remote"] in ("sendrecv", "send", "recv", None):
+                    self.ring(call, conn)
+            else:
+                self.response(m, 200, "OK", call, conn=conn)
+        elif method == "BYE":
+            self.response(m, 200, "OK", call, conn=conn)
+            if call:
+                self.end(call, "the other side hung up")
+        elif method == "CANCEL":
+            self.response(m, 200, "OK", call, conn=conn)
+            if call and not call.final_invite:
+                self.final_response(call, 487, "Request Terminated")
+                self.end(call, "missed")
+        elif method == "NOTIFY":
+            self.response(m, 200, "OK", conn=conn)
+            # the registration's own state: a contact's can be an old one of ours
+            if re.search(rb'<registration\b[^>]*\bstate="terminated"', m.body):
+                log("the network ended the registration")
+                raise Reregister("network deregistration")
+        elif method == "OPTIONS":
+            self.response(m, 200, "OK", conn=conn, extra=("Allow: %s" % ALLOW,))
+        elif method == "MESSAGE":
+            self.response(m, 488, "Not Acceptable Here", conn=conn)     # SMS over IMS: not yet
+        else:
+            self.response(m, 405 if not call else 200, "Method Not Allowed" if not call else "OK", conn=conn)
+
+    def on_incoming(self, m, conn):
+        if any(c.state != "ended" for c in self.calls.values()):
+            self.response(m, 486, "Busy Here", conn=conn)
+            return
+        number = ""
+        for h in m.all("p-asserted-identity") + m.all("from"):
+            u = re.search(r"(?:tel:|sip:)(\+?[\d*#]+)", h)
+            if u:
+                number = u.group(1)
+                break
+        call = Call(self.next_id, True, number)
+        self.next_id += 1
+        call.call_id = m.get("call-id")
+        call.invite = m
+        call.conn = conn
+        call.local_uri = self.my_uri()
+        fr = re.search(r"<([^>]+)>", m.get("from") or "")
+        call.remote_uri = fr.group(1) if fr else ""
+        call.remote_tag = params(m.get("from") or "").get("tag")
+        ct = re.search(r"<([^>]+)>", m.get("contact") or "")
+        call.target = ct.group(1) if ct else ""
+        for r in m.all("record-route"):
+            call.routes += [x.strip() for x in r.split(",")]
+        call.media = Media(self.pdn.dev, self.addr)
+        sdp = parse_sdp(m.body) if m.body else None
+        if not sdp or not self.use_answer(call, sdp):
+            self.response(m, 488, "Not Acceptable Here", conn=conn)
+            call.media.stop()
+            return
+        self.calls[call.id] = call
+        self.by_call_id[call.call_id] = call
+        self.response(m, 100, "Trying", conn=conn)
+        sup = ",".join(m.all("supported") + m.all("require"))
+        call.qos_required = sdp["qos"] and "precondition" in sup
+        if call.qos_required:
+            call.prack_wait = True
+            self.response(m, 183, "Session Progress", call, body=self.sdp(call, True), conn=conn,
+                          extra=("Require: 100rel,precondition", "RSeq: 1", "Allow: %s" % ALLOW))
+            log("call %d: incoming, 183 sent" % call.id)
+        else:
+            self.ring(call, conn)
+
+    def ring(self, call, conn):
+        call.ringing = True
+        self.response(call.invite, 180, "Ringing", call, conn=conn, extra=("Allow: %s" % ALLOW,))
+        self.set_state(call, "incoming")
+
+    # ---- the control socket ----
+
+    def emit(self, ev):
+        data = (json.dumps(ev) + "\n").encode()
+        for c in list(self.ctl_clients):
+            try:
+                c.send(data)
+            except OSError:
+                self.ctl_close(c)
+
+    def ctl_close(self, c):
+        self.ctl_clients.pop(c, None)
+        c.close()
+
+    def ctl_open(self):
+        try:
+            os.unlink(CTL)
+        except OSError:
+            pass
+        self.ctl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.ctl.bind(CTL)
+        os.chmod(CTL, 0o660)
+        self.ctl.listen(4)
+
+    def ctl_command(self, c, line):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            return
+        cmd = d.get("cmd")
+        if cmd == "dial":
+            self.dial(str(d.get("number", "")))
+        elif cmd == "answer":
+            self.answer(d.get("id"))
+        elif cmd == "hangup":
+            self.hangup(d.get("id"))
+        elif cmd in ("dtmf", "mute", "route"):
+            call = next((x for x in self.calls.values() if x.state != "ended"), None)
+            if call and call.media:
+                if cmd == "dtmf":
+                    call.media.dtmf(str(d.get("digit", "")))
+                elif cmd == "mute":
+                    call.media.muted = bool(d.get("on"))
+                else:
+                    call.media.route(str(d.get("device", "")))
+        elif cmd == "status":
+            calls = [{"id": x.id, "state": x.state, "dir": "in" if x.incoming else "out", "number": x.number}
+                     for x in self.calls.values() if x.state != "ended"]
+            c.send((json.dumps({"ev": "status", "registered": self.registered, "calls": calls}) + "\n").encode())
+
+    # ---- the loop ----
+
+    def pump(self, c, data):
+        self.bufs[c] += data
+        while True:
+            buf = self.bufs[c].lstrip(b"\r\n")
+            raw, rest = frame(buf)
+            self.bufs[c] = rest if raw else buf
+            if not raw:
+                return
+            self.dispatch(Msg(raw), c)
+
+    def dispatch(self, m, conn):
+        if m.status is not None:
+            self.on_status(m)
+        else:
+            self.on_request(m, conn)
+
+    def loop(self):
+        self.ctl_open()
+        self.subscribe()
+        self.next_ping = time.time() + 30
+        while True:
+            now = time.time()
+            if now >= self.next_refresh:
+                self.send(self.register_msg(True))
+                self.next_refresh = now + 120     # until the answer sets it
+            if now >= self.next_subscribe:
+                self.subscribe()
+            if now >= self.next_ping:
+                self.next_ping = now + 30
+                if self.at.cmd("AT", 3)[-1:] != ["OK"]:
+                    raise Reregister("the modem stopped answering")
+                if self.conn:
+                    self.send(b"\r\n\r\n")
+            for call in list(self.calls.values()):
+                if call.refresh_at and now >= call.refresh_at and call.state == "active":
+                    call.refresh_at = now + call.session_expires * 0.5
+                    self.request(call, "UPDATE", extra=("Session-Expires: %d;refresher=%s" % (
+                        call.session_expires, "uas" if call.incoming else "uac"),))
+                if call.state == "ended":
+                    del self.calls[call.id]
+                    self.by_call_id.pop(call.call_id, None)
+            r = select.select(list(self.bufs) + self.udp + [self.listener, self.ctl] + list(self.ctl_clients), [], [], 1)[0]
+            for s in r:
+                if s is self.listener:
+                    c, _ = s.accept()
+                    c.setblocking(False)
+                    self.bufs[c] = b""
+                elif s is self.ctl:
+                    c, _ = s.accept()
+                    self.ctl_clients[c] = b""
+                elif s in self.ctl_clients:
+                    d = s.recv(4096)
+                    if not d:
+                        self.ctl_close(s)
+                        continue
+                    self.ctl_clients[s] += d
+                    while b"\n" in self.ctl_clients.get(s, b""):
+                        line, self.ctl_clients[s] = self.ctl_clients[s].split(b"\n", 1)
+                        self.ctl_command(s, line)
+                elif s in self.udp:
+                    self.dispatch(Msg(s.recv(65535)), None)
+                elif s in self.bufs:
+                    try:
+                        d = s.recv(65535)
+                    except OSError:
+                        d = b""
+                    if not d:
+                        was_main = s is self.conn
+                        self.drop(s)
+                        if was_main:
+                            log("the P-CSCF closed our connection")
+                            self.connect()
+                        continue
+                    self.pump(s, d)
+
+    def stop(self):
+        self.registered = False
+        for call in list(self.calls.values()):
+            if call.media:
+                call.media.stop()
+        if self.expires and self.conn:
+            try:        # leave the network tidily
+                self.send(self.register_msg(True, 0))
+            except (OSError, Reregister):
+                pass
+        self.xfrm.clear()
+        for s in self.udp + list(self.bufs):
+            s.close()
+        for s in (self.listener, self.ctl):
+            if s:
+                s.close()
+        for c in self.ctl_clients:
+            c.close()
+        try:
+            os.unlink(CTL)
+        except OSError:
+            pass
+
+
+def wait_modem():
+    """until the modem is on the network"""
+    for _ in range(120):
+        try:
+            a = At("cmd7")
+        except OSError:
+            time.sleep(5)
+            continue
+        try:
+            r = a.cmd("AT+CGATT?", 3)
+        finally:
+            a.close()
+        if any(x.replace(" ", "") == "+CGATT:1" for x in r):
+            return True
+        time.sleep(5)
+    return False
+
+
+def service():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    if not wait_modem():
+        log("the modem is not on the network")
+        return 1
+    pdn = Pdn()
+    pdn.up()
+    at = At("cmd7")
+    at.cmd("AT+CMEE=1")
+    ident = Identity(at)
+    ua = Ua(pdn, ident, at)
+    try:
+        if not ua.register():
+            log("not registered")
+            return 1
+        ua.loop()
+    except Reregister as e:
+        log("starting over: %s" % e)
+        return 1
+    finally:
+        ua.stop()
+        ident.sim.close()
+        at.close()
+
+
+def main():
+    if sys.argv[1:] == ["run"]:
+        try:
+            return service()
+        except (RuntimeError, OSError) as e:
+            # only our own messages and system errors: no identity reaches these
+            log("failed: %s" % e)
+            return 1
+    sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

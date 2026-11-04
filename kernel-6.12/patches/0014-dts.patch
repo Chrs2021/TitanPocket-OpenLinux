@@ -11,9 +11,9 @@ let the bootloader's overlay apply.
 ---
  arch/arm64/boot/dts/mediatek/Makefile         |    3 +
  .../dts/mediatek/mt6771-lk-dtbo-labels.dtsi   |  210 ++
- .../mediatek/mt6771-unihertz-titan-pocket.dts | 1019 +++++++++
- arch/arm64/boot/dts/mediatek/mt6771.dtsi      | 1901 +++++++++++++++++
- 4 files changed, 3133 insertions(+)
+ .../mediatek/mt6771-unihertz-titan-pocket.dts | 1110 ++++++++++
+ arch/arm64/boot/dts/mediatek/mt6771.dtsi      | 1913 +++++++++++++++++
+ 4 files changed, 3236 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
 index 8fd7b2bb7a1590341e7bb4ea1ecf039ae3e8eb0d..d80f5fd16f5664930365fc17045cbe226c32fd4a 100644
@@ -253,10 +253,10 @@ index 0000000000000000000000000000000000000000..152fa0a724a2e7e71716a5e3622ae029
 +};
 diff --git a/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts b/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts
 new file mode 100644
-index 0000000000000000000000000000000000000000..65d39a0fe64d48969bac2b653ee4bb581e4b2945
+index 0000000000000000000000000000000000000000..29fc69ec4c9e1fc5b7d31620246272a12b934285
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts
-@@ -0,0 +1,1019 @@
+@@ -0,0 +1,1110 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Unihertz Titan Pocket (MT6771, 720x720 DSI panel, QWERTY keyboard).
@@ -1220,6 +1220,61 @@ index 0000000000000000000000000000000000000000..65d39a0fe64d48969bac2b653ee4bb58
 +};
 +
 +&pctl {
++	/* the microSD slot; values from the stock device tree and the pins' state there */
++	mmc1_pins_default: mmc1-pins-default {
++		pins-cmd-dat {
++			pinmux = <PINMUX_GPIO31__FUNC_MSDC1_CMD>,
++				 <PINMUX_GPIO32__FUNC_MSDC1_DAT0>,
++				 <PINMUX_GPIO34__FUNC_MSDC1_DAT1>,
++				 <PINMUX_GPIO33__FUNC_MSDC1_DAT2>,
++				 <PINMUX_GPIO30__FUNC_MSDC1_DAT3>;
++			drive-strength = <8>;
++			input-enable;
++			input-schmitt-enable;
++			mediatek,pull-up-adv = <10>;
++		};
++
++		pins-clk {
++			pinmux = <PINMUX_GPIO29__FUNC_MSDC1_CLK>;
++			drive-strength = <8>;
++			input-enable;
++			input-schmitt-enable;
++			mediatek,pull-down-adv = <10>;
++		};
++
++		pins-cd {
++			pinmux = <PINMUX_GPIO3__FUNC_GPIO3>;
++			input-enable;
++			bias-pull-up;
++		};
++	};
++
++	mmc1_pins_uhs: mmc1-pins-uhs {
++		pins-cmd-dat {
++			pinmux = <PINMUX_GPIO31__FUNC_MSDC1_CMD>,
++				 <PINMUX_GPIO32__FUNC_MSDC1_DAT0>,
++				 <PINMUX_GPIO34__FUNC_MSDC1_DAT1>,
++				 <PINMUX_GPIO33__FUNC_MSDC1_DAT2>,
++				 <PINMUX_GPIO30__FUNC_MSDC1_DAT3>;
++			drive-strength = <6>;
++			input-enable;
++			mediatek,pull-up-adv = <10>;
++		};
++
++		pins-clk {
++			pinmux = <PINMUX_GPIO29__FUNC_MSDC1_CLK>;
++			drive-strength = <8>;
++			input-enable;
++			mediatek,pull-down-adv = <10>;
++		};
++
++		pins-cd {
++			pinmux = <PINMUX_GPIO3__FUNC_GPIO3>;
++			input-enable;
++			bias-pull-up;
++		};
++	};
++
 +	camera_mclk_pins: camera-mclk-pins {
 +		pins-mclk {
 +			pinmux = <PINMUX_GPIO99__FUNC_CMMCLK0>,
@@ -1276,12 +1331,48 @@ index 0000000000000000000000000000000000000000..65d39a0fe64d48969bac2b653ee4bb58
 +&modem {
 +	status = "okay";
 +};
++
++/*
++ * The microSD slot. Card detect is GPIO 3, active high (stock: cd_level 1). The stock
++ * tree also lists SDR104 and DDR50; this stops at SDR50 until the card has proved reliable.
++ */
++&mmc1 {
++	status = "okay";
++	pinctrl-names = "default", "state_uhs";
++	pinctrl-0 = <&mmc1_pins_default>;
++	pinctrl-1 = <&mmc1_pins_uhs>;
++	bus-width = <4>;
++	max-frequency = <200000000>;
++	cap-sd-highspeed;
++	sd-uhs-sdr12;
++	sd-uhs-sdr25;
++	sd-uhs-sdr50;
++	no-mmc;
++	no-sdio;
++	cd-gpios = <&pctl 3 GPIO_ACTIVE_HIGH>;
++	vmmc-supply = <&mt6358_vmch_reg>;
++	vqmmc-supply = <&mt6358_vmc_reg>;
++	post-power-on-delay-ms = <100>;
++	assigned-clocks = <&topckgen CLK_TOP_MUX_MSDC30_1>;
++	assigned-clock-parents = <&topckgen CLK_TOP_MSDCPLL_D2>;
++};
++
++/* the stock driver powers the card and its pads at 3.0 V */
++&mt6358_vmch_reg {
++	regulator-min-microvolt = <3000000>;
++	regulator-max-microvolt = <3000000>;
++};
++
++&mt6358_vmc_reg {
++	regulator-min-microvolt = <1800000>;
++	regulator-max-microvolt = <3000000>;
++};
 diff --git a/arch/arm64/boot/dts/mediatek/mt6771.dtsi b/arch/arm64/boot/dts/mediatek/mt6771.dtsi
 new file mode 100644
-index 0000000000000000000000000000000000000000..7ca0d052e2e475ca67dd6ddf589588707e9b3efe
+index 0000000000000000000000000000000000000000..62fa836dac690b4cb5c3fb8b292f9b14174e6f87
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771.dtsi
-@@ -0,0 +1,1901 @@
+@@ -0,0 +1,1913 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * MediaTek MT6771 (Helio P60/P70).
@@ -2604,6 +2695,18 @@ index 0000000000000000000000000000000000000000..7ca0d052e2e475ca67dd6ddf58958870
 +		 * MediaTek UFS bindings were written for: their examples use
 +		 * these addresses. Interrupt from the vendor tree (SPI 80).
 +		 */
++		mmc1: mmc@11240000 {
++			compatible = "mediatek,mt8183-mmc";
++			reg = <0 0x11240000 0 0x1000>,
++			      <0 0x11e10000 0 0x1000>;
++			interrupts = <GIC_SPI 78 IRQ_TYPE_LEVEL_LOW>;
++			clocks = <&topckgen CLK_TOP_MUX_MSDC30_1>,
++				 <&infracfg CLK_INFRA_MSDC1>,
++				 <&infracfg CLK_INFRA_MSDC1_SCK>;
++			clock-names = "source", "hclk", "source_cg";
++			status = "disabled";
++		};
++
 +		ufshci: ufs@11270000 {
 +			compatible = "mediatek,mt6771-ufshci", "mediatek,mt8183-ufshci";
 +			reg = <0 0x11270000 0 0x2300>;

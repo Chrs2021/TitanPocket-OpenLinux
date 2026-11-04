@@ -6,15 +6,15 @@ A fragment on top of defconfig: make defconfig titanpocket.config.
 The media core stays modular for the out-of-tree camera driver; udmabuf
 is built in for libcamera.
 ---
- arch/arm64/configs/titanpocket.config | 152 ++++++++++++++++++++++++++
- 1 file changed, 152 insertions(+)
+ arch/arm64/configs/titanpocket.config | 162 ++++++++++++++++++++++++++
+ 1 file changed, 162 insertions(+)
 
 diff --git a/arch/arm64/configs/titanpocket.config b/arch/arm64/configs/titanpocket.config
 new file mode 100644
-index 0000000000000000000000000000000000000000..9578876e94673e41e3a45198df8ddce09b7ea587
+index 0000000000000000000000000000000000000000..d3399ac14a0ccf40ef207e1fe2892c2b15f48bf6
 --- /dev/null
 +++ b/arch/arm64/configs/titanpocket.config
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,162 @@
 +# Titan Pocket on top of arm64 defconfig:
 +#   make defconfig titanpocket.config
 +CONFIG_LOCALVERSION="-titanpocket"
@@ -167,3 +167,13 @@ index 0000000000000000000000000000000000000000..9578876e94673e41e3a45198df8ddce0
 +# media core, built as modules; libcamera's software ISP shares buffers
 +# through udmabuf
 +CONFIG_UDMABUF=y
++CONFIG_NLS_CP437=y
++CONFIG_EXFAT_FS=y
++# IMS: SIP's IPsec (transport mode ESP, set up by the IMS client through XFRM)
++CONFIG_XFRM_USER=y
++CONFIG_INET_ESP=y
++CONFIG_INET6_ESP=y
++CONFIG_CRYPTO_AUTHENC=y
++CONFIG_CRYPTO_CBC=y
++CONFIG_CRYPTO_MD5=y
++CONFIG_CRYPTO_DES=y

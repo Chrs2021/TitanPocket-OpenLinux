@@ -21,6 +21,8 @@ wake lock), in flight mode until ModemManager enables it. Identities
 else.
 """
 
+import json
+import socket
 import os
 import subprocess
 
@@ -32,6 +34,7 @@ I_MODEM = MM + ".Modem"
 I_3GPP = MM + ".Modem.Modem3gpp"
 I_USSD = MM + ".Modem.Modem3gpp.Ussd"
 I_VOICE = MM + ".Modem.Voice"
+I_SIGNAL = MM + ".Modem.Signal"
 I_SIM = MM + ".Sim"
 I_CALL = MM + ".Call"
 MODEM_SERVICE = "titan-modem"
@@ -68,6 +71,9 @@ CALL_STATES = {0: "unknown", 1: "dialing", 2: "ringing", 3: "incoming", 4: "acti
 CALL_DIALING, CALL_RINGING_OUT, CALL_RINGING_IN, CALL_ACTIVE = 1, 2, 3, 4
 CALL_HELD, CALL_WAITING, CALL_TERMINATED = 5, 6, 7
 CALL_INCOMING, CALL_OUTGOING = 1, 2
+IMS_SOCKET = "/run/titan-ims.sock"
+IMS_STATES = {"dialing": CALL_DIALING, "ringing": CALL_RINGING_OUT, "incoming": CALL_RINGING_IN,
+              "active": CALL_ACTIVE, "ended": CALL_TERMINATED}
 # MMModem3gppUssdSessionState
 USSD_IDLE, USSD_ACTIVE, USSD_USER_RESPONSE = 1, 2, 3
 # MMModem3gppNetworkAvailability
@@ -135,6 +141,13 @@ class Client(GObject.Object):
     def __init__(self):
         super().__init__()
         self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self.ims = None             # titan-ims's control socket
+        self.ims_buf = b""
+        self.ims_on = False         # registered: calls go there
+        self.ims_calls = {}         # "ims:N" -> {id, state, dir, number}
+        self.ims_dial_done = None
+        self._ims_connect()
+        GLib.timeout_add_seconds(5, self._ims_connect)
         self.path = None            # the modem's object path
         self.ifaces = {}            # interface name -> proxy
         self.sim = None             # the SIM's proxy
@@ -184,7 +197,7 @@ class Client(GObject.Object):
             self._drop()
             self.path = path
         if path:
-            for iface in (I_MODEM, I_3GPP, I_USSD, I_VOICE):
+            for iface in (I_MODEM, I_3GPP, I_USSD, I_VOICE, I_SIGNAL):
                 if iface in objs[path] and iface not in self.ifaces:
                     self.ifaces[iface] = self._proxy(path, iface)
             for iface in list(self.ifaces):
@@ -237,10 +250,105 @@ class Client(GObject.Object):
 
     # ---- reading ----
 
+    # ---- titan-ims: calls over LTE, the same signals and call properties as ModemManager's ----
+
+    def _ims_connect(self):
+        if self.ims is None:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.connect(IMS_SOCKET)
+            except OSError:
+                s.close()
+                return True
+            self.ims = s
+            GLib.io_add_watch(s.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._ims_read)
+            self.ims_send({"cmd": "status"})
+        return True
+
+    def ims_send(self, msg):
+        if self.ims is not None:
+            try:
+                self.ims.sendall((json.dumps(msg) + "\n").encode())
+            except OSError:
+                pass
+
+    def _ims_read(self, fd, cond):
+        try:
+            d = self.ims.recv(8192)
+        except OSError:
+            d = b""
+        if not d:
+            self.ims.close()
+            self.ims = None
+            self.ims_buf = b""
+            self.ims_on = False
+            for path in list(self.ims_calls):
+                self._ims_call({"id": int(path[4:]), "state": "ended"})
+            self.emit("changed")
+            return False
+        self.ims_buf += d
+        while b"\n" in self.ims_buf:
+            line, self.ims_buf = self.ims_buf.split(b"\n", 1)
+            try:
+                self._ims_event(json.loads(line))
+            except ValueError:
+                pass
+        return True
+
+    def _ims_event(self, ev):
+        kind = ev.get("ev")
+        if kind == "registered":
+            self.ims_on = bool(ev.get("on"))
+            self.emit("changed")
+        elif kind == "status":
+            self.ims_on = bool(ev.get("registered"))
+            for c in ev.get("calls", ()):
+                self._ims_call(c)
+            self.emit("changed")
+        elif kind == "call":
+            self._ims_call(ev)
+        elif kind == "error" and self.ims_dial_done:
+            done, self.ims_dial_done = self.ims_dial_done, None
+            done(None, ev.get("text", "call failed"))
+
+    def _ims_call(self, ev):
+        path = "ims:%d" % ev["id"]
+        old = self.ims_calls.get(path)
+        new = {**(old or {}), **ev}
+        self.ims_calls[path] = new
+        st = IMS_STATES.get(new["state"], 0)
+        if old is None:
+            self.emit("call-added", path)
+            if not new.get("dir") == "in" and self.ims_dial_done:
+                done, self.ims_dial_done = self.ims_dial_done, None
+                done(path, None)
+        else:
+            self.emit("call-state", path, IMS_STATES.get(old["state"], 0), st)
+        if new["state"] == "ended":
+            del self.ims_calls[path]
+            self.emit("call-removed", path)
+
+    def ims_call_prop(self, path, name, default):
+        c = self.ims_calls.get(path)
+        if c is None:
+            return CALL_TERMINATED if name == "State" else default
+        if name == "State":
+            return IMS_STATES.get(c["state"], 0)
+        if name == "Direction":
+            return CALL_INCOMING if c.get("dir") == "in" else CALL_OUTGOING
+        if name == "Number":
+            return c.get("number", "")
+        return default
+
+    def is_ims(self, path):
+        return bool(path) and path.startswith("ims:")
+
     def present(self):
         return self.path is not None
 
     def has(self, iface):
+        if iface == I_VOICE and self.ims_on:
+            return True
         return iface in self.ifaces
 
     def prop(self, iface, name, default=None):
@@ -249,6 +357,8 @@ class Client(GObject.Object):
         return default if v is None else v.unpack()
 
     def call_prop(self, path, name, default=None):
+        if self.is_ims(path):
+            return self.ims_call_prop(path, name, default)
         proxy = self.calls.get(path)
         v = proxy.get_cached_property(name) if proxy else None
         return default if v is None else v.unpack()
@@ -277,7 +387,7 @@ class Client(GObject.Object):
         op = self.prop(I_3GPP, "OperatorName", "") or self.prop(I_3GPP, "OperatorCode", "")
         reg = REGISTRATION.get(self.prop(I_3GPP, "RegistrationState", 4), "")
         tech = access_text(self.prop(I_MODEM, "AccessTechnologies", 0))
-        parts = [op or reg, tech, "%d %%" % self.signal_quality() if op else ""]
+        parts = [op or reg, tech, "VoLTE" if self.ims_on else "", "%d %%" % self.signal_quality() if op else ""]
         return " · ".join(p for p in parts if p) or STATES.get(st, "")
 
     # ---- doing ----
@@ -306,10 +416,25 @@ class Client(GObject.Object):
         proxy.call(method, params, Gio.DBusCallFlags.NONE, timeout, None, finished, None)
 
     def call_method(self, path, method, sig=None, args=None, done=None, timeout=30000):
+        if self.is_ims(path):
+            cid = int(path[4:])
+            if method == "Accept":
+                self.ims_send({"cmd": "answer", "id": cid})
+            elif method == "Hangup":
+                self.ims_send({"cmd": "hangup", "id": cid})
+            elif method == "SendDtmf":
+                self.ims_send({"cmd": "dtmf", "digit": args[0]})
+            if done:
+                GLib.idle_add(lambda: done(None, None) and False)
+            return
         self.call(I_CALL, method, sig, args, done, timeout, path=path)
 
     def dial(self, number, done):
         """create a call to number and start it; done(path, error)"""
+        if self.ims_on:
+            self.ims_dial_done = done
+            self.ims_send({"cmd": "dial", "number": number})
+            return
         def created(res, err):
             if err:
                 done(None, err)

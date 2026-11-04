@@ -1,0 +1,13 @@
+[Unit]
+Description=IMS client for voice over LTE (docs/modem.md, "IMS")
+After=titan-modem.service
+BindsTo=titan-modem.service
+
+[Service]
+# PipeWire's (root's session), to take it off the output during a call
+Environment=XDG_RUNTIME_DIR=/run/user/0
+ExecStart=/usr/local/sbin/titan-ims run
+Restart=on-failure
+# a carrier remembers failed registrations: leave time between tries
+RestartSec=120
+StandardOutput=journal

@@ -701,8 +701,20 @@ the assert (22403 times in 45 s). Exceptions are channels 16-19.
 ## Mobile data
 
 Measured 2026-11-04 with the Tello SIM on 310260: 9 of 9 pings to a public IPv6 address (36-156 ms) and a TCP
-connection in 53 ms, through a host route, with the phone's Wi-Fi routes untouched. No CLDMA errors. Not measured:
-throughput, long runs, and data across suspend.
+connection in 53 ms, through a host route, with the phone's Wi-Fi routes untouched. No CLDMA errors. Soak, same day, with
+`AT+CEMODE=2` (below): 780 of 780 pings at one a second, over 8 minutes of traffic, 2 more after 5 quiet minutes (RRC idle, then
+connected again) and 3 more after a radio off and on (registered within about a second); no modem assert, and
+USB up throughout. Not measured: long runs beyond that, and data across suspend.
+
+**LTE stopped 60 s after radio on (fixed).** With the modem's defaults, every run lost data about 60 s after `mmcli -e`
+(between T+50 and T+71 s, the last good and first bad 10 s samples), whatever the traffic: uplink packets still drained through CLDMA, downlink stopped,
+`AT+CSCON?` went to 0 and `AT+CESQ` to 255/255, while `+CEREG` stayed 1 and the PDN stayed listed. Minutes later it read not registered,
+and LTE signal returned. The modem reported nothing on `nwurc` or `nwcmd`, and asserted nothing. Measured with the same result: MCDI idle states
+off, ModemManager stopped, and the SPM firmware not started (`mt6771_spm.deep=0`), with the SPM's request and mask registers unchanged across
+the failure. The modem starts as `+CEMODE: 1` (voice-centric), `+CEVDP: 3`, `+CIREG: 0,0,0`, and two changes each held for the whole
+two-minute run: `AT+CEMODE=2` (data-centric) and `AT+CEVDP=1` (CS voice only). This fits the standard's rule that a voice-centric
+device with no voice service on LTE disables LTE, though only the settings and the result were measured; the modem's reason was not. `radioinit.py` sends
+`AT+CEMODE=2`, the choice that does not rule out voice over IMS; a modem restart forgets it.
 
 **The driver.** `titan_modem` runs CLDMA as the vendor's order has it: reset before the modem's power-on (the infra reset
 registers), then after its release the MTU, the receive DMA enable (`SO_CFG` bit 0), the queues' start addresses, the start
@@ -726,11 +738,83 @@ queue 3; not done here. debugfs `titan-modem/cldma` shows the registers and coun
 Before step 4's answer no packet came back (13 sent, 0 received). `AT+CGCONTRDP=0` gives the APN (`wholesale...`) and
 two IPv6 DNS servers; it gives no address on this network, which is IPv6 only. The carrier's DNS server does not answer ping.
 
-Not done: IPv4 (needs 464XLAT), DNS setup, routing (`--default` sets a default route; otherwise nothing changes),
+IPv4 is under "Network switches". `ltedata.py` alone leaves DNS and routing alone unless given `--default`. Not done:
 ModemManager knowing about the bearer (it stays `registered`, not `connected`), and a clean way down.
 `AT+CGACT=0,0` on the only PDN takes the modem off the network (`searching`, then `CME ERROR 5873`), so `ltedata.py` has no
 "down": restart `titan-modem`. An already active PDN gets no second `ifup`: restart it too. The APN is `fast.t-mobile.com` by default.
 NetAgent's other `+EIF` reports (`ipupdate`, `ipchg`, `ra`, `ifdown`) are not handled, and `ltedata.py` exits once data is up.
+
+## Network switches
+
+`titan-net` (`/usr/local/bin/titan-net`, with `titan-net.service` as its daemon) holds the state in
+`/var/lib/titan-net/state.json`. The Wi-Fi app has the Wi-Fi switch and Phone Settings has Airplane mode and Cellular data.
+
+- `wifi off` disables and stops `wpa_supplicant@wlan0` and takes `wlan0` down, so it stays off across boots. Measured: on again,
+  a route in about 6 s.
+- `airplane on` turns off Wi-Fi, Bluetooth (`titan-bt`, `bluetooth`) and the modem's radio; off restores what was on. `wifi on`
+  during airplane mode stays off until airplane mode ends. Measured for Wi-Fi and Bluetooth; the modem's part only on a modem that was off.
+- `cell on` is the fallback, off by default: after Wi-Fi has had no default route for 15 s the daemon starts `titan-modem`, enables the
+  modem and runs `ltedata.py --default`. `ccmni0`'s route has metric 1024 and `wlan0`'s 600, so traffic returns to Wi-Fi by itself.
+  Measured with Wi-Fi switched off: DNS set about 25 s later, and `example.com` and `github.com` resolved through the carrier's DNS and
+  completed TLS over IPv6; with Wi-Fi back, routes returned to `wlan0`.
+- IPv4 over LTE is 464XLAT, in the daemon while LTE is up and the network gave no IPv4 of its own (it has given IPv6 alone on a fresh attach).
+  It asks LTE's DNS for `ipv4only.arpa` (RFC 7050) for the carrier's NAT64 /96, then runs `tayga` (Debian package, `tayga.service` disabled)
+  on a tun device `clat`, `192.0.0.1` here, with a random IPv6 address in LTE's /64. `clat`'s default route has metric 2048, behind `wlan0`.
+  Delivering that address to the tun device needs IPv6 forwarding, a system-wide switch, so it is on only while `clat` exists; `wlan0` is
+  unaffected (networkd handles its router advertisements). Measured with Wi-Fi off: 8 of 8 pings to `1.1.1.1`, TCP and UDP DNS to
+  IPv4 addresses, and 3 MB by HTTPS over IPv4 at about 3 MB/s (24 Mbit/s). A name with only IPv4 addresses resolves to the
+  carrier's IPv6 translation, which skips `clat`. Wi-Fi on: both families moved to `wlan0` within 4 s; off: back to `clat` and `ccmni0` in 3 s.
+  `cell off` removes the device and tayga and restores forwarding; `cell on` had IPv4 back in 33 s. IPv4 packets marked don't-fragment are limited to
+  1380 bytes, as tayga applies `clat`'s 1400 to the IPv6 side too (it reports the limit by ICMP, so TCP is unaffected). `titan-net status` shows `cell_ipv4`.
+- If the PDN goes down while LTE is meant to be up (`AT+CGACT?` inactive at two checks in a row), the daemon takes down `clat` and the address and starts over.
+- `cell off` stops `titan-modem` if the daemon started it, otherwise restarts it: taking down the only PDN detaches the modem.
+
+The modem service holds a wake lock, so the phone does not deep sleep once fallback has started. The fallback has not been tested with Wi-Fi losing
+its network while switched on, only with the switch.
+
+## IMS
+
+Voice on this network is IMS, and the SIP stack is the AP's job: on Android `volte_stack` and `volte_ua` run on the CPU, with
+`volte_imcb` and `volte_imsm_93` between them and the modem (`ccci_imsc`, `ccci_imsm`), read as reference only and not shipped. Replaying
+Android's AT commands with nothing on those channels gets the IMS PDN, and no registration: the modem does not register by itself.
+`titan-ims` (`/usr/local/sbin/titan-ims`, Python for now) is our own client, on TS 24.229 with AKA (RFC 3310) and sec-agree (RFC 3329, TS 33.203).
+It logs status lines and a short list of safe headers: never identities, keys, addresses or SIP bodies.
+
+**The modem's part.** With IMS enabled (`AT+EIMSPDN= "onoff", 1`, `AT+EWFCP=2`, `AT+EIMSRCS=0,0`, `AT+EIMSCFG=1,0,1,1,1,1`) and an `ims` entry
+in the APN table, `AT+EAPNACT=1,"ims","ims",0` brings the PDN up beside data's: without the IMS commands it gets `CME ERROR 5873`, and when it is
+already up `5847`. `+EIF` then gives it an interface of its own (`ccmni1` when data has `ccmni0`), MTU 1500, and `AT+CGCONTRDP=<cid>` the P-CSCF addresses (fields
+7 and 8; 3 here). It has a default route of metric 4096, for sockets bound to that interface; `titan-net` tells it from data's by that metric.
+
+**Registration.** A first `REGISTER` over UDP to port 5060 gets a 401 with an AKAv1-MD5 challenge and `Security-Server`. The SIM's ISIM
+(`AT+CCHO`, `AT+CGLA`, `AUTHENTICATE` in 3G context) answers it and gives the keys. The client sets up four ESP SAs in transport mode with `ip xfrm`
+(the network chose `hmac-sha-1-96` and `aes-cbc`) and sends the second `REGISTER` through them. **Over UDP that got no answer, and over TCP a 200**, so
+all protected signalling is TCP. Measured 2026-11-04: registered on the first try each run, about 3590 s granted, and `SUBSCRIBE` to `reg` accepted, with IPv6 and
+IPv4 data still working. The refresh, at 60 % of that, has not been observed. The kernel needs `CONFIG_XFRM_USER`, `CONFIG_INET_ESP`, `CONFIG_INET6_ESP` and friends
+(`titanpocket.config`). The registration's P-Associated-URI gave one identity here and no `tel:` URI, so calls present the SIM's public identity.
+
+**Calls.** First incoming call 2026-11-04: it rang, answered and the other side heard the phone's mic (2048 RTP packets sent), so the network carries RTP from the AP. The phone's own sound failed: PipeWire still held the output after the ringtone, so `aplay` failed with "Device or resource busy" and the receive loop stopped after 1 packet. `titan-ims` now suspends PipeWire's sinks for the call and retries the player. On the second call the other side was heard, through the loudspeaker: DL1 feeds it as well as the earpiece, so `titan-ims` now turns that route off for the call and back on after (not yet tested on a call). The speaker mode bypasses PipeWire's limiter, so it plays 6 dB down. Signalling: Outgoing and incoming INVITE with preconditions (183, PRACK, UPDATE), CANCEL, BYE, session timers. The sound is on the CPU, not
+the modem: RTP on the IMS interface, AMR-WB (12.65 kbit/s) or AMR (12.2 kbit/s) through `libvo-amrwbenc` and `libopencore-amr*`, in either RFC 4867 packing,
+`telephone-event` for DTMF, and `aplay`/`arecord` on `hw:0,0` and `hw:0,2` with the HiFi routes from the UCM profile (earpiece, speaker, headphones; main mic with the
+preamplifier at 24 dB). Offline, encoding and decoding a tone in both codecs and packings kept its level (AMR-WB RMS 4151 of 4242, AMR 4053), and the devices open. There is no echo cancellation and no jitter buffer.
+
+**Using it.** `titan-net voice on` (Phone Settings, "Voice calls"; off by default, as it keeps the modem on and so the phone awake) keeps the modem on
+the network and `titan-ims.service` running, with or without data. `titan_mm` connects to `/run/titan-ims.sock` and offers its calls with the same signals as ModemManager's, so `titan-dialer` and
+`titan-call-watch` take them without knowing the difference; the header shows "VoLTE" when registered.
+
+**Not done:** emergency calls (there is no emergency registration: 911 and 112 are sent as `urn:service:sos`, untested, and the dialer says so), SMS over IMS (a `MESSAGE` gets 488),
+call waiting and hold, video, handover to Wi-Fi calling, and the modem being told of the registration (`+CIREG` stays 0).
+
+## Status bar signal
+
+`titan-signal` (a service) follows ModemManager and writes 0 to 4 to `/run/titan-signal`; the panel reads it every 10 s
+and draws the bars left of Wi-Fi. No file means the modem is off, and no bars show. Bars come from LTE RSRP in ModemManager's
+`Modem.Signal` interface (`Setup` with 15 s): -110, -100 and -90 dBm are the thresholds. ModemManager's plain signal quality read 0 on LTE
+after a re-enable. Not registered shows 0 bars. Measured: -83 dBm gives 4.
+
+Enabling did not always register. With `titan-signal` running, 4 enables after a run that had failed gave: not registered in 25 s
+(`idle`, `CEREG: 2,0`, `CESQ` all empty), 16 s, 1 s, 2 s; with it stopped, 4 more gave 1-2 s. ModemManager logged `network forced PS
+detach` on the disable before the first failure. The sample is too small to blame the service, and earlier cycles without it were all
+2-3 s. Not understood.
 
 ## Phone apps
 

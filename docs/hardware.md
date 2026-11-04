@@ -205,6 +205,11 @@ gives lux, `Sensor("ps")` 0 near / 1 far.
 
 ## microSD card
 
+On Linux 6.12 (2026-11-04) the slot is `mmc1` (`mediatek,mt8183-mmc` at `0x11240000`): `vmch` and `vmc` at 3.0 V as the stock driver has them, card detect on GPIO 3, pins 29-34. A 28.8 GB SDHC card
+comes up at SDR50 (`mmcblk0`, 96 MHz, 4 bits). With a badly seated card, card detect still reads present and every command times out (`host->error` 2 on CMD8 and CMD55); reseating it cured
+that. Measured read-only: 5 samples of 16 MB read twice matched, no errors, and the FAT filesystem mounts. Reads are slow, about 2.3 MB/s in 512 KB requests, cause not known; the stock tree also lists SDR104
+and DDR50, not enabled here. Writes have not been measured. The 100 ms power-on delay and 8 mA drive in the device tree were tried while the card was badly seated, and are not known to be needed.
+
 `/dev/mmcblk0` (28.8 GB, one FAT32 partition, label `TITAN`; formatted by
 Android as portable storage, its empty Android folders kept). It holds
 **Pictures**: `titan-usb-storage.service` mounts it at `/media/sdcard` and

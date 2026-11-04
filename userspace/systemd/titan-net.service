@@ -1,0 +1,11 @@
+[Unit]
+Description=Radio switches and cellular fallback (titan-net)
+After=network.target titan-wifi.service ModemManager.service
+
+[Service]
+ExecStart=/usr/local/bin/titan-net daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

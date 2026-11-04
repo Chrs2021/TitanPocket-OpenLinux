@@ -1,0 +1,415 @@
+#!/usr/bin/python3
+"""
+titan-net: the phone's radios and uplinks (docs/modem.md, "Network switches").
+
+  titan-net status            the state, as JSON
+  titan-net wifi on|off       Wi-Fi; stays off across boots
+  titan-net airplane on|off   Wi-Fi, Bluetooth and the modem off; off restores them
+  titan-net cell on|off       cellular data as the fallback when Wi-Fi has no route
+  titan-net voice on|off      the modem on and registered, for calls over LTE (titan-ims)
+  titan-net daemon            titan-net.service: applies the state, runs the fallback
+
+LTE sits behind Wi-Fi by route metric (wlan0 600, LTE 1024), so traffic moves back to
+Wi-Fi as soon as it has a route. The modem service holds the phone awake while it runs, so
+fallback costs battery; it starts only once Wi-Fi has had no route for a while, and cell
+is off until asked for.
+
+The carrier's LTE is IPv6 only, so IPv4 over it is 464XLAT: tayga translates between a
+tun device with IPv4 addresses and the carrier's NAT64 (Clat, below).
+"""
+import ipaddress
+import json
+import os
+import re
+import secrets
+import select
+import subprocess
+import sys
+import time
+
+STATE = "/var/lib/titan-net/state.json"
+DEFAULTS = {"wifi": True, "cell": False, "voice": False, "airplane": False, "bt_restore": False,
+            "modem_restore": False, "cell_started_modem": False}
+WPA = "wpa_supplicant@wlan0"
+MODEM = "titan-modem"
+IMS = "titan-ims"
+IMS_METRIC = "metric 4096"      # titan-ims's route on its own interface, not data's
+LTEDATA = "/usr/local/lib/titan-modem/ltedata.py"
+DEVS = ["ccmni%d" % i for i in range(8)]     # the modem picks the interface
+GRACE = 15          # seconds without a Wi-Fi route before LTE comes up
+TICK = 5
+CLAT = "clat"
+CLAT_DIR = "/run/titan-net"
+CLAT_V4, TAYGA_V4 = "192.0.0.1", "192.0.0.2"    # the RFC 7335 range for this
+CLAT_METRIC = 2048  # behind Wi-Fi's IPv4 route
+CLAT_MTU = 1400     # LTE's 1428, less translation's growth with a fragment header
+FORWARD = "/proc/sys/net/ipv6/conf/all/forwarding"
+
+
+def load():
+    try:
+        with open(STATE) as f:
+            return {**DEFAULTS, **json.load(f)}
+    except (OSError, ValueError):
+        return dict(DEFAULTS)
+
+
+def save(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".new"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.rename(tmp, STATE)
+
+
+def run(*c, timeout=60):
+    try:
+        p = subprocess.run(c, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+
+
+def active(unit):
+    return run("systemctl", "is-active", "--quiet", unit)[0] == 0
+
+
+def modem_state():
+    """ModemManager's state name, or None without a modem"""
+    rc, out = run("mmcli", "-m", "any", "-K", timeout=10)
+    if rc:
+        return None
+    for line in out.splitlines():
+        if line.startswith("modem.generic.state "):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def has_route(dev):
+    for v in ("-4", "-6"):
+        if run("ip", v, "route", "show", "default", "dev", dev, timeout=5)[1].strip():
+            return True
+    return False
+
+
+def cell_dev():
+    """the LTE interface with an address the network gave it, or None"""
+    for dev in DEVS:
+        if not os.path.exists("/sys/class/net/" + dev):
+            continue
+        if not run("ip", "-o", "addr", "show", "dev", dev, "scope", "global", timeout=5)[1].strip():
+            continue
+        if IMS_METRIC not in run("ip", "-6", "route", "show", "default", "dev", dev, timeout=5)[1]:
+            return dev
+    return None
+
+
+def ims_up():
+    return any(IMS_METRIC in run("ip", "-6", "route", "show", "default", "dev", d, timeout=5)[1]
+               for d in DEVS if os.path.exists("/sys/class/net/" + d))
+
+
+def voice_keep():
+    """for calls: the modem on and on the network, whatever data is doing"""
+    if not active(MODEM):
+        run("systemctl", "start", MODEM, timeout=90)
+    if modem_wait(secs=20) == "disabled":
+        run("mmcli", "-m", "any", "-e", timeout=60)
+    if not active(IMS):
+        run("systemctl", "start", "--no-block", IMS)
+
+
+def cell_up():
+    return cell_dev() is not None
+
+
+def apply_wifi(on):
+    if on:
+        run("systemctl", "enable", "--now", WPA)
+        run("ip", "link", "set", "wlan0", "up")
+    else:
+        run("systemctl", "disable", "--now", WPA)
+        run("ip", "link", "set", "wlan0", "down")
+
+
+def modem_wait(want=("disabled", "enabled", "searching", "registered", "connected"), secs=40):
+    end = time.time() + secs
+    while time.time() < end:
+        s = modem_state()
+        if s in want:
+            return s
+        time.sleep(2)
+    return None
+
+
+def cell_stop(st):
+    """off the network: there is no taking down the only PDN without a restart"""
+    if active(MODEM) and (cell_up() or st["cell_started_modem"]):
+        run("systemctl", "stop" if st["cell_started_modem"] and not st["voice"] else "restart", MODEM, timeout=90)
+    st["cell_started_modem"] = False
+    save(st)
+
+
+def cell_start(st):
+    if not active(MODEM):
+        st["cell_started_modem"] = True
+        save(st)
+        run("systemctl", "start", MODEM, timeout=90)
+    if not modem_wait():
+        return
+    if modem_state() == "disabled":
+        run("mmcli", "-m", "any", "-e", timeout=60)
+    if modem_wait(("registered", "connected"), 25) is None:
+        # enabling does not always reach the network: once more from off
+        run("mmcli", "-m", "any", "-d", timeout=40)
+        return
+    rc, out = run("python3", LTEDATA, "--default", timeout=60)
+    print("ltedata: %s" % (out.strip() or "rc %d" % rc), flush=True)
+    if rc and not cell_up():
+        # an active PDN gets no second report: restart for a clean one
+        run("systemctl", "restart", MODEM, timeout=90)
+
+
+class Pdn:
+    """Is the PDN still up? ccmni0 keeps its address after the network or the modem drops it,
+    and ltedata.py is gone by then. On its own AT channel, which also logs the modem's reports."""
+    PORT = "/dev/radio/cmd3"
+
+    def __init__(self):
+        self.fd = None
+        self.buf = ""
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+        self.fd = None
+        self.buf = ""
+
+    def lines(self, secs, until=None):
+        out, end = [], time.time() + secs
+        while time.time() < end and self.fd is not None:
+            if select.select([self.fd], [], [], 0.1)[0]:
+                try:
+                    self.buf += os.read(self.fd, 4096).decode(errors="replace")
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    self.close()
+                    break
+            while "\r\n" in self.buf:
+                line, self.buf = self.buf.split("\r\n", 1)
+                line = line.strip()
+                if line.startswith("+CGEV"):
+                    print("modem: %s" % re.sub(r"[0-9a-fA-F.:]{7,}", "<a>", line)[:80], flush=True)
+                elif line:
+                    out.append(line)
+                if line == until or "ERROR" in line:
+                    return out
+        return out
+
+    def at(self, cmd, secs=3):
+        try:
+            os.write(self.fd, (cmd + "\r").encode())
+        except OSError:
+            self.close()
+            return []
+        return self.lines(secs, "OK")
+
+    def active(self):
+        """True or False, or None when it cannot tell"""
+        if self.fd is None:
+            try:
+                self.fd = os.open(self.PORT, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            except OSError:
+                return None
+            self.at("ATE0")
+            self.at("AT+CGEREP=2,1")
+        lines = self.at("AT+CGACT?")
+        if "OK" not in lines:
+            return None
+        n = sum(1 for x in lines if re.match(r"\+CGACT: \d+,1", x))
+        return n >= (2 if ims_up() else 1)     # IMS's PDN is not data's
+
+
+class Clat:
+    """464XLAT's translator on the phone. tayga sits on a tun device: IPv4 goes out to the NAT64
+    prefix from an IPv6 address of its own in LTE's /64. The kernel hands that address to the
+    tun device, which takes IPv6 forwarding, a system-wide switch. Only while this runs."""
+
+    def __init__(self):
+        self.proc = None
+        self.net = None     # the /64 tayga's address is in
+
+    @staticmethod
+    def lte_net(dev):
+        """(LTE's global /64 or None, whether the network gave IPv4 as well)"""
+        net = None
+        for line in run("ip", "-6", "-o", "addr", "show", "dev", dev, "scope", "global", timeout=5)[1].splitlines():
+            m = re.search(r"inet6 (\S+/64)\b", line)
+            if m:
+                net = ipaddress.ip_interface(m.group(1)).network
+                break
+        return net, bool(run("ip", "-4", "-o", "addr", "show", "dev", dev, "scope", "global", timeout=5)[1].strip())
+
+    @staticmethod
+    def nat64(dev):
+        """The prefix from the AAAA the network's DNS64 makes for an IPv4-only name (RFC 7050)"""
+        out = run("resolvectl", "-i", dev, "query", "-t", "AAAA", "--legend=no", "ipv4only.arpa", timeout=15)[1]
+        for tok in out.split():
+            try:
+                a = ipaddress.IPv6Address(tok)
+            except ValueError:
+                continue
+            if a.packed[12:] in (bytes((192, 0, 0, 170)), bytes((192, 0, 0, 171))):
+                return ipaddress.IPv6Network((int(a) >> 32 << 32, 96))
+        return None
+
+    def stop(self):
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+            self.proc = None
+            print("IPv4 over LTE: stopped", flush=True)
+        self.net = None
+        if os.path.exists("/sys/class/net/" + CLAT):
+            run("ip", "link", "del", CLAT, timeout=5)
+            with open(FORWARD, "w") as f:
+                f.write("0")
+
+    def start(self, dev, net):
+        prefix = self.nat64(dev)
+        if prefix is None:
+            return      # the next tick asks again: DNS may not be set yet
+        addr = ipaddress.IPv6Address(int(net.network_address) | secrets.randbits(64))
+        os.makedirs(CLAT_DIR, exist_ok=True)
+        conf = os.path.join(CLAT_DIR, "tayga.conf")
+        with open(conf, "w") as f:
+            f.write("tun-device %s\nipv4-addr %s\nprefix %s\nmap %s %s\n" % (CLAT, TAYGA_V4, prefix, CLAT_V4, addr))
+        if run("tayga", "--mktun", "-c", conf, timeout=10)[0]:
+            print("IPv4 over LTE: no tun device", flush=True)
+            return
+        with open(FORWARD, "w") as f:
+            f.write("1")
+        run("ip", "link", "set", CLAT, "up", "mtu", str(CLAT_MTU), timeout=5)
+        run("ip", "addr", "add", CLAT_V4 + "/32", "dev", CLAT, timeout=5)
+        run("ip", "-6", "route", "add", str(addr), "dev", CLAT, timeout=5)
+        run("ip", "route", "add", "default", "dev", CLAT, "src", CLAT_V4, "metric", str(CLAT_METRIC), timeout=5)
+        self.proc = subprocess.Popen(["tayga", "--nodetach", "-c", conf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.net = net
+        print("IPv4 over LTE: started on %s" % dev, flush=True)
+
+    def sync(self):
+        """Call with LTE up: running, on LTE's current /64, unless the network gave IPv4 itself"""
+        dev = cell_dev()
+        net, v4 = self.lte_net(dev) if dev else (None, False)
+        if net is None or v4:
+            self.stop()
+        elif self.proc is None or self.proc.poll() is not None or net != self.net:
+            self.stop()
+            self.start(dev, net)
+
+
+def cell_forget():
+    """the PDN is gone: take its address away, so the next tick brings up a new one"""
+    for dev in DEVS:
+        if os.path.exists("/sys/class/net/" + dev):
+            run("ip", "addr", "flush", "dev", dev, timeout=5)
+            run("ip", "link", "set", dev, "down", timeout=5)
+
+
+def daemon():
+    st = load()
+    apply_wifi(st["wifi"] and not st["airplane"])
+    lost = None
+    pdn = Pdn()
+    clat = Clat()
+    clat.stop()     # from a daemon before this one
+    down = 0
+    while True:
+        st = load()
+        want = st["cell"] and not st["airplane"]
+        if st["voice"] and not st["airplane"]:
+            voice_keep()
+        elif active(IMS):
+            run("systemctl", "stop", IMS, timeout=30)
+            if not want and active(MODEM) and not cell_up():
+                run("systemctl", "stop", MODEM, timeout=90)
+        if not want or not cell_up():
+            clat.stop()
+        if not want:
+            lost = None
+            if cell_up() or st["cell_started_modem"]:
+                cell_stop(st)
+        elif cell_up():
+            lost = None
+            # two checks in a row: the modem may be between states
+            a = pdn.active()
+            down = down + 1 if a is False else 0
+            if down >= 2:
+                print("the PDN is down: starting over", flush=True)
+                down = 0
+                clat.stop()
+                cell_forget()
+            else:
+                clat.sync()
+        elif has_route("wlan0"):
+            lost = None
+        else:
+            lost = lost or time.time()
+            if time.time() - lost >= GRACE:
+                pdn.close()     # ltedata.py and a modem restart want a clear field
+                cell_start(st)
+        pdn.lines(TICK) if pdn.fd is not None else time.sleep(TICK)
+
+
+def status():
+    st = load()
+    return {"wifi": st["wifi"], "cell": st["cell"], "airplane": st["airplane"],
+            "wifi_route": has_route("wlan0"), "cell_up": cell_up(), "cell_ipv4": has_route(CLAT), "voice": st["voice"], "volte": ims_up(), "modem": modem_state()}
+
+
+def main():
+    a = sys.argv[1:]
+    if a == ["daemon"]:
+        return daemon()
+    if a == ["status"]:
+        print(json.dumps(status()))
+        return 0
+    if len(a) != 2 or a[0] not in ("wifi", "airplane", "cell", "voice") or a[1] not in ("on", "off"):
+        sys.exit(__doc__)
+    st = load()
+    on = a[1] == "on"
+    if a[0] == "wifi":
+        st["wifi"] = on
+        save(st)
+        apply_wifi(on and not st["airplane"])
+    elif a[0] in ("cell", "voice"):
+        st[a[0]] = on
+        save(st)            # the daemon starts or stops it
+    elif on != st["airplane"]:
+        if on:
+            st["bt_restore"] = active("titan-bt")
+            st["modem_restore"] = modem_state() in ("searching", "registered", "connected", "enabled")
+            st["airplane"] = True
+            save(st)
+            apply_wifi(False)
+            run("systemctl", "stop", "bluetooth", "titan-bt")
+            if modem_state() not in (None, "disabled"):
+                run("mmcli", "-m", "any", "-d", timeout=40)
+        else:
+            st["airplane"] = False
+            save(st)
+            apply_wifi(st["wifi"])
+            if st["bt_restore"]:
+                run("systemctl", "start", "titan-bt", "bluetooth")
+            if st["modem_restore"] and modem_state() == "disabled":
+                run("mmcli", "-m", "any", "-e", timeout=60)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

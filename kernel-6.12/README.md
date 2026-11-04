@@ -120,7 +120,7 @@ logs what the kernel found and returns to fastboot.
 | Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; about 31 mA (4.14 reached 12 mA); the SCP sensor hub stays awake unless `mt6771_scp.sleep=1` (untested); what the SPM firmware does: `docs/spm-firmware.md` |
 | Cameras (OV16880, OV8865) | `modules/camera/linux612/` (CAMSV, CAM A statistics, the DIP) | ✅ both at 30 fps through the hardware ISP, auto exposure and white balance, libcamera; the flash is not enabled |
 | NFC (ST21NFC) | `modules/nfc/linux612/` (`/dev/st21nfc`) | ✅ tags read; the controller and its 26 MHz clock buffer are off while the device is closed |
-| Cellular modem | `modules/modem/linux612/` (`titan_modem`) | ✅ registers on LTE under ModemManager, IPv6 data over CLDMA (`tools/modem/ltedata.py`); calls, SMS, USSD and IPv4 not done |
+| Cellular modem | `modules/modem/linux612/` (`titan_modem`) | ✅ registers on LTE under ModemManager, IPv6 data over CLDMA, IPv4 through 464XLAT, IMS registration and first calls with our own client (`userspace/sbin/titan-ims`) (`tools/modem/ltedata.py`); SMS, USSD and emergency calls not done |
 
 ## Firmware
 

@@ -373,7 +373,10 @@ class Dialer(ui.AppWindow):
             self.hint.set_text("this modem offers no voice calls to ModemManager")
             return
         self.call_path = None
-        self.show_call_page(n, "calling…", incoming=False)
+        emergency = re.sub(r"\D", "", n) in ("911", "112")
+        # no emergency registration yet (docs/modem.md, "IMS")
+        self.show_call_page(n, "emergency calling is untested: use another phone if you can" if emergency
+                            else "calling…", incoming=False)
 
         def started(path, err):
             if err:
@@ -479,6 +482,8 @@ class Dialer(ui.AppWindow):
             self.delete_call(path)
 
     def delete_call(self, path):
+        if self.mm.is_ims(path):
+            return
         self.mm.call(mm.I_VOICE, "DeleteCall", "(o)", (path,))
 
     def back_to_dial(self):
@@ -497,6 +502,11 @@ class Dialer(ui.AppWindow):
         self.stop_audio()
         if self.device != "speaker":
             self.device = wired_device()
+        if self.mm.is_ims(self.call_path):      # titan-ims has the sound on the CPU
+            self.mm.ims_send({"cmd": "route", "device": self.device if self.device in ("speaker", "headphones") else "earpiece"})
+            if self.muted:
+                self.set_mute(True)
+            return
         try:
             self.audio = subprocess.Popen([CALL_AUDIO, "run", self.device],
                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -516,6 +526,9 @@ class Dialer(ui.AppWindow):
 
     def set_mute(self, on):
         self.muted = on
+        if self.mm.is_ims(self.call_path):
+            self.mm.ims_send({"cmd": "mute", "on": on})
+            return
         subprocess.Popen([CALL_AUDIO, "mute", "on" if on else "off"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

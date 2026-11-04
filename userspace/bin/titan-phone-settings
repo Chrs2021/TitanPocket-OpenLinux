@@ -17,6 +17,7 @@ titan_ui4), through ModemManager (titan_mm; docs/modem.md, "Phone apps").
 Turning the radio on makes the phone transmit; every change is the user's
 tap. Identities stay on the screen: never logged.
 """
+import json
 import sys
 
 import titan_mm as mm
@@ -105,6 +106,18 @@ class Settings(ui.AppWindow):
         self.radio_on = water.WaterCheck("Radio on", "off: flight mode, nothing transmitted")
         self.radio_on.connect("toggled", lambda w, on: self.set_radio(on))
         p.inner.append(self.radio_on)
+        self.airplane = water.WaterCheck("Airplane mode", "Wi-Fi, Bluetooth and the modem off")
+        self.airplane.connect("toggled", lambda w, on: self.set_net("airplane", on))
+        p.inner.append(self.airplane)
+        self.cell_data = water.WaterCheck("Cellular data",
+                                          "fallback when Wi-Fi has no route; keeps the phone "
+                                          "awake while in use")
+        self.cell_data.connect("toggled", lambda w, on: self.set_net("cell", on))
+        p.inner.append(self.cell_data)
+        self.voice = water.WaterCheck("Voice calls",
+                                      "over LTE; keeps the modem on, so the phone stays awake")
+        self.voice.connect("toggled", lambda w, on: self.set_net("voice", on))
+        p.inner.append(self.voice)
         page.append(p)
 
         restart = ui.GlassButton("Restart modem", icon=ui.ICONS["refresh"], height=54)
@@ -250,6 +263,12 @@ class Settings(ui.AppWindow):
         self.radio_on.set_sensitive(c.present() and st not in (mm.STATE_LOCKED, mm.STATE_FAILED))
         self.radio_on.set_active(st is not None and st >= mm.STATE_ENABLED)
         self.status.set_text(c.status_line())
+        net = self.net_state()
+        self.airplane.set_active(net.get("airplane", False))
+        self.cell_data.set_active(net.get("cell", False))
+        self.cell_data.set_sensitive(not net.get("airplane", False))
+        self.voice.set_active(net.get("voice", False))
+        self.voice.set_sensitive(not net.get("airplane", False))
 
         self.info["Model"].set_text(" ".join(x for x in (c.prop(mm.I_MODEM, "Manufacturer", ""),
                                                          c.prop(mm.I_MODEM, "Model", "")) if x)
@@ -356,6 +375,23 @@ class Settings(ui.AppWindow):
                                     if on else "modem off") if rc == 0 else out, rc != 0)
             self.refresh()
         mm.run_async(["systemctl", "start" if on else "stop", mm.MODEM_SERVICE], done)
+
+    def net_state(self):
+        try:
+            with open("/var/lib/titan-net/state.json") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def set_net(self, what, on):
+        word = {"airplane": "airplane mode", "voice": "voice calls"}.get(what, "cellular data")
+        self.say(self.message, "%s %s…" % (word, "on" if on else "off"))
+
+        def done(rc, out):
+            self.say(self.message, "%s %s" % (word, "on" if on else "off") if rc == 0 else out,
+                     rc != 0)
+            self.refresh()
+        mm.run_async(["titan-net", what, "on" if on else "off"], done)
 
     def restart_modem(self):
         self.busy = True
