@@ -92,7 +92,7 @@ toggled with the clock present. Fixed in the codec driver.
 
 Apps play through **PipeWire** (0.3.65, with WirePlumber and the PulseAudio
 layer `pipewire-pulse`), running in root's user session, which the desktop
-session starts ([desktop.md](desktop.md)):
+session starts (desktop.md):
 
 ```
 app (Chromium via PulseAudio API, pw-play, ...)
@@ -260,7 +260,7 @@ daemon applies the level itself, whenever the file changes:
 - Headphones start at level 107 (about −30 dB).
 - The top bar shows a headphone icon while they're in use, and the volume
   indicator shows headphones instead of a speaker
-  ([desktop.md](desktop.md#top-bar-indicators)).
+  (desktop.md).
 
 ## Microphones
 
@@ -286,7 +286,7 @@ mic; the vibration motor running lifts the main mic by 20 dB. A 1 kHz tone
 from the speaker did not show up in a capture taken at the same time (not
 investigated: the speaker may not run while the uplink starts).
 
-**Recorder** (`titan-recorder`, [desktop.md](desktop.md#recorder-titan-recorder))
+**Recorder** (`titan-recorder`, desktop.md)
 records the main mic at PGA 30 dB.
 
 **On Linux 6.12** the uplink is upstream's MT6358 codec under DAPM:

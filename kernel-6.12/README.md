@@ -116,9 +116,10 @@ logs what the kernel found and returns to fastboot.
 | IR transmitter | `mtk-pwm-ir-tx` | ✅ `/dev/lirc0` |
 | Vibration motor | `regulator-haptic` | ✅ |
 | Suspend to idle | | ✅ ~120 mA with the screen off |
-| Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; 43.5 mA so far (4.14 reached 12 mA); the SCP sensor hub stays awake unless `mt6771_scp.sleep=1` (untested) |
+| Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; 43.5 mA so far (4.14 reached 12 mA); the SCP sensor hub stays awake unless `mt6771_scp.sleep=1` (untested); what the SPM firmware does: `docs/spm-firmware.md` |
 | Cameras (OV16880, OV8865) | `modules/camera/linux612/` (CAMSV, CAM A statistics, the DIP) | ⚠️ ported and built, not yet run; the flash is not enabled |
-| NFC, cellular modem | | ❌ |
+| NFC (ST21NFC) | `modules/nfc/linux612/` (`/dev/st21nfc`) | ✅ tags read; the controller and its 26 MHz clock buffer are off while the device is closed |
+| Cellular modem | `modules/modem/linux612/` (`titan_modem`) | ⚠️ boots and answers AT through a WWAN port (ModemManager) in flight mode; radio not on yet |
 
 ## Firmware
 

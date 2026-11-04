@@ -26,11 +26,11 @@ console before the display driver binds.
  drivers/soc/mediatek/Kconfig          |   44 +
  drivers/soc/mediatek/Makefile         |    4 +
  drivers/soc/mediatek/mt6771-scp.c     | 1206 +++++++++++++++++++++++++
- drivers/soc/mediatek/mt6771-spm.c     |  354 ++++++++
+ drivers/soc/mediatek/mt6771-spm.c     |  358 ++++++++
  drivers/soc/mediatek/mtk-lk-fb.c      |  249 +++++
  drivers/soc/mediatek/mtk-mcdi.c       |  196 ++++
  include/linux/soc/mediatek/mtk-mcdi.h |   13 +
- 7 files changed, 2066 insertions(+)
+ 7 files changed, 2070 insertions(+)
 
 diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
 index 1b7afb19ccd637471ad82ad833f589cb0f9405b1..cc73ddf801462547795930636f466c91eb5a83e9 100644
@@ -1326,10 +1326,10 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/soc/mediatek/mt6771-spm.c b/drivers/soc/mediatek/mt6771-spm.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..fa89d5c41c4428c7b6cbf8264e33edee6177b182
+index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0a60a8f33
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-spm.c
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,358 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SPM: resource requests and system suspend.
@@ -1381,12 +1381,15 @@ index 0000000000000000000000000000000000000000..fa89d5c41c4428c7b6cbf8264e33edee
 +#define SPM_DDREN_REQ		BIT(7)
 +
 +/* Wake-up status the firmware leaves (vendor __spm_get_wakeup_status()) */
-+#define PCM_REG_DATA_INI	0x028	/* PC if the PCM asserted */
++#define PCM_REG_DATA_INI	0x028	/* PC before a handshake, 0 after */
 +#define PCM_REG13_DATA		0x134
 +#define SPM_WAKEUP_STA		0x15c
 +#define SPM_BSI_D1_SR		0x420	/* sleep time, 32 kHz ticks */
 +#define SPM_SW_DEBUG		0x604
 +#define SPM_SW_RSV_0		0x608	/* wake-up events (PCM R12) */
++/* handshake timeouts the firmware records (vendor SPM_DBG1_*: bit 0 EMI
++ * clock off, 1 PMIC wrapper sleep, 2 PMIC wrapper DVFS) */
++#define WDT_LATCH_SPARE0_FIX	0x780
 +
 +/* SiP calls (vendor mtk_secure_api.h) */
 +#define MTK_SIP_SPM_SUSPEND_ARGS	MTK_SIP_SMC_CMD(0x220)
@@ -1551,7 +1554,7 @@ index 0000000000000000000000000000000000000000..fa89d5c41c4428c7b6cbf8264e33edee
 +
 +static int mt6771_spm_suspend_enter(suspend_state_t state)
 +{
-+	u32 r12, wake_sta, r13, timer, debug, pc;
++	u32 r12, wake_sta, r13, timer, debug, pc, fail;
 +	unsigned long wake_src;
 +	int ret;
 +
@@ -1583,9 +1586,10 @@ index 0000000000000000000000000000000000000000..fa89d5c41c4428c7b6cbf8264e33edee
 +	regmap_read(spm_regmap, SPM_BSI_D1_SR, &timer);
 +	regmap_read(spm_regmap, SPM_SW_DEBUG, &debug);
 +	regmap_read(spm_regmap, PCM_REG_DATA_INI, &pc);
-+	pr_info("mt6771-spm: suspend %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x\n",
++	regmap_read(spm_regmap, WDT_LATCH_SPARE0_FIX, &fail);
++	pr_info("mt6771-spm: suspend %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x, fail 0x%x\n",
 +		ret, wake_src, r12, wake_sta, r13,
-+		(u32)div_u64((u64)timer * 1000, 32768), debug, pc);
++		(u32)div_u64((u64)timer * 1000, 32768), debug, pc, fail);
 +
 +	return ret;
 +}

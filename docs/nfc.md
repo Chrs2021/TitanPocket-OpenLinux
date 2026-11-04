@@ -27,6 +27,40 @@ parameters): `titan-nfc info` shows config CRC `A5 5E`, matching the value
 in the vendor file `st21nfc_conf.txt`, so the Android-written tuning is
 intact and we don't reconfigure the analog front end.
 
+## On Linux 6.12 (2026-11-03)
+
+The chip is an ST21NFC that speaks NCI 2.0 (ST's `st21nfc` family), not
+the HCI/SHDLC ST21NFCA that upstream's `st21nfca` drives; upstream's
+`st-nci` would need the kernel NFC stack and a different userspace. So
+6.12 gets a small driver of our own with ST's character-device interface,
+`modules/nfc/linux612/st21nfc.c` (built with `modules/nfc/build612.sh`,
+installed to the module tree's `updates/` and loaded by its DT node):
+read, write, poll and the `PULSE_RESET` / polarity ioctls as above, so
+`titan-nfc` runs unchanged.
+
+Wiring (vendor tree and stock dtbo, now in the board DTS on `i2c_3`):
+I2C address 0x08 (`4-0008`), VEN on GPIO19, IRQ on GPIO20 (level high
+while the controller has a packet), the 26 MHz reference from the
+MT6358's XO buffer 3 (`DCXO_CW00` bit 8, through its set/clear views
+0x78a/0x78c; the vendor's software-controlled `CLK_BUF_NFC`).
+
+**Power.** Without a driver the controller was left as LK set it: VEN
+driven high, the controller awake since boot with an unread
+`CORE_RESET_NTF` (reading the bus returned `60 00 1F`) and its IRQ
+raised, the clock buffer off. The driver holds VEN low (hibernate) and
+the buffer off from probe and whenever `/dev/st21nfc` is closed; opening
+it turns the buffer on and raises VEN. Measured on the battery gauge
+(USB unplugged, 60 s per state, a wakelock held): stray 118 mA, driver
+loaded 120, device open 120, closed 119: all within the gauge's noise,
+so the stray state costs less than about 2 mA. Checked: `titan-nfc info`
+reports NCI 2.0 and config CRC `A5 5E` (the factory RF tuning, as on
+4.14); after it closes VEN is low and the buffer off again; at boot the
+driver loads at about 6 s and hibernates the controller. A tag:
+`titan-nfc poll` found an NFC-A card (SAK 0x08, MIFARE Classic 1K, a
+4-byte UID) through the driver's poll and IRQ, and VEN went low again
+when it exited. (NDEF does not apply to MIFARE Classic; `classic-dump`
+is its path, not tried on 6.12.)
+
 ## titan-nfc
 
 `userspace/titan-nfc/` (Rust, one dependency: `crossterm` for the UI),

@@ -1,0 +1,1 @@
+obj-m := st21nfc.o
