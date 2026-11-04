@@ -69,6 +69,10 @@ needs the wakeup_count handshake), so the ones userspace holds
 the GPS runs: the chip wakes the SoC about once a second then, and a resume
 with the GPS running can crash the CONNSYS chip (docs/power.md).
 
+On Linux 6.12 the screen-off state is a minimal system: the Wi-Fi and
+Bluetooth functions go off on the chip (Radios) and come back at screen on
+(only what was on); TITAN_SLEEP_RADIOS=on keeps them. On 4.14:
+
 TITAN_SLEEP_WIFI=off takes Wi-Fi down while asleep (experimental): while
 associated, the CONNSYS chip wakes the SoC within ~0.5 s even with the
 driver's suspend mode (measured, docs/power.md). wpa_supplicant and
@@ -106,6 +110,9 @@ SHOT_W = SHOT_H = 720
 BACKLIGHT_LED = "/sys/class/leds/lcd-backlight/brightness"
 # Linux 6.12: upstream pwm-backlight, the same PWM high time out of 1023
 BACKLIGHT_612 = "/sys/class/backlight/backlight/brightness"
+# ... dimming the MT6370's boost (PWM input); at level 0 its driver clears
+# BL_EN, so the boost converter is off with the screen
+BOOST_612 = "/sys/class/backlight/mt6370-backlight/brightness"
 ON_612 = not os.path.exists(BACKLIGHT_LED)
 BACKLIGHT = BACKLIGHT_612 if ON_612 else BACKLIGHT_LED
 VOL_CONTROL = "Speaker Amp Volume"
@@ -157,9 +164,16 @@ WLAN_CMD = "/usr/local/bin/titan-wlan-cmd"
 WAKE_LOCKS = "/sys/power/wake_lock"     # the userspace wakelocks held now
 CTL_FIFO = "/run/titan-powerkey.ctl"   # "off" from the compositor (idle)
 WIFI_IF = "wlan0"
-# off by default: taking wlan0 down before suspend (with Bluetooth on) hung
-# the phone once (hardware watchdog reset, 2026-10-12) - under investigation
+# 4.14: off by default: taking wlan0 down before suspend (with Bluetooth on)
+# hung the phone once (hardware watchdog reset, 2026-10-12)
 WIFI_OFF_IN_SLEEP = os.environ.get("TITAN_SLEEP_WIFI", "on") == "off"
+# Linux 6.12: with the screen off the Wi-Fi and Bluetooth functions are off
+# on the chip (titan-bt stopped, 0 to /dev/wmtWifi), so CONNSYS stops holding
+# the 26 MHz clock, DRAM and the bus: 7.6 mA less in deep sleep, measured
+# 2026-11-02. They come back at screen on (Wi-Fi reconnects in a few s).
+# TITAN_SLEEP_RADIOS=on keeps them up.
+RADIOS_OFF_IN_SLEEP = os.environ.get("TITAN_SLEEP_RADIOS", "off") == "off"
+WMT_WIFI = "/dev/wmtWifi"
 
 
 def log(msg):
@@ -289,6 +303,28 @@ def time_sync(on):
         log("time sync: %s" % e)
 
 
+boost_level = None      # the MT6370 boost's level while the screen is off
+
+
+def boost(on):
+    """6.12: the backlight boost off with the screen, back at its level"""
+    global boost_level
+    if not os.path.exists(BOOST_612):
+        return
+    try:
+        if on:
+            if boost_level:
+                write(BOOST_612, boost_level)
+            boost_level = None
+        else:
+            level = open(BOOST_612).read().strip()
+            if level != "0":
+                boost_level = level
+            write(BOOST_612, "0")
+    except OSError as e:
+        log("backlight boost %s: %s" % ("on" if on else "off", e))
+
+
 def panel(on):
     try:
         if on:
@@ -302,6 +338,9 @@ def panel(on):
             write(FB_BLANK, "0" if on else "4")
         elif not on:
             write(BACKLIGHT_612, "0")   # on: brightness() below restores it
+            boost(False)
+        else:
+            boost(True)
     except OSError as e:
         log("panel %s: %s" % ("on" if on else "off", e))
     if on:
@@ -337,10 +376,40 @@ def brightness():
         pass
 
 
-def wifi(up):
-    if not WIFI_OFF_IN_SLEEP or not os.path.exists("/sys/class/net/" + WIFI_IF):
-        return
-    os.system("ip link set %s %s" % (WIFI_IF, "up" if up else "down"))
+def service_active(name):
+    return subprocess.run(["systemctl", "is-active", "--quiet", name]).returncode == 0
+
+
+class Radios:
+    """the radios while the screen is off: on 6.12 their functions go off on
+    the chip and only what was on comes back; on 4.14 wlan0 goes down
+    (TITAN_SLEEP_WIFI=off) or nothing changes"""
+    def __init__(self):
+        self.wifi = self.bt = False
+
+    def off(self):
+        if ON_612 and RADIOS_OFF_IN_SLEEP:
+            self.wifi = os.path.exists("/sys/class/net/" + WIFI_IF)
+            self.bt = service_active("titan-bt")
+            try:
+                if self.bt:
+                    subprocess.run(["systemctl", "stop", "titan-bt"], timeout=20)
+                if self.wifi:
+                    write(WMT_WIFI, "0")
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log("radios off: %s" % e)
+            log("radios off (wifi %s, bt %s)" % (self.wifi, self.bt))
+        elif WIFI_OFF_IN_SLEEP and os.path.exists("/sys/class/net/" + WIFI_IF):
+            os.system("ip link set %s down" % WIFI_IF)
+
+    def on(self):
+        if ON_612 and RADIOS_OFF_IN_SLEEP:
+            cmds = (["systemctl restart titan-wifi"] if self.wifi else []) + \
+                   (["systemctl start titan-bt"] if self.bt else [])
+            if cmds:
+                background(["sh", "-c", "; ".join(cmds)])
+        elif WIFI_OFF_IN_SLEEP and os.path.exists("/sys/class/net/" + WIFI_IF):
+            os.system("ip link set %s up" % WIFI_IF)
 
 
 class Volume:
@@ -510,11 +579,22 @@ def power_menu():
 
 
 def plugged():
-    """A charger or computer on the USB port: the kernel refuses suspend then
-    (the cable-detect interrupt aborts it at the noirq stage)."""
-    for s in ("usb", "ac"):
+    """A charger or computer on the USB port. 4.14 names the supplies "usb"
+    and "ac" and its kernel refuses suspend then (the cable-detect interrupt
+    aborts it at the noirq stage); 6.12 names them after the drivers
+    (mt6370-charger, tcpm-source-psy-*) and suspends, which drops the USB
+    shell. Any online USB or mains supply counts."""
+    base = "/sys/class/power_supply"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return False
+    for s in names:
         try:
-            with open("/sys/class/power_supply/%s/online" % s) as f:
+            with open("%s/%s/type" % (base, s)) as f:
+                if f.read().strip() not in ("USB", "Mains"):
+                    continue
+            with open("%s/%s/online" % (base, s)) as f:
                 if f.read().strip() == "1":
                     return True
         except OSError:
@@ -696,6 +776,7 @@ def main():
     for p in others:
         log("volume keys also from %s" % p)
     key = PowerKey(path, volume, others)
+    radios = Radios()
     while True:
         key.volume = volume         # screen on: volume keys work
         key.screen_on = True
@@ -707,7 +788,7 @@ def main():
         lock_session()
         log("screen off, suspending")
         panel(False)
-        wifi(False)
+        radios.off()
         held_before = []
         while True:
             # plugged in: don't even try (each refused attempt froze every
@@ -737,7 +818,7 @@ def main():
             # suspend refused (USB connected, ...): screen stays off
             if key.wait_press(RETRY_S):
                 break
-        wifi(True)
+        radios.on()
         panel(True)
         brightness()                # the display driver may restore its own level
         volume.reload()             # the amp may have lost power while asleep

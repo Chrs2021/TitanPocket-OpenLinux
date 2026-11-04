@@ -11,9 +11,9 @@ let the bootloader's overlay apply.
 ---
  arch/arm64/boot/dts/mediatek/Makefile         |    3 +
  .../dts/mediatek/mt6771-lk-dtbo-labels.dtsi   |  210 ++
- .../mediatek/mt6771-unihertz-titan-pocket.dts |  974 +++++++++
- arch/arm64/boot/dts/mediatek/mt6771.dtsi      | 1893 +++++++++++++++++
- 4 files changed, 3080 insertions(+)
+ .../mediatek/mt6771-unihertz-titan-pocket.dts |  989 +++++++++
+ arch/arm64/boot/dts/mediatek/mt6771.dtsi      | 1897 +++++++++++++++++
+ 4 files changed, 3099 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
 index 8fd7b2bb7a1590341e7bb4ea1ecf039ae3e8eb0d..d80f5fd16f5664930365fc17045cbe226c32fd4a 100644
@@ -253,10 +253,10 @@ index 0000000000000000000000000000000000000000..152fa0a724a2e7e71716a5e3622ae029
 +};
 diff --git a/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts b/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts
 new file mode 100644
-index 0000000000000000000000000000000000000000..a3d67e88ff8f73fefd682f5ebe94c54475472bb6
+index 0000000000000000000000000000000000000000..d3d633907793e28861cfaa192668803a27c2d906
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts
-@@ -0,0 +1,974 @@
+@@ -0,0 +1,989 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Unihertz Titan Pocket (MT6771, 720x720 DSI panel, QWERTY keyboard).
@@ -423,8 +423,8 @@ index 0000000000000000000000000000000000000000..a3d67e88ff8f73fefd682f5ebe94c544
 + * MT6370 sub-PMIC (vendor dtbo: i2c5 0x34, PMU interrupt GPIO 10; Type-C
 + * port controller interrupt GPIO 41). Only its Type-C port is used: TCPM
 + * tells mtu3 whether a cable is there (the role switch), since the SoC's
-+ * USB PHY doesn't see VBUS. The other functions stay disabled so that
-+ * nothing changes the backlight, charging, flash or LEDs LK set up.
++ * USB PHY doesn't see VBUS. The backlight node only turns the boost off
++ * and on (its settings are LK's); the flash stays disabled.
 + * Sink only at 5 V and device only: no VBUS output, no PD voltage change.
 + */
 +&i2c_5 {
@@ -444,9 +444,24 @@ index 0000000000000000000000000000000000000000..a3d67e88ff8f73fefd682f5ebe94c544
 +			#io-channel-cells = <1>;
 +		};
 +
-+		backlight {
++		/*
++		 * The backlight boost, dimmed by the display PWM (pwm-backlight
++		 * below): at level 0 the driver clears BL_EN, so titan-powerkey
++		 * turns the boost off with the screen. The properties are what LK
++		 * leaves (read 2026-11-02: BL_EN 0x7e, BSTCTRL 0xed, PWM 0xb4, DIM
++		 * 0x3f/0x06 = level 511); the driver only sets bits from them.
++		 */
++		mt6370_backlight: backlight {
 +			compatible = "mediatek,mt6370-backlight";
-+			status = "disabled";
++			mediatek,bled-channel-use = /bits/ 8 <15>;
++			mediatek,bled-pwm-enable;
++			mediatek,bled-pwm-hys-enable;
++			mediatek,bled-ovp-shutdown;
++			mediatek,bled-ovp-microvolt = <29000000>;
++			mediatek,bled-ocp-shutdown;
++			mediatek,bled-ocp-microamp = <1500000>;
++			max-brightness = <2048>;
++			default-brightness = <511>;
 +		};
 +
 +		/*
@@ -1233,10 +1248,10 @@ index 0000000000000000000000000000000000000000..a3d67e88ff8f73fefd682f5ebe94c544
 +};
 diff --git a/arch/arm64/boot/dts/mediatek/mt6771.dtsi b/arch/arm64/boot/dts/mediatek/mt6771.dtsi
 new file mode 100644
-index 0000000000000000000000000000000000000000..dbf02171aa4e2ac723415392aa69f25805ece97d
+index 0000000000000000000000000000000000000000..93b40f13dcf7db53d3c174b8d9a133bfdfd26558
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771.dtsi
-@@ -0,0 +1,1893 @@
+@@ -0,0 +1,1897 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * MediaTek MT6771 (Helio P60/P70).
@@ -2039,6 +2054,8 @@ index 0000000000000000000000000000000000000000..dbf02171aa4e2ac723415392aa69f258
 +			spm-resources {
 +				compatible = "mediatek,mt6771-spm-resources";
 +				mediatek,sspm-mbox = <&sspm_mbox1>;
++				/* the MT6358's rails in low power asleep (deep=1) */
++				mediatek,pwrap = <&pwrap>;
 +			};
 +
 +			spm: power-controller {
@@ -2189,6 +2206,8 @@ index 0000000000000000000000000000000000000000..dbf02171aa4e2ac723415392aa69f258
 +				 <&topckgen CLK_TOP_MUX_SCP>;
 +			clock-names = "main", "scp-sel";
 +			mediatek,pwrap = <&pwrap>;
++			/* the AP's awake requests (INFRA_IRQ_SET/CLEAR) */
++			mediatek,infracfg = <&infracfg>;
 +			memory-region = <&scp_sensor_mem>, <&scp_log_mem>;
 +			status = "disabled";
 +		};

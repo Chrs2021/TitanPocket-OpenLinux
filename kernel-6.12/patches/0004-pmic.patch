@@ -10,17 +10,17 @@ MISC bit 8: without XPP in the enum their interrupts were never
 dispatched and the PMIC's level interrupt stormed once one was enabled.
 mt6397-core adds the accdet cell with its two interrupts.
 ---
- drivers/mfd/mt6397-core.c                  | 10 +++++++
- drivers/regulator/mt6358-regulator.c       | 26 +++++++++++++++++
- drivers/rtc/rtc-mt6397.c                   | 43 +++++++++++++++++++++++++++++
+ drivers/mfd/mt6397-core.c                  | 10 +++++
+ drivers/regulator/mt6358-regulator.c       | 26 +++++++++++++
+ drivers/rtc/rtc-mt6397.c                   | 43 ++++++++++++++++++++++
  include/linux/mfd/mt6358/core.h            |  1 +
  include/linux/mfd/mt6358/registers.h       |  1 +
- include/linux/mfd/mt6397/rtc.h             |  6 ++++
+ include/linux/mfd/mt6397/rtc.h             |  6 +++
  include/linux/regulator/mt6358-regulator.h |  1 +
  7 files changed, 88 insertions(+)
 
 diff --git a/drivers/mfd/mt6397-core.c b/drivers/mfd/mt6397-core.c
-index c2939e785..f2eb498fe 100644
+index c2939e785818fc0bd132789cd28a51b02cb6d82c..f2eb498fe63833d6698ec31e863e7380390875f3 100644
 --- a/drivers/mfd/mt6397-core.c
 +++ b/drivers/mfd/mt6397-core.c
 @@ -176,6 +176,11 @@ static const struct mfd_cell mt6331_mt6332_devs[] = {
@@ -48,7 +48,7 @@ index c2939e785..f2eb498fe 100644
  		.name = "mt6358-keys",
  		.num_resources = ARRAY_SIZE(mt6358_keys_resources),
 diff --git a/drivers/regulator/mt6358-regulator.c b/drivers/regulator/mt6358-regulator.c
-index 44bef0bdf..2386baae9 100644
+index 44bef0bdfdbe35132a026230c85780e10eb69dc0..2386baae961b69af30a6cefe38d1c8b7bd4038bb 100644
 --- a/drivers/regulator/mt6358-regulator.c
 +++ b/drivers/regulator/mt6358-regulator.c
 @@ -501,6 +501,18 @@ static const struct regulator_ops mt6358_volt_fixed_ops = {
@@ -92,7 +92,7 @@ index 44bef0bdf..2386baae9 100644
  
  /* The array is indexed by id(MT6366_ID_XXX) */
 diff --git a/drivers/rtc/rtc-mt6397.c b/drivers/rtc/rtc-mt6397.c
-index 161706366..867af17d2 100644
+index 1617063669cc58a4314957a98a9832856229cadc..867af17d22981eed8771ffa1d7cbc310cc3b578a 100644
 --- a/drivers/rtc/rtc-mt6397.c
 +++ b/drivers/rtc/rtc-mt6397.c
 @@ -11,6 +11,7 @@
@@ -160,7 +160,7 @@ index 161706366..867af17d2 100644
  }
  
 diff --git a/include/linux/mfd/mt6358/core.h b/include/linux/mfd/mt6358/core.h
-index 68578e201..ddb46eda4 100644
+index 68578e2019b081d3234cf209600d2a17fb394542..ddb46eda40ef19d887fffed598ed9a536629ea13 100644
 --- a/include/linux/mfd/mt6358/core.h
 +++ b/include/linux/mfd/mt6358/core.h
 @@ -32,6 +32,7 @@ enum mt6358_irq_top_status_shift {
@@ -172,7 +172,7 @@ index 68578e201..ddb46eda4 100644
  	MT6358_MISC_TOP,
  };
 diff --git a/include/linux/mfd/mt6358/registers.h b/include/linux/mfd/mt6358/registers.h
-index d83e87298..32a324812 100644
+index d83e87298ac46889dbb96c85adc7dc5e9f54b2d1..32a3248129a312d674424ee0310e898a31c516f0 100644
 --- a/include/linux/mfd/mt6358/registers.h
 +++ b/include/linux/mfd/mt6358/registers.h
 @@ -75,6 +75,7 @@
@@ -184,7 +184,7 @@ index d83e87298..32a324812 100644
  #define MT6358_BM_TOP_INT_CON1                0xc38
  #define MT6358_BM_TOP_INT_STATUS0             0xc4a
 diff --git a/include/linux/mfd/mt6397/rtc.h b/include/linux/mfd/mt6397/rtc.h
-index 068ae1c0f..a34e3d3f0 100644
+index 068ae1c0f0e8e9a43c11309b44f11b41d15cfe50..a34e3d3f004e38390536fa3cb37965da90183e1a 100644
 --- a/include/linux/mfd/mt6397/rtc.h
 +++ b/include/linux/mfd/mt6397/rtc.h
 @@ -57,6 +57,11 @@
@@ -208,7 +208,7 @@ index 068ae1c0f..a34e3d3f0 100644
  
  #endif /* _LINUX_MFD_MT6397_RTC_H_ */
 diff --git a/include/linux/regulator/mt6358-regulator.h b/include/linux/regulator/mt6358-regulator.h
-index 562386f9b..bb3ea2113 100644
+index 562386f9b80ebe7b73e755cf08c9165cecdf2b69..bb3ea2113c2e968523e8d505717ae9289127322c 100644
 --- a/include/linux/regulator/mt6358-regulator.h
 +++ b/include/linux/regulator/mt6358-regulator.h
 @@ -47,6 +47,7 @@ enum {

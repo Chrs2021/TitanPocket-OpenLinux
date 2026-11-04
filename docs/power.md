@@ -472,7 +472,11 @@ tagged `power-switch`, and logind's default is **poweroff**), so
   stops outside 0-59 °C (MediaTek's stock limits) and resumes 6 °C inside.
   The OZ8806 gauge treats 4.35 V as full. The MT6370's green LED shows a
   full battery; `titan-charge` reads the 6.12 charger and the `cpu-thermal`
-  zone.
+  zone. The charge limit stops charging through the charger's
+  `charge_behaviour` (`inhibit-charge`/`auto`, added to `mt6370-charger`
+  next to the temperature stop; the input keeps powering the phone), and
+  the low-battery blink is the `timer` trigger, which the LED driver hands
+  to the chip's own blink (written 2026-11-02, not yet run).
 - **Suspend to idle** works and draws about what awake idle does with the
   screen off (~120 mA). **Deep sleep** goes through MediaTek's SPM firmware
   (`mt6771_spm.deep=1`) and wakes with the display, GPU, USB, Wi-Fi,
@@ -481,6 +485,30 @@ tagged `power-switch`, and logind's default is **poweroff**), so
   26 MHz clock (held by the connectivity chip, whose radio functions were
   still on) and DRAM staying up; 4.14 reached 12 mA (the sleep floor
   above). The sensor hub's SCP is kept awake on 6.12 for now.
+- **Screen off is a minimal system** on 6.12: `titan-powerkey` switches the
+  Wi-Fi and Bluetooth functions off on the chip (`titan-bt` stopped, 0 to
+  `/dev/wmtWifi`) and back on at screen on, only those that were on, Wi-Fi
+  reconnecting in a few seconds. With them off CONNSYS stops holding the
+  26 MHz clock, DRAM and the bus; deep sleep measured 7.6 mA lower (53.9
+  against 61.5 mA, same image). `TITAN_SLEEP_RADIOS=on` keeps them up.
+- **Wakelocks and the cable** (2026-11-03, kernel #94): the 6.12 config
+  lacked `CONFIG_PM_WAKELOCKS`, so `/sys/power/wake_lock` didn't exist and
+  neither the GPS's wakelock nor any other kept the phone awake; it is set
+  now (checked: a lock written there shows, `wake_unlock` clears it, and
+  with one held titan-powerkey logs "not suspending: wakelock"). And 6.12
+  names the supplies after their drivers (`mt6370-charger`,
+  `tcpm-source-psy-*`) where 4.14 has `usb` and `ac`, so titan-powerkey
+  never saw the cable; unlike 4.14's, the 6.12 kernel suspends with it
+  plugged in, dropping the USB shell. titan-powerkey now counts any online
+  USB or mains supply (checked: screen off, cable in, no wakelock: no
+  suspend).
+- **The backlight boost** (MT6370, upstream `mt6370-backlight` with LK's
+  settings) goes off with the screen: `titan-powerkey` sets its level to 0
+  (the driver clears BL_EN) and back at screen on. Its level is not a
+  brightness (the display PWM dims), so systemd-backlight is masked for it
+  (`systemd-backlight@backlight:mt6370-backlight.service`): after a
+  shutdown with the screen off it had saved 0 and restored its 5 % minimum
+  (102 of 2048) at the next boot, a dim screen.
 
 ## Not done
 

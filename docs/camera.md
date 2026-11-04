@@ -1278,7 +1278,7 @@ be off, which would make the AE under-expose — check on a lit scene with
 the mode's nominal VTS, so it can't use the longer frames libcamera's default
 frame duration gives the rear full-res mode (20.6 fps).
 
-## On Linux 6.12 (2026-11-02, built, not yet run)
+## On Linux 6.12 (2026-11-02: works)
 
 `modules/camera/linux612/titan_camera.c` is the driver for the 6.12 kernel
 (`modules/camera/build612.sh`); the 4.14 one in `v4l2/` is unchanged. The
@@ -1354,5 +1354,26 @@ from the device tree and upstream drivers:
   (the DIP gets camsv1's addresses; otherwise its DMA would reach other
   memory), and system suspend is refused while streaming.
 
-Not ported: the MT6370 flash (its LED driver is not enabled on 6.12), the
+**Measured on the phone (2026-11-02, `boot-6.12-deep.img`, build #86).**
+The IOMMU bound with larbs 0, 5 and 6 and the display came up as before;
+`titan-dip` and `titan-camera` joined IOMMU group 0 (the domain check
+passed) and stay runtime-suspended with the CAM and ISP domains off
+between streams. Entity names: `ov16880 3-0036`, `ov8865 2-0010`.
+- Rear raw BA81 2336x1752: 30 frames, all data (the black level, 16, in
+  that dark scene).
+- Rear YUYV 2336x1752 through the DIP: 29.92 fps, 60 frames, no drops,
+  DIP 12 ms a frame (13.7 max).
+- Front YUYV 1632x1224: 30.25 fps, 300 frames, no drops, DIP 6 ms (6.8
+  max); a real picture.
+- AE and AWB run on both; in that dim room both sat at the 1/100 s cap
+  and the sensors' full 15.5x gain (front registers read back over I2C:
+  exposure 0x1800 = 384 lines, gain 0x07c0), luma 23-33 against a target
+  of 46. A brighter picture there needs digital gain in the DIP or a
+  longer exposure (not done).
+- libcamera lists both cameras; on 6.12 it names them by device tree node
+  (`/base/soc/camsv@1a050000/rear`), which `titan-camera-gui` now derives
+  (`camera_id()`); the app previews and takes photos.
+
+Not ported: the MT6370 flash (its LED driver is not enabled on 6.12; the
+app hides its flash control without `/dev/flashlight`), the
 `titan_camcap` and `titan_dip` bring-up modules.

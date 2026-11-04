@@ -8,13 +8,14 @@ voltage, current, NTC temperature).
 mt6370-charger: the input current follows the Type-C source (a supplier
 named with power-supplies) and BC1.2; charge current, voltage and
 termination come from the monitored battery, with end of charge enabled;
-charging stops outside the battery's operating temperature range.
+charging stops outside the battery's operating temperature range, and
+while userspace sets charge_behaviour to inhibit-charge (a charge limit).
 ---
  drivers/power/supply/Kconfig          |   7 +
  drivers/power/supply/Makefile         |   1 +
- drivers/power/supply/mt6370-charger.c | 163 +++++++-
+ drivers/power/supply/mt6370-charger.c | 190 +++++++++-
  drivers/power/supply/oz8806_battery.c | 525 ++++++++++++++++++++++++++
- 4 files changed, 694 insertions(+), 2 deletions(-)
+ 4 files changed, 721 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
 index bcfa63fb9f1e207b92ca1cf675165ca861d3dc93..fdaa82a768ff866a8f948c68a9ed6fa76143945a 100644
@@ -47,7 +48,7 @@ index 8dcb4154531718875a2a1aaeba05b1f3268cb4d7..6fde145b9f1112470816498449643c79
  obj-$(CONFIG_BATTERY_MAX1720X)	+= max1720x_battery.o
  obj-$(CONFIG_BATTERY_MAX1721X)	+= max1721x_battery.o
 diff --git a/drivers/power/supply/mt6370-charger.c b/drivers/power/supply/mt6370-charger.c
-index ad8793bf997e15a7d6a6bca96e538e6056bb3153..7830dafaab4233082c96d6ad9068a5466897a07e 100644
+index ad8793bf997e15a7d6a6bca96e538e6056bb3153..23eca0dffe2d5594274c872b4a8f5f26aca74bc2 100644
 --- a/drivers/power/supply/mt6370-charger.c
 +++ b/drivers/power/supply/mt6370-charger.c
 @@ -20,6 +20,7 @@
@@ -67,17 +68,19 @@ index ad8793bf997e15a7d6a6bca96e538e6056bb3153..7830dafaab4233082c96d6ad9068a546
  	/* MT6370_REG_CHG_CTRL3 */
  	F_IAICR, F_AICR_EN, F_ILIM_EN,
  	/* MT6370_REG_CHG_CTRL4 */
-@@ -96,6 +97,9 @@ struct mt6370_priv {
+@@ -96,6 +97,11 @@ struct mt6370_priv {
  	struct workqueue_struct *wq;
  	struct work_struct bc12_work;
  	struct delayed_work mivr_dwork;
 +	struct delayed_work temp_dwork;
 +	int temp_min, temp_max;		/* charging range, tenths of a degree C */
 +	bool temp_hold;			/* charging stopped for the temperature */
++	bool inhibit;			/* charge_behaviour inhibit-charge */
++	struct mutex chg_en_lock;	/* CHG_EN from temp_hold and inhibit */
  	unsigned int irq_nums[MT6370_IRQ_MAX];
  	int attach;
  	int psy_usb_type;
-@@ -153,6 +157,7 @@ static const struct linear_range mt6370_chg_ranges[MT6370_RANGE_F_MAX] = {
+@@ -153,6 +159,7 @@ static const struct linear_range mt6370_chg_ranges[MT6370_RANGE_F_MAX] = {
  
  static const struct mt6370_chg_field mt6370_chg_fields[F_MAX] = {
  	MT6370_CHG_FIELD(F_IINLMTSEL, MT6370_REG_CHG_CTRL2, 2, 3),
@@ -85,7 +88,7 @@ index ad8793bf997e15a7d6a6bca96e538e6056bb3153..7830dafaab4233082c96d6ad9068a546
  	MT6370_CHG_FIELD(F_CFO_EN, MT6370_REG_CHG_CTRL2, 1, 1),
  	MT6370_CHG_FIELD(F_CHG_EN, MT6370_REG_CHG_CTRL2, 0, 0),
  	MT6370_CHG_FIELD_RANGE(F_IAICR, MT6370_REG_CHG_CTRL3, 2, 7),
-@@ -251,6 +256,31 @@ static int mt6370_chg_otg_of_parse_cb(struct device_node *of,
+@@ -251,6 +258,31 @@ static int mt6370_chg_otg_of_parse_cb(struct device_node *of,
  				  MT6370_OTG_PIN_EN_MASK);
  }
  
@@ -117,7 +120,7 @@ index ad8793bf997e15a7d6a6bca96e538e6056bb3153..7830dafaab4233082c96d6ad9068a546
  static void mt6370_chg_bc12_work_func(struct work_struct *work)
  {
  	struct mt6370_priv *priv = container_of(work, struct mt6370_priv,
-@@ -306,8 +336,10 @@ static void mt6370_chg_bc12_work_func(struct work_struct *work)
+@@ -306,8 +338,10 @@ static void mt6370_chg_bc12_work_func(struct work_struct *work)
  bc12_work_func_out:
  	mutex_unlock(&priv->attach_lock);
  
@@ -129,8 +132,58 @@ index ad8793bf997e15a7d6a6bca96e538e6056bb3153..7830dafaab4233082c96d6ad9068a546
  }
  
  static int mt6370_chg_toggle_cfo(struct mt6370_priv *priv)
-@@ -624,6 +656,11 @@ static enum power_supply_property mt6370_chg_properties[] = {
+@@ -527,6 +561,17 @@ static int mt6370_chg_set_online(struct mt6370_priv *priv,
+ 	return 0;
+ }
+ 
++/* charging on unless the temperature or userspace (a charge limit) holds it */
++static int mt6370_chg_update_enable(struct mt6370_priv *priv)
++{
++	int ret;
++
++	mutex_lock(&priv->chg_en_lock);
++	ret = mt6370_chg_field_set(priv, F_CHG_EN, !(priv->temp_hold || priv->inhibit));
++	mutex_unlock(&priv->chg_en_lock);
++	return ret;
++}
++
+ static int mt6370_chg_get_property(struct power_supply *psy,
+ 				   enum power_supply_property psp,
+ 				   union power_supply_propval *val)
+@@ -561,6 +606,10 @@ static int mt6370_chg_get_property(struct power_supply *psy,
+ 	case POWER_SUPPLY_PROP_USB_TYPE:
+ 		val->intval = priv->psy_usb_type;
+ 		return 0;
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		val->intval = priv->inhibit ? POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
++					      POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++		return 0;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -587,6 +636,9 @@ static int mt6370_chg_set_property(struct power_supply *psy,
+ 		return mt6370_chg_field_set(priv, F_IPREC, val->intval);
+ 	case POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT:
+ 		return mt6370_chg_field_set(priv, F_IEOC, val->intval);
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		priv->inhibit = val->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++		return mt6370_chg_update_enable(priv);
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -603,6 +655,7 @@ static int mt6370_chg_property_is_writeable(struct power_supply *psy,
+ 	case POWER_SUPPLY_PROP_INPUT_VOLTAGE_LIMIT:
+ 	case POWER_SUPPLY_PROP_PRECHARGE_CURRENT:
+ 	case POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT:
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+ 		return 1;
+ 	default:
+ 		return 0;
+@@ -622,8 +675,14 @@ static enum power_supply_property mt6370_chg_properties[] = {
+ 	POWER_SUPPLY_PROP_PRECHARGE_CURRENT,
+ 	POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT,
  	POWER_SUPPLY_PROP_USB_TYPE,
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
  };
  
 +static void mt6370_chg_external_power_changed(struct power_supply *psy)
@@ -141,15 +194,18 @@ index ad8793bf997e15a7d6a6bca96e538e6056bb3153..7830dafaab4233082c96d6ad9068a546
  static const struct power_supply_desc mt6370_chg_psy_desc = {
  	.name = "mt6370-charger",
  	.type = POWER_SUPPLY_TYPE_USB,
-@@ -632,6 +669,7 @@ static const struct power_supply_desc mt6370_chg_psy_desc = {
+@@ -632,6 +691,10 @@ static const struct power_supply_desc mt6370_chg_psy_desc = {
  	.get_property = mt6370_chg_get_property,
  	.set_property = mt6370_chg_set_property,
  	.property_is_writeable = mt6370_chg_property_is_writeable,
 +	.external_power_changed = mt6370_chg_external_power_changed,
++	/* a charge limit holds charging; the input still powers the phone */
++	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
  	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
  		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
  		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
-@@ -727,6 +765,118 @@ static int mt6370_chg_init_setting(struct mt6370_priv *priv)
+@@ -727,6 +790,119 @@ static int mt6370_chg_init_setting(struct mt6370_priv *priv)
  	return 0;
  }
  
@@ -207,12 +263,13 @@ index ad8793bf997e15a7d6a6bca96e538e6056bb3153..7830dafaab4233082c96d6ad9068a546
 +		hold = l.temp < priv->temp_min || l.temp > priv->temp_max;
 +
 +	if (hold != priv->temp_hold) {
-+		if (mt6370_chg_field_set(priv, F_CHG_EN, !hold)) {
++		priv->temp_hold = hold;
++		if (mt6370_chg_update_enable(priv)) {
++			priv->temp_hold = !hold;
 +			dev_err(priv->dev, "Failed to %s charging\n",
 +				hold ? "stop" : "resume");
 +			goto out;
 +		}
-+		priv->temp_hold = hold;
 +		dev_info(priv->dev, "battery at %d.%d C: charging %s\n",
 +			 l.temp / 10, abs(l.temp % 10), hold ? "stopped" : "resumed");
 +		power_supply_changed(priv->psy);
@@ -268,7 +325,15 @@ index ad8793bf997e15a7d6a6bca96e538e6056bb3153..7830dafaab4233082c96d6ad9068a546
  #define MT6370_CHG_DT_PROP_DECL(_name, _type, _field)	\
  {							\
  	.name = "mediatek,chg-" #_name,			\
-@@ -920,11 +1070,20 @@ static int mt6370_chg_probe(struct platform_device *pdev)
+@@ -871,6 +1047,7 @@ static int mt6370_chg_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	priv->dev = &pdev->dev;
++	mutex_init(&priv->chg_en_lock);
+ 
+ 	priv->regmap = dev_get_regmap(pdev->dev.parent, NULL);
+ 	if (!priv->regmap)
+@@ -920,11 +1097,20 @@ static int mt6370_chg_probe(struct platform_device *pdev)
  	if (ret)
  		return dev_err_probe(dev, ret, "Failed to init mivr delayed work\n");
  

@@ -25,12 +25,12 @@ console before the display driver binds.
 ---
  drivers/soc/mediatek/Kconfig          |   44 +
  drivers/soc/mediatek/Makefile         |    4 +
- drivers/soc/mediatek/mt6771-scp.c     | 1206 +++++++++++++++++++++++++
- drivers/soc/mediatek/mt6771-spm.c     |  358 ++++++++
+ drivers/soc/mediatek/mt6771-scp.c     | 1232 +++++++++++++++++++++++++
+ drivers/soc/mediatek/mt6771-spm.c     |  449 +++++++++
  drivers/soc/mediatek/mtk-lk-fb.c      |  249 +++++
  drivers/soc/mediatek/mtk-mcdi.c       |  196 ++++
  include/linux/soc/mediatek/mtk-mcdi.h |   13 +
- 7 files changed, 2070 insertions(+)
+ 7 files changed, 2187 insertions(+)
 
 diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
 index 1b7afb19ccd637471ad82ad833f589cb0f9405b1..cc73ddf801462547795930636f466c91eb5a83e9 100644
@@ -114,10 +114,10 @@ index 6830512848fd0feb2d559894ac1b88397b487e91..e02ca4c3f3ef7dd57b0ee87c32237f18
  obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
 diff --git a/drivers/soc/mediatek/mt6771-scp.c b/drivers/soc/mediatek/mt6771-scp.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279af2704771
+index 0000000000000000000000000000000000000000..32179eb5867ca4a289d41153f37667f273b4be2f
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-scp.c
-@@ -0,0 +1,1206 @@
+@@ -0,0 +1,1232 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SCP (Cortex-M4, MediaTek's tinysys firmware) and its sensor hub
@@ -146,12 +146,14 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 + * 0x504C5402, read/write positions, 1 MB ring). debugfs: mt6771-scp/log.
 + *
 + * Sleep: once the hub ran, the SCP went into deep sleep (CPU_SLEEP_STATUS
-+ * 3), its SRAM read as zeros and the AP's awake request (INFRA_IRQ_SET)
-+ * no longer woke it, also with the SPM firmware running. So the SCP's
++ * 3), its SRAM read as zeros and the AP's awake request no longer woke it,
++ * also with the SPM firmware running: the request went to the wrong block
++ * (see INFRA_IRQ_SET; fixed 2026-11-02). So the SCP's
 + * sleep is switched off (IPI_DVFS_SLEEP 0, the vendor's "SCP Sleep: OFF")
 + * as soon as it is ready. mt6771_scp.sleep=1 leaves it on, with what the
-+ * vendor's scp_dvfs.c does and that test lacked: the MT6358's sensor hub
-+ * supply levels, and the SCP's clock mux on its request (IPI_SCP_PLL_CTRL).
++ * vendor's scp_dvfs.c does and that test lacked: the SCP's clock mux on its
++ * request (IPI_SCP_PLL_CTRL). The MT6358's sensor hub supply levels (and
++ * SRCVOLTEN low power) are set at every boot, as there.
 + *
 + * Each sensor is an IIO device: read once (enabled for the read) or
 + * through a buffer. Several programs read the same sensor at once (the
@@ -170,6 +172,7 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +#include <linux/iio/buffer.h>
 +#include <linux/iio/iio.h>
 +#include <linux/iio/kfifo_buf.h>
++#include <linux/mfd/syscon.h>
 +#include <linux/module.h>
 +#include <linux/of.h>
 +#include <linux/of_platform.h>
@@ -204,8 +207,21 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +#define  SSHUB_SLEEP_VOSEL_EN		BIT(1)
 +#define  SSHUB_VOSEL(uv)		(((uv) - 500000) / 6250)
 +#define  SSHUB_VOSEL_MASK		0x7f7f	/* VOSEL, VOSEL_SLEEP << 8 */
++/*
++ * ... and its last line ("Workaround once force BUCK in NML mode"): the
++ * PMIC's low power also on SRCVOLTEN, so the bucks leave forced normal mode
++ * when the SPM drops it (4.14 reads 1, 6.12 left 0).
++ */
++#define MT6358_TOP_CLK_CON0			0x134
++#define  RG_SRCVOLTEN_LP_EN		BIT(4)
 +
-+/* SCPSYS: the AP's awake requests */
++/*
++ * The AP's awake requests, in INFRACFG_AO (0x10001000): MediaTek's scp_reg.h
++ * puts them at scpreg.scpsys + 0xb14, and its v01 driver maps scpsys from the
++ * "mediatek,scpsys" node, whose first range is INFRACFG_AO. (The SCP node's
++ * fourth range, 0x105d4000, is its L1 cache control: writing the request
++ * there read back as nothing the SCP answers, and woke no sleeping SCP.)
++ */
 +#define INFRA_IRQ_SET		0xb14
 +#define INFRA_IRQ_CLEAR		0xb18
 +#define  AP_AWAKE_LOCK		0
@@ -367,7 +383,7 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +	void __iomem *sram;
 +	void __iomem *cfg;
 +	void __iomem *clkctrl;
-+	void __iomem *scpsys;
++	struct regmap *infracfg;	/* the awake requests */
 +	int irq;
 +
 +	struct mutex send_lock;
@@ -411,6 +427,16 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +	DECLARE_BITMAP(ipi_seen, IPI_NR);
 +};
 +
++/*
++ * With the vendor's SPM firmware running (mt6771_spm.deep=1), which handles
++ * the wake from the SCP's deep sleep, the SCP may sleep: an awake SCP keeps
++ * its SPM request up (R12_SCP_SPM_IRQ_B) and ends every system suspend at
++ * once (measured).
++ */
++static bool scp_sleep;
++module_param_named(sleep, scp_sleep, bool, 0444);
++MODULE_PARM_DESC(sleep, "Leave the SCP's sleep on (needs the SPM firmware: mt6771_spm.deep=1)");
++
 +/* ---- SCP IPI ---- */
 +
 +/* the SCP takes the request by clearing its bit (vendor scp_awake_lock()) */
@@ -420,9 +446,9 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +	u32 v;
 +	int i;
 +
-+	writel(0xa0 | BIT(bit), scp->scpsys + INFRA_IRQ_SET);
++	regmap_write(scp->infracfg, INFRA_IRQ_SET, 0xa0 | BIT(bit));
 +	for (i = 0; i < 10000; i++) {
-+		v = readl(scp->scpsys + INFRA_IRQ_SET);
++		regmap_read(scp->infracfg, INFRA_IRQ_SET, &v);
 +		if ((v & 0xf0) != 0xa0) {
 +			ret = -EIO;
 +			break;
@@ -433,7 +459,8 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +		}
 +		udelay(10);
 +	}
-+	writel(readl(scp->scpsys + INFRA_IRQ_SET), scp->scpsys + INFRA_IRQ_CLEAR);
++	regmap_read(scp->infracfg, INFRA_IRQ_SET, &v);
++	regmap_write(scp->infracfg, INFRA_IRQ_CLEAR, v);
 +	return ret;
 +}
 +
@@ -472,9 +499,14 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +		dev_warn(scp->dev, "IPI %u: previous IPI not taken\n", id);
 +		goto out;
 +	}
-+	/* an SCP that did not wake has no SRAM to write to */
++	/*
++	 * With its sleep on (mt6771_scp.sleep), an SCP that did not wake has
++	 * no SRAM to write to. With it off (the default) the SCP is awake, and
++	 * the handshake's readback does not follow the vendor's pattern
++	 * (INFRA_IRQ_SET without 0xa0, -EIO, measured): carry on as before.
++	 */
 +	ret = scp_awake(scp, AP_AWAKE_LOCK);
-+	if (ret) {
++	if (ret && scp_sleep) {
 +		dev_warn(scp->dev, "IPI %u: SCP did not wake: %d\n", id, ret);
 +		goto out;
 +	}
@@ -605,15 +637,6 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +	scp_ipi_send(scp, IPI_CHREX, &token, sizeof(token));
 +}
 +
-+/*
-+ * With the vendor's SPM firmware running (mt6771_spm.deep=1), which handles
-+ * the wake from the SCP's deep sleep, the SCP may sleep: an awake SCP keeps
-+ * its SPM request up (R12_SCP_SPM_IRQ_B) and ends every system suspend at
-+ * once (measured).
-+ */
-+static bool scp_sleep;
-+module_param_named(sleep, scp_sleep, bool, 0444);
-+MODULE_PARM_DESC(sleep, "Leave the SCP's sleep on (needs the SPM firmware: mt6771_spm.deep=1)");
 +
 +static void no_sleep_work(struct work_struct *work)
 +{
@@ -878,6 +901,8 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +	if (!ret)
 +		ret = regmap_update_bits(map, MT6358_LDO_VSRAM_OTHERS_SSHUB_CON0,
 +					 SSHUB_EN | SSHUB_SLEEP_VOSEL_EN, SSHUB_EN);
++	if (!ret)
++		ret = regmap_set_bits(map, MT6358_TOP_CLK_CON0, RG_SRCVOLTEN_LP_EN);
 +	return ret;
 +}
 +
@@ -1204,9 +1229,9 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +	scp->clkctrl = devm_platform_ioremap_resource_byname(pdev, "clkctrl");
 +	if (IS_ERR(scp->clkctrl))
 +		return PTR_ERR(scp->clkctrl);
-+	scp->scpsys = devm_platform_ioremap_resource_byname(pdev, "scpsys");
-+	if (IS_ERR(scp->scpsys))
-+		return PTR_ERR(scp->scpsys);
++	scp->infracfg = syscon_regmap_lookup_by_phandle(dev->of_node, "mediatek,infracfg");
++	if (IS_ERR(scp->infracfg))
++		return dev_err_probe(dev, PTR_ERR(scp->infracfg), "no infracfg\n");
 +
 +	clk = devm_clk_get_enabled(dev, "main");
 +	if (IS_ERR(clk))
@@ -1223,10 +1248,11 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +		ret = devm_add_action_or_reset(dev, scp_sel_release, scp);
 +		if (ret)
 +			return ret;
-+		ret = scp_pmic_sshub(scp);
-+		if (ret)
-+			return dev_err_probe(dev, ret, "sensor hub supplies\n");
 +	}
++	/* as MediaTek's scp_dvfs.c at every boot, the SCP's sleep on or off */
++	ret = scp_pmic_sshub(scp);
++	if (ret)
++		return dev_err_probe(dev, ret, "sensor hub supplies\n");
 +
 +	np = of_parse_phandle(dev->of_node, "memory-region", 0);
 +	rmem = np ? of_reserved_mem_lookup(np) : NULL;
@@ -1326,10 +1352,10 @@ index 0000000000000000000000000000000000000000..e416d0b137bee041d276ca3659eb279a
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/soc/mediatek/mt6771-spm.c b/drivers/soc/mediatek/mt6771-spm.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0a60a8f33
+index 0000000000000000000000000000000000000000..9bdc4d819211f9a58333d44c56740689cc69de60
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-spm.c
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,449 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SPM: resource requests and system suspend.
@@ -1366,6 +1392,7 @@ index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0
 +#include <linux/module.h>
 +#include <linux/of.h>
 +#include <linux/of_address.h>
++#include <linux/of_platform.h>
 +#include <linux/platform_device.h>
 +#include <linux/psci.h>
 +#include <linux/regmap.h>
@@ -1376,6 +1403,12 @@ index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0
 +#define SPM_SRC_REQ		0x0b8
 +#define PWR_STATUS		0x180
 +#define PWR_STATUS_2ND		0x184
++/* what the firmware decides its sleep from (vendor mtk_spm_reg_mt6771.h): the
++ * source masks it honours, the subsystems' idle and request status */
++#define SPM_SRC_MASK		0x0bc
++#define SPM_SRC2_MASK		0x0c0
++#define SUBSYS_IDLE_STA		0x170
++#define SRC_REQ_STA		0x17c
 +#define SPM_APSRC_REQ		BIT(0)
 +#define SPM_F26M_REQ		BIT(1)
 +#define SPM_DDREN_REQ		BIT(7)
@@ -1454,6 +1487,16 @@ index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0
 +MODULE_PARM_DESC(pcm_flags, "SPM suspend flags (vendor SPM_FLAG_*)");
 +
 +/*
++ * Second flag word (vendor SPM_FLAG1_*). MediaTek's spm_go_to_sleep() sets
++ * BIG_BUCK_OFF_ENABLE | BIG_BUCK_ON_ENABLE (0x300) unless its hotplug code
++ * already switched the A73 cluster's buck off: the SPM (through the SSPM)
++ * then switches it off for the sleep and on at the wake.
++ */
++static uint pcm_flags1;
++module_param(pcm_flags1, uint, 0644);
++MODULE_PARM_DESC(pcm_flags1, "SPM suspend flags 1 (vendor SPM_FLAG1_*; 0x300: A73 buck off asleep)");
++
++/*
 + * Off until it is stable: the first runs left the display tinted (the
 + * suspend ran with LK's display pipeline live, which the vendor's
 + * suspend refuses: "CANNOT SLEEP: power domain(s) still on").
@@ -1471,6 +1514,63 @@ index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0
 +static bool deep;
 +module_param(deep, bool, 0444);
 +MODULE_PARM_DESC(deep, "Start the SPM firmware and suspend through it");
++
++/*
++ * MT6358 rails in low power while the SoC sleeps (vendor pmic_initial_setting.c
++ * PMIC_LP_INIT_SETTING(), run at every 4.14 boot; values as 4.14 reads them).
++ * *_OP_EN: which controls a rail follows (bit 0 software, 1 SRCLKEN0, 2
++ * SRCLKEN1, 3 SRCLKEN2); *_OP_CFG: low power rather than off when a hardware
++ * control drops. SRCLKEN0 is the SPM's suspend, SRCLKEN2 its deep idle, both
++ * driven by the SPM firmware, so this is done only with it (deep=1). VS2,
++ * VDRAM1, VSRAM_OTHERS, VXO22, VA12, VAUX18, VAUD28, VDRAM2 and VUSB go to low
++ * power, VBIF28 off; the modem's RF rails (VFE28, VRF18, VRF12) follow its
++ * SRCLKEN1. 6.12 leaves them at reset: software only, full power asleep.
++ */
++static const struct {
++	u16 reg, val;
++} mt6358_lp[] = {
++	{ 0x1610, 0x000b }, { 0x1616, 0x010a },	/* BUCK_VDRAM1_OP_EN, _OP_CFG */
++	{ 0x1710, 0x000b }, { 0x1716, 0x010a },	/* BUCK_VS2 */
++	{ 0x1a8a, 0x000b }, { 0x1a90, 0x000a },	/* LDO_VXO22 */
++	{ 0x1a9e, 0x000b }, { 0x1aa4, 0x000a },	/* LDO_VA12 */
++	{ 0x1ab2, 0x000b }, { 0x1ab8, 0x000a },	/* LDO_VAUX18 */
++	{ 0x1ac6, 0x0003 }, { 0x1acc, 0x0002 },	/* LDO_VAUD28 */
++	{ 0x1b0a, 0x000b }, { 0x1b10, 0x000a },	/* LDO_VDRAM2 */
++	{ 0x1b32, 0x000b }, { 0x1b38, 0x000a },	/* LDO_VUSB */
++	{ 0x1bae, 0x000b }, { 0x1bb4, 0x000a },	/* LDO_VSRAM_OTHERS */
++	{ 0x1da0, 0x000b },			/* LDO_VBIF28_OP_EN (off asleep) */
++	{ 0x1c0a, 0x0005 },			/* LDO_VFE28_OP_EN */
++	{ 0x1c1e, 0x0005 },			/* LDO_VRF18_OP_EN */
++	{ 0x1c32, 0x0005 },			/* LDO_VRF12_OP_EN */
++};
++
++/* the PMIC's regmap (the wrapper's), or an error pointer */
++static struct regmap *mt6771_spm_pmic(struct device *dev)
++{
++	struct device_node *np = of_parse_phandle(dev->of_node, "mediatek,pwrap", 0);
++	struct platform_device *pwrap = np ? of_find_device_by_node(np) : NULL;
++	struct regmap *map;
++
++	of_node_put(np);
++	if (!pwrap)
++		return ERR_PTR(-ENODEV);
++	map = dev_get_regmap(&pwrap->dev, NULL);
++	put_device(&pwrap->dev);
++	return map ?: ERR_PTR(-EPROBE_DEFER);
++}
++
++/* after the SPM firmware runs: the rails follow its SRCLKEN at once */
++static int mt6771_spm_pmic_lp(struct regmap *map)
++{
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(mt6358_lp); i++) {
++		ret = regmap_write(map, mt6358_lp[i].reg, mt6358_lp[i].val);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
 +
 +static struct regmap *spm_regmap;
 +static void __iomem *sspm_slots, *sspm_ctrl;
@@ -1554,7 +1654,8 @@ index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0
 +
 +static int mt6771_spm_suspend_enter(suspend_state_t state)
 +{
-+	u32 r12, wake_sta, r13, timer, debug, pc, fail;
++	u32 r12, wake_sta, r13, timer, debug, pc, pwr, fail;
++	u32 req_in, idle_in, src_in, req, idle, mask, mask2;
 +	unsigned long wake_src;
 +	int ret;
 +
@@ -1571,8 +1672,12 @@ index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0
 +	mtk_mcdi_pause(true);
 +	sspm_spm_command(SSPM_SPM_SUSPEND);
 +
++	regmap_read(spm_regmap, PWR_STATUS, &pwr);	/* the domains going into it */
 +	regmap_clear_bits(spm_regmap, SPM_SRC_REQ, SPM_HELD_REQ);
-+	spm_sip(MTK_SIP_SPM_SUSPEND_ARGS, pcm_flags, 0, PCM_TIMER_MAX);
++	regmap_read(spm_regmap, SPM_SRC_REQ, &src_in);	/* ... and who asks for what */
++	regmap_read(spm_regmap, SRC_REQ_STA, &req_in);
++	regmap_read(spm_regmap, SUBSYS_IDLE_STA, &idle_in);
++	spm_sip(MTK_SIP_SPM_SUSPEND_ARGS, pcm_flags, pcm_flags1, PCM_TIMER_MAX);
 +	ret = psci_cpu_suspend_enter(MT6771_PSCI_SUSPEND);
 +	mt6771_spm_hold(spm_regmap);
 +
@@ -1587,9 +1692,14 @@ index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0
 +	regmap_read(spm_regmap, SPM_SW_DEBUG, &debug);
 +	regmap_read(spm_regmap, PCM_REG_DATA_INI, &pc);
 +	regmap_read(spm_regmap, WDT_LATCH_SPARE0_FIX, &fail);
-+	pr_info("mt6771-spm: suspend %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x, fail 0x%x\n",
++	regmap_read(spm_regmap, SRC_REQ_STA, &req);
++	regmap_read(spm_regmap, SUBSYS_IDLE_STA, &idle);
++	regmap_read(spm_regmap, SPM_SRC_MASK, &mask);
++	regmap_read(spm_regmap, SPM_SRC2_MASK, &mask2);
++	pr_info("mt6771-spm: suspend %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x, fail 0x%x, pwr 0x%x, src_req 0x%x, req_sta 0x%x/0x%x, idle_sta 0x%x/0x%x, src_mask 0x%x/0x%x\n",
 +		ret, wake_src, r12, wake_sta, r13,
-+		(u32)div_u64((u64)timer * 1000, 32768), debug, pc, fail);
++		(u32)div_u64((u64)timer * 1000, 32768), debug, pc, fail, pwr, src_in,
++		req_in, req, idle_in, idle, mask, mask2);
 +
 +	return ret;
 +}
@@ -1638,7 +1748,11 @@ index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0
 +		return dev_err_probe(dev, PTR_ERR(spm_regmap), "no SPM regmap\n");
 +
 +	if (deep) {
++		struct regmap *pmic = mt6771_spm_pmic(dev);
 +		struct device_node *np;
++
++		if (IS_ERR(pmic))
++			return dev_err_probe(dev, PTR_ERR(pmic), "no PMIC\n");
 +
 +		np = of_parse_phandle(dev->of_node, "mediatek,sspm-mbox", 0);
 +		if (!np)
@@ -1649,6 +1763,9 @@ index 0000000000000000000000000000000000000000..e6d6421e91d27e60e7b68e84513b5bc0
 +		if (IS_ERR(sspm_slots) || IS_ERR(sspm_ctrl))
 +			return dev_err_probe(dev, -ENOMEM, "SSPM mailbox\n");
 +		mt6771_spm_start_firmware(dev);
++		ret = mt6771_spm_pmic_lp(pmic);
++		if (ret)
++			return dev_err_probe(dev, ret, "PMIC low power setup\n");
 +	}
 +
 +	ret = mt6771_spm_hold(spm_regmap);

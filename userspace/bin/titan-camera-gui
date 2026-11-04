@@ -116,6 +116,7 @@ import numpy as np  # noqa: E402
 import titan_ui4 as ui  # noqa: E402
 import titan_water4 as water  # noqa: E402
 import gi  # noqa: E402
+import titan_vibrator  # noqa: E402
 
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Gst", "1.0")
@@ -131,18 +132,27 @@ def camsv_dir():
     return (found[0] if found else "/sys/devices/platform/1a050000.camsv1") + "/"
 
 
+def camera_id(sysdir, model):
+    """libcamera's name for a camera: the device tree path of the sensor's
+    device when it has one (6.12: /base/soc/camsv@1a050000/rear), else its
+    sysfs path and model (4.14: platform/1a050000.camsv1/rear ov16880)"""
+    node = os.path.realpath(os.path.join(sysdir, "of_node"))
+    if node.startswith("/sys/firmware/devicetree/"):
+        return node[len("/sys/firmware/devicetree"):]
+    return os.path.relpath(sysdir, "/sys/devices") + " " + model
+
+
 SYSDEV = camsv_dir()
-CAMID = SYSDEV[len("/sys/devices/"):]   # libcamera names cameras by this path
 CAMERAS = [
     # libcamera id, label, mirrored preview, still size, sensor device, focus
     # motor, fallback rotation (clockwise), hardware-ISP preview size, hardware-
     # ISP still size. "still" is the GPU software-ISP size (cropped Bayer
     # margins); "hwstill" is the exact sensor-mode size the DIP delivers (the
     # driver only has a tile list for the mode's own size).
-    {"id": CAMID + "rear ov16880", "label": "Rear",
+    {"id": camera_id(SYSDEV + "rear", "ov16880"), "label": "Rear",
      "mirror": False, "still": (4668, 3504), "sysdir": SYSDEV + "rear",
      "focus": True, "rotation": 90, "hwisp": (2336, 1752), "hwstill": (4672, 3504)},
-    {"id": CAMID + "front ov8865", "label": "Front",
+    {"id": camera_id(SYSDEV + "front", "ov8865"), "label": "Front",
      "mirror": True, "still": (3260, 2448), "sysdir": SYSDEV + "front",
      "focus": False, "rotation": 270, "hwisp": (1632, 1224), "hwstill": (3264, 2448)},
 ]
@@ -162,7 +172,6 @@ QR_DENSITY = 2              # zbar reads every 2nd line and column
 QR_MAX = 3                  # QR chips kept on screen
 QR_FRESH_MS = 1200          # a chip stays outlined this long after its code was seen
 BROWSER = "/usr/local/bin/titan-chromium"
-VIBRATOR = "/sys/class/leds/vibrator"
 QR_BUZZ = (40, 90, 40)      # ms on, off, on: a new QR code was found
 JPEG_QUALITY = 92
 
@@ -191,6 +200,9 @@ FLASH_TORCH_LEVEL = 6               # 175 mA per LED
 FLASH_PHOTO_TIMEOUT_MS = 6000    # a full-resolution capture takes ~4 s
 FLASH_AUTO_GAIN = 512               # analogue gain code, 128 = 1x
 FLASH_MODES = ["off", "auto", "on", "torch"]
+# MediaTek's flashlight driver (4.14); Linux 6.12 has no flash driver yet,
+# so there the control is hidden and the flash stays off
+FLASH_OK = os.path.exists("/dev/flashlight")
 AF_ASSIST_LEVEL = FLASH_TORCH_LEVEL
 # flash metering, in units of the AF statistics' pixel sums (word 3 per
 # block, over STAT_NPIX pixels): raw/8, black ~8, clipping at ~119
@@ -228,13 +240,7 @@ def vibrate(pattern):
     BSP driver's LED-class node: a duration, then activate; it stops by
     itself (docs/hardware.md)"""
     def pulse(ms):
-        try:
-            with open(VIBRATOR + "/duration", "w") as f:
-                f.write(str(ms))
-            with open(VIBRATOR + "/activate", "w") as f:
-                f.write("1")
-        except OSError:
-            pass
+        titan_vibrator.pulse(ms)
         return False
     t = 0
     for i, ms in enumerate(pattern):
@@ -661,6 +667,9 @@ class CameraApp(ui.AppWindow):
         self.flash_mode = st.get("flash", "off")
         if self.flash_mode not in FLASH_MODES:
             self.flash_mode = "off"
+        self.flash_saved = self.flash_mode     # kept for the other kernel
+        if not FLASH_OK:
+            self.flash_mode = "off"
         self.flash = Flash()
 
         self.preview = None         # Gst.Pipeline
@@ -827,7 +836,7 @@ class CameraApp(ui.AppWindow):
         rot = {c["id"]: self.rotation[c["id"]] for c in CAMERAS
                if self.rotation[c["id"]] != self.driver_rotation(c)}
         st = {"camera": self.cam, "rotation": rot, "focus": self.focus,
-              "flash": self.flash_mode,
+              "flash": self.flash_mode if FLASH_OK else self.flash_saved,
               "last_photo": self.last_photo}
         try:
             os.makedirs(STATE_DIR, exist_ok=True)
@@ -954,7 +963,7 @@ class CameraApp(ui.AppWindow):
 
     def show_flash(self):
         rear = CAMERAS[self.cam]["focus"]
-        self.flash_btn.set_visible(rear)
+        self.flash_btn.set_visible(rear and FLASH_OK)
         self.flash_btn.set_label({"off": "Off", "auto": "Auto", "on": "On",
                                   "torch": "Torch"}[self.flash_mode])
         self.flash_btn.set_kind("suggested" if self.flash_mode != "off" else "")

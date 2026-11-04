@@ -7,13 +7,16 @@
 # volume is the one set with the volume keys (titan-powerkey).
 #
 #   GAIN: AFE FM gain, 0..524288 (0x80000 = 0 dB); default 32768 (-24 dB).
+#
+# On Linux 6.12 (card titanpocket) FM plays through PipeWire, as in
+# titan-radio-gui: the CONNSYS I2S captured on UL2 (hw:0,3) piped into
+# pw-cat, a stream "FM radio" on the default sink; GAIN is then its volume
+# (GAIN / 0x80000, linear).
 FREQ=${1:-99.5}
 GAIN=${2:-32768}
 
 modprobe fmradio_drv || exit 1
 for i in $(seq 25); do [ -e /dev/fm ] && break; sleep 0.2; done
-
-tinymix -D 0 set "Audio FM I2S Volume" "$GAIN" >/dev/null
 
 pid=
 cleanup() {
@@ -23,7 +26,16 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-# hostless link, held prepared: device 21 (FM_I2S_Playback)
-spk-hold 0 21 48000 & pid=$!
+if [ -e /proc/asound/titanpocket ]; then
+	# after titan-fm has powered FM up; killing pw-cat ends arecord too
+	VOL=$(awk "BEGIN { printf \"%.4f\", $GAIN / 524288 }")
+	( sleep 1; exec arecord -q -D hw:CARD=titanpocket,DEV=3 -f S16_LE -r 48000 -c 2 -t wav ) |
+		XDG_RUNTIME_DIR=/run/user/0 pw-cat --playback --volume "$VOL" \
+			-P '{ media.name = "FM radio" application.name = "Radio" }' - & pid=$!
+else
+	tinymix -D 0 set "Audio FM I2S Volume" "$GAIN" >/dev/null
+	# hostless link, held prepared: device 21 (FM_I2S_Playback)
+	spk-hold 0 21 48000 & pid=$!
+fi
 
 titan-fm "$FREQ"

@@ -10,6 +10,9 @@
 //! `cmd_discharging` (/proc/mtk_battery_cmd/current_cmd: "0 1" stops, "0 0"
 //! charges). Its own smart-charging limit (sc_tuisoc) would work off
 //! MediaTek's battery percentage, which is -1 here: the gauge is the OZ8806.
+//! On Linux 6.12 the switch is the charger's `charge_behaviour`
+//! (/sys/class/power_supply/mt6370-charger: "inhibit-charge" stops, "auto"
+//! charges), which our mt6370-charger combines with its temperature stop.
 //! Unplugging clears the hold, so the next plug-in starts charging. The hold
 //! also needs the cell above HOLD_MIN_MV, so a wrong percentage can't keep
 //! an empty battery from charging.
@@ -17,7 +20,8 @@
 //! **LED** (MT6370 RGB: led1 red, led2 green, led3 blue, as the stock lights
 //! HAL maps them): red while charging, green when full or held at the limit,
 //! a short red flash every 2 s below LOW % on battery (the chip's own PWM
-//! blink: no wake-ups), off otherwise.
+//! blink: no wake-ups; on 6.12 the timer trigger, which upstream's
+//! leds-mt6370-rgb hands to the same hardware blink), off otherwise.
 //!
 //! **Log**: a CSV line to /var/log/titan-charge/YYYY-MM.csv
 //!
@@ -61,6 +65,7 @@ const POLL: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_secs(60);
 const LIMIT_FILE: &str = "/var/lib/titan-charge/limit";
 const CHG_CMD: &str = "/proc/mtk_battery_cmd/current_cmd";
+const CHG612_BEHAVIOUR: &str = "/sys/class/power_supply/mt6370-charger/charge_behaviour";
 const RESUME_GAP: i64 = 5;
 /// The limit holds only above this cell voltage (mV): ~75 % on this battery's
 /// own log (80 % ~4.09 V, 90 % ~4.21 V at light load). A gauge that is wrong
@@ -242,14 +247,29 @@ fn set_limit(n: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// enable or stop charging (MediaTek's cmd_discharging)
+/// Linux 6.12: our mt6370-charger, not MediaTek's charger framework
+fn on_612() -> bool {
+    std::path::Path::new(CHG612_BEHAVIOUR).exists()
+}
+
+/// enable or stop charging (MediaTek's cmd_discharging; 6.12's
+/// charge_behaviour)
 fn charging(on: bool) {
-    if let Err(e) = fs::write(CHG_CMD, if on { "0 0" } else { "0 1" }) {
-        eprintln!("titan-charge: {}: {}", CHG_CMD, e);
+    let (path, v) = if on_612() {
+        (CHG612_BEHAVIOUR, if on { "auto" } else { "inhibit-charge" })
+    } else {
+        (CHG_CMD, if on { "0 0" } else { "0 1" })
+    };
+    if let Err(e) = fs::write(path, v) {
+        eprintln!("titan-charge: {}: {}", path, e);
     }
 }
 
 fn charging_held() -> bool {
+    if on_612() {
+        // the choices, the current one in brackets
+        return read(CHG612_BEHAVIOUR).is_some_and(|s| s.contains("[inhibit-charge]"));
+    }
     // "usb_unlimited cmd_discharging"
     read(CHG_CMD).map(|s| s.split_whitespace().nth(1) == Some("1")).unwrap_or(false)
 }
@@ -269,14 +289,21 @@ fn led_write(n: u32, attr: &str, v: &str) {
 }
 
 fn led(state: Led) {
+    let k612 = on_612();
     for n in 1..=3 {
         led_write(n, "brightness", "0");
-        led_write(n, "trigger", "cc_mode");
+        led_write(n, "trigger", if k612 { "none" } else { "cc_mode" });
     }
     match state {
         Led::Off => {}
         Led::Charging => led_write(1, "brightness", LED_LEVEL),
         Led::Full => led_write(2, "brightness", LED_LEVEL),
+        Led::Low if k612 => {
+            // 2 s, ~3/31 on, as below; blink_set picks the chip's PWM mode
+            led_write(1, "trigger", "timer");
+            led_write(1, "delay_on", "190");
+            led_write(1, "delay_off", "1810");
+        }
         Led::Low => {
             // the chip blinks it: a 2 s period, a short flash
             led_write(1, "trigger", "pwm_mode");

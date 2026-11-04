@@ -6,15 +6,15 @@ A fragment on top of defconfig: make defconfig titanpocket.config.
 The media core stays modular for the out-of-tree camera driver; udmabuf
 is built in for libcamera.
 ---
- arch/arm64/configs/titanpocket.config | 144 +++++++++++++++++++++++++++++++++
- 1 file changed, 144 insertions(+)
+ arch/arm64/configs/titanpocket.config | 149 ++++++++++++++++++++++++++
+ 1 file changed, 149 insertions(+)
 
 diff --git a/arch/arm64/configs/titanpocket.config b/arch/arm64/configs/titanpocket.config
 new file mode 100644
-index 0000000..feaaa6d
+index 0000000000000000000000000000000000000000..0453ac30fd03c0b8e5f6e8334c712086609dd039
 --- /dev/null
 +++ b/arch/arm64/configs/titanpocket.config
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,149 @@
 +# Titan Pocket on top of arm64 defconfig:
 +#   make defconfig titanpocket.config
 +CONFIG_LOCALVERSION="-titanpocket"
@@ -123,6 +123,9 @@ index 0000000..feaaa6d
 +CONFIG_PM_DEBUG=y
 +CONFIG_PM_ADVANCED_DEBUG=y
 +CONFIG_PM_SLEEP_DEBUG=y
++# userspace wakelocks (/sys/power/wake_lock, wake_unlock): titan-powerkey
++# doesn't suspend while one is held; titan-gnss-open holds one
++CONFIG_PM_WAKELOCKS=y
 +# USB cable detection: the MT6370's Type-C port (TCPM) drives mtu3's role switch
 +CONFIG_MFD_MT6370=y
 +CONFIG_TYPEC=y
@@ -145,6 +148,8 @@ index 0000000..feaaa6d
 +CONFIG_PWM_MTK_DISP=y
 +CONFIG_BACKLIGHT_CLASS_DEVICE=y
 +CONFIG_BACKLIGHT_PWM=y
++# the MT6370 boost: off with the screen (titan-powerkey)
++CONFIG_BACKLIGHT_MT6370=y
 +CONFIG_CMA=y
 +CONFIG_DMA_CMA=y
 +

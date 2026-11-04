@@ -88,7 +88,10 @@ marks after a space started up to 400 µs late (the CPU waking from deep
 idle), and the Flipper showed only raw samples. Holding CPU latency at 0
 helped but left one mark per frame 100-150 µs long.
 
-`titan-ir` still needs a lirc backend.
+`titan-ir` uses it when `/dev/irtx` is absent (`irtx.rs`): the same
+plans, split for lirc's limits (at most 1023 values and 500 ms a write, no
+zero durations; a write ends after a mark and the space is a timed pause),
+the carrier and a 33 % duty cycle by ioctl. Built, not yet run on 6.12.
 
 ## The library: Flipper-IRDB
 

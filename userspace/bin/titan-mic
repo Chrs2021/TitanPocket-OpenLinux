@@ -1,7 +1,7 @@
 #!/bin/sh
 # titan-mic: the MT6358 codec's microphone path (stock audio_device.xml).
 #
-#   titan-mic on [main|back|dual] [GAIN]   power the uplink; capture: hw:0,1
+#   titan-mic on [main|back|dual] [GAIN]   power the uplink; capture: hw:0,1 (6.12: hw:0,2)
 #   titan-mic off
 #   titan-mic status
 #
@@ -13,8 +13,52 @@
 # ADCs are always cycled. Capture is ALSA device 1 (MultiMedia1_Capture,
 # 48 kHz stereo S16): left = preamp 1, right = preamp 2. GAIN: the PGA, 0-30
 # dB in 6 dB steps (default 30).
+#
+# On Linux 6.12 (card titanpocket, upstream's MT6358 codec) the same path is
+# DAPM's: Mic Type Mux DCC, PGA L/R Mux AIN0 (main) / AIN2 (back), ADC L/R
+# Mux the preamplifiers, the AFE's UL1 inputs from ADDA UL; capture is UL1,
+# hw:0,2, and the uplink powers up while it is open. PGA Volume goes to 24
+# dB (0-4, 6 dB steps).
 set -e
 c() { amixer -q -c 0 cset "name=$1" "$2"; }
+
+if [ -e /proc/asound/titanpocket ]; then
+	case "${1:-status}" in
+	on)
+		case ${2:-main} in
+		main) l=AIN0; r=AIN0 ;;
+		back) l=AIN2; r=AIN2 ;;
+		dual) l=AIN0; r=AIN2 ;;
+		*) echo "titan-mic: main, back or dual" >&2; exit 2 ;;
+		esac
+		g=$(( ${3:-30} / 6 )); [ $g -gt 4 ] && g=4
+		c "Mic Type Mux" DCC
+		c "PGA L Mux" $l
+		c "PGA R Mux" $r
+		c "ADC L Mux" "Left Preamplifier"
+		c "ADC R Mux" "Right Preamplifier"
+		c "PGA Volume" $g,$g
+		c "UL1_CH1 ADDA_UL_CH1" on
+		c "UL1_CH2 ADDA_UL_CH2" on
+		;;
+	off)
+		c "UL1_CH1 ADDA_UL_CH1" off
+		c "UL1_CH2 ADDA_UL_CH2" off
+		c "PGA L Mux" None
+		c "PGA R Mux" None
+		;;
+	status)
+		for n in "Mic Type Mux" "PGA L Mux" "PGA R Mux" "PGA Volume" "UL1_CH1 ADDA_UL_CH1"; do
+			printf '%-24s %s\n' "$n" "$(amixer -c 0 cget "name=$n" | sed -n "s/.*: values=//p")"
+		done
+		;;
+	*)
+		sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+		exit 2
+		;;
+	esac
+	exit 0
+fi
 
 case "${1:-status}" in
 on)
