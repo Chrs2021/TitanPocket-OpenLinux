@@ -656,11 +656,30 @@ voltages itself. The Vcore command table the vendor gives the SSPM
 
 **Resets on the way into sleep.** About one suspend in 35 ends in a reset
 (2 in about 70 with the breadcrumbs, both on 5-minute sleeps; none in 50
-back to back 20-second sleeps). The SoC's watchdog block says it was
-software-triggered, not an orderly reboot (`NONRST2` 0x40002000 against
-0x48002000 after a reboot), pstore is empty, and LK's `bootreason=SPM_reboot`
+back to back 20-second sleeps). The SoC's watchdog block's `NONRST2`
+reads 0x40002000 after one, against 0x48002000 after a reboot. Read with
+the vendor's definitions (`mtk_wdt.h`, 2026-11-09) that isn't a reset
+type: bits 31:29 are the boot stage (2, LK) and bits 28:26 the stage at
+the last reset, which a reboot keeps (2) and these resets lost (0), as
+a power loss does; bit 13 is the vendor's "bypass power key". So these
+look like PMIC-level resets (an undervoltage or a rail failing as the
+rails go to their sleep levels would fit), not software ones. pstore is
+empty, and LK's `bootreason=SPM_reboot`
 says nothing: a plain reboot shows it too. The SPM driver leaves breadcrumbs
 in the MT6358 RTC (`RTC_SPAR0` bits 8-15 keep their value across a reset;
 mainline.md, "Suspend"): one reset stopped after the devices had suspended,
 the other inside the suspend call before the SSPM was told. The finer
 breadcrumbs since kernel #107 will say which call it is.
+
+Kernel #116 (built 2026-11-09, not yet flashed) says more at boot and
+after each suspend. At boot, `mt6771-spm` prints the MT6358's power-on
+and power-off status (`PONSTS` 0x00c: power key, RTC alarm, charger,
+reboot; `POFFSTS` 0x00e: undervoltage, power-good failure, thermal,
+watchdog reset, cold reset, power key long press, normal off, ...) and
+the watchdog's `WDT_STA` and `NONRST` registers with the stages decoded:
+the next reset's line says which. After each suspend the log line adds
+the breadcrumb steps whose write didn't reach the RTC ("crumbs lost", a
+bit per step) and the step the RTC held going into the sleep ("held"):
+every reset since #107 showed step 10, the last one written before the
+SSPM is asked to suspend, which the SSPM's own PMIC work may stop the
+later ones from reaching.

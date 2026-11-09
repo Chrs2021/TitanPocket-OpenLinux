@@ -12,15 +12,12 @@ const WARM: &str = "/sys/class/leds/yellow:flash";
 /// a level is 25 mA x (level + 1) per LED
 pub const TORCH_LEVEL: u32 = 6; // 175 mA
 pub const TORCH_MAX: u32 = 15; // 400 mA, the torch maximum
-#[allow(dead_code)]
 pub const PHOTO_LEVEL: u32 = 39; // 1000 mA strobe
-#[allow(dead_code)] // the strobe waits for the pre-flash metering port
 pub const PULSE_MS: u32 = 1184; // the strobe's hardware timeout (device tree)
 
 /// white and warm share of a level's current, for the tones Neutral, Warm, Cool
 const TONES: [(f64, f64); 3] = [(1.0, 1.0), (0.25, 1.0), (1.0, 0.25)];
 
-#[allow(dead_code)]
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Lit {
     Off,
@@ -38,6 +35,47 @@ fn write(led: &str, attr: &str, v: impl ToString) -> std::io::Result<()> {
     std::fs::write(Path::new(led).join(attr), v.to_string())
 }
 
+/// each LED's current (mA) at `level` for `tone`
+fn currents(tone: usize, level: u32) -> [(&'static str, f64); 2] {
+    let (w, y) = TONES[tone.min(2)];
+    let ma = 25.0 * (level + 1) as f64;
+    [(WHITE, ma * w), (WARM, ma * y)]
+}
+
+/// a level the strobe can give (its floor is 50 mA a LED); dimmer ones go on the torch
+pub fn strobe_can(tone: usize, level: u32) -> bool {
+    currents(tone, level).iter().all(|c| c.1 >= 50.0)
+}
+
+/// fire the strobe at `level`; the PMIC ends it after PULSE_MS. Needs no `Flash`, so the
+/// still pipeline's streaming thread can fire it on the capture's first frame; the main
+/// thread's `Flash` is told with `strobing()` so that `off()` ends it early.
+pub fn strobe(tone: usize, level: u32) -> bool {
+    let cur = currents(tone, level);
+    for (led, ma) in cur {
+        if write(led, "flash_timeout", PULSE_MS * 1000).and(write(led, "flash_brightness", (ma * 1000.0) as u32)).is_err() {
+            return false;
+        }
+    }
+    for attempt in 0..10 {
+        // a torch's off reaches the driver a moment later: EBUSY until then
+        match cur.iter().try_for_each(|(led, _)| write(led, "flash_strobe", 1)) {
+            Ok(()) => return true,
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) && attempt < 9 => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(e) => {
+                eprintln!("flash: {e}");
+                for led in [WHITE, WARM] {
+                    let _ = write(led, "flash_strobe", 0);
+                }
+                return false;
+            }
+        }
+    }
+    false
+}
+
 impl Flash {
     pub fn new(tone: usize) -> Flash {
         Flash { tone, lit: Lit::Off, guard: None }
@@ -52,9 +90,7 @@ impl Flash {
     }
 
     fn currents(&self, level: u32) -> [(&'static str, f64); 2] {
-        let (w, y) = TONES[self.tone.min(2)];
-        let ma = 25.0 * (level + 1) as f64;
-        [(WHITE, ma * w), (WARM, ma * y)]
+        currents(self.tone, level)
     }
 
     /// the torch at `level`, off after `timeout_ms` (0: until off())
@@ -80,36 +116,11 @@ impl Flash {
         true
     }
 
-    /// the flash proper (for the pre-flash metering, not ported yet); dim levels (under the strobe's 50 mA floor) stay on the torch
-    #[allow(dead_code)]
-    pub fn pulse(&mut self, level: u32) -> bool {
-        let cur = self.currents(level);
-        if cur.iter().any(|c| c.1 < 50.0) {
-            return self.torch(level, PULSE_MS);
-        }
+    /// a strobe is about to be fired elsewhere (`strobe()`, on the still's first frame):
+    /// switch the torch off and remember it, so that `off()` ends the strobe too
+    pub fn strobing(&mut self) {
         self.off();
         self.lit = Lit::Strobe;
-        for (led, ma) in cur {
-            if write(led, "flash_timeout", PULSE_MS * 1000).and(write(led, "flash_brightness", (ma * 1000.0) as u32)).is_err() {
-                self.off();
-                return false;
-            }
-        }
-        for attempt in 0..10 {
-            // the torch's off reaches the driver a moment later: EBUSY until then
-            match cur.iter().try_for_each(|(led, _)| write(led, "flash_strobe", 1)) {
-                Ok(()) => return true,
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) && attempt < 9 => {
-                    std::thread::sleep(std::time::Duration::from_millis(10))
-                }
-                Err(e) => {
-                    eprintln!("flash: {e}");
-                    self.off();
-                    return false;
-                }
-            }
-        }
-        false
     }
 
     pub fn off(&mut self) {

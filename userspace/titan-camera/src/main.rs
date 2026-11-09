@@ -11,15 +11,18 @@
 //!   use shutter speeds down to 1 s (the frame stretches for them).
 //! - Autofocus (rear): contrast detection on the preview, tap to focus, a manual focus slider.
 //! - Flash (rear): Off, Auto, On, Torch; hold the button for the tone (Neutral, Warm, Cool).
+//!   A flash photo is metered with a pre-flash first (meter.rs), then taken with a strobe
+//!   pulse at the metered exposure.
 //! - QR codes, found passively in the preview: a chip each (Copy, Open for links), a short buzz
 //!   for a new one; nothing opens on its own.
 //!
 //! Keys: Space/Enter shutter, V photo/video, F switch camera, R rotate, T flash, C tone,
-//! A autofocus, S settings, Escape back.
+//! A autofocus, S settings, Escape closes the settings, else exits (as the back button does).
 mod af;
 mod camera;
 mod exposure;
 mod flash;
+mod meter;
 mod pipeline;
 mod qr;
 mod settings;
@@ -73,6 +76,17 @@ const MANUAL_SETTLE: u32 = 4; // frames after a manual exposure reaches the sens
 const BURST: u32 = 6;
 const LONG_S: f64 = 1.0 / 15.0; // longer: one frame, no burst (on a support, presumably)
 const AUTO_FLASH_GAIN: i32 = 4 * camera::GAIN_UNIT; // auto exposure at 4x or more: dark
+const FLASH_SETTLE: u32 = 6; // still frames after the strobe fires (the first frame) and the metered exposure
+const PHOTO_MAX_US: f64 = 10000.0; // shake: longer exposures blur; then gain (as the driver's AE)
+
+/// the flash for a photo
+enum FlashPlan {
+    None,
+    /// a continuous light through the capture (no metering possible)
+    Torch,
+    /// a strobe pulse at `level` on the first frame, at the metered exposure (lines, gain)
+    Strobe(u32, (f64, f64)),
+}
 
 fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
@@ -106,6 +120,7 @@ struct App {
     still: RefCell<Option<Still>>,
     sensor: RefCell<Option<Sensor>>,
     expo: RefCell<Option<exposure::Exposure>>,
+    meter: RefCell<Option<meter::Meter>>,
     gen: Cell<u64>,
     busy: Cell<bool>,
     rec_start: Cell<Option<Instant>>,
@@ -397,51 +412,174 @@ impl App {
         }
         let st = self.st.borrow().clone();
         let cam = self.cam().clone();
-        // before the preview stops: the scene's exposure (exposure x gain) and darkness
-        let (prod_us, dark) = match self.sensor.borrow().as_ref() {
+        let dark = self
+            .sensor
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.get(camera::CID_ANALOGUE_GAIN))
+            .map(|g| g >= AUTO_FLASH_GAIN)
+            .unwrap_or(false);
+        let use_flash = cam.focus && flash::Flash::present() && (st.flash == 2 || (st.flash == 1 && dark));
+        // Torch mode keeps its light; a fixed exposure keeps its values: neither is metered
+        if use_flash && st.flash != 3 && !st.manual_exposure() && self.meter_start() {
+            return; // capture() follows the metering
+        }
+        self.capture(if use_flash && st.flash != 3 { FlashPlan::Torch } else { FlashPlan::None });
+    }
+
+    // ---- flash metering (meter.rs) ----
+
+    /// pre-flash: the preview at a short manual exposure, the flash on; false when there are
+    /// no statistics (then the flash is a continuous light)
+    fn meter_start(self: &Rc<Self>) -> bool {
+        let cam = self.cam().clone();
+        let Some(amb) = meter::read_stats(&cam.sysdir.join("af_stats")) else { return false };
+        let (lines, gain, line) = {
+            let sensor = self.sensor.borrow();
+            let Some(s) = sensor.as_ref() else { return false };
+            let (Some(e), Some(g)) = (s.get(camera::CID_EXPOSURE), s.get(camera::CID_ANALOGUE_GAIN)) else { return false };
+            let line = s.line_us(cam.binned.0);
+            s.set_exposure(cam.binned.1, cam.binned.0, meter::START_US, 1.0);
+            (e as f64, g as f64 / camera::GAIN_UNIT as f64, line)
+        };
+        let mut m = meter::Meter::new(&amb, lines, gain, line, flash::PHOTO_LEVEL, (PHOTO_MAX_US / line).floor(), camera::GAIN_MAX);
+        m.exposing(meter::START_US);
+        *self.meter.borrow_mut() = Some(m);
+        self.busy.set(true);
+        self.shutter.set_sensitive(false);
+        self.set_status(Some("Metering\u{2026}"), 0);
+        self.flash.borrow_mut().torch(meter::PRE_LEVEL, meter::TIMEOUT_MS as u32 + 1000);
+        let me = self.clone();
+        glib::timeout_add_local(Duration::from_millis(15), move || me.meter_tick());
+        true
+    }
+
+    fn meter_tick(self: &Rc<Self>) -> glib::ControlFlow {
+        let cam = self.cam().clone();
+        let st = meter::read_stats(&cam.sysdir.join("af_stats"));
+        let step = {
+            let mut mb = self.meter.borrow_mut();
+            let Some(m) = mb.as_mut() else { return glib::ControlFlow::Break };
+            let has = self
+                .sensor
+                .borrow()
+                .as_ref()
+                .map(|s| {
+                    let e = s.get(camera::CID_EXPOSURE).unwrap_or(-100) as f64;
+                    (e - m.lines()).abs() <= 1.0 && s.get(camera::CID_ANALOGUE_GAIN) == Some(camera::GAIN_UNIT)
+                })
+                .unwrap_or(false);
+            m.tick(st.as_ref(), has)
+        };
+        match step {
+            meter::Step::Wait => glib::ControlFlow::Continue,
+            meter::Step::Expose(us) => {
+                if let Some(s) = self.sensor.borrow().as_ref() {
+                    s.set_exposure(cam.binned.1, cam.binned.0, us, 1.0);
+                }
+                if let Some(m) = self.meter.borrow_mut().as_mut() {
+                    m.exposing(us);
+                }
+                glib::ControlFlow::Continue
+            }
+            meter::Step::Dim(level) => {
+                self.flash.borrow_mut().torch(level, meter::TIMEOUT_MS as u32 + 1000);
+                glib::ControlFlow::Continue
+            }
+            meter::Step::Done(level, exposure) => {
+                if let Some(m) = self.meter.borrow_mut().take() {
+                    eprintln!("meter: {}", m.log);
+                }
+                self.flash.borrow_mut().off();
+                // the preview stops for the still; the next one starts on auto exposure
+                self.busy.set(false);
+                self.capture(match exposure {
+                    Some(e) => FlashPlan::Strobe(level, e),
+                    None => FlashPlan::Torch,
+                });
+                glib::ControlFlow::Break
+            }
+        }
+    }
+
+    fn capture(self: &Rc<Self>, plan: FlashPlan) {
+        let st = self.st.borrow().clone();
+        let cam = self.cam().clone();
+        // before the preview stops: the scene's exposure (exposure x gain)
+        let (prod_us, line) = match self.sensor.borrow().as_ref() {
             Some(s) => {
                 let lines = s.get(camera::CID_EXPOSURE).unwrap_or(1000) as f64;
                 let g = s.get(camera::CID_ANALOGUE_GAIN).unwrap_or(camera::GAIN_UNIT);
-                (lines * s.line_us(cam.binned.0) * g as f64 / camera::GAIN_UNIT as f64, g >= AUTO_FLASH_GAIN)
+                let line = s.line_us(cam.binned.0);
+                (lines * line * g as f64 / camera::GAIN_UNIT as f64, line)
             }
-            None => (10000.0, false),
+            None => (10000.0, camera::FALLBACK_LINE_US),
         };
-        let use_flash = cam.focus && flash::Flash::present() && (st.flash == 2 || (st.flash == 1 && dark));
         let size = if st.photo_size == 0 { cam.full } else { cam.binned };
         let shutter = SHUTTERS[st.shutter].1;
         let iso = ISOS[st.iso].1;
-        // manual: the fixed value(s), the other from the scene's exposure
-        let manual = st.manual_exposure().then(|| {
-            let us = shutter.map(|s| s * 1e6).unwrap_or_else(|| (prod_us / iso.unwrap_or(1.0)).clamp(40.0, 1e6));
-            let gain = iso.unwrap_or_else(|| (prod_us / us).clamp(1.0, camera::GAIN_MAX));
-            (us, gain)
-        });
-        let long = shutter.map(|s| s > LONG_S).unwrap_or(false);
-        let plan_first: Option<Box<dyn FnOnce() + Send>> = manual.map(|(us, gain)| {
+        // manual: the fixed value(s), the other from the scene's exposure; or the metered one
+        let manual = match plan {
+            FlashPlan::Strobe(_, (lines, gain)) => Some((lines * line, gain)),
+            _ => st.manual_exposure().then(|| {
+                let us = shutter.map(|s| s * 1e6).unwrap_or_else(|| (prod_us / iso.unwrap_or(1.0)).clamp(40.0, 1e6));
+                let gain = iso.unwrap_or_else(|| (prod_us / us).clamp(1.0, camera::GAIN_MAX));
+                (us, gain)
+            }),
+        };
+        let long = shutter.map(|s| s > LONG_S).unwrap_or(false) && !matches!(plan, FlashPlan::Strobe(..));
+        // the strobe fires on the first frame (its pulse lasts flash::PULSE_MS); dim levels
+        // under the strobe's floor are a short torch, lit before the still starts
+        let strobe = match plan {
+            FlashPlan::Strobe(level, _) if flash::strobe_can(st.tone, level) => Some((st.tone, level)),
+            _ => None,
+        };
+        if manual.is_some() {
+            // set before the stream starts too: the driver applies it at stream on
+            if let (Some(s), Some((us, gain))) = (Sensor::open(&cam), manual) {
+                s.set_exposure(size.1, size.0, us, gain);
+            }
+        }
+        let plan_first: Option<Box<dyn FnOnce() + Send>> = if manual.is_some() || strobe.is_some() {
             let c = cam.clone();
-            Box::new(move || {
-                if let Some(s) = Sensor::open(&c) {
+            Some(Box::new(move || {
+                if let Some((tone, level)) = strobe {
+                    flash::strobe(tone, level);
+                }
+                if let (Some(s), Some((us, gain))) = (Sensor::open(&c), manual) {
                     s.set_exposure(size.1, size.0, us, gain);
                 }
-            }) as Box<dyn FnOnce() + Send>
-        });
-        let plan = StillPlan {
-            settle: if manual.is_some() { MANUAL_SETTLE } else { PHOTO_SETTLE },
-            burst: if long { 1 } else { BURST },
-            on_first: plan_first,
+            }) as Box<dyn FnOnce() + Send>)
+        } else {
+            None
         };
+        let plan_settle = match plan {
+            FlashPlan::Strobe(..) => FLASH_SETTLE,
+            _ if manual.is_some() => MANUAL_SETTLE,
+            _ => PHOTO_SETTLE,
+        };
+        let still_plan = StillPlan { settle: plan_settle, burst: if long { 1 } else { BURST }, on_first: plan_first };
         let region = if cam.focus { *self.af_region.lock().unwrap() } else { (0.5, 0.5) };
         self.busy.set(true);
         self.shutter.set_sensitive(false);
-        self.set_status(Some(if long { "Long exposure — hold still…" } else { "Taking photo…" }), 0);
+        self.set_status(Some(if long { "Long exposure \u{2014} hold still\u{2026}" } else { "Taking photo\u{2026}" }), 0);
         self.stop_preview();
-        if use_flash && st.flash != 3 {
-            // a continuous light through the capture (the pre-flash metering isn't ported yet)
-            self.flash.borrow_mut().torch(flash::TORCH_MAX, 8000);
+        match plan {
+            FlashPlan::Torch => {
+                self.flash.borrow_mut().torch(flash::TORCH_MAX, 8000);
+            }
+            FlashPlan::Strobe(level, _) => {
+                if strobe.is_some() {
+                    self.flash.borrow_mut().strobing();
+                } else {
+                    self.flash.borrow_mut().torch(level, 4000);
+                }
+            }
+            FlashPlan::None => {}
         }
         let gen = self.gen.get() + 1;
         self.gen.set(gen);
-        match Still::new(&cam.id, size, plan, region, gen, self.tx.clone()) {
+        match Still::new(&cam.id, size, still_plan, region, gen, self.tx.clone()) {
             Ok(s) if s.start() => {
                 *self.still.borrow_mut() = Some(s);
                 let frames = PHOTO_SETTLE + BURST + 4;
@@ -911,6 +1049,9 @@ fn build(gtk_app: &gtk::Application) {
     top.set_margin_top(10);
     top.set_margin_start(10);
     top.set_margin_end(10);
+    // back: leave the app (the window's close request ends a recording properly)
+    let back_btn = icon_button("go-previous-symbolic");
+    back_btn.set_tooltip_text(Some("Back (Esc)"));
     let flash_btn = gtk::Button::with_label("Off");
     let chip = label("", "chip");
     chip.set_valign(gtk::Align::Center);
@@ -921,6 +1062,7 @@ fn build(gtk_app: &gtk::Application) {
     spacer.set_hexpand(true);
     let mode_btn = gtk::Button::with_label("Photo");
     let settings_btn = icon_button("emblem-system-symbolic");
+    top.append(&back_btn);
     top.append(&flash_btn);
     top.append(&chip);
     top.append(&rec);
@@ -1020,6 +1162,7 @@ fn build(gtk_app: &gtk::Application) {
         still: RefCell::new(None),
         sensor: RefCell::new(None),
         expo: RefCell::new(None),
+        meter: RefCell::new(None),
         gen: Cell::new(0),
         busy: Cell::new(false),
         rec_start: Cell::new(None),
@@ -1154,12 +1297,20 @@ fn build(gtk_app: &gtk::Application) {
             "c" | "C" => a.cycle_tone(),
             "a" | "A" => a.autofocus(Some((0.5, 0.5))),
             "s" | "S" => a.panel.set_reveal_child(!a.panel.reveals_child()),
-            "Escape" => a.panel.set_reveal_child(false),
+            "Escape" => {
+                if a.panel.reveals_child() {
+                    a.panel.set_reveal_child(false);
+                } else {
+                    a.window.close(); // close_request ends a recording properly
+                }
+            }
             _ => return glib::Propagation::Proceed,
         }
         glib::Propagation::Stop
     });
     window.add_controller(keys);
+    let w = window.clone();
+    back_btn.connect_clicked(move |_| w.close());
 
     let a = app.clone();
     glib::spawn_future_local(async move {

@@ -18,7 +18,7 @@ pub const GAIN_UNIT: i32 = 128;
 pub const GAIN_MAX: f64 = 15.5;
 pub const FOCUS_MAX: i32 = 1023;
 /// line time of both rear modes (HTS / pixel rate), when the controls can't be read
-const FALLBACK_LINE_US: f64 = 2512.0 / 288.0;
+pub const FALLBACK_LINE_US: f64 = 2512.0 / 288.0;
 
 #[derive(Clone, Debug)]
 pub struct Camera {

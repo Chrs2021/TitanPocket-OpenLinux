@@ -1,4 +1,4 @@
-# Hardware video encoder (VENC), work in progress
+# Hardware video encoder (VENC)
 
 Goal: H.264 recording on the MT6771's hardware encoder from our own driver,
 with no Android library at run time. Started 2026-11-08.
@@ -131,7 +131,7 @@ scp venc_rc.bin root@PHONE:/lib/firmware/titan/venc_rc.bin
 
 Register 0x90's 0x400-byte buffer starts zeroed (the processor's state).
 
-## Test driver: titan_venc (2026-11-08, not yet run on the phone)
+## Test driver: titan_venc (2026-11-08; works on the phone, 2026-11-09)
 
 `modules/venc/titan_venc.c` (`build612.sh`): one NV12 frame at a time
 through debugfs (`config`, `in`, `run`, `out`, `regs`), Baseline profile,
@@ -159,6 +159,22 @@ time through 0x060 (the vendor's ISR); stop = pause (0xac), wait for status
 Test on the phone: `tools/venc/venc-test.sh [frames] [w h kbps fps gop]`
 encodes a synthetic moving pattern to `/tmp/venc-test.h264`.
 
+**On the phone (2026-11-09, kernel #115).** The first run worked:
+- 320×240, 5 frames: an I frame and four P frames, each ending with
+  status 0x4 (frame done), 1.3-1.5 ms of hardware time a frame.
+  Decoded with GStreamer's `openh264dec` on the phone, the frames are the
+  test pattern: the gradient, the box 12 pixels further right each frame,
+  the chroma following the script.
+- 1280×720, 60 frames at 4000 kbit/s, GOP 30: every frame status 0x4, I
+  frames at 0 and 30, 4063 kbit/s at 30 fps (the hardware rate control
+  holds the target), about 10-12 ms a frame, and the whole 1 MB stream
+  decodes without an error.
+
+So the register sequence, the buffers, the RC microcode and the SPS/PPS
+writer are right as they stand. Next is step 4 of the plan: a V4L2
+memory-to-memory encoder, so `v4l2h264enc` and the camera app can record
+with it instead of x264 on the CPU.
+
 ## Plan
 
 1. Field-level spec of all 45 registers from the decompiled code, for the
@@ -167,8 +183,8 @@ encodes a synthetic moving pattern to `/tmp/venc-test.h264`.
 2. DT: the `vencsys` clock node, the VENC power domain under scpsys, larb4,
    the VENC node with its IOMMU ports. The same domain also enables the
    hardware JPEG encoder (mainline `mediatek,mt8183-jpgenc`).
-3. A debugfs test module (like `titan_dip`): one NV12 frame in, H.264 slice
-   data out; check with ffmpeg after prepending our own SPS/PPS.
+3. ✅ A debugfs test module (like `titan_dip`): one NV12 frame in, H.264
+   out (2026-11-09, above).
 4. A V4L2 memory-to-memory (stateful) encoder, so GStreamer's
    `v4l2h264enc` and the camera app can record.
 

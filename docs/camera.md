@@ -612,8 +612,23 @@ and the app runs without it, and it reads the luma straight from the
 preview's YUYV, every n-th pixel for frames over 1000 wide, so the branch
 has no `videoscale` or `videoconvert`. 3 scans a second: at 5 a second the
 decoding thread took about 26% of a core on the 960x720 preview, at 3
-about 12%. Not ported yet: the flash pre-metering. Flash On and Auto light
-the torch maximum through the capture instead of a metered strobe.
+about 12%. Tested on the phone with a real code: it decodes and the chip
+appears. Flash pre-metering (2026-11-09, `meter.rs`; built and unit-tested,
+not yet run on the phone): as the Python app's ("Flash exposure",
+above). The preview stays up at 400 µs, gain 1×, with the torch at its
+maximum; the app reads `af_stats` every 15 ms, waits for the sensor to
+show the exposure and then 3 frames, steps 8× while the 97th-percentile
+block clips or the scene is too dark, dims the pre-flash for a close
+subject, and solves for the photo's exposure × gain (and flash level)
+from the ambient and lit levels. The still then starts at that exposure
+(set before stream on and again on the first frame) and fires the strobe
+on its first frame (`flash::strobe`, from the streaming thread; the main
+thread's `Flash` only records it, so it can end it), keeping the burst
+after 6 settle frames, inside the strobe's 1184 ms. Levels under the
+strobe's 50 mA floor go on the torch. Without statistics (or after the
+2.5 s timeout with no valid read) the flash is the torch maximum through
+the capture, as before. Torch mode and a fixed shutter or ISO aren't
+metered.
 
 The preview runs at the ISP's scaled-down size (`Camera::preview`: rear
 960x720, front 816x612; see "The resizer" below), or the binned mode when

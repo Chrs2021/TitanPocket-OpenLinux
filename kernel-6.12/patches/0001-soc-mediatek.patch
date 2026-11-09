@@ -26,11 +26,11 @@ console before the display driver binds.
  drivers/soc/mediatek/Kconfig          |   44 +
  drivers/soc/mediatek/Makefile         |    4 +
  drivers/soc/mediatek/mt6771-scp.c     | 1238 +++++++++++++++++++++++++
- drivers/soc/mediatek/mt6771-spm.c     |  639 +++++++++++++
+ drivers/soc/mediatek/mt6771-spm.c     |  719 ++++++++++++++
  drivers/soc/mediatek/mtk-lk-fb.c      |  249 +++++
  drivers/soc/mediatek/mtk-mcdi.c       |  196 ++++
  include/linux/soc/mediatek/mtk-mcdi.h |   13 +
- 7 files changed, 2383 insertions(+)
+ 7 files changed, 2463 insertions(+)
 
 diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
 index 1b7afb19ccd637471ad82ad833f589cb0f9405b1..cc73ddf801462547795930636f466c91eb5a83e9 100644
@@ -1358,10 +1358,10 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/soc/mediatek/mt6771-spm.c b/drivers/soc/mediatek/mt6771-spm.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..325a68925f16d445f12467d3c82f20c59b91a572
+index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e375767d50
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-spm.c
-@@ -0,0 +1,639 @@
+@@ -0,0 +1,719 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SPM: resource requests and system suspend.
@@ -1653,22 +1653,45 @@ index 0000000000000000000000000000000000000000..325a68925f16d445f12467d3c82f20c5
 +	return 0;
 +}
 +
++/*
++ * The steps whose breadcrumb didn't reach the RTC this suspend (a WACS2
++ * transfer timed out, or the RTC stayed busy): a reset then shows an
++ * earlier step than the one it died in. Reported after the resume.
++ */
++static u32 crumb_failed;
++
 +static void spm_crumb_atomic(unsigned int step)
 +{
 +	u32 v;
 +	int i;
 +
-+	if (!crumb_map || !pwrap_base ||
-+	    wacs2((MT6358_RTC_SPAR0 >> 1) << 16, &v))
++	if (!crumb_map || !pwrap_base)
 +		return;
++	if (wacs2((MT6358_RTC_SPAR0 >> 1) << 16, &v))
++		goto fail;
 +	v = (v & ~CRUMB_MASK) | (crumb_count & 0xf) << 12 | step << 8;
-+	wacs2(BIT(31) | (MT6358_RTC_SPAR0 >> 1) << 16 | v, NULL);
-+	wacs2(BIT(31) | (MT6358_RTC_WRTGR >> 1) << 16 | 1, NULL);
++	if (wacs2(BIT(31) | (MT6358_RTC_SPAR0 >> 1) << 16 | v, NULL) ||
++	    wacs2(BIT(31) | (MT6358_RTC_WRTGR >> 1) << 16 | 1, NULL))
++		goto fail;
 +	for (i = 0; i < 10000; i++) {
-+		if (wacs2((MT6358_RTC_BBPU >> 1) << 16, &v) || !(v & RTC_BBPU_CBUSY))
-+			break;
++		if (wacs2((MT6358_RTC_BBPU >> 1) << 16, &v))
++			goto fail;
++		if (!(v & RTC_BBPU_CBUSY))
++			return;
 +		udelay(1);
 +	}
++fail:
++	crumb_failed |= BIT(step);
++}
++
++/* the breadcrumb step the RTC holds now, or -1 when it can't be read */
++static int spm_crumb_readback(void)
++{
++	u32 v;
++
++	if (!pwrap_base || wacs2((MT6358_RTC_SPAR0 >> 1) << 16, &v))
++		return -1;
++	return v >> 8 & 0xf;
 +}
 +
 +static int spm_crumb_notify(struct notifier_block *nb, unsigned long ev,
@@ -1687,6 +1710,58 @@ index 0000000000000000000000000000000000000000..325a68925f16d445f12467d3c82f20c5
 +	.notifier_call = spm_crumb_notify,
 +};
 +
++/*
++ * Why the last boot ended, from the two blocks that keep it: the MT6358's
++ * power-on and power-off status (PONSTS 0x00c, POFFSTS 0x00e; vendor
++ * upmu_hw.h) and the SoC watchdog's NONRST registers, which a watchdog or
++ * software reset keeps and a power loss clears. In NONRST2 the boot
++ * stages: bits 31:29 now, 28:26 at the last reset (1 preloader, 2 LK,
++ * 3 kernel; mtk_wdt.h). The resets on the way into deep sleep showed
++ * NONRST2 0x40002000, no last stage, as after a power loss, against
++ * 0x48002000 after a reboot: POFFSTS should say which loss.
++ */
++#define MT6358_PONSTS		0x00c
++#define MT6358_POFFSTS		0x00e
++#define MT6358_TOP_RST_STATUS	0x152
++
++static void spm_bits(char *buf, size_t len, u32 v, const char *const *names, int n)
++{
++	int i, k = 0;
++
++	buf[0] = 0;
++	for (i = 0; i < n; i++)
++		if (v & BIT(i))
++			k += scnprintf(buf + k, len - k, "%s%s", k ? " " : "", names[i]);
++}
++
++static void spm_reset_report(struct device *dev, struct regmap *pmic)
++{
++	static const char *const pon[] = { "pwrkey", "rtc-alarm", "charger", "spar", "reboot" };
++	static const char *const poff[] = { "uvlo", "pgfail", "psoc", "thermal", "wdt-reset",
++					    "cold-reset", "pwrkey-long", "normal-off", "bwdt", "ddlo" };
++	char ponb[64], poffb[96];
++	struct device_node *np;
++	void __iomem *wdt;
++	u32 on = 0, off = 0, rst = 0, sta = 0, nr1 = 0, nr2 = 0;
++
++	regmap_read(pmic, MT6358_PONSTS, &on);
++	regmap_read(pmic, MT6358_POFFSTS, &off);
++	regmap_read(pmic, MT6358_TOP_RST_STATUS, &rst);
++	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6771-wdt");
++	wdt = of_iomap(np, 0);
++	of_node_put(np);
++	if (wdt) {
++		sta = readl(wdt + 0x0c);	/* WDT_STA */
++		nr1 = readl(wdt + 0x20);	/* NONRST_REG */
++		nr2 = readl(wdt + 0x24);	/* NONRST_REG2 */
++		iounmap(wdt);
++	}
++	spm_bits(ponb, sizeof(ponb), on, pon, ARRAY_SIZE(pon));
++	spm_bits(poffb, sizeof(poffb), off, poff, ARRAY_SIZE(poff));
++	dev_info(dev, "last boot ended: PMIC power-on 0x%x (%s), power-off 0x%x (%s), top rst 0x%x; WDT sta 0x%x, nonrst 0x%x/0x%x (stage %u, last stage %u)\n",
++		 on, ponb, off, poffb, rst, sta, nr1, nr2, nr2 >> 29 & 7, nr2 >> 26 & 7);
++}
++
 +/* the last boot's breadcrumb, then a clean slate */
 +static void spm_crumb_init(struct device *dev, struct regmap *pmic)
 +{
@@ -1699,6 +1774,7 @@ index 0000000000000000000000000000000000000000..325a68925f16d445f12467d3c82f20c5
 +	dev_info(dev, "last boot's suspend breadcrumb: step %u (%s), %u completed (mod 16)\n",
 +		 step, step < ARRAY_SIZE(crumb_names) ? crumb_names[step] : "?",
 +		 v >> 12 & 0xf);
++	spm_reset_report(dev, pmic);
 +	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6771-pwrap");
 +	pwrap_base = of_iomap(np, 0);
 +	of_node_put(np);
@@ -1812,6 +1888,8 @@ index 0000000000000000000000000000000000000000..325a68925f16d445f12467d3c82f20c5
 +	return regmap_set_bits(regmap, SPM_SRC_REQ, SPM_HELD_REQ);
 +}
 +
++static int crumb_held;
++
 +static int mt6771_spm_suspend_enter(suspend_state_t state)
 +{
 +	u32 r12, wake_sta, r13, timer, debug, pc, pwr, fail;
@@ -1819,6 +1897,7 @@ index 0000000000000000000000000000000000000000..325a68925f16d445f12467d3c82f20c5
 +	unsigned long wake_src;
 +	int ret;
 +
++	crumb_failed = 0;
 +	spm_crumb_atomic(CRUMB_ENTER);
 +	ret = mt6771_spm_domains_off();
 +	if (ret)
@@ -1848,6 +1927,7 @@ index 0000000000000000000000000000000000000000..325a68925f16d445f12467d3c82f20c5
 +		return -EBUSY;
 +	}
 +	spm_crumb_atomic(CRUMB_SSPM_DOWN);
++	crumb_held = spm_crumb_readback();	/* what a reset in the sleep would show */
 +
 +	regmap_read(spm_regmap, PWR_STATUS, &pwr);	/* the domains going into it */
 +	regmap_clear_bits(spm_regmap, SPM_SRC_REQ, SPM_HELD_REQ);
@@ -1875,10 +1955,10 @@ index 0000000000000000000000000000000000000000..325a68925f16d445f12467d3c82f20c5
 +	regmap_read(spm_regmap, SUBSYS_IDLE_STA, &idle);
 +	regmap_read(spm_regmap, SPM_SRC_MASK, &mask);
 +	regmap_read(spm_regmap, SPM_SRC2_MASK, &mask2);
-+	pr_info("mt6771-spm: suspend %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x, fail 0x%x, pwr 0x%x, src_req 0x%x, req_sta 0x%x/0x%x, idle_sta 0x%x/0x%x, src_mask 0x%x/0x%x\n",
++	pr_info("mt6771-spm: suspend %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x, fail 0x%x, pwr 0x%x, src_req 0x%x, req_sta 0x%x/0x%x, idle_sta 0x%x/0x%x, src_mask 0x%x/0x%x, crumbs lost 0x%x, held %d\n",
 +		ret, wake_src, r12, wake_sta, r13,
 +		(u32)div_u64((u64)timer * 1000, 32768), debug, pc, fail, pwr, src_in,
-+		req_in, req, idle_in, idle, mask, mask2);
++		req_in, req, idle_in, idle, mask, mask2, crumb_failed, crumb_held);
 +
 +	return ret;
 +}
