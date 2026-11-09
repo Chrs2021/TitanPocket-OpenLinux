@@ -12,8 +12,18 @@
 set -euo pipefail
 
 KSRC=/workspace/kernel_vol_mnt/mainline/linux-6.12.115
-O=/root/titan-6.12-build
-DEST=/workspace/out/mainline
+O=${O:-/root/titan-6.12-build}
+# REPRO=1: a reproducible build. The kernel's build stamp (uname -v: build
+# counter, time, user@host) comes from the source's last commit instead of
+# this machine, so the same commit, compiler and config give the same
+# Image.gz anywhere (docs/build-and-flash.md, "Reproducible builds"). Without
+# it the stamp counts builds (#110), which tells test flashes apart.
+if [ "${REPRO:-}" = 1 ]; then
+	export KBUILD_BUILD_TIMESTAMP="$(git -C "$KSRC" log -1 --format=%cd --date=rfc2822)"
+	export KBUILD_BUILD_USER=titanpocket KBUILD_BUILD_HOST=reproducible
+	export KBUILD_BUILD_VERSION=1
+fi
+DEST=${DEST:-/workspace/out/mainline}
 LOG=$DEST/build.log
 DTB=mediatek/mt6771-unihertz-titan-pocket.dtb
 export ARCH=arm64
@@ -21,7 +31,10 @@ mkdir -p "$O" "$DEST"
 cd "$O"
 
 do_config() {
-	make -C "$KSRC" O="$O" defconfig titanpocket.config
+	# titanpocket-local.config: this checkout's own additions, if any (not published)
+	local extra=
+	[ -f "$KSRC/arch/arm64/configs/titanpocket-local.config" ] && extra=titanpocket-local.config
+	make -C "$KSRC" O="$O" defconfig titanpocket.config $extra
 	# report fragment options Kconfig dropped (unmet dependencies)
 	grep -E '^CONFIG_[A-Z0-9_]+=' "$KSRC/arch/arm64/configs/titanpocket.config" |
 	while IFS= read -r line; do

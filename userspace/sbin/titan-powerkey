@@ -28,6 +28,7 @@ is gone, so a crashed app can't leave the keys dead.
              charger or computer is plugged in, or a userspace wakelock
              is held, it doesn't try at all, it looks again every
              RETRY_S seconds
+  awake      short press while a call rings in → declines it (titan-call-watch)
   awake      held 3 s, unlocked → the power menu (the shell's)
   screen off short press → panel on
   asleep     the power key wakes the SoC; its press is swallowed and the
@@ -37,7 +38,8 @@ is gone, so a crashed app can't leave the keys dead.
 The saved screen brightness (titan-brightness) is applied at start and every
 time the screen comes back on.
 
-Screenshot: the red key (left side, KEY_RED = 250 on mtk-kpd) together with
+Screenshot: the red key (left side, KEY_RED = 250: mtk-kpd on 4.14, the
+keypad mt6779-keypad on 6.12, with the volume keys) together with
 volume up, in either order, while the screen is on. The frame on the panel
 (fbgrab) is saved as ~/Pictures/Screenshots/Screenshot_<date>_<time>.png,
 where Photos finds it; the backlight dips for a moment as a shutter. Volume
@@ -88,8 +90,10 @@ is linked to the backlight, so every panel enable sets bl_power back to on. Pres
 the PMIC resets the phone after holding the key for ~10 s.
 """
 import errno
+import json
 import os
 import select
+import socket
 import struct
 import subprocess
 import sys
@@ -151,12 +155,19 @@ VIBRATE = "/usr/local/bin/titan-vibrate"
 WAYLAND_DISPLAY = "wayland-1"
 # from the compositor: exists while the lock screen is up
 LOCKED_FLAG = "/run/titan-locked"
+# titan-call-watch's lock-screen info, and its decline request: a short
+# press while a call rings in declines it instead of locking
+LOCKINFO = "/run/titan-lockinfo"
+IMS_CTL = "/run/titan-ims.sock"
+CALL_DECLINE = "/run/titan-call.decline"
 # to the compositor: lock now (it deletes the file)
 LOCK_REQUEST = "/run/titan-lock.request"
 LOCK_WAIT_S = 0.6
 LOCK_SETTLE_S = 0.08                # a frame or two for the lock screen
 RETRY_S = 30
-WAKE_WINDOW_S = 1.5                  # wait for the waking key press after resume
+WAKE_AT = "/run/titan-wake-at"       # epoch seconds: a service wants the phone awake then
+RTC_ALARM = "/sys/class/rtc/rtc0/wakealarm"
+WAKE_WINDOW_S = 3.0                  # wait for the waking key press after resume
 FB_BLANK = "/sys/class/graphics/fb0/blank"
 # exists while the screen is off (titan-kbd keeps the keyboard backlight dark)
 SCREEN_OFF_FLAG = "/run/titan-screen.off"
@@ -531,6 +542,48 @@ def session_up():
     return os.path.exists(os.path.join(PIPEWIRE_RUNTIME, WAYLAND_DISPLAY))
 
 
+def call_volume(up):
+    """A volume key in a call: titan-ims steps the earpiece's level. False when it isn't
+    on the earpiece (or there's no call), and the key changes PipeWire's volume as ever."""
+    try:
+        with open(LOCKINFO) as f:
+            if "call=active\n" not in f.read():
+                return False
+    except OSError:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(IMS_CTL)
+            s.sendall((json.dumps({"cmd": "volume", "up": up}) + "\n").encode())
+            buf = b""
+            while True:     # other clients' events may come first
+                d = s.recv(4096)
+                if not d:
+                    return False
+                buf += d
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if ev.get("ev") == "volume":
+                        if ev.get("handled"):
+                            log("call volume: %s dB" % ev.get("db"))
+                        return bool(ev.get("handled"))
+    except (OSError, socket.timeout):
+        return False
+
+
+def call_ringing():
+    try:
+        with open(LOCKINFO) as f:
+            return "call=ringing\n" in f.read()
+    except OSError:
+        return False
+
+
 def lock_session():
     """ask Weston to lock and wait until its lock screen is up, so that's
     what the panel shows when it comes back on"""
@@ -611,8 +664,24 @@ def wake_locks():
         return []
 
 
+def set_wake_alarm():
+    """the alarm a service asked for (titan-ims, to renew its registration)"""
+    try:
+        with open(WAKE_AT) as f:
+            at = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    try:
+        write(RTC_ALARM, "0")
+        now = int(time.time())
+        write(RTC_ALARM, str(at if at > now + 5 else now + 30))     # overdue: not a wake loop
+    except OSError as e:
+        log("wake alarm: %s" % e)
+
+
 def suspend():
     """True after a real suspend/resume cycle, False if the kernel refused."""
+    set_wake_alarm()
     os.sync()
     try:
         write("/sys/power/state", "mem")
@@ -677,6 +746,8 @@ class PowerKey:
                 if value == 1 and self.screen_on:
                     screenshot()
                 return
+        if value in (1, 2) and call_volume(code == KEY_VOLUMEUP):   # the earpiece, in a call
+            return
         if self.volume and value in (1, 2) and not keys_grabbed():   # press, autorepeat
             before = self.volume.level
             up = code == KEY_VOLUMEUP
@@ -726,6 +797,9 @@ class PowerKey:
                 if b"off" in msg and self.screen_on:
                     log("idle: screen off")
                     return True     # as a press would
+                if b"on" in msg.replace(b"off", b"") and not self.screen_on:
+                    log("screen on for a call")
+                    return True     # as a press would
             for fd in r:
                 if fd == self.fd or fd == self.ctl:
                     continue
@@ -737,6 +811,10 @@ class PowerKey:
                     _, _, typ, code, value = EVENT.unpack_from(data, i)
                     if typ == EV_KEY and code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
                         self.volume_event(code, value)
+                    elif typ == EV_KEY and code == KEY_RED:
+                        # on 6.12 the red key is the keypad's (mt6779-keypad),
+                        # with the volume keys, not the power key's device
+                        self.red_event(value)
             if self.fd not in r:
                 continue
             try:
@@ -785,6 +863,13 @@ def main():
         key.on_hold = None
         key.volume = None
         key.screen_on = False
+        if call_ringing():
+            try:
+                open(CALL_DECLINE, "w").close()
+                log("short press: declining the ringing call")
+            except OSError as e:
+                log("decline: %s" % e)
+            continue
         lock_session()
         log("screen off, suspending")
         panel(False)

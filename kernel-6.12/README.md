@@ -80,8 +80,11 @@ The command line gains:
 |---|---|
 | `clk_ignore_unused pd_ignore_unused` | some clocks and power domains LK leaves on have no consumer in the device tree yet |
 | `titan.root` (`DEBIAN=1`) | `firstlight-init` mounts the Debian root filesystem and switches to it |
-| `mem_sleep_default=s2idle` (`DEBIAN=1`) | suspend to idle unless deep sleep is enabled (below) |
-| `mt6771_spm.deep=1` (optional, `EXTRA_CMDLINE`) | offers `deep` in `/sys/power/mem_sleep`: suspend through the SPM firmware |
+| `mem_sleep_default=deep` (`DEBIAN=1`) | the power key's suspend is deep sleep through the SPM firmware; `SLEEP=s2idle` gives `mem_sleep_default=s2idle` instead |
+| `mt6771_spm.deep=1` (`DEBIAN=1` with deep) | offers `deep` in `/sys/power/mem_sleep`: starts the SPM firmware and suspends through it |
+| `mt6771_spm.wake_mask=0xe87d5ef` (`DEBIAN=1` with deep) | the SPM's default wake sources less the sensor hub's (bit 11): the SCP's request would end every suspend at once; the modem's interrupts stay wake sources |
+| `mt6771_scp.sleep=1` (`DEBIAN=1` with deep) | leaves the SCP's own sleep on (the vendor switches it off at boot); the sensors still work |
+| `mt6771_spm.pcm_flags1=0x300` (`DEBIAN=1` with deep) | `BIG_BUCK_OFF_ENABLE` and `_ON`: the SPM cuts the A73 cluster's buck (`vproc11`) in sleep |
 
 Flash it from LK's fastboot (the bootloader must be unlocked; keep a
 copy of the stock boot partition):
@@ -117,7 +120,7 @@ logs what the kernel found and returns to fastboot.
 | IR transmitter | `mtk-pwm-ir-tx` | ✅ `/dev/lirc0` |
 | Vibration motor | `regulator-haptic` | ✅ |
 | Suspend to idle | | ✅ ~120 mA with the screen off |
-| Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; about 31 mA (4.14 reached 12 mA); the SCP sensor hub stays awake unless `mt6771_scp.sleep=1` (untested); what the SPM firmware does: `docs/spm-firmware.md` |
+| Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; 23 mA with the modem stopped, 39 mA with it registered and VoLTE up (4.14 reached 12 mA), with the SCP asleep and the A73 buck cut (2026-11-05); an occasional reset on entering sleep, under investigation; what the SPM firmware does: `docs/spm-firmware.md` |
 | Cameras (OV16880, OV8865) | `modules/camera/linux612/` (CAMSV, CAM A statistics, the DIP) | ✅ both at 30 fps through the hardware ISP, auto exposure and white balance, libcamera; the flash is not enabled |
 | NFC (ST21NFC) | `modules/nfc/linux612/` (`/dev/st21nfc`) | ✅ tags read; the controller and its 26 MHz clock buffer are off while the device is closed |
 | Cellular modem | `modules/modem/linux612/` (`titan_modem`) | ✅ registers on LTE under ModemManager, IPv6 data over CLDMA, IPv4 through 464XLAT, IMS registration and first calls with our own client (`userspace/sbin/titan-ims`) (`tools/modem/ltedata.py`); SMS, USSD and emergency calls not done |

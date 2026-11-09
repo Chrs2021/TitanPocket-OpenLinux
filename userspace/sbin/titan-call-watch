@@ -6,13 +6,25 @@ it gives one vibration pulse and starts titan-dialer in the Weston
 session, which finds the ringing call, shows it and rings. A dialer that
 is already open handles the call itself (it runs one at a time). Runs as
 titan-call-watch.service; idle while the modem is off.
+
+The lock screen (docs/desktop.md, "Calls and texts on the lock screen"):
+/run/titan-lockinfo, replaced whole, says whether a call rings or is in
+progress, its number and start, and how many texts came in since the
+phone locked (a count: never a sender or a text), and for Home's glance
+pill the unread texts in titan-ims's messages database (state 'new',
+counted read-only whenever it changes). The lock screen's popped
+bubble asks to answer (/run/titan-call.answer), titan-powerkey's short press
+to decline (/run/titan-call.decline); this takes both and deletes them.
 """
 import os
 import subprocess
 import sys
 
+import sqlite3
+import time
+
 import titan_mm as mm
-from gi.repository import GLib
+from gi.repository import Gio, GLib
 
 try:
     import titan_vibrator
@@ -20,6 +32,12 @@ except ImportError:
     titan_vibrator = None
 
 DIALER = "/usr/local/bin/titan-dialer"
+POWERKEY_CTL = "/run/titan-powerkey.ctl"
+LOCKINFO = "/run/titan-lockinfo"
+LOCKED = "/run/titan-locked"
+ANSWER = "/run/titan-call.answer"
+DECLINE = "/run/titan-call.decline"
+MESSAGES_DB = "/var/lib/titan-ims/messages.sqlite3"
 # the Weston session (titan-desktop.service, root's)
 SESSION_ENV = {"WAYLAND_DISPLAY": "wayland-1", "XDG_RUNTIME_DIR": "/run/user/0"}
 
@@ -28,14 +46,111 @@ def log(msg):
     print("titan-call-watch: " + msg, file=sys.stderr, flush=True)
 
 
+class LockInfo:
+    """what the lock screen shows: one call (ringing or in progress) and a
+    count of texts since the lock"""
+
+    def __init__(self):
+        self.path = None        # the call shown
+        self.state = None       # "ringing" | "active"
+        self.number = ""
+        self.since = 0
+        self.texts = 0
+        self.unread = unread_count()
+        self.write()
+
+    def write(self):
+        lines = ["call=%s" % (self.state or "none"), "texts=%d" % self.texts,
+                 "unread=%d" % self.unread]
+        if self.state:
+            # the number only: a line break in it would add a key
+            lines.append("caller=" + "".join(ch for ch in self.number if ch.isprintable())[:47])
+            if self.since:
+                lines.append("since=%d" % self.since)
+        tmp = LOCKINFO + ".new"
+        try:
+            with open(tmp, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            os.replace(tmp, LOCKINFO)
+        except OSError as e:
+            log("%s: %s" % (LOCKINFO, e))
+
+    def call(self, path, state, number=None):
+        if self.path not in (None, path) and state == "ringing":
+            return              # one call shown: a second one waits in the dialer
+        if path != self.path:
+            self.since = 0
+        self.path, self.state = path, state
+        if number is not None:
+            self.number = number
+        self.since = int(time.time()) if state == "active" and not self.since else self.since
+        self.write()
+
+    def ended(self, path):
+        if path != self.path:
+            return
+        self.path, self.state, self.number, self.since = None, None, "", 0
+        self.write()
+
+    def text(self):
+        if os.path.exists(LOCKED):
+            self.texts += 1
+            self.write()
+
+    def recount(self):
+        n = unread_count()
+        if n != self.unread:
+            self.unread = n
+            self.write()
+        return False            # as a one-shot GLib timeout
+
+    def unlocked(self):
+        if self.texts:
+            self.texts = 0
+            self.write()
+
+
+def unread_count():
+    """incoming texts not yet read in Messages; 0 without the database"""
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % MESSAGES_DB, uri=True, timeout=2)
+        try:
+            return db.execute("SELECT count(*) FROM messages "
+                              "WHERE dir = 'in' AND state = 'new'").fetchone()[0]
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return 0
+
+
+def take(path):
+    """a request file there: delete it, True"""
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
 def main():
     client = mm.Client()
+    info = LockInfo()
 
     def added(c, path):
         direction = c.call_prop(path, "Direction", 0)
         state = c.call_prop(path, "State", 0)
+        number = c.call_prop(path, "Number", "") or ""
+        if state == mm.CALL_ACTIVE:
+            info.call(path, "active", number)
         if direction != mm.CALL_INCOMING or state not in (mm.CALL_RINGING_IN, mm.CALL_WAITING):
             return
+        info.call(path, "ringing", number)
+        try:                                    # the screen, if the phone is asleep
+            fd = os.open(POWERKEY_CTL, os.O_WRONLY | os.O_NONBLOCK)
+            os.write(fd, b"on\n")
+            os.close(fd)
+        except OSError:
+            pass
         log("incoming call: starting the dialer")      # never the number: it stays on screen
         if titan_vibrator:
             titan_vibrator.pulse(500)
@@ -46,6 +161,55 @@ def main():
         except OSError as e:
             log("%s: %s" % (DIALER, e))
     client.connect("call-added", added)
+
+    def changed(c, path, old, new):
+        if new == mm.CALL_ACTIVE:
+            info.call(path, "active", c.call_prop(path, "Number", "") or None)
+        elif new == mm.CALL_TERMINATED:
+            info.ended(path)
+    client.connect("call-state", changed)
+    client.connect("call-removed", lambda c, path: info.ended(path))
+
+    def text(c):                    # never the sender or the text
+        log("new text")
+        info.text()
+        GLib.timeout_add(1000, info.recount)    # titan-ims stores it first
+        if titan_vibrator:
+            titan_vibrator.pulse(300)
+    client.connect("text-added", text)
+
+    # the lock screen's requests, and the unlock (the texts' count resets)
+    def run_changed(mon, f, other, event):
+        name = f.get_basename()
+        if event in (Gio.FileMonitorEvent.CREATED, Gio.FileMonitorEvent.CHANGES_DONE_HINT):
+            if name == os.path.basename(ANSWER) and take(ANSWER):
+                if info.path and info.state == "ringing":
+                    log("answered from the lock screen")
+                    client.call_method(info.path, "Accept")
+            elif name == os.path.basename(DECLINE) and take(DECLINE):
+                if info.path and info.state == "ringing":
+                    log("declined with the power key")
+                    client.call_method(info.path, "Hangup")
+        elif event == Gio.FileMonitorEvent.DELETED and name == os.path.basename(LOCKED):
+            info.unlocked()
+    mon = Gio.File.new_for_path(os.path.dirname(LOCKINFO)).monitor_directory(
+        Gio.FileMonitorFlags.NONE, None)
+    mon.connect("changed", run_changed)
+    # Messages marks texts read (and titan-ims adds them): count again, once
+    # the writes settle
+    pending = []
+
+    def db_changed(mon, f, other, event):
+        if not pending:
+            pending.append(GLib.timeout_add(500, lambda: (pending.clear(), info.recount())[1]))
+    try:
+        dbmon = Gio.File.new_for_path(os.path.dirname(MESSAGES_DB)).monitor_directory(
+            Gio.FileMonitorFlags.NONE, None)
+        dbmon.connect("changed", db_changed)
+    except GLib.Error as e:
+        log("messages database: %s" % e.message)
+    take(ANSWER)                    # stale requests from before a restart
+    take(DECLINE)
     GLib.MainLoop().run()
 
 

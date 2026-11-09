@@ -143,6 +143,7 @@ class Dialer(ui.AppWindow):
         self.call_started = None        # monotonic time it went active
         self.audio = None               # titan-call-audio run
         self.device = "earpiece"
+        self.rings = []
         self.muted = False
         self.ring_id = 0
         self.tick_id = 0
@@ -401,6 +402,7 @@ class Dialer(ui.AppWindow):
         self.hangup_btn.set_label("Decline" if incoming else "Hang up")
         self.toggles.set_visible(not incoming)
         self.mute_btn.active = self.speaker_btn.active = self.keypad_btn.active = False
+        self.device = "earpiece"    # as the Speaker button now shows, not the last call's
         for b in (self.mute_btn, self.speaker_btn, self.keypad_btn):
             b.queue_draw()
         self.dtmf.set_visible(False)
@@ -549,8 +551,9 @@ class Dialer(ui.AppWindow):
             titan_vibrator.pulse(700)
         path = ring_file()
         if path:
-            subprocess.Popen(["pw-play", "--volume", "0.5", path], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+            self.rings = [p for p in self.rings if p.poll() is None]     # reaps the finished ones
+            self.rings.append(subprocess.Popen(["pw-play", "--volume", "0.5", path],
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         return True
 
     def stop_ringing(self):

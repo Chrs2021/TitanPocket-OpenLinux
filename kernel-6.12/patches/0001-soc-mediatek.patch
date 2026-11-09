@@ -25,12 +25,12 @@ console before the display driver binds.
 ---
  drivers/soc/mediatek/Kconfig          |   44 +
  drivers/soc/mediatek/Makefile         |    4 +
- drivers/soc/mediatek/mt6771-scp.c     | 1232 +++++++++++++++++++++++++
- drivers/soc/mediatek/mt6771-spm.c     |  449 +++++++++
+ drivers/soc/mediatek/mt6771-scp.c     | 1238 +++++++++++++++++++++++++
+ drivers/soc/mediatek/mt6771-spm.c     |  639 +++++++++++++
  drivers/soc/mediatek/mtk-lk-fb.c      |  249 +++++
  drivers/soc/mediatek/mtk-mcdi.c       |  196 ++++
  include/linux/soc/mediatek/mtk-mcdi.h |   13 +
- 7 files changed, 2187 insertions(+)
+ 7 files changed, 2383 insertions(+)
 
 diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
 index 1b7afb19ccd637471ad82ad833f589cb0f9405b1..cc73ddf801462547795930636f466c91eb5a83e9 100644
@@ -114,10 +114,10 @@ index 6830512848fd0feb2d559894ac1b88397b487e91..e02ca4c3f3ef7dd57b0ee87c32237f18
  obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
 diff --git a/drivers/soc/mediatek/mt6771-scp.c b/drivers/soc/mediatek/mt6771-scp.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..32179eb5867ca4a289d41153f37667f273b4be2f
+index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597ab175c0fb
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-scp.c
-@@ -0,0 +1,1232 @@
+@@ -0,0 +1,1238 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SCP (Cortex-M4, MediaTek's tinysys firmware) and its sensor hub
@@ -758,8 +758,14 @@ index 0000000000000000000000000000000000000000..32179eb5867ca4a289d41153f37667f2
 +
 +	for (i = 0; i < s->nch; i++)
 +		s->last[i] = u->data[i];
++	/*
++	 * The hub's proximity record is { u32 steps; s32 oneshot; } (vendor proximity_vec_t):
++	 * the state is oneshot, 0 near / 1 far, which the vendor's alspshub reports (its alsps
++	 * framework then adds the 1 Android saw: 1 near, 2 far). steps reads 0 here: taking word 0
++	 * gave "near" for every change (2026-11-09).
++	 */
 +	if (s->type == SENSOR_TYPE_PROXIMITY)
-+		s->last[0] = u->data[0] ? u->data[0] - 1 : 0;	/* 1 near, 2 far */
++		s->last[0] = u->data[1] ? 1 : 0;
 +	complete(&s->sample);
 +	if (s->buffered) {
 +		memcpy(s->scan.val, s->last, sizeof(s->scan.val));
@@ -1352,10 +1358,10 @@ index 0000000000000000000000000000000000000000..32179eb5867ca4a289d41153f37667f2
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/soc/mediatek/mt6771-spm.c b/drivers/soc/mediatek/mt6771-spm.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..9bdc4d819211f9a58333d44c56740689cc69de60
+index 0000000000000000000000000000000000000000..325a68925f16d445f12467d3c82f20c59b91a572
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-spm.c
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,639 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SPM: resource requests and system suspend.
@@ -1386,6 +1392,7 @@ index 0000000000000000000000000000000000000000..9bdc4d819211f9a58333d44c56740689
 + */
 +#include <linux/arm-smccc.h>
 +#include <linux/bits.h>
++#include <linux/delay.h>
 +#include <linux/io.h>
 +#include <linux/iopoll.h>
 +#include <linux/mfd/syscon.h>
@@ -1559,6 +1566,147 @@ index 0000000000000000000000000000000000000000..9bdc4d819211f9a58333d44c56740689
 +	return map ?: ERR_PTR(-EPROBE_DEFER);
 +}
 +
++/*
++ * Breadcrumbs that outlive a reset: how far the last suspend got, in the
++ * MT6358 RTC's RTC_SPAR0 bits 8-15 (reserved in the vendor's layout; the RTC
++ * keeps them across a reset, measured; neither DRAM, so pstore, nor the
++ * PMIC's other registers do). Low nibble the step, high nibble the suspends
++ * completed (mod 16); logged and cleared at probe. Written through the
++ * wrapper's regmap where sleeping is allowed (it takes a mutex and sleeps in
++ * its polls): the PM notifier and the SPM's own late (suspend_noirq) and early
++ * (resume_noirq) callbacks. Inside suspend_enter, with one CPU left and its
++ * interrupts off, nobody else can be using the wrapper: there the crumbs go
++ * straight through its WACS2 channel (as pwrap_read16/write16, mt8183 layout).
++ */
++#define MT6358_RTC_BBPU		0x588
++#define RTC_BBPU_CBUSY		BIT(6)
++#define MT6358_RTC_SPAR0	0x5b8
++#define MT6358_RTC_WRTGR	0x5c2
++#define CRUMB_MASK		GENMASK(15, 8)
++#define PWRAP_WACS2_CMD		0xc20
++#define PWRAP_WACS2_RDATA	0xc24
++#define PWRAP_WACS2_VLDCLR	0xc28
++#define  WACS_FSM(x)		(((x) >> 16) & 7)
++#define  WACS_FSM_IDLE		0
++#define  WACS_FSM_WFVLDCLR	6
++#define  WACS_SYNC_IDLE		BIT(20)
++
++enum {
++	CRUMB_PREPARE = 1,	/* devices about to suspend */
++	CRUMB_SLEEP,		/* devices suspended: into the SPM's sleep */
++	CRUMB_WOKE,		/* back from the SPM's sleep, devices to resume */
++	CRUMB_RESUMED,		/* devices resumed */
++	CRUMB_ENTER,		/* CPUs off, in suspend_enter */
++	CRUMB_SSPM_DOWN,	/* SSPM told, into ATF and the SPM's sleep */
++	CRUMB_BACK,		/* back from ATF: the SPM woke us */
++	CRUMB_SSPM_UP,		/* SSPM told of the resume */
++	CRUMB_ATF_ARGS,		/* wake mask and PCM WDT set in ATF */
++	CRUMB_SSPM_ASK,		/* MCDI paused, asking the SSPM to suspend */
++	CRUMB_SSPM_NOANS,	/* the SSPM did not answer: suspend aborted */
++	CRUMB_SSPM_RUNG,	/* its mailbox rung, waiting for the answer */
++};
++
++static const char *const crumb_names[] = {
++	"none", "devices suspending", "devices suspended, CPUs going off",
++	"devices resuming", "resumed", "in suspend_enter",
++	"SSPM suspended: in the SPM's sleep or its wake",
++	"back from the SPM's wake", "SSPM resumed",
++	"ATF args set, pausing MCDI", "MCDI paused, SSPM asked to suspend",
++	"SSPM did not answer: suspend aborted",
++	"SSPM mailbox rung, waiting for its answer",
++};
++
++static struct regmap *crumb_map;
++static unsigned int crumb_count;
++
++static void spm_crumb(unsigned int step)
++{
++	u32 v;
++
++	if (!crumb_map)
++		return;
++	regmap_update_bits(crumb_map, MT6358_RTC_SPAR0, CRUMB_MASK,
++			   (crumb_count & 0xf) << 12 | step << 8);
++	regmap_write(crumb_map, MT6358_RTC_WRTGR, 1);
++	regmap_read_poll_timeout(crumb_map, MT6358_RTC_BBPU, v,
++				 !(v & RTC_BBPU_CBUSY), 10, 10000);
++}
++
++static void __iomem *pwrap_base;
++
++/* one WACS2 transfer, interrupts off; the RDATA word's low 16 bits */
++static int wacs2(u32 cmd, u32 *rdata)
++{
++	u32 v;
++
++	if (readl_poll_timeout_atomic(pwrap_base + PWRAP_WACS2_RDATA, v,
++				      WACS_FSM(v) == WACS_FSM_IDLE && (v & WACS_SYNC_IDLE),
++				      1, 10000))
++		return -ETIMEDOUT;
++	writel(cmd, pwrap_base + PWRAP_WACS2_CMD);
++	if (readl_poll_timeout_atomic(pwrap_base + PWRAP_WACS2_RDATA, v,
++				      WACS_FSM(v) == WACS_FSM_WFVLDCLR, 1, 10000))
++		return -ETIMEDOUT;
++	if (rdata)
++		*rdata = v & 0xffff;
++	writel(1, pwrap_base + PWRAP_WACS2_VLDCLR);
++	return 0;
++}
++
++static void spm_crumb_atomic(unsigned int step)
++{
++	u32 v;
++	int i;
++
++	if (!crumb_map || !pwrap_base ||
++	    wacs2((MT6358_RTC_SPAR0 >> 1) << 16, &v))
++		return;
++	v = (v & ~CRUMB_MASK) | (crumb_count & 0xf) << 12 | step << 8;
++	wacs2(BIT(31) | (MT6358_RTC_SPAR0 >> 1) << 16 | v, NULL);
++	wacs2(BIT(31) | (MT6358_RTC_WRTGR >> 1) << 16 | 1, NULL);
++	for (i = 0; i < 10000; i++) {
++		if (wacs2((MT6358_RTC_BBPU >> 1) << 16, &v) || !(v & RTC_BBPU_CBUSY))
++			break;
++		udelay(1);
++	}
++}
++
++static int spm_crumb_notify(struct notifier_block *nb, unsigned long ev,
++			    void *unused)
++{
++	if (ev == PM_SUSPEND_PREPARE)
++		spm_crumb(CRUMB_PREPARE);
++	else if (ev == PM_POST_SUSPEND) {
++		crumb_count++;
++		spm_crumb(CRUMB_RESUMED);
++	}
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block spm_crumb_nb = {
++	.notifier_call = spm_crumb_notify,
++};
++
++/* the last boot's breadcrumb, then a clean slate */
++static void spm_crumb_init(struct device *dev, struct regmap *pmic)
++{
++	struct device_node *np;
++	u32 v, step;
++
++	if (regmap_read(pmic, MT6358_RTC_SPAR0, &v))
++		return;
++	step = v >> 8 & 0xf;
++	dev_info(dev, "last boot's suspend breadcrumb: step %u (%s), %u completed (mod 16)\n",
++		 step, step < ARRAY_SIZE(crumb_names) ? crumb_names[step] : "?",
++		 v >> 12 & 0xf);
++	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6771-pwrap");
++	pwrap_base = of_iomap(np, 0);
++	of_node_put(np);
++	crumb_map = pmic;
++	spm_crumb(0);
++	register_pm_notifier(&spm_crumb_nb);
++}
++
 +/* after the SPM firmware runs: the rails follow its SRCLKEN at once */
 +static int mt6771_spm_pmic_lp(struct regmap *map)
 +{
@@ -1587,21 +1735,33 @@ index 0000000000000000000000000000000000000000..9bdc4d819211f9a58333d44c56740689
 +#define SPM_HELD_REQ		(SPM_APSRC_REQ | SPM_F26M_REQ | SPM_DDREN_REQ)
 +
 +/* sspm_ipi_send_sync() in polling mode, as spm_to_sspm_command() */
++/* a command timed out: its answer may still come, and must not block the next */
++static bool sspm_late;
++
 +static int sspm_spm_command(u32 cmd)
 +{
 +	u32 val;
 +	int i, ret;
 +
-+	if (readl(sspm_ctrl + SSPM_MBOX_OUT_IRQ) & SSPM_SPM_IRQ)
-+		return -EBUSY;
++	if (readl(sspm_ctrl + SSPM_MBOX_OUT_IRQ) & SSPM_SPM_IRQ) {
++		if (!sspm_late)
++			return -EBUSY;
++		/* the late answer to the command that timed out: clear it */
++		writel(SSPM_SPM_IRQ, sspm_ctrl + SSPM_MBOX_OUT_IRQ);
++		pr_info("mt6771-spm: SSPM answered a timed-out command late\n");
++	}
++	sspm_late = false;
 +	writel(cmd, sspm_slots + 4 * SSPM_SPM_SLOT);
 +	for (i = 1; i < SSPM_SPM_LEN; i++)
 +		writel(0, sspm_slots + 4 * (SSPM_SPM_SLOT + i));
 +	writel(SSPM_SPM_IRQ, sspm_ctrl + SSPM_MBOX_IN_IRQ);
++	if (cmd == SSPM_SPM_SUSPEND)
++		spm_crumb_atomic(CRUMB_SSPM_RUNG);
 +
 +	ret = readl_poll_timeout_atomic(sspm_ctrl + SSPM_MBOX_OUT_IRQ, val,
 +					val & SSPM_SPM_IRQ, 1, 500000);
 +	if (ret) {
++		sspm_late = true;
 +		pr_warn("mt6771-spm: SSPM command %u: no answer\n", cmd);
 +		return ret;
 +	}
@@ -1659,6 +1819,7 @@ index 0000000000000000000000000000000000000000..9bdc4d819211f9a58333d44c56740689
 +	unsigned long wake_src;
 +	int ret;
 +
++	spm_crumb_atomic(CRUMB_ENTER);
 +	ret = mt6771_spm_domains_off();
 +	if (ret)
 +		return ret;
@@ -1669,8 +1830,24 @@ index 0000000000000000000000000000000000000000..9bdc4d819211f9a58333d44c56740689
 +	wake_src = spm_sip(MTK_SIP_SPM_GET_PWR_CTRL_ARGS, SPM_PWR_CTRL_SUSPEND,
 +			   PW_WAKE_SRC, 0);
 +	spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 1, PCM_WDT_SEC);
++	spm_crumb_atomic(CRUMB_ATF_ARGS);
 +	mtk_mcdi_pause(true);
-+	sspm_spm_command(SSPM_SPM_SUSPEND);
++	spm_crumb_atomic(CRUMB_SSPM_ASK);
++	ret = sspm_spm_command(SSPM_SPM_SUSPEND);
++	if (ret < 0) {
++		/*
++		 * Going on into the SPM's sleep without the SSPM's part: every
++		 * reset on 2026-11-08 (9 of them) stopped at the step before.
++		 * Undo what suspend_enter set and refuse this suspend; the
++		 * kernel resumes the devices and titan-powerkey tries again.
++		 */
++		spm_crumb_atomic(CRUMB_SSPM_NOANS);
++		mtk_mcdi_pause(false);
++		spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 0, 0);
++		pr_warn("mt6771-spm: suspend aborted: SSPM did not answer (%d)\n", ret);
++		return -EBUSY;
++	}
++	spm_crumb_atomic(CRUMB_SSPM_DOWN);
 +
 +	regmap_read(spm_regmap, PWR_STATUS, &pwr);	/* the domains going into it */
 +	regmap_clear_bits(spm_regmap, SPM_SRC_REQ, SPM_HELD_REQ);
@@ -1679,9 +1856,11 @@ index 0000000000000000000000000000000000000000..9bdc4d819211f9a58333d44c56740689
 +	regmap_read(spm_regmap, SUBSYS_IDLE_STA, &idle_in);
 +	spm_sip(MTK_SIP_SPM_SUSPEND_ARGS, pcm_flags, pcm_flags1, PCM_TIMER_MAX);
 +	ret = psci_cpu_suspend_enter(MT6771_PSCI_SUSPEND);
++	spm_crumb_atomic(CRUMB_BACK);
 +	mt6771_spm_hold(spm_regmap);
 +
 +	sspm_spm_command(SSPM_SPM_RESUME);
++	spm_crumb_atomic(CRUMB_SSPM_UP);
 +	mtk_mcdi_pause(false);
 +	spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 0, 0);
 +
@@ -1766,6 +1945,7 @@ index 0000000000000000000000000000000000000000..9bdc4d819211f9a58333d44c56740689
 +		ret = mt6771_spm_pmic_lp(pmic);
 +		if (ret)
 +			return dev_err_probe(dev, ret, "PMIC low power setup\n");
++		spm_crumb_init(dev, pmic);
 +	}
 +
 +	ret = mt6771_spm_hold(spm_regmap);
@@ -1785,7 +1965,23 @@ index 0000000000000000000000000000000000000000..9bdc4d819211f9a58333d44c56740689
 +	return mt6771_spm_hold(spm_regmap);
 +}
 +
-+static DEFINE_SIMPLE_DEV_PM_OPS(mt6771_spm_pm_ops, NULL, mt6771_spm_resume);
++static int mt6771_spm_suspend_noirq(struct device *dev)
++{
++	spm_crumb(CRUMB_SLEEP);
++	return 0;
++}
++
++static int mt6771_spm_resume_noirq(struct device *dev)
++{
++	spm_crumb(CRUMB_WOKE);
++	return 0;
++}
++
++static const struct dev_pm_ops mt6771_spm_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(NULL, mt6771_spm_resume)
++	NOIRQ_SYSTEM_SLEEP_PM_OPS(mt6771_spm_suspend_noirq,
++				  mt6771_spm_resume_noirq)
++};
 +
 +static const struct of_device_id mt6771_spm_of_match[] = {
 +	{ .compatible = "mediatek,mt6771-spm-resources" },

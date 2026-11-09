@@ -156,6 +156,43 @@ def nbc_tables(vendor, system):
     return out
 
 
+def seee_tables(vendor, system):
+    """{sensor: [(offset, value)]} from the stock ISP_MGR_SEEE::apply (edge enhancement)"""
+    sys.path.insert(0, EMU_DIR if os.path.exists(os.path.join(EMU_DIR, "emu_hal.py"))
+                    else os.path.join(HERE, "..", "re"))
+    from emu_hal import Hal
+    out = {}
+    for sensor, _, _ in SENSORS:
+        h = Hal(verbose=False)
+        h.lenient = True
+        h.load(os.path.join(system, "libc++.so"))
+        h.load(os.path.join(vendor, "libcam.hal3a.v3.so"))
+        h.start()
+        for name in ("_ZN6NS3Av317mapSensorDevToIdxEi", "_ZN6NS3Av317mapSensorIdxToDevEi"):
+            h.uc.mem_write(h.sym(name), struct.pack("<II", 0x52800000, 0xD65F03C0))
+        regs = h.malloc(0x6000)
+        h.w32(regs + 0x04, 0x100)              # YUV_EN: SEEE 8
+        pre = lib(vendor, sensor, "Scene_Preview")
+        ee = sorted(n for n in pre if n.startswith("%smipiraw_EE_" % sensor))
+        table = pre[ee[len(ee) // 2]]          # a mid-ISO table
+        mgr = h.call(h.sym("_ZN13NSIspTuningv312ISP_MGR_SEEE11getInstanceEN11NSIspTuning12ESensorDev_TE"), 0)
+        buf = h.malloc(len(table) + 0x400)
+        h.uc.mem_write(buf, table)
+        h.call(h.sym("_ZN13NSIspTuningv312ISP_MGR_SEEE3putIN11NSIspTuning14ISP_NVRAM_EE_TEEERS0_RKT_"),
+               mgr, buf)
+        cam = h.malloc(0x4000)                 # RAWIspCamInfo: zeros (no bypass)
+        before = bytes(h.uc.mem_read(regs, 0x6000))
+        h.call(h.sym("_ZN13NSIspTuningv312ISP_MGR_SEEE5applyERKN11NSIspTuning13RAWIspCamInfoEPV13_dip_x_reg_t_"),
+               mgr, cam, regs)
+        after = bytes(h.uc.mem_read(regs, 0x6000))
+        # YUV_EN is the driver's; the SEEE block is 0x46c4 (control: EE 1, SE 0) to 0x473c
+        out[sensor] = [(i, struct.unpack_from("<I", after, i)[0]) for i in range(0x4000, 0x6000, 4)
+                       if before[i:i + 4] != after[i:i + 4]]
+        print("%s: edge enhancement from %s, %d registers" % (sensor, ee[len(ee) // 2],
+                                                              len(out[sensor])), file=sys.stderr)
+    return out
+
+
 def c_array(name, values, per_line=6):
     lines = []
     for i in range(0, len(values), per_line):
@@ -201,6 +238,18 @@ def main():
         pairs = "".join("\t{ 0x%04x, 0x%08x },\n" % p for p in nbc[sensor])
         text.append("static const u32 %s_nbc[%s][2] = {\n%s};" % (
             sensor, len(nbc[sensor]) or "", pairs))
+    if a.no_nbc:
+        seee = {s: [] for s, _, _ in SENSORS}
+        text.append("/* Edge enhancement (SEEE): not generated (--no-nbc), so none */")
+    else:
+        seee = seee_tables(a.vendor, a.system or os.path.join(os.path.dirname(a.vendor.rstrip("/")),
+                                                              "..", "system", "lib64"))
+        text.append("/* Edge enhancement (SEEE: EE, the sharpening) registers, from the stock")
+        text.append(" * ISP_MGR_SEEE::apply run on a mid-ISO EE table. {offset, value} pairs. */")
+    for sensor, _, _ in SENSORS:
+        pairs = "".join("\t{ 0x%04x, 0x%08x },\n" % p for p in seee[sensor])
+        text.append("static const u32 %s_seee[%s][2] = {\n%s};" % (
+            sensor, len(seee[sensor]) or "", pairs))
     with open(a.output, "w") as f:
         f.write("\n".join(text) + "\n")
     print("wrote %s" % a.output, file=sys.stderr)

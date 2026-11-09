@@ -47,6 +47,7 @@
 #include <linux/netdevice.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/poll.h>
 #include <linux/random.h>
 #include <linux/rtnetlink.h>
@@ -466,6 +467,7 @@ struct cldma {
 	u32 tx_head, tx_tail;	/* free-running */
 	spinlock_t tx_lock;
 	bool tx_started;
+	bool running;
 
 	struct sk_buff *rx_skb[CLDMA_RX_GPDS];
 	dma_addr_t rx_dma[CLDMA_RX_GPDS];
@@ -2253,14 +2255,55 @@ static void cldma_start(struct titan_md *md)
 	writel(~0U, cl->pdn + CLDMA_L3TIMCR1);
 	writel(~0U, cl->pdn + CLDMA_L3RIMCR0);
 	writel(~0U, cl->pdn + CLDMA_L3RIMCR1);
+	cl->running = true;
 	dev_info(md->dev, "CLDMA started: SO_CFG %08x\n",
 		 readl(cl->ao + CLDMA_SO_CFG));
+}
+
+/*
+ * The SPM's deep sleep resets the block in the PDN domain and not the always-on one (measured:
+ * UL_START 0, the transmit interrupts masked; SO_CFG, SO_START and the receive masks kept). So
+ * nothing could be sent after a sleep, and the modem asserted some time later
+ * (errc_chm_main.c:8825, as when CLDMA was never started). Set it up again before anything can
+ * transmit, the uplink from its oldest unfinished descriptor.
+ */
+static void cldma_restore(struct titan_md *md)
+{
+	struct cldma *cl = &md->cl;
+	unsigned long flags;
+	int i;
+
+	if (!cl->running || readl(cl->pdn + CLDMA_UL_START(0)))
+		return;
+	spin_lock_irqsave(&cl->tx_lock, flags);
+	for (i = 0; i < CLDMA_TXQ; i++) {
+		u32 a = cl->tgpd_dma + (i ? CLDMA_TX_GPDS + i - 1 :
+					cl->tx_tail % CLDMA_TX_GPDS) * sizeof(*cl->tgpd);
+
+		writel(a, cl->pdn + CLDMA_UL_START(i));
+		writel(a, cl->ao + CLDMA_UL_START_BK(i));
+	}
+	wmb();
+	writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMCR0);
+	writel(~0U, cl->pdn + CLDMA_L3TIMCR0);
+	writel(~0U, cl->pdn + CLDMA_L3TIMCR1);
+	writel(~0U, cl->pdn + CLDMA_L3RIMCR0);
+	writel(~0U, cl->pdn + CLDMA_L3RIMCR1);
+	writel(CLDMA_ALL_QUEUES, cl->pdn + CLDMA_SO_RESUME_CMD);
+	cl->tx_started = cl->tx_head != cl->tx_tail;
+	if (cl->tx_started)
+		writel(CLDMA_ALL_QUEUES, cl->pdn + CLDMA_UL_START_CMD);
+	readl(cl->pdn + CLDMA_UL_RESUME_CMD);
+	spin_unlock_irqrestore(&cl->tx_lock, flags);
+	dev_info(md->dev, "CLDMA set up again after deep sleep: %u to send\n",
+		 cl->tx_head - cl->tx_tail);
 }
 
 static void cldma_stop(struct titan_md *md)
 {
 	struct cldma *cl = &md->cl;
 
+	cl->running = false;
 	disable_irq(cl->irq);
 	napi_disable(&cl->napi);
 	writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMSR0);
@@ -2534,6 +2577,7 @@ static int titan_md_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_smem;
 
+	device_init_wakeup(dev, true);
 	md->misc.minor = MISC_DYNAMIC_MINOR;
 	md->misc.name = "titan-modem";
 	md->misc.fops = &md_fops;
@@ -2630,12 +2674,58 @@ static const struct of_device_id titan_md_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, titan_md_of_match);
 
+/*
+ * Across suspend the modem runs on its own and needs nothing done, but its interrupts must wake
+ * the AP: a call, a text or its file service's request arrives on them. The SPM's default wake
+ * mask has the lines (R12_CCIF0, R12_CCIF1, R12_MD2AP_PEER, R12_MD1_WDT, R12_CLDMA).
+ */
+static int titan_md_suspend(struct device *dev)
+{
+	struct titan_md *md = dev_get_drvdata(dev);
+
+	if (!device_may_wakeup(dev))
+		return 0;
+	enable_irq_wake(md->irq);
+	if (md->irq_ex > 0)
+		enable_irq_wake(md->irq_ex);
+	if (md->cl.irq > 0)
+		enable_irq_wake(md->cl.irq);
+	return 0;
+}
+
+static int titan_md_resume(struct device *dev)
+{
+	struct titan_md *md = dev_get_drvdata(dev);
+
+	if (!device_may_wakeup(dev))
+		return 0;
+	disable_irq_wake(md->irq);
+	if (md->irq_ex > 0)
+		disable_irq_wake(md->irq_ex);
+	if (md->cl.irq > 0)
+		disable_irq_wake(md->cl.irq);
+	return 0;
+}
+
+/* before interrupts return: the network can transmit from then on */
+static int titan_md_resume_noirq(struct device *dev)
+{
+	cldma_restore(dev_get_drvdata(dev));
+	return 0;
+}
+
+static const struct dev_pm_ops titan_md_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(titan_md_suspend, titan_md_resume)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, titan_md_resume_noirq)
+};
+
 static struct platform_driver titan_md_driver = {
 	.probe = titan_md_probe,
 	.remove = titan_md_remove,
 	.driver = {
 		.name = "titan-modem",
 		.of_match_table = titan_md_of_match,
+		.pm = pm_sleep_ptr(&titan_md_pm_ops),
 	},
 };
 module_platform_driver(titan_md_driver);

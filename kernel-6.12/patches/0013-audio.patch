@@ -7,25 +7,30 @@ driver, the FS1860 speaker amplifier, the AFE's hardware gain and the
 FM paths (hostless and through the CPU), the modem's voice links
 (Hostless_Speech, PCM 2; UL2 and I2S3 from the modem's downlink), the PCM
 DAIs' own rate codes (the general ones left PCM 2 at 8 kHz), and jack
-detection: an MT6358 ACCDET driver and the card's headset jack.
+detection: an MT6358 ACCDET driver and the card's headset jack. The
+MT6358 codec keeps the handset gain across its power-down (it came back
+at -40 dB) and starts it at -10 dB; the AFE writes a stream's buffer
+address again on every prepare, as deep sleep loses that register.
 ---
  sound/soc/codecs/Kconfig                      |  15 +
  sound/soc/codecs/Makefile                     |   4 +
  sound/soc/codecs/fs1860.c                     | 519 ++++++++++++++++++
  sound/soc/codecs/mt6358-accdet.c              | 323 +++++++++++
  sound/soc/codecs/mt6358-accdet.h              |  11 +
+ sound/soc/codecs/mt6358.c                     |   8 +
  sound/soc/mediatek/Kconfig                    |  12 +
+ sound/soc/mediatek/common/mtk-afe-fe-dai.c    |  10 +
  .../mediatek/common/mtk-afe-platform-driver.c |  17 +-
  sound/soc/mediatek/mt8183/Makefile            |   2 +
  .../soc/mediatek/mt8183/mt6771-titanpocket.c  | 320 +++++++++++
  sound/soc/mediatek/mt8183/mt8183-afe-common.h |   4 +
- sound/soc/mediatek/mt8183/mt8183-afe-pcm.c    |  36 ++
+ sound/soc/mediatek/mt8183/mt8183-afe-pcm.c    |  46 ++
  sound/soc/mediatek/mt8183/mt8183-dai-adda.c   |   4 +
  .../soc/mediatek/mt8183/mt8183-dai-hostless.c |  29 +
  .../soc/mediatek/mt8183/mt8183-dai-hw-gain.c  | 163 ++++++
  sound/soc/mediatek/mt8183/mt8183-dai-i2s.c    | 103 ++++
  .../mediatek/mt8183/mt8183-interconnection.h  |   2 +
- 16 files changed, 1560 insertions(+), 4 deletions(-)
+ 18 files changed, 1588 insertions(+), 4 deletions(-)
 
 diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
 index 399dcf3d1c64b6b7a6b57d2bb2ed4834ecfee292..3bd964f6300cf0593f447f49c73e75e6f17ac4ad 100644
@@ -967,6 +972,32 @@ index 0000000000000000000000000000000000000000..d32656ee0fecf6eaa353871f8657d9d4
 +				     struct snd_soc_jack *jack);
 +
 +#endif
+diff --git a/sound/soc/codecs/mt6358.c b/sound/soc/codecs/mt6358.c
+index 9247b90d1b99e2e3a85d4abc54f2dbf55dac6516..dd3a185d1f245680408132a72c1e98a89022a2d2 100644
+--- a/sound/soc/codecs/mt6358.c
++++ b/sound/soc/codecs/mt6358.c
+@@ -1517,6 +1517,9 @@ static int mt_rcv_event(struct snd_soc_dapm_widget *w,
+ 		regmap_write(priv->regmap, MT6358_AUDDEC_ANA_CON9, 0x0001);
+ 		/* Switch HS MUX to audio DAC */
+ 		regmap_write(priv->regmap, MT6358_AUDDEC_ANA_CON6, 0x009b);
++		/* the gain "Handset Volume" set: power-down left it at -40 dB */
++		regmap_write(priv->regmap, MT6358_ZCD_CON3,
++			     priv->ana_gain[AUDIO_ANALOG_VOLUME_HSOUTL]);
+ 		break;
+ 	case SND_SOC_DAPM_PRE_PMD:
+ 		/* HS mux to open */
+@@ -2407,6 +2410,11 @@ static struct snd_soc_dai_driver mt6358_dai_driver[] = {
+ 
+ static void mt6358_codec_init_reg(struct mt6358_priv *priv)
+ {
++	/* the handset's gain until "Handset Volume" is set (0 would be +8 dB) */
++	priv->ana_gain[AUDIO_ANALOG_VOLUME_HSOUTL] = DL_GAIN_N_10DB;
++	priv->ana_gain[AUDIO_ANALOG_VOLUME_HSOUTR] = DL_GAIN_N_10DB;
++	regmap_write(priv->regmap, MT6358_ZCD_CON3, DL_GAIN_N_10DB);
++
+ 	/* Disable HeadphoneL/HeadphoneR short circuit protection */
+ 	regmap_update_bits(priv->regmap, MT6358_AUDDEC_ANA_CON0,
+ 			   RG_AUDHPLSCDISABLE_VAUDP15_MASK_SFT,
 diff --git a/sound/soc/mediatek/Kconfig b/sound/soc/mediatek/Kconfig
 index 3033e2d3fe16840631a465dd967da77f7a6ff43c..b51e7cf3f739001c9843f4887f7d9c17b6a1face 100644
 --- a/sound/soc/mediatek/Kconfig
@@ -990,6 +1021,29 @@ index 3033e2d3fe16840631a465dd967da77f7a6ff43c..b51e7cf3f739001c9843f4887f7d9c17
  config SND_SOC_MT8183_MT6358_TS3A227E_MAX98357A
  	tristate "ASoC Audio driver for MT8183 with MT6358 TS3A227E MAX98357A RT1015 codec"
  	depends on I2C && GPIOLIB
+diff --git a/sound/soc/mediatek/common/mtk-afe-fe-dai.c b/sound/soc/mediatek/common/mtk-afe-fe-dai.c
+index 3044d9ab3d4d95e53a414281a072b77c5d24acf3..e3aa726903e6407e381b4073492027f338c3ec6b 100644
+--- a/sound/soc/mediatek/common/mtk-afe-fe-dai.c
++++ b/sound/soc/mediatek/common/mtk-afe-fe-dai.c
+@@ -266,8 +266,18 @@ int mtk_afe_fe_prepare(struct snd_pcm_substream *substream,
+ 	struct snd_soc_pcm_runtime *rtd  = snd_soc_substream_to_rtd(substream);
+ 	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
+ 	int id = snd_soc_rtd_to_cpu(rtd, 0)->id;
++	struct mtk_base_afe_memif *memif = &afe->memif[id];
+ 	int pbuf_size;
+ 
++	/*
++	 * The buffer's end address is a volatile register, outside the
++	 * regcache, so a power-down of the audio block (deep sleep) loses it
++	 * while hw_params stands: write the buffer again on every prepare.
++	 */
++	if (memif->dma_bytes)
++		mtk_memif_set_addr(afe, id, memif->dma_area, memif->dma_addr,
++				   memif->dma_bytes);
++
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+ 		if (afe->get_memif_pbuf_size) {
+ 			pbuf_size = afe->get_memif_pbuf_size(substream);
 diff --git a/sound/soc/mediatek/common/mtk-afe-platform-driver.c b/sound/soc/mediatek/common/mtk-afe-platform-driver.c
 index 70fd05d5ff486c6da7e648eaef90e0a4f1a6567f..2f744f9a4534d761f3acb31b42e06d9156e7bb39 100644
 --- a/sound/soc/mediatek/common/mtk-afe-platform-driver.c
@@ -1385,7 +1439,7 @@ index 40ab48c1566c8cac33af206f9caae784855fab27..fa213ce399eb7123be30ad654c64a459
 +int mt8183_dai_hw_gain_register(struct mtk_base_afe *afe);
  #endif
 diff --git a/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c b/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c
-index 23c8974d9adbd9fd97e8394582cd89822c789c8e..2af9a8f4cd9065fb50bf26c59404953e517c722d 100644
+index 23c8974d9adbd9fd97e8394582cd89822c789c8e..fba8147861352a19d443d2496299cb094484b16c 100644
 --- a/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c
 +++ b/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c
 @@ -115,12 +115,34 @@ static unsigned int dai_memif_rate_transform(struct device *dev,
@@ -1465,6 +1519,26 @@ index 23c8974d9adbd9fd97e8394582cd89822c789c8e..2af9a8f4cd9065fb50bf26c59404953e
  	mt8183_dai_memif_register,
  };
  
+@@ -1154,9 +1190,19 @@ static const struct of_device_id mt8183_afe_pcm_dt_match[] = {
+ };
+ MODULE_DEVICE_TABLE(of, mt8183_afe_pcm_dt_match);
+ 
++/*
++ * System sleep: an open stream (PipeWire keeps the device open while idle)
++ * holds the AFE runtime-active, and the MT6771's deep sleep (the SPM) powers
++ * the audio block off: without these the registers were never saved, and the
++ * first playback after a deep sleep ran its memif from reset values, the DAC
++ * looping one buffer (a steady tone) with "hw_ptr err" (Titan Pocket,
++ * 2026-11-05). Forcing the runtime callbacks caches and restores them.
++ */
+ static const struct dev_pm_ops mt8183_afe_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(mt8183_afe_runtime_suspend,
+ 			   mt8183_afe_runtime_resume, NULL)
++	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				pm_runtime_force_resume)
+ };
+ 
+ static struct platform_driver mt8183_afe_pcm_driver = {
 diff --git a/sound/soc/mediatek/mt8183/mt8183-dai-adda.c b/sound/soc/mediatek/mt8183/mt8183-dai-adda.c
 index be69bcea2a786af7710ef4b173b5a2606f86d91b..ecffcb73610b98a9ae1537ef41c6b2319222ddd7 100644
 --- a/sound/soc/mediatek/mt8183/mt8183-dai-adda.c

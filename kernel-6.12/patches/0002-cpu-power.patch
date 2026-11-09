@@ -8,10 +8,10 @@ leaves the SoC to mediatek-cpufreq, and dt_idle_states can start every
 idle state disabled (dt_idle_states.off=1) for bring-up.
 ---
  drivers/cpufreq/cpufreq-dt-platdev.c |  1 +
- drivers/cpufreq/mediatek-cpufreq.c   | 11 +++++++++++
+ drivers/cpufreq/mediatek-cpufreq.c   | 23 +++++++++++++++++++++++
  drivers/cpuidle/dt_idle_states.c     | 11 +++++++++++
  drivers/devfreq/mtk-cci-devfreq.c    |  9 +++++++++
- 4 files changed, 32 insertions(+)
+ 4 files changed, 44 insertions(+)
 
 diff --git a/drivers/cpufreq/cpufreq-dt-platdev.c b/drivers/cpufreq/cpufreq-dt-platdev.c
 index 9e86a0e8b9e8615fd63c8c046b267d98cb41dee9..45409550b447b2bad1e14b91af4493958527b624 100644
@@ -26,10 +26,29 @@ index 9e86a0e8b9e8615fd63c8c046b267d98cb41dee9..45409550b447b2bad1e14b91af449395
  	{ .compatible = "mediatek,mt8186", },
  	{ .compatible = "mediatek,mt8365", },
 diff --git a/drivers/cpufreq/mediatek-cpufreq.c b/drivers/cpufreq/mediatek-cpufreq.c
-index 663f61565cf7289fe34d9a735e825206dd13152c..e1db464ececa17d540367c5280a691cbdd18ace3 100644
+index 663f61565cf7289fe34d9a735e825206dd13152c..736ddfe80f0f91437dce6856cea18eb96687f8fa 100644
 --- a/drivers/cpufreq/mediatek-cpufreq.c
 +++ b/drivers/cpufreq/mediatek-cpufreq.c
-@@ -728,6 +728,16 @@ static const struct mtk_cpufreq_platform_data mt8186_platform_data = {
+@@ -23,6 +23,9 @@ struct mtk_cpufreq_platform_data {
+ 	int sram_min_volt;
+ 	int sram_max_volt;
+ 	bool ccifreq_supported;
++	/* schedutil's rate limit: little cluster (the one with CPU 0), big one; 0 for the default */
++	unsigned int little_delay_us;
++	unsigned int big_delay_us;
+ };
+ 
+ /*
+@@ -596,6 +599,8 @@ static int mtk_cpufreq_init(struct cpufreq_policy *policy)
+ 	policy->freq_table = freq_table;
+ 	policy->driver_data = info;
+ 	policy->clk = info->cpu_clk;
++	policy->transition_delay_us = cpumask_test_cpu(0, &info->cpus) ?
++		info->soc_data->little_delay_us : info->soc_data->big_delay_us;
+ 
+ 	return 0;
+ }
+@@ -728,6 +733,23 @@ static const struct mtk_cpufreq_platform_data mt8186_platform_data = {
  	.ccifreq_supported = true,
  };
  
@@ -41,12 +60,19 @@ index 663f61565cf7289fe34d9a735e825206dd13152c..e1db464ececa17d540367c5280a691cb
 +	.sram_min_volt = 850000,
 +	.sram_max_volt = 1118750,
 +	.ccifreq_supported = true,
++	/*
++	 * With the default 1 ms the little cluster changed frequency up to 315 times a second, each
++	 * change sleeping about 46 times on its voltage: 190-260 mA with the screen on against
++	 * 142-151 mA here, with first frame, opening and scrolling unchanged (docs/power.md).
++	 */
++	.little_delay_us = 50000,
++	.big_delay_us = 10000,
 +};
 +
  static const struct mtk_cpufreq_platform_data mt8516_platform_data = {
  	.min_volt_shift = 100000,
  	.max_volt_shift = 200000,
-@@ -748,6 +758,7 @@ static const struct of_device_id mtk_cpufreq_machines[] __initconst __maybe_unus
+@@ -748,6 +770,7 @@ static const struct of_device_id mtk_cpufreq_machines[] __initconst __maybe_unus
  	{ .compatible = "mediatek,mt817x", .data = &mt2701_platform_data },
  	{ .compatible = "mediatek,mt8173", .data = &mt2701_platform_data },
  	{ .compatible = "mediatek,mt8176", .data = &mt2701_platform_data },

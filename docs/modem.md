@@ -140,6 +140,17 @@ only re-applies the value LK left, and the modem sets its own voltage.
 
 ## File service
 
+**The service runs `titan-mdd` (Rust, `userspace/titan-phone`) since 2026-11-06**, with `titan-radioinit` and
+`titan-ltedata` in place of `radioinit.py` and `ltedata.py`; the Python ones below stay for bring-up work (the
+Rust daemon leaves out `mdd.py`'s `SPH_TEST` loopback and `AT_CMDS`). Checked by replay: the modem's
+requests from one boot (1438 packets: 1072 compact reads, 64 writes, 61 opens, RPC queries, speech and AT
+traffic) were recorded under `mdd.py`, then sent to each daemon over a SOCK_SEQPACKET pair (`MDD_FD`) against
+two fresh copies of the same NVRAM snapshot. 1437 of the 1438 packets got byte-identical replies, the
+exception being `FS_GetDiskInfo`'s two free-space counts (the other copy took room in `/run`), and all 370
+resulting files were identical. On the phone it then booted the modem (registered in 6 s), handed the AT
+channel over, wrote the speech parameters and got the modem's acks for speech on and off; 0.5 MB resident
+against `mdd.py`'s 11.7 MB. The recording held NVRAM contents and was deleted.
+
 The modem's files (CCCI_FS, channels 14/15, served on Android by
 `ccci_fsd`) come from `tools/modem/mdd.py`, from a scratch directory in
 RAM (`FS_ROOT`, default `/run/titan-modem-mock`) holding the modem's
@@ -777,7 +788,7 @@ its network while switched on, only with the switch.
 Voice on this network is IMS, and the SIP stack is the AP's job: on Android `volte_stack` and `volte_ua` run on the CPU, with
 `volte_imcb` and `volte_imsm_93` between them and the modem (`ccci_imsc`, `ccci_imsm`), read as reference only and not shipped. Replaying
 Android's AT commands with nothing on those channels gets the IMS PDN, and no registration: the modem does not register by itself.
-`titan-ims` (`/usr/local/sbin/titan-ims`, Python for now) is our own client, on TS 24.229 with AKA (RFC 3310) and sec-agree (RFC 3329, TS 33.203).
+`titan-ims` (`/usr/local/sbin/titan-ims`) is our own client, on TS 24.229 with AKA (RFC 3310) and sec-agree (RFC 3329, TS 33.203). It exists in two forms with the same behaviour and control protocol: the original Python (`userspace/debian/overlay/...`) and a Rust rewrite (`userspace/titan-ims-rs`, see "Rust port" below).
 It logs status lines and a short list of safe headers: never identities, keys, addresses or SIP bodies.
 
 **The modem's part.** With IMS enabled (`AT+EIMSPDN= "onoff", 1`, `AT+EWFCP=2`, `AT+EIMSRCS=0,0`, `AT+EIMSCFG=1,0,1,1,1,1`) and an `ims` entry
@@ -792,17 +803,34 @@ all protected signalling is TCP. Measured 2026-11-04: registered on the first tr
 IPv4 data still working. The refresh, at 60 % of that, has not been observed. The kernel needs `CONFIG_XFRM_USER`, `CONFIG_INET_ESP`, `CONFIG_INET6_ESP` and friends
 (`titanpocket.config`). The registration's P-Associated-URI gave one identity here and no `tel:` URI, so calls present the SIM's public identity.
 
-**Calls.** First incoming call 2026-11-04: it rang, answered and the other side heard the phone's mic (2048 RTP packets sent), so the network carries RTP from the AP. The phone's own sound failed: PipeWire still held the output after the ringtone, so `aplay` failed with "Device or resource busy" and the receive loop stopped after 1 packet. `titan-ims` now suspends PipeWire's sinks for the call and retries the player. On the second call the other side was heard, through the loudspeaker: DL1 feeds it as well as the earpiece, so `titan-ims` now turns that route off for the call and back on after (not yet tested on a call). The speaker mode bypasses PipeWire's limiter, so it plays 6 dB down. Signalling: Outgoing and incoming INVITE with preconditions (183, PRACK, UPDATE), CANCEL, BYE, session timers. The sound is on the CPU, not
+**Calls.** First incoming call 2026-11-04: it rang, answered and the other side heard the phone's mic (2048 RTP packets sent), so the network carries RTP from the AP. The phone's own sound failed: PipeWire still held the output after the ringtone, so `aplay` failed with "Device or resource busy" and the receive loop stopped after 1 packet. `titan-ims` now suspends PipeWire's sinks for the call and retries the player. On the second call the other side was heard, through the loudspeaker: DL1 feeds it as well as the earpiece, so `titan-ims` now turns that route off for the call and back on after (the earpiece not yet confirmed by ear). The speaker mode bypasses PipeWire's limiter, so it plays 6 dB down; calls set `Handset` to -6 dB, as the card's default is about -22 dB. Since 2026-11-06 the call's sound goes through PipeWire (`pw-cat` with the Phone role) instead of `aplay`, so a ringtone or other stream can't hold the device; after changing routes `titan-ims` suspends and resumes the `titan-speaker` sink so PipeWire opens DL1 again with the new route. The earpiece was then confirmed by ear, but quiet, for two reasons. `amixer sset Handset -6dB` never worked, because amixer reads `-6dB` as an option (`titan-ims` now sets the raw `Handset Volume` value, dB + 10). And the MT6358 driver drops the handset gain to -40 dB when the earpiece powers down and never restores it on power-up, so the sink reopen left it at -40 dB (the control then reads -13, the inverted 0x1f). Kernel #111 restores the gain at power-up (`mt_rcv_event`, with -10 dB until the control is set); `titan-ims` also sets it after every reopen.
+
+**Jitter buffer (2026-11-06).** Calls crackled with no packet lost: each decoded frame went into the player's pipe as its packet
+arrived, so late packets and the other side's silence (AMR DTX: one comfort-noise frame in 160 ms) left the player short, and
+every short period is a click. Now the receive thread only queues frames (at most 10, 200 ms; a burst drops the oldest), and a
+playout thread starts once 3 are in and keeps 60 ms of sound in the pipe (`FIONREAD` on its end), so the speaker paces it and
+no clock drifts against another. A slot with no frame gets the decoder's own fill (`NO_DATA`: concealment, or comfort noise
+after a SID frame), as AMR's receiver is meant to run every 20 ms. `pw-cat`'s latency went from 20 to 40 ms. Tested without a
+call against a fake speaker draining the pipe in real time, fed 5 s of AMR-WB with 0-60 ms of jitter and 1 s of DTX: playing
+each frame on arrival left 64 of 270 periods short, the jitter buffer none (2 at the very end, after the feed stopped). The
+call log now counts filled and dropped frames.
+
+**Call volume.** In a call on the earpiece the volume keys step the handset gain by 2 dB, -10 to +8 dB, starting at -6 dB: `titan-powerkey` sees `call=active` in `/run/titan-lockinfo` and sends `{"cmd": "volume", "up": ...}` to `titan-ims`, which keeps the level in `/var/lib/titan-ims/earpiece-db` for later calls. On the loudspeaker or headphones `titan-ims` declines and the keys change PipeWire's volume as usual, which the call's stream follows.
+
+Outgoing calls took three tries. An offer with `a=des:qos mandatory remote sendrecv` got `580 Precondition Failure`; `optional` for the remote side passed it. Then the carrier's server answered `200 OK` within about 2 s, with no ringing stage and `Reason: SIP;text="Invalid Identity Header";code=438`, and the other phone did not ring, with either form of the number as the identity. Adding `P-Early-Media: supported`, `Session-Expires: 1800`, `Min-SE: 90`, `Privacy: none`, `timer` in `Supported` and `application/3gpp-ims+xml` in `Accept` together made the other phone ring (one call, 2026-11-04); which of them mattered was not tested. A call should present `sip:+1...`: the `reg` event lists it, while P-Associated-URI gave the number without the `+`. Signalling: Outgoing and incoming INVITE with preconditions (183, PRACK, UPDATE), CANCEL, BYE, session timers. The sound is on the CPU, not
 the modem: RTP on the IMS interface, AMR-WB (12.65 kbit/s) or AMR (12.2 kbit/s) through `libvo-amrwbenc` and `libopencore-amr*`, in either RFC 4867 packing,
-`telephone-event` for DTMF, and `aplay`/`arecord` on `hw:0,0` and `hw:0,2` with the HiFi routes from the UCM profile (earpiece, speaker, headphones; main mic with the
-preamplifier at 24 dB). Offline, encoding and decoding a tone in both codecs and packings kept its level (AMR-WB RMS 4151 of 4242, AMR 4053), and the devices open. There is no echo cancellation and no jitter buffer.
+`telephone-event` for DTMF, and `pw-cat` (the Phone media role) for playback with `arecord` for the mic (`plughw:...,DEV=2`), on the HiFi routes from the UCM profile (earpiece, speaker, headphones; main mic with the preamplifier at 24 dB). Offline, encoding and decoding a tone in both codecs and packings kept its level (AMR-WB RMS 4151 of 4242, AMR 4053), and the devices open. There is no echo cancellation; the jitter buffer came later (below, "Jitter buffer").
+
+**Rust port (2026-11-06).** `titan-ims` is also written in Rust, in its own crate `userspace/titan-ims-rs` (build `userspace/titan-ims-rs/build.sh` -> `out/titan-ims/titan-ims`). Unlike the `titan-phone` services (static musl) it is a glibc dynamic binary, 0.7 MB: it `dlopen`s the AMR codec libraries (`libvo-amrwbenc`, `libopencore-amr{wb,nb}`) and `libsqlite3` at runtime, as the Python did with `ctypes`, so it links nothing but glibc and `libdl` and the build needs no codec libraries. Everything else is the standard library plus small C calls (`poll`, `ioctl FIONREAD`, sockets with `SO_BINDTODEVICE`/`IPV6_TCLASS` set before `bind`, `dlopen`), shelling out to `mmcli`/`gdbus`/`amixer`/`ip`/`pactl` as before. SIP parsing, SDP, the IPsec SAs (`ip xfrm`), the MD5 digest, base64, JSON, AMR RFC 4867 packing and GSM 7-bit/TPDU/RP are all by hand, with 18 unit tests. Modules: `util` (log, programs, MD5, base64, JSON, SIP text), `net` (IPv6 sockets and `poll`), `modem` (AT channels, the SIM's ISIM, the PDN, identities), `codec` (AMR via `dlopen`), `sms` (GSM-7/TPDU/RP and the SQLite store), `sip` (message parser, SDP, `Xfrm`, the `Call` record), `media` (RTP, the jitter buffer, routing, earpiece), `ua` (the user agent and event loop). It keeps `/run/titan-ims.sock` and the same JSON, so the dialer and `titan-call-watch` do not change. The SIM runs its own authentication, as in the Python: the code only relays the `AUTHENTICATE` APDU and hands the CK/IK the SIM returns to the kernel's IPsec. The port was built one module at a time and compared against the Python's bit-exact outputs where possible (AMR pack/unpack, GSM-7, the digest). Registration was verified on the phone 2026-11-06 (a 60 s run with the Python stopped): it brought up the bearer, ran the AKA challenge, negotiated IPsec (hmac-sha-1-96/aes-cbc), registered for 3600 s and answered the control socket, with identities masked in the log exactly as the Python masks them. It was then swapped in as the service and carried a real incoming call (answered, earpiece audio, the jitter buffer reporting 0 dropped and 0 player restarts) and SMS both ways on 2026-11-06. `cp /usr/local/lib/titan-py/titan-ims /usr/local/sbin/titan-ims && systemctl restart titan-ims` rolls back to the Python one. `build-rootfs.sh` keeps installing the Python version until the Rust one has carried calls for a while.
 
 **Using it.** `titan-net voice on` (Phone Settings, "Voice calls"; off by default, as it keeps the modem on and so the phone awake) keeps the modem on
 the network and `titan-ims.service` running, with or without data. `titan_mm` connects to `/run/titan-ims.sock` and offers its calls with the same signals as ModemManager's, so `titan-dialer` and
 `titan-call-watch` take them without knowing the difference; the header shows "VoLTE" when registered.
 
-**Not done:** emergency calls (there is no emergency registration: 911 and 112 are sent as `urn:service:sos`, untested, and the dialer says so), SMS over IMS (a `MESSAGE` gets 488),
+**Not done:** emergency calls (there is no emergency registration: 911 and 112 are sent as `urn:service:sos`, untested, and the dialer says so), MMS and RCS,
 call waiting and hold, video, handover to Wi-Fi calling, and the modem being told of the registration (`+CIREG` stays 0).
+
+**SMS.** First run 2026-11-04, on the first try: one text received and stored, its report accepted (202), and two sent from `titan-messages`, each accepted and acknowledged by the network within a second (RP-ACK), and both received by the other phone. On Android `volte_ua` has SMS handling and the `+g.3gpp.smsip` tag, and the RIL sends `AT+CMGS`; our capture holds only the set-up, with no message sent. `titan-ims` does it in SIP (TS 24.341): the registration's Contact carries `+g.3gpp.smsip`, and a `MESSAGE` of type `application/vnd.3gpp.sms` carries an RP-DATA (TS 24.011) with an SMS-SUBMIT or SMS-DELIVER (TS 23.040), to `tel:` the service centre from `AT+CSCA?`. A message is stored before it is acknowledged, in `/var/lib/titan-ims/messages.sqlite3` (mode 600); text and numbers never reach a log. Long messages go in parts and come back whole, in any order. `{"cmd": "sms", "to": ..., "text": ..., "class": 0-3 (optional)}` on the control socket sends one (the class sets the TP-DCS message class: 0 flash, 1 ME, 2 SIM, 3 TE; omitted means no class); the state follows as `sms-state`, and `sms` announces a new one. An incoming WAP push (8-bit data or a port-addressing header, which is how an MMS notification arrives) is stored as an `[MMS - not downloaded]` placeholder, not as binary — there is no MMS stack yet. (The Rust client earlier mis-stored such a message because `CString` cannot hold the NUL bytes a WAP-push PDU carries; it now binds the body's raw bytes, and the messages app reads bodies lossily, so a bad row cannot blank the list.) Long messages, and non-GSM text, have only been tested offline: the published GSM 7-bit and SMS-DELIVER examples, and our encoders against our decoder (GSM, escapes, UCS2, emoji, up to 7 parts). The app is `userspace/titan-messages` (docs/desktop.md).
 
 ## Status bar signal
 
@@ -815,6 +843,14 @@ Enabling did not always register. With `titan-signal` running, 4 enables after a
 (`idle`, `CEREG: 2,0`, `CESQ` all empty), 16 s, 1 s, 2 s; with it stopped, 4 more gave 1-2 s. ModemManager logged `network forced PS
 detach` on the disable before the first failure. The sample is too small to blame the service, and earlier cycles without it were all
 2-3 s. Not understood.
+
+**Carrier name.** The modem names no network: `AT+COPS?` answers `310260` in all three formats (`AT+COPS=3,0` long, `3,1` short,
+`3,2` numeric), its own table (`AT+COPN`) has 35 entries without this code, the SIM has no service provider name, and
+ModemManager passes the number on as the operator name. The name comes from Debian's `mobile-broadband-provider-info`
+database instead: the first provider that lists the code, since virtual operators repeat their host's codes after it (310260 is
+listed by T-Mobile, then SpeedTalk, Mint and US Mobile). `titan-signal` writes it to `/run/titan-carrier` while registered
+(ModemManager's name when it is a name, else the database's, else the code); Phone Settings shows it for the network
+("T-Mobile (310260)"), the SIM's operator and the network scan.
 
 ## Phone apps
 
@@ -850,7 +886,10 @@ valid SIM").
   Mute switches the uplink's two PCM 2 mixers off. Untested in a call: the
   speech DSP still returned silence in loopback (see "Speech").
 - `titan-call-watch.service` (enabled): on a ringing call, one pulse of the
-  motor and starts the dialer in the Weston session. It does not turn the
+  motor and starts the dialer in the Weston session. It also keeps the lock
+  screen's `/run/titan-lockinfo` (the call and its number, a count of texts)
+  and answers or declines from the lock screen's requests (desktop.md,
+  "Calls and texts"). It does not turn the
   screen on. The modem's wake lock keeps the phone from suspending, so a
   call can only come in while the modem service runs, and that costs the
   awake current.
@@ -860,6 +899,42 @@ locked; Modem: Radio on; Network: check the registration; APN if the carrier
 needs one. **Never screenshot the SIM or Modem pages for debugging**: the
 debug screenshots go off the phone. A harness of ours once did, with a
 masking bug that showed identities in full (fixed, 2026-11-03).
+
+### The phone app in Rust, with the proximity sensor (2026-11-09)
+
+`userspace/titan-dialer` (`build.sh` -> `out/titan-dialer`, installed as
+`/usr/local/bin/titan-dialer-rs` beside the Python app, which
+titan-call-watch still starts): the same three pages (keypad, call, USSD)
+and behaviour. Its modem client (`src/modem.rs`) is titan_mm.py's in Rust:
+ModemManager through gio proxies on the system bus (the first modem, its
+Modem, Modem3gpp, Ussd and Voice interfaces and its calls, followed through
+the ObjectManager and name-owner signals) and titan-ims's control socket,
+whose calls get `ims:N` paths and ModemManager's call states. A number goes
+to titan-ims while it's registered, else to `Voice.CreateCall`. Proxy
+signals are connected with `connect_local` (gio-rs's typed connectors want
+`Send` closures). It takes the Python app's lock
+(`$XDG_RUNTIME_DIR/titan-dialer.lock`), so the two never run together.
+
+**Proximity during calls** (`src/proximity.rs`): while a call is on screen
+on the earpiece (dialing, ringing out or active; not on the loudspeaker or
+a headset or headphones, not while one rings in), the app reads the
+sensor: the SCP hub's `scp-proximity` IIO device (0 near, 1 far, reported on
+change; docs/hardware.md), its own buffer claimed with
+`IIO_BUFFER_GET_FD_IOCTL`, the state before the first change from
+`in_proximity_raw`. Near for 250 ms darkens the panel as titan-powerkey's
+screen off does on 6.12 (backlight 0, the MT6370 boost 0) without locking or
+suspending, and a black full-window shield swallows touches and keys; far
+lights it again (the boost's level, then `titan-brightness apply`). A guard
+shell holds the restore, so the screen comes back if the app dies while
+it's dark; it doesn't light the panel when titan-powerkey has turned the
+screen off meanwhile (`/run/titan-screen.off`). `/run/titan-proximity.off`
+exists while the call has the screen dark.
+
+Tried on the phone (kernel #115, a VoLTE call through titan-ims): the
+screen went dark at the ear and lit again away from it, four times in the
+call, each time back to the levels it had (backlight 887, boost 511); the
+app closed cleanly after the call. titan-call-watch still starts the
+Python dialer for incoming calls.
 
 ## Modem debug data
 
@@ -923,9 +998,43 @@ need the firmware disassembled, which this project does not do.
 
 The module is loaded by hand (`insmod`, or `systemctl start titan-modem`),
 never at boot, and unloading powers the modem off. The service holds a
-wake lock while it runs: the modem across suspend is untested. Each experiment ran with a watchdog pinger on
-`/dev/watchdog` (systemd's runtime watchdog is off), stopped by its stop
-file with the magic close, so a hang resets the phone into the unchanged
-kernel. `titan-powerkey` was paused (SIGSTOP) during the tests: this
-kernel has no `/sys/power/wake_lock`, and the phone suspended between
-commands.
+wake lock while it runs unless `/var/lib/titan-modem/allow-sleep` exists;
+with that file the phone deep-sleeps with the modem on, and a call wakes
+it (2026-11-05: see power.md, "Sleep with the modem on"). Risky experiments
+ran with a watchdog pinger on `/dev/watchdog` (systemd's runtime watchdog
+is off), stopped by its stop file with the magic close, so a hang resets
+the phone into the unchanged kernel. A test that should keep the phone
+awake takes a wake lock (`echo name > /sys/power/wake_lock`, kernel #94
+and later); a USB cable also keeps it awake.
+
+## Emergency calls
+
+**Not supported (2026-11-05).** Don't rely on this phone to reach emergency
+services.
+
+- Calls go over VoLTE through `titan-ims`, our IMS client on the AP. Emergency
+  calling over IMS is its own procedure (an emergency registration, an
+  emergency bearer, the location sent with the call), and `titan-ims` does
+  none of it: a dialled 911 or 112 is placed as an ordinary call, which the
+  network is likely to refuse.
+- Most phones running Linux (postmarketOS on Qualcomm devices, for one) have
+  VoLTE in the modem's own firmware, which also handles the emergency
+  procedure. Here the AP runs IMS, so the modem firmware can't fill that gap.
+- The older fallback, a circuit-switched call over 2G/3G, needs a network that
+  still has one; most US networks have switched it off.
+
+**How it's handled, as postmarketOS does:** said plainly, before anyone
+installs (README, build-and-flash.md, the status table); the dialer doesn't
+block an emergency number or pretend a call went through.
+
+**Testing:** never by calling an emergency number. That is illegal in many
+places and takes a dispatcher away from a real call. What can be checked
+without dialling: that the dialer recognises the emergency numbers, which
+path a call would take (IMS or the modem's own `ATD`), and that the modem is
+up and able to try with no SIM inserted.
+
+**To do before a release** (roadmap.md, "Community release"): the modem kept
+running without a SIM (a postmarketOS device lost emergency calls by
+disabling it), and an emergency call button reachable from the lock screen
+without unlocking.
+

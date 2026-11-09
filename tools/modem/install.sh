@@ -4,8 +4,8 @@
 #   tools/modem/install.sh [user@host]
 # titan_modem.ko goes to the module tree's updates/ with the WWAN core
 # (wwan.ko), blacklisted so the DT node does not load it at boot (it must
-# start with its file server); mdd.py and nvcopy.sh go to
-# /usr/local/lib/titan-modem, the unit to /etc/systemd/system (not enabled).
+# start with its file server); titan-mdd, titan-radioinit and titan-ltedata
+# (Rust) to /usr/local/bin, mdd.py and nvcopy.sh to /usr/local/lib/titan-modem, the unit to /etc/systemd/system (not enabled).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 HOST=${1:-root@172.16.42.1}
@@ -17,6 +17,10 @@ scp -q $O tools/modem/mdd.py tools/modem/nvcopy.sh tools/modem/radioinit.py tool
 scp -q $O userspace/debian/overlay/etc/udev/rules.d/81-titan-modem.rules "$HOST:/etc/udev/rules.d/"
 scp -q $O modules/modem/out612/titan_modem.ko "$HOST:/lib/modules/$K/updates/"
 scp -q $O modules/modem/out612/wwan.ko "$HOST:/lib/modules/$K/kernel/drivers/net/wwan/"
+# the service's daemons in Rust (userspace/titan-phone/build.sh)
+for b in titan-mdd titan-radioinit titan-ltedata; do
+	scp -q $O out/titan-phone/$b "$HOST:/usr/local/bin/$b"
+done
 scp -q $O tools/modem/titan-modem.service "$HOST:/etc/systemd/system/"
 ssh $O "$HOST" "echo 'blacklist titan_modem' > /etc/modprobe.d/titan-modem.conf && \
 	depmod -a $K && systemctl daemon-reload"

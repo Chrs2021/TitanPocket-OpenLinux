@@ -8,6 +8,9 @@
 Description=Open GNSS (no libmnl): titan-gps-probe + snapshot fixes -> gpsd
 Requires=titan-gps-driver.service
 After=titan-gps-driver.service network-online.target
+# it sends to gpsd over UDP; started on a client's connection alone, gpsd may not be there
+Wants=gpsd.service
+StartLimitIntervalSec=0
 Conflicts=titan-gnss.service titan-mnld.service
 
 [Service]

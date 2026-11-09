@@ -218,10 +218,18 @@ index 8ccfacb46..22105b5ce 100644
  
  	struct {
 diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
-index e26f438d9..12f8a7c21 100644
+index e26f438d9..8988c4696 100644
 --- a/src/libcamera/pipeline/simple/simple.cpp
 +++ b/src/libcamera/pipeline/simple/simple.cpp
-@@ -265,6 +265,7 @@ static const SimplePipelineInfo supportedDevices[] = {
+@@ -32,6 +32,7 @@
+ #include <libcamera/pixel_format.h>
+ #include <libcamera/stream.h>
+ 
++#include "libcamera/internal/bayer_format.h"
+ #include "libcamera/internal/camera.h"
+ #include "libcamera/internal/camera_manager.h"
+ #include "libcamera/internal/camera_sensor.h"
+@@ -265,6 +266,7 @@ static const SimplePipelineInfo supportedDevices[] = {
  	{ "mxc-isi", {}, false },
  	{ "qcom-camss", {}, true },
  	{ "sun6i-csi", {}, false },
@@ -229,7 +237,7 @@ index e26f438d9..12f8a7c21 100644
  };
  
  bool isRaw(const StreamConfiguration &cfg)
-@@ -390,7 +391,13 @@ public:
+@@ -390,7 +392,13 @@ public:
  	const Transform &combinedTransform() const { return combinedTransform_; }
  
  private:
@@ -244,6 +252,37 @@ index e26f438d9..12f8a7c21 100644
  	static constexpr unsigned int kNumBuffersMax = 32;
  
  	/*
+@@ -755,6 +763,30 @@ void SimpleCameraData::tryPipeline(unsigned int code, const Size &size)
+ 		}
+ 
+ 		configs_.push_back(config);
++
++		/*
++		 * Titan Pocket: the DIP (the hardware ISP) can scale a sensor
++		 * mode down with its resizer (CRZ) for a smaller YUYV stream;
++		 * the node size then differs from the sensor's. V4L2 has no way
++		 * to say which sensor mode a node size goes with, so the pairs
++		 * are the driver's (titan_camera.c crz_sizes).
++		 */
++		static const struct { Size sensor, out; } titanScaled[] = {
++			{ { 2336, 1752 }, { 960, 720 } },	/* rear, binned */
++			{ { 1632, 1224 }, { 816, 612 } },	/* front, binned */
++		};
++		if (std::string(video_->driverName()) != "titan-camera" ||
++		    BayerFormat::fromPixelFormat(pixelFormat).isValid())
++			continue;
++		for (const auto &t : titanScaled) {
++			if (t.sensor != format.size)
++				continue;
++			Configuration scaled = config;
++			scaled.captureSize = t.out;
++			scaled.outputFormats = { pixelFormat };
++			scaled.outputSizes = t.out;
++			configs_.push_back(scaled);
++		}
+ 	}
+ }
+ 
 diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
 index 28043150e..e6571651e 100644
 --- a/src/libcamera/sensor/camera_sensor_properties.cpp

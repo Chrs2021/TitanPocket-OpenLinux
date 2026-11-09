@@ -1,0 +1,21 @@
+[package]
+name = "titan-camera"
+version = "0.1.0"
+edition = "2021"
+description = "Camera for the Titan Pocket: photos and video on the hardware ISP (GTK 4 + GStreamer, Rust)"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", features = ["v4_8"] }
+gst = { package = "gstreamer", version = "0.23", features = ["v1_22"] }
+gst-app = { package = "gstreamer-app", version = "0.23", features = ["v1_22"] }
+gst-video = { package = "gstreamer-video", version = "0.23", features = ["v1_22"] }
+async-channel = "2"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+strip = true

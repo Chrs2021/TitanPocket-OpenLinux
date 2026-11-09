@@ -6,8 +6,11 @@ one or the other (the units conflict).
 
 Each session it:
   1. makes sure it has GPS broadcast ephemeris no older than an hour or so
-     (IGS's merged file from BKG, kept in STATE/brdc.rnx; an older one is
-     used while the network is away, up to EPH_MAX_AGE);
+     (IGS's merged file, from the first of BRDC_URLS that serves a valid one,
+     kept in STATE/brdc.rnx). Without the network it falls back, in order: the
+     file up to EPH_MAX_AGE old with what the chip decoded before; then, up to
+     SEARCH_MAX_AGE old, only to aim the search, so the chip can decode fresh
+     ephemeris from the sky; the solver never uses orbits that old;
   2. rewrites the GPS search assignments (02) of the replay script
      a session generated from scratch (session.py) for this moment
      (own02.regenerate) from the last position;
@@ -31,6 +34,9 @@ once a second anyway, and a resume while the GPS runs can crash the
 CONNSYS chip (Wi-Fi with it). The lock lapses WAKE_HOLD s after the last
 renewal, so a daemon that dies doesn't keep the phone awake.
 
+/run/titan-gnss-open.status says what it is doing, for titan-location-gui, in
+JSON: never a position.
+
 STATE (/var/lib/titan-gnss-open) holds brdc.rnx (the download), chip.rnx
 and chip-gnss.json (ephemeris the chip sent), iono (Klobuchar
 coefficients), and position: "lat lon", the last fix, which seeds the next
@@ -48,6 +54,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 import gzip
 import json
@@ -61,14 +68,28 @@ WINDOW = 60             # s of batches in each fix (90 s: sharper, laggier)
 HEIGHT = (0.0, 300.0)   # a-priori height above the ellipsoid and its sigma, m
 EVERY = 2               # s between fixes
 EPH_REFRESH = 3600      # s: fetch the ephemeris again after this
-EPH_MAX_AGE = 4 * 3600  # s: older than this, don't use it
+EPH_MAX_AGE = 4 * 3600  # s: older than this, don't use it in a fix
+SEARCH_MAX_AGE = 48 * 3600  # s: older than this, don't even aim the search with it
 GAP = 15                # s between sessions (the receiver needs a moment)
+GAP_MAX = 300           # s between sessions that keep failing: don't hammer the chip
+SILENCE = 90            # s with nothing from the probe: the chip stopped, start over
+EARLIEST = 1767225600   # 2026-01-01: a clock before this has not been set
 MIN_CN0 = 15
 SKY_EVERY = 30          # s between elevations and azimuths (they move slowly)
 SNR_AGE = 10            # s: a satellite not heard for this long has no SNR in GSV
 WAKE_LOCK = "titan-gnss-open"   # its name in /sys/power/wake_lock
 WAKE_HOLD = 30          # s the wakelock lasts unless renewed (every WAKE_HOLD / 3)
-BRDC_URL = "https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{y}{doy:03d}0000_01D_MN.rnx.gz"
+# BKG's three served when these were added (2026-11-04); IGN timed out then, and is here
+# because it is another organisation. A login page answers 200: fetch_orbits checks the file.
+BRDC_URLS = (
+    "https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{y}{doy:03d}0000_01D_MN.rnx.gz",
+    "https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{y}/{doy:03d}/BRDC00WRD_R_{y}{doy:03d}0000_01D_MN.rnx.gz",
+    "https://igs.bkg.bund.de/root_ftp/MGEX/BRDC/{y}/{doy:03d}/BRDC00WRD_S_{y}{doy:03d}0000_01D_MN.rnx.gz",
+    "https://igs.ign.fr/pub/igs/data/{y}/{doy:03d}/BRDC00WRD_S_{y}{doy:03d}0000_01D_MN.rnx.gz",
+)
+FETCH_TIMEOUT = 20      # s for each server
+FETCH_BACK = 3 * 3600   # s: just after midnight UTC, yesterday's file: today's hardly has anything
+MIN_ORBITS = 20         # GPS satellites a valid file has at least
 
 
 def _load(name, file):
@@ -90,23 +111,68 @@ def say(*a):
     print("titan-gnss-open:", *a, flush=True)
 
 
+def status(state, **kw):
+    """for titan-location-gui; no position, ever"""
+    path = "/run/titan-gnss-open.status"
+    try:
+        with open(path + ".new", "w") as f:
+            json.dump(dict(state=state, at=int(time.time()), **kw), f)
+        os.replace(path + ".new", path)
+    except OSError:
+        pass
+
+
+def valid_orbits(data):
+    """the decompressed file if this is one: servers answer 200 with login pages too"""
+    if data[:2] != b"\x1f\x8b":
+        return None
+    try:
+        raw = gzip.decompress(data)
+    except (OSError, EOFError, ValueError):
+        return None
+    head, sep, rest = raw.partition(b"END OF HEADER")
+    if not sep:
+        return None
+    # a RINEX 3 navigation record starts in column 1 with its satellite
+    sats = {line[:3] for line in rest.split(b"\n") if line[:1] == b"G" and line[1:3].isdigit()}
+    return raw if len(sats) >= MIN_ORBITS else None
+
+
+def fetch_orbits(path):
+    """the first server with a valid file, into path; True if one had it"""
+    day = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=FETCH_BACK)
+    for url in BRDC_URLS:
+        host = url.split("/")[2]
+        try:
+            req = urllib.request.Request(url.format(y=day.year, doy=day.timetuple().tm_yday),
+                                         headers={"User-Agent": "titan-gnss-open"})
+            raw = valid_orbits(urllib.request.urlopen(req, timeout=FETCH_TIMEOUT).read())
+        except Exception as e:                          # offline, or that server is down
+            say("ephemeris: %s: %s" % (host, type(e).__name__))
+            continue
+        if raw is None:
+            say("ephemeris: %s: not a valid file" % host)
+            continue
+        with open(path + ".new", "wb") as f:
+            f.write(raw)
+        os.replace(path + ".new", path)
+        say("ephemeris fetched from %s" % host)
+        return True
+    return False
+
+
 def ephemeris():
-    """the ephemeris {prn: [...]}, fetched again when it's old; None if none usable"""
+    """(the ephemeris {prn: [...]}, which tier it is), fetched again when it's old:
+    "fresh" for fixes, "search" only to aim the receiver, (None, "none") if nothing is usable"""
     path = os.path.join(STATE, "brdc.rnx")
     age = time.time() - os.path.getmtime(path) if os.path.exists(path) else None
-    if age is None or age > EPH_REFRESH:
-        now = datetime.datetime.now(datetime.timezone.utc)
-        url = BRDC_URL.format(y=now.year, doy=now.timetuple().tm_yday)
-        try:
-            data = gzip.decompress(urllib.request.urlopen(url, timeout=60).read())
-            with open(path + ".new", "wb") as f:
-                f.write(data)
-            os.replace(path + ".new", path)
-            age = 0
-            say("ephemeris fetched")
-        except Exception as e:                          # offline: keep the old one
-            say("ephemeris fetch failed (%s)" % e)
-    eph = ge.load(path) if age is not None and age <= EPH_MAX_AGE else {}
+    if (age is None or age > EPH_REFRESH) and fetch_orbits(path):
+        age = 0
+    try:
+        eph = ge.load(path) if age is not None and age <= EPH_MAX_AGE else {}
+    except (OSError, StopIteration, ValueError):        # never leave a bad file to crash on
+        say("ephemeris: the file could not be read")
+        eph = {}
     # GPS ephemeris the chip itself sent in earlier sessions (2B subframes):
     # the newest issues, and all there is while offline
     now = ge.gps_seconds(datetime.datetime.now(datetime.timezone.utc))
@@ -114,7 +180,14 @@ def ephemeris():
         for e in l:
             if abs(now - e["t_toe"]) < EPH_MAX_AGE:
                 add_ephemeris(eph, prn, e)
-    return eph or None
+    if eph:
+        return eph, "fresh"
+    if age is not None and age <= SEARCH_MAX_AGE:
+        try:
+            return ge.load(path), "search"
+        except (OSError, StopIteration, ValueError):
+            pass
+    return None, "none"
 
 
 def load_iono():
@@ -309,14 +382,17 @@ def send_fix(sock, lat, lon, h, nsat, utc, hdop, extra=""):
     sock.sendto((gga + extra + rmc).encode(), GPSD)
 
 
-def session(eph, lat, lon, sock):
-    """one probe session; returns when it ends"""
+def session(eph, tier, lat, lon, sock):
+    """one probe session; returns (lines from the chip, fixes) when it ends. With tier
+    "search" its orbits only aim the receiver: fixes wait for what the chip decodes."""
     rx = ge.ecef(lat, lon, 0.0)
     start = time.time() + 2                             # rewrite + probe start
     # GLONASS and BeiDou search assignments from the same file too: replayed
     # from the capture, they point at the wrong Doppler and hardly acquire
     try:
         gnss = ge.load_gnss(os.path.join(STATE, "brdc.rnx"))
+        if tier == "search":        # GLONASS's orbit data doesn't extrapolate this far
+            gnss = {k: l for k, l in gnss.items() if k[0] != "R"}
     except (OSError, ValueError, StopIteration):
         gnss = None
     if gnss is None and chip_gnss():
@@ -341,12 +417,40 @@ def session(eph, lat, lon, sock):
     while time.time() < start:
         time.sleep(0.05)
     t_start = ge.gps_seconds(datetime.datetime.now(datetime.timezone.utc))
-    say("session: %d assignments" % done)
+    say("session: %d assignments%s" % (done, ", aimed with old orbits" if tier == "search" else ""))
+    status("starting", orbit=tier, assignments=done)
     p = subprocess.Popen([PROBE, script, "--seconds", str(SESSION)], stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True, bufsize=1)
+                         stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
+    # its stderr is read as it comes, so a full pipe can't stop it; and nothing from the chip
+    # for SILENCE s ends the session, or this would wait for ever
+    tail = collections.deque(maxlen=20)
+    threading.Thread(target=lambda: tail.extend(p.stderr), daemon=True).start()
+    alive = [time.time()]
+
+    def watchdog():
+        while p.poll() is None:
+            if time.time() - alive[0] > SILENCE:
+                say("nothing from the chip for %d s: starting over" % SILENCE)
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)    # all of it, or the pipe stays open
+                except OSError:
+                    pass
+                return
+            time.sleep(2)
+    threading.Thread(target=watchdog, daemon=True).start()
+    lines_seen = 0
     batches = {}            # (constellation, batch bytes, ms // 400) -> (ms, [(key, m)])
     ident = {}              # (record's satellite, minute) -> ephemeris key
     solve_eph = gnss or {("G", prn): l for prn, l in eph.items()}
+    if tier == "search":            # only what the chip has decoded, recently
+        solve_eph = {}
+        when = ge.gps_seconds(datetime.datetime.now(datetime.timezone.utc))
+        for prn, l in chip_ephemeris().items():
+            for e in l:
+                if abs(when - e["t_toe"]) < EPH_MAX_AGE:
+                    add_ephemeris(solve_eph, ("G", prn), e)
+        for key, l in chip_gnss().items():
+            solve_eph.setdefault(key, []).extend(l)
     last_fix = time.time()
     last_try = 0.0
     fixes = 0
@@ -357,9 +461,9 @@ def session(eph, lat, lon, sock):
     view, sky_t = {}, 0.0   # sky(), and when
     cache_cr = chip_gnss()
     chip = chip_ephemeris() # what the chip has sent before (STATE/chip.rnx)
-    for line in p.stdout:
-        f = line.split()
-        if len(f) == 4 and f[1] in ("3b", "4b"):
+    def nav_frame(line, f):
+        """a navigation frame: 3B and 4B, or 2B"""
+        if f[1] in ("3b", "4b"):
             nav_cr.append(line)
             raw = bytes.fromhex(f[3])
             done_set = (f[1] == "4b" and navsub.decode_bds(raw)[1] == 3) or \
@@ -378,35 +482,59 @@ def session(eph, lat, lon, sock):
                 if fresh:
                     save_chip_gnss(cache_cr)
                     say("ephemeris from the chip: %s" % " ".join("%s%02d" % k for k in fresh))
-            continue
-        if len(f) == 4 and f[1] == "2b":
-            nav.append(line)
-            prn_, sfid, status, words = navsub.decode(bytes.fromhex(f[3]))
-            if sfid == 4 and not status:            # page 18: the ionosphere model
-                k = navsub.iono(words)
-                if k and k != sf.IONO:
-                    sf.IONO = k
-                    save_iono(k)
-                    say("ionosphere coefficients from the chip")
-            if sfid == 3:                           # a subframe 3 may complete a set
-                fresh, new = [], []
-                for prn, l in navsub.from_lines(nav, t_start).items():
-                    for e in l:
-                        if add_ephemeris(chip, prn, e):         # cache every issue
-                            fresh.append((prn, e))
-                        if add_ephemeris(eph, prn, e):          # and use the ones we lacked
-                            add_ephemeris(solve_eph, ("G", prn), e)
+            return
+        nav.append(line)
+        prn_, sfid, sv_status, words = navsub.decode(bytes.fromhex(f[3]))
+        if sfid == 4 and not sv_status:             # page 18: the ionosphere model
+            k = navsub.iono(words)
+            if k and k != sf.IONO:
+                sf.IONO = k
+                save_iono(k)
+                say("ionosphere coefficients from the chip")
+        if sfid == 3:                               # a subframe 3 may complete a set
+            fresh, new = [], []
+            for prn, l in navsub.from_lines(nav, t_start).items():
+                for e in l:
+                    if add_ephemeris(chip, prn, e):             # cache every issue
+                        fresh.append((prn, e))
+                    if add_ephemeris(eph, prn, e) or tier == "search":   # and use the ones we lacked
+                        if add_ephemeris(solve_eph, ("G", prn), e):
                             new.append(prn)
-                if fresh:
-                    save_chip_ephemeris(fresh)
-                    say("ephemeris from the chip: %s%s" % (
-                        " ".join("G%02d" % prn for prn, _ in fresh),
-                        " (new to this session: %s)" % " ".join("G%02d" % n for n in new) if new else ""))
+            if fresh:
+                save_chip_ephemeris(fresh)
+                say("ephemeris from the chip: %s%s" % (
+                    " ".join("G%02d" % prn for prn, _ in fresh),
+                    " (new to this session: %s)" % " ".join("G%02d" % n for n in new) if new else ""))
+
+    reported = [0.0]
+
+    def report(now):
+        hearing = sum(1 for cn0, t in heard.values() if cn0 and now - t < SNR_AGE)
+        strong = sum(1 for cn0, t in heard.values() if cn0 and cn0 >= MIN_CN0 and now - t < SNR_AGE)
+        status("fix" if now - last_fix < 2 * EVERY + 3 and fixes else "tracking" if hearing else "searching",
+               orbit=tier, heard=hearing, strong=strong, above=len(view), fixes=fixes,
+               orbits=len(solve_eph))
+
+    for line in p.stdout:
+        alive[0] = time.time()
+        lines_seen += 1
+        if alive[0] - reported[0] > 5:      # the chip is talking, whether or not it hears anyone
+            reported[0] = alive[0]
+            report(alive[0])
+        f = line.split()
+        if len(f) == 4 and f[1] in ("3b", "4b", "2b"):
+            try:                # one bad frame is no reason to lose the session
+                nav_frame(line, f)
+            except (ValueError, IndexError, KeyError, ArithmeticError) as e:
+                say("a navigation frame could not be read: %s" % type(e).__name__)
             continue
         if len(f) != 4 or f[1] != "29":
             continue
-        pl = bytes.fromhex(f[3])
-        r = mm.record(pl)
+        try:
+            pl = bytes.fromhex(f[3])
+            r = mm.record(pl)
+        except (ValueError, IndexError, KeyError):
+            continue
         if not r or pl[5] != 0xA0:
             continue
         if r["sat"][0] != "G" and not gnss:
@@ -429,6 +557,7 @@ def session(eph, lat, lon, sock):
         if now - last_try < EVERY:
             continue
         last_try = now
+        report(now)
         if now - sky_t > SKY_EVERY:
             view = sky(solve_eph, t_start + ms / 1000, seed, *sf.ecef_latlon(seed))
             sky_t = now
@@ -450,7 +579,11 @@ def session(eph, lat, lon, sock):
             continue
         # one time error for all batches (so four satellites a batch
         # suffice), leaving out satellites whose residuals stay off
-        fx, used, rms, _, dropped = sf.solve_robust(recent, solve_eph, seed, height=HEIGHT)
+        try:
+            fx, used, rms, _, dropped = sf.solve_robust(recent, solve_eph, seed, height=HEIGHT)
+        except (ValueError, ArithmeticError, KeyError, IndexError) as e:
+            say("a fix could not be solved: %s" % type(e).__name__)
+            continue
         if used < 3 or rms > 120:
             sock.sendto(sky_nmea(view, heard, (), None, now).encode(), GPSD)
             continue
@@ -471,14 +604,14 @@ def session(eph, lat, lon, sock):
             save_position(flat, flon)
             say("fix %d: %d satellites, %d batches, residual rms %.0f m" % (fixes, nsat, used, rms))
     p.wait()
-    err = p.stderr.read()
-    for l in err.splitlines():
-        if "giving up" in l or "not acknowledged" in l:
-            say("probe:", l)
+    for l in list(tail):
+        if "giving up" in l or "not acknowledged" in l or "is Location off" in l or "read:" in l or "write:" in l:
+            say("probe:", l.strip())
     if fixes:
         flat, flon = sf.ecef_latlon(seed)
         save_position(flat, flon)
     say("session ended (%d fixes)" % fixes)
+    return lines_seen, fixes
 
 
 def keep_awake():
@@ -507,20 +640,38 @@ def main():
     threading.Thread(target=keep_awake, daemon=True).start()
     load_iono()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    running = [True]
-    while running[0]:
+    gap = GAP
+    while True:
+        if time.time() < EARLIEST:      # everything here is computed from the time
+            say("the clock has not been set: waiting")
+            status("no-clock")
+            time.sleep(30)
+            continue
         pos = position()
         if pos is None:
             say("no %s/position (\"lat lon\", within some tens of km): waiting" % STATE)
+            status("no-position")
             time.sleep(60)
             continue
-        eph = ephemeris()
+        eph, tier = ephemeris()
         if not eph:
             say("no usable ephemeris (offline?): waiting")
+            status("no-orbits")
             time.sleep(60)
             continue
-        session(eph, pos[0], pos[1], sock)
-        time.sleep(GAP)
+        lines, fixes = 0, 0
+        try:
+            lines, fixes = session(eph, tier, pos[0], pos[1], sock)
+        except Exception as e:          # the daemon outlives a session's bug
+            where = traceback.extract_tb(e.__traceback__)[-1]
+            # the kind and the place only: a message could hold a position
+            say("session failed: %s at %s:%d" % (type(e).__name__, os.path.basename(where.filename), where.lineno))
+        finally:
+            subprocess.run(["pkill", "-x", os.path.basename(PROBE)[:15]], check=False)
+        # a session that heard nothing: the chip needs longer, and must not be hammered
+        gap = GAP if lines > 0 else min(gap * 2, GAP_MAX)
+        status("restarting", wait=gap, chip_answered=lines > 0)
+        time.sleep(gap)
 
 
 if __name__ == "__main__":
@@ -530,3 +681,7 @@ if __name__ == "__main__":
         pass
     finally:
         release_wake_lock()
+        try:
+            os.unlink("/run/titan-gnss-open.status")
+        except OSError:
+            pass

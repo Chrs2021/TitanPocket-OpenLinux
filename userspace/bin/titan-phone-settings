@@ -19,6 +19,7 @@ tap. Identities stay on the screen: never logged.
 """
 import json
 import sys
+import xml.etree.ElementTree as ET
 
 import titan_mm as mm
 import titan_ui4 as ui
@@ -31,6 +32,34 @@ GLOBE_ICON = ("M12 3.5a8.5 8.5 0 1 0 0 17a8.5 8.5 0 1 0 0-17zM3.5 12h17M12 3.5c2
               "3.5 8.5c0 3.2-1 6-3.5 8.5M12 3.5c-2.5 2.5-3.5 5.3-3.5 8.5c0 3.2 1 6 3.5 8.5")
 PHONE_ICON = ("M6.5 3.5h3l1.5 4.5-2 1.5a11 11 0 0 0 5.5 5.5l1.5-2 4.5 1.5v3a2 2 0 0 1-2 2"
               "A16 16 0 0 1 4.5 5.5a2 2 0 0 1 2-2z")
+PROVIDERS = "/usr/share/mobile-broadband-provider-info/serviceproviders.xml"
+_carriers = None
+
+
+def carrier_name(code):
+    """A carrier's name for an operator code (MCC + MNC), from the provider database: the
+    first provider listing it, as titan-signal does. The modem names none itself."""
+    global _carriers
+    if _carriers is None:
+        _carriers = {}
+        try:
+            for p in ET.parse(PROVIDERS).iter("provider"):
+                name = (p.findtext("name") or "").strip()
+                for n in p.iter("network-id"):
+                    if name:
+                        _carriers.setdefault(n.get("mcc", "") + n.get("mnc", ""), name)
+        except (OSError, ET.ParseError):
+            pass
+    return _carriers.get(code or "")
+
+
+def named(name, code):
+    """ModemManager's operator name, unless it's only the code: then the database's"""
+    if name and not name.isdigit():
+        return name
+    return carrier_name(code or name) or name or code
+
+
 TABS = (("Modem", PHONE_ICON), ("SIM", SIM_ICON), ("Network", SIGNAL_ICON), ("APN", GLOBE_ICON))
 
 CSS = """
@@ -302,15 +331,17 @@ class Settings(ui.AppWindow):
         elif not self.busy:
             self.sim_msg.set_text("")
         self.pin_panel.set_visible(c.sim is not None and not locked)
-        self.sim_info["Operator"].set_text(c.prop(mm.I_SIM, "OperatorName", "")
-                                           or c.prop(mm.I_SIM, "OperatorIdentifier", "") or "—")
+        self.sim_info["Operator"].set_text(named(c.prop(mm.I_SIM, "OperatorName", ""),
+                                                 c.prop(mm.I_SIM, "OperatorIdentifier", "")) or "—")
         self.sim_info["ICCID"].set_text(self.ident(c.prop(mm.I_SIM, "SimIdentifier", "")))
         self.sim_info["IMSI"].set_text(self.ident(c.prop(mm.I_SIM, "Imsi", "")))
 
         # the network
         enabled = st is not None and st >= mm.STATE_ENABLED
-        op = c.prop(mm.I_3GPP, "OperatorName", "")
         code = c.prop(mm.I_3GPP, "OperatorCode", "")
+        op = named(c.prop(mm.I_3GPP, "OperatorName", ""), code)
+        if op == code:
+            op = ""     # shown once, in brackets
         self.net["Network"].set_text(" ".join(x for x in (op, "(%s)" % code if code else "") if x)
                                      or "—")
         self.net["Registration"].set_text(
@@ -471,7 +502,7 @@ class Settings(ui.AppWindow):
         self.say(self.scan_msg, "%d networks found: tap one to use it" % len(nets)
                  if nets else "no networks found")
         for n in nets:
-            name = n.get("operator-long") or n.get("operator-short") or n.get("operator-code", "?")
+            name = named(n.get("operator-long") or n.get("operator-short"), n.get("operator-code")) or "?"
             tech = mm.access_text(n.get("access-technology", 0))
             avail = mm.AVAILABILITY.get(n.get("status", 0), "")
             b = ui.GlassButton("%s  %s  (%s)" % (name, tech, avail), height=50, size=17,

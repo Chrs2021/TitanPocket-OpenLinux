@@ -1,13 +1,15 @@
 # The modem (MD1): titan_modem boots it from the image LK loaded, and
-# mdd.py serves its NVRAM files from a RAM copy of the phone's own NVRAM
+# titan-mdd serves its NVRAM files from a RAM copy of the phone's own NVRAM
 # (nvcopy.sh; the partitions are never written, the modem's writes are
-# lost at stop). Once the modem's AT layer is up, mdd.py hands the AT channel
+# lost at stop). Once the modem's AT layer is up, titan-mdd hands the AT channel
 # to the driver, which makes it a 27.010 mux with a WWAN port per channel
-# (81-titan-modem.rules gives them names and ModemManager its two); radioinit.py
+# (81-titan-modem.rules gives them names and ModemManager its two); titan-radioinit
 # then brings the SIM up with the radio off, as Android's RIL does. The radio stays
-# off until the modem is enabled. Speech for a call: SIGUSR1 to mdd.py
+# off until the modem is enabled. Speech for a call: SIGUSR1 to titan-mdd
 # (speech on, with the parameters in /var/lib/titan-modem/sph-params.bin,
-# made by tools/modem/sphparam.py from the vendor XML), SIGUSR2 (off). Holds a wake lock while it runs (the modem
+# made by tools/modem/sphparam.py from the vendor XML), SIGUSR2 (off). titan-mdd and
+# titan-radioinit are the Rust versions of tools/modem/mdd.py and radioinit.py
+# (userspace/titan-phone), which stay for bring-up work. Holds a wake lock while it runs (the modem
 # across suspend is untested). Not enabled: start it by hand.
 [Unit]
 Description=Modem (MD1): boot and NVRAM file service
@@ -17,10 +19,11 @@ Before=ModemManager.service
 [Service]
 Environment=FS_ROOT=/run/titan-modem NV_QUIET=1 AT_PORT=1 SPH_PARAM=/var/lib/titan-modem/sph-params.bin
 ExecStartPre=/bin/sh /usr/local/lib/titan-modem/nvcopy.sh /run/titan-modem
-ExecStartPre=/bin/sh -c 'echo titan-modem > /sys/power/wake_lock'
+# holds the phone awake, unless deep sleep with the modem on is being used (docs/power.md)
+ExecStartPre=/bin/sh -c '[ -e /var/lib/titan-modem/allow-sleep ] || echo titan-modem > /sys/power/wake_lock'
 ExecStartPre=/sbin/modprobe titan_modem
-ExecStart=/usr/bin/python3 /usr/local/lib/titan-modem/mdd.py 0
-ExecStartPost=-/usr/bin/python3 /usr/local/lib/titan-modem/radioinit.py
+ExecStart=/usr/local/bin/titan-mdd 0
+ExecStartPost=-/usr/local/bin/titan-radioinit
 ExecStopPost=-/sbin/modprobe -r titan_modem
 ExecStopPost=/bin/rm -rf /run/titan-modem
 ExecStopPost=-/bin/sh -c 'echo titan-modem > /sys/power/wake_unlock'

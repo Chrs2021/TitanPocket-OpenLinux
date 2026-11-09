@@ -576,6 +576,55 @@ On 2026-10-18 the flash and the torch stopped. The kernel logged
     one whose chip was dismissed.
 - Keys: Space/Enter photo, F switch camera, R rotate, A autofocus, T flash.
 
+### The Rust camera app (titan-camera, 2026-11-09, not yet run on the phone)
+
+`userspace/titan-camera` (`build.sh` -> `out/titan-camera`, installed as
+`/usr/local/bin/titan-camera` beside the Python app until it has been tried):
+the same hardware-ISP preview, stills, autofocus and flash, rewritten in Rust
+(gtk4-rs 0.9, gstreamer-rs 0.23, built against the phone's Debian 12
+libraries like titan-messages), plus:
+
+- **Video**: Photo/Video mode. A recording replaces the preview stream with
+  one that also encodes: the GPU-rotated frames are scaled to the video size
+  (4:3: 1440×1080 at 12 Mbit/s, 960×720 at 6, 640×480 at 3) as NV12 and go to
+  the best H.264 encoder installed (`v4l2h264enc` once the hardware encoder
+  has a V4L2 driver, docs/video-encoder.md; else `x264enc`, ultrafast,
+  zero latency; else `openh264enc`), with Opus sound from `pulsesrc`, into
+  MP4 (Matroska when this `mp4mux` takes no Opus) in `~/Videos/Camera`.
+  Stopping sends EOS so the muxer closes the file. The rootfs now installs
+  `gstreamer1.0-plugins-ugly` and `gstreamer1.0-pulseaudio` for this.
+- **Shutter speed and ISO** (settings panel): Auto, or 1/2000 s to 1/30 s on
+  the preview and in video, and down to 1 s for photos. With both on Auto
+  the driver's own exposure runs. Fixing either one takes over: the sensor
+  gets the fixed value (exposure in lines from the line time, (width +
+  hblank) / pixel rate; gain with 128 = 1×, ISO 100 = 1×), and the app moves
+  the other one from the preview's centre-weighted luma toward Y 105 (shutter
+  priority or ISO priority). A photo starts from the preview's exposure ×
+  gain; a shutter longer than the frame raises VBLANK for that stream (the
+  driver limits exposure to frame length − 8 lines), and photos longer than
+  1/15 s take one frame instead of a burst.
+- **Photo size**: the sensor's full mode (rear 16 MP, front 8 MP) or its
+  binned mode (4 MP, 2 MP; faster).
+
+QR codes (2026-11-09): as the Python app's (above), with two changes. The
+decoder (`qr.rs`) loads libzbar with `dlopen`, so the build needs no zbar
+and the app runs without it, and it reads the luma straight from the
+preview's YUYV, every n-th pixel for frames over 1000 wide, so the branch
+has no `videoscale` or `videoconvert`. 3 scans a second: at 5 a second the
+decoding thread took about 26% of a core on the 960x720 preview, at 3
+about 12%. Not ported yet: the flash pre-metering. Flash On and Auto light
+the torch maximum through the capture instead of a metered strobe.
+
+The preview runs at the ISP's scaled-down size (`Camera::preview`: rear
+960x720, front 816x612; see "The resizer" below), or the binned mode when
+a recording is larger. Measured with the app on the phone's screen: the
+whole app took 89% of a core with the 2336x1752 preview, 61% with the
+960x720 one (QR decoding apart).
+
+The settings live in `~/.config/titan-camera/settings` (key=value). Unit
+tests cover the settings file, the sharpness measure and the focus search
+(a simulated lens), the exposure loop, and the V4L2 control layouts.
+
 ## MediaTek ISP (hardware), work in progress
 
 The camera path so far bypasses MediaTek's ISP: CAMSV only stores raw
@@ -1267,9 +1316,307 @@ The flash photos were soft. Taking that apart:
     preview size); 6 of 6 launches then streamed. It predates this work; the
     hardware-statistics AF just didn't need frames, so it went unnoticed.
 
+**Noise reduction: the fault is IMGI, not SMX (2026-11-05, later).** On 6.12,
+with `nr=1` the rear camera's stream stops at once and the IOMMU reports
+`larb=5 port=0` (IMGI) reading iova `0xc00`, over and over: the DIP's raw input
+runs from base 0 plus a tile offset, so its base register is overwritten once
+NBC's tile list is in use. Clearing NBC's links to the local contrast engines
+(ANR_CON1 bits 28-29, new `nr_con1_clr` parameter, default `0x30000000`) didn't
+change it, and neither did leaving them set. The NBC tile list has 17 words a
+tile against 16 (the extra one last; word 2 becomes 1, word 10 `0x100000`
+instead of `0x40000`); the HAL's own NBC run shows 0x11 in its tile settings,
+so 17 is probably right and the question is which register each word reaches.
+Decoded with the tile engine's own printer (`emu_tile.py --dump-tdr`), tile 0
+of the two lists differs only by `CTRL_NBC_EN` and the extra `NBC_TILE_EDGE`
+word (load size 16 -> 17 words). Read live while stalled, the DIP's registers
+hold tile words in the wrong places (IMGI's offset register held tile 0's
+control word `0xc32a2001`; `RGB_EN` and `DMA_EN` garbage, switching on SMX and
+other DMAs: the `0xc00` reads), where a working frame holds what the driver
+wrote (`RGB_EN 0x8d5`, `DMA_EN 0x2001`, IMGI offset `0xa50`). So the tile
+loader takes 16 words a tile from a 17-word list and slips a word each tile.
+Not the cause, each tried with NBC on: SMX (the HAL's 41 MB area allocated and
+all eight ports' bases set: `dip_core.h`, allocated only with `nr`), ANR_CON1's
+link bits, `TDR_TILE` (0x54) at 0x10 or 0x11, and any single extra bit in
+`TCM` or `TCM2` (all 62 tried, none gave a frame). The HAL's `0x11` sits in
+its tile settings with or without NBC, so its lists differ from ours to begin
+with; its `TCM2` 0x2100 probably goes with a list that has no NBC word. Its
+real lists are built by the MDP framework's stream code, which the emulation
+doesn't reach. Next: find how the real stack maps tile words to registers (the
+DIP driver's or the tile loader's code), or build the list the way the HAL's
+stream does. SEEE adds a `SEEE_TILE_EDGE` word the same way and will likely
+meet the same problem. `configTpipeData` (`libdip_postproc.so` 0x132338) is
+decompiled for this; it copies the TCM words, it doesn't compute them.
+
+**How the HAL really builds a tile list** (found later the same day). Not
+from hand-picked tile fields, as `dip_tdr.py` does, but from the DIP's
+register image, in two steps: `DIP_ISP_PIPE::configTpipeData`
+(`libdip_postproc.so` 0x132338) fills an `ISP_TPIPE_CONFIG` (at its
+`lVar17 + 0x560`) from the module registers (NBC's mode from ANR_CON1 bits
+0, 1 and 20, `NBC_ANR_LTM_LINK`; SEEE, NBC2 and the others likewise), and
+`tile_copy_config_by_platform` (`libdpframework.so` 0xab030) copies that into
+the tile engine's config, including the SMX enables and sizes (SMX2's enable
+from `ISP_TPIPE_CONFIG` + 0x114, its input size from + 0x580). Our lists skip
+both, which is why only the basic module set works. More tried with NBC on,
+none giving a frame: `TCM2` = 0x100 plus each single bit (bit 13, the HAL's
+NBC bit, is what makes the stray DMA reads), clearing ANR_CON1 bit 20.
+Next: run that pipeline in emulation (capture the HAL's `ISP_TPIPE_CONFIG`
+from the `configPipe` run with our register image, then
+`tile_copy_config_by_platform` and `tile_main_platform`), which gives the list
+the HAL would build, for NBC, SEEE, LSC2 and CRZ alike. The experiment
+parameters (`tcm2`, `nr_con1_clr`) are still in the driver.
+
+**The HAL's own tile lists, in emulation (2026-11-06).** `emu_dip_config.py
+--size W H STRIDE --rgb RGB_EN [--nbc TABLE] --trace-tile` runs `configPipe`
+with our register settings and dumps the `ISP_TPIPE_CONFIG` that
+`configTpipeData` filled (at its `lVar17 + 0x6a8`; `pixel_id`, `cam_in_fmt`,
+`ctl_extension_en`, `mix1_sel` confirm the layout is `tile_cfg_fields.txt`'s),
+and `emu_tile.py --cfg FILE sw.tpipe_width=768` runs the tile engine on it.
+Checked: for 2336x1752 with OBC2 the list is word for word ours (64 words).
+With the rear NBC table the HAL's config adds only `nbc_en` and ANR's ENY, ENC
+and LTM_LINK, no SMX; its list has our layout (17 words a tile) and differs
+only in tile geometry (LTM_LINK widens the overlap). That list, put in
+`dip_tdr.h` (it replaces ours for 2336x1752+NBC), stalls the same way: the
+enable registers and IMGI's offset fill with tile words. So the list is not
+what's wrong; how the DIP is started differs from the HAL's. Writing the rest
+of the tile control block as the HAL's image has it (0x60, 0x64, 0x68, 0xe4
+= 0, now in `dip_program`) changed nothing. The remaining difference: the HAL
+loads the DIP's registers through the command queue (a descriptor of module
+slots), where `dip_program` writes them directly and runs thread 0 with an
+all-NOP descriptor. The emulation at this size builds no descriptor to compare;
+that is the next thing to get.
+
+**Parked (2026-11-06).** `--write2cq` calls `DIP_ISP_PIPE::write2CQ` in the
+emulation and reads the descriptor back (`VirDipDrvImp::getCQDescBufVirAddr`,
+`getCQModuleInfo`): slot words `0x4000_0000 | (count - 1) << 16 | address`,
+the second word an offset into the HAL's register buffer, `0x1c000000` the
+end. A normal frame loads 17 blocks (TDR control 0x50 x 4, 0xe0, 0x310,
+0x31c, IMG3O 0x394 x 6, 0x3b8, IMGI 0x504 x 6, PGN, UDM 0x1540 x 23, G2G,
+G2C, 0x3040, 0x5380 x 39, 0x1000, GGM 0x2180 x 193, OBC2, 0x5000 x 155); NBC
+adds one, its whole block 0x3300-0x37e4 (314 registers; ours sets the 51 from
+0x3700; below that are ANR's lookup and tone-mapping tables,
+`ISP_NVRAM_ANR_LUT_T`, `Calculate_NBC_LTM`). Clearing 0x3300-0x36fc as the
+HAL's image has it (now in `dip_program`) didn't help: NBC still stalls.
+Untested: moving the whole pipeline onto the command queue, and the values
+the HAL fills in at enqueue (0x310, 0x31c, the 0x5000 and 0x5380 blocks are
+still zero at this point of the emulation). The tools stay: `emu_dip_config.py
+--size --rgb --nbc --trace-tile --write2cq`, `emu_tile.py --cfg`. The text
+below is the earlier (4.14) reading.
+
+**Which modules switch which tile-loader groups (2026-11-09).** The HAL
+builds the TCM enables bit by bit in `PostProcPipe::configPipe`
+(`libdip_postproc.so`, no constant anywhere): the DMA ports and input
+formats give the base bits (TCM 0x08182002, TCM2 0x100 for our path:
+IMGI, IMG3O, UNP, UDM, C42), and the tuning image's module enables the rest:
+
+| module (enable bit) | TCM bit |
+|---|---|
+| G2C (YUV_EN 3) | TCM 27 |
+| SL2B-SL2E (YUV_EN 11-14) | TCM 23-26 |
+| LSC2 (RGB_EN 15) | TCM 21 |
+| SL2 (RGB_EN 3) | TCM 22 |
+| LCE (RGB_EN 5) | TCM 31 |
+| YUV2_EN 6 / 7 | TCM 0 / 28 |
+| NBC, NBC2 (YUV_EN 5, 6) | TCM2 13, 14 |
+| PCA, SEEE (YUV_EN 7, 8) | TCM2 11, 12 |
+| NR3D / YUV_EN 9 | TCM2 2 |
+| DBS2 (RGB_EN 10) | TCM2 15 |
+| RMG2, BNR2, RMM2 (RGB_EN 12-14) | TCM2 16-18 |
+| RGB_EN 18-20 (RNR ...) | TCM2 23-25 |
+| RGB_EN 22 / 23 (FLC) / 24 | TCM2 29 / 31 / 1 |
+| DMA_EN 17 | TCM2 30 |
+
+The base list's words fit groups taken in ascending bit order (5 control
+words, then IMGI 2, IMG3O 3, UNP 1, UDM 1, G2C 3 on TCM 27, C42 1), so NBC
+(TCM2 13) comes last, as the tile engine emits it. Still open: with TCM2
+bit 13 the loader takes 20 words a tile (TDRI_XSIZE reads back 0x4f), the
+engine emits 17 (NBC_TILE_EDGE only); its register map also has
+`NBC_LTM_{TOP,BOTTOM,LEFT,RIGHT}_LOSS`, which may be the missing three.
+`tile_tdr_isp_mask_to_dump` (`libdpframework.so` 0x209258) lays out all 269
+tile words in fixed slots, each gated by a field of `TILE_REG_MAP_STRUCT`:
+running it in emulation one field at a time gives every group's size.
+Probing this live hangs the phone (a stalled DIP read from userspace):
+don't. `tools/re/emu_dip_config.py --watch-tcm` logs the HAL's TCM writes.
+With NBC on, the watch shows the HAL writing TCM 0x08182002, TCM2 0x2100,
+TCM3 0, TDR_CTL 0xb and TDR_TILE 0 (`configTpipeData` copies them to
+0x50-0x5c/0xe0 from `DIP_ISP_PIPE`, whose fields sit 4 bytes below
+`PostProcPipe`'s; the 0x11 in front is a software setting, not a register).
+That is what split mode programmed, and the HAL's list is the 17-word
+layout the base tile engine emits (emulated `tile_tdr_isp_mask_to_dump`:
+NBC enable field 0x208 gates one slot, SEEE 0x238 one, NBC2 0x20c one; the
+`_internal` variants are another, smaller layout). So the loader settings
+and the list match the HAL's; what differs is elsewhere (the command-queue
+load of the NBC block, or state in the HAL's register image).
+
+**Noise reduction works (2026-11-09).** NBC's ANR runs on both cameras in
+every mode and is on by default (`nr=1`): on a dark indoor scene (mean luma
+about 4/255 before display) the luma noise, measured as the mean absolute
+Laplacian, drops from 15 to 5 and the chroma noise to nearly nothing, with
+edges kept and no tile seams; 300 rear frames ran without a stall. A frame
+costs 14.1 ms instead of 12.1 (rear 2336x1752), 7.1 instead of 6.1 (front
+1632x1224), 49.6 instead of 46.6 (rear full res). Three things were wrong:
+
+- *The tile loader.* With `TCM2` bit 13 the loader fetches each tile in
+  4-word bursts: NBC's 17-word tile is read as 20 words and the last 3 are
+  dropped (markers placed there appear nowhere in 0x0-0x6000; `TDRI_XSIZE`
+  reads back 0x4f). Split mode (one DIP start per tile) now pads every
+  slot to a multiple of 4 words with zeros (`dip_split_layout`) and runs
+  whenever NBC is on. NBC's one tile word, `NBC_TILE_EDGE`, lands in
+  ANR_CON1 bits 16-19 (0xd first tile, 0xc middle, 0xe last).
+- *ANR's links.* The stock tables set ANR_CON1 bit 24, `NBC_ANR_SL2_LINK`
+  (ANR takes the shading module SL2's radius), and bit 20, the tile
+  engine's `NBC_ANR_LTM_LINK` (ANR takes LCE's tone map). Neither partner
+  runs here, and with either link set ANR takes input and never produces
+  output: the DIP's debug port (`DMA_DEBUG_SEL` 0x7bc, read in 0x84, as the
+  vendor driver's stall dump does; `dip_debug_port`) showed IMGI part way
+  through the tile and IMG3O with nothing written. The field names and bit
+  positions come from `SmoothANR` in `libcam.hal3a.v3.so`, which extracts
+  each field from the register words to log it: bit 0 `ENC`, bit 1 `ENY`,
+  bits 4-11 the luma filter indices, bit 24 `SL2_LINK`, bit 28 `TABLE_EN`,
+  bit 29 `TBL_PRC`. Bits 28-29 enable the ANR LUT (0x3300-0x36fc), which
+  the HAL builds every frame (`Paramctrl::prepareHw_PerFrame_ANR_TBL`) and
+  we don't have; the driver clears 20, 24, 28 and 29 (`nr_con1_clr`
+  0x31100000). Earlier notes here called 28-29 the LCE/LTM links; they
+  aren't.
+- *The front tile list* was generated with ANR's ENY and ENC clear, so its
+  tiles carried no overlap for the filter and ANR waited for pixels that
+  never came. `dip_tdr.py --nbc` now sets them (`--anr`, default both); the
+  rear list (from the HAL) already had them. Lists for the full-resolution
+  modes were added. Modes with no NBC list run without it.
+
+SMX isn't needed: its crops work at tile rows (`TRU`/`TRD`, `TILE_YSIZE`)
+and these tiles are full height; the 41 MB area is no longer allocated
+(`nr_smx` for experiments). Left for later: the LUT (needs the HAL's
+per-frame table generation), the LTM and SL2 links, and per-ISO tables
+(the driver uses one mid-ISO table). A stalled DIP recovers on the next
+frame's programming and the kernel's stall report is safe; only userspace
+reads of a stalled DIP hung the phone. Experiment parameters: `dip_dbg`
+(debug port after good frames too), `nr_lut`, `dip_keep`/`dip_pad`/`dip_padval`,
+`dip_tcm2`.
+
+**The DIP's interrupt and clock (2026-11-09).** The driver used to wait
+for each frame (and each split tile) by polling `CTL_START` with
+`udelay(500)`, a CPU core spinning for as long as the DIP ran: 8% of the
+eight cores busy during a 30 fps rear stream. It now sleeps on the DIP's
+interrupt (SPI 268, already in the DT): `CTL_CQ_INT_EN` bit 0, command
+queue thread 0 done, the only enable set. Found by setting every enable
+and reading the latched status after a frame: `CTL_INT_STATUS` 0x00031004
+and `CTL_CQ_INT_STATUS` 0x1 (the HAL leaves the enables at 0 and waits on
+GCE events instead). Both status registers are read-clear; the handler
+touches them only while the camera has the DIP clocked. Same stream: 3%
+busy, 360 interrupts for 90 frames of 4 tiles. `dip_poll=1` restores the
+old wait.
+
+The DIP is compute-bound: its frame time scales with its clock, img_sel.
+The DT gives it 364 MHz (syspll_d3), the lower step of MediaTek's mmdvfs
+table for it; the upper is 525 MHz (mmpll_d6), which needs Vcore OPP 0
+(0.8 V), where 6.12 holds Vcore. Frame times (three runs each, ms):
+
+| mode | 364 MHz | 364, NBC | 525 MHz | 525, NBC |
+|---|---|---|---|---|
+| rear 2336x1752 | 12.1 | 13.7 | 8.4 | 10.0 |
+| rear 4672x3504 | 46.7 | 51.4 | 32.4 | 36.6 |
+| front 1632x1224 | 6.1 | 7.2 | 4.2 | 5.7 |
+
+At full resolution with NBC a 364 MHz frame takes longer than the
+sensor's (about 50 ms), so the burst for stills lost every other frame
+(10 drops in 10). The driver now picks the rate per stream (`dip_rate`, 0
+automatic): 525 MHz above 8 MP, 364 MHz for the binned modes, where 30 fps
+has room to spare and a faster clock left on for the whole session only
+costs power. Full resolution at 525 MHz: no drops.
+
+**Sharpening (SEEE) works (2026-11-09), off by default (`ee=1`).** The
+same recipe as NBC: `YUV_EN` bit 8, `TCM2` bit 12, tile lists generated
+with `top.seee_en` and `seee.se_edge` 2 (`dip_tdr.py --seee`;
+`configTpipeData` sets `se_edge` to SEEE_CTRL & 3, and the HAL's
+SEEE_CTRL is 2, EE on and SE off), split mode, and the 30 registers
+0x46c4-0x473c from the stock `ISP_MGR_SEEE::apply` run on a mid-ISO EE
+table (`gen-dip-tuning.py`, `*_seee` in `dip_tuning.h`; the EE table's
+byte b goes to 0x46c8 + b). From `SmoothEE`'s field extraction the
+table's link and extra features are all off: `GLUT_LINK_EN` (0x46e0 bit
+21), `CBOOST_EN` (0x4714 bit 24), `PBC_EN` (0x471c bit 31). The tile
+lists are now keyed by module set (`DIP_MOD_NBC`, `DIP_MOD_SEEE`; lists
+for NBC, SEEE and both at all four sizes); NBC+SEEE tiles have 18 words.
+Every mode ran clean with both on (rear 2336x1752 14.1 ms a frame, front
+1632x1224 7.1, front full 24.6, rear full 50.1). On the same dark scene
+the mean absolute Laplacian rose from 4.7 to 5.1 with EE (NBC on in
+both): EE's gain depends on luma and cores out small detail, so it needs
+judging on a lit scene before it goes on by default.
+
+**Noise reduction needs the SMX stripe buffers (2026-11-05).** NBC's tables,
+its tile lists and the `nr` switch are in the drivers, off by default: with
+NBC on the DIP faults on its SMX port. Tiled noise reduction carries its
+state from one tile to the next through the SMX DMAs (SMX1-4, inputs and
+outputs at 0x7d0-0x920; enables SMX1 `RGB_EN` bit 25, SMX2 and SMX3
+`YUV2_EN` bits 8 and 9, SMX4 `RGB2_EN` bit 0, their DMAs `DMA_EN` bits
+18-24). The HAL allocates one SMX area per command queue,
+`0x2710040` bytes (about 41 MB), the first port's share `0x9c4008`
+(`DipRingBufferImp`, `getSMXIOBuffer`), and the tile engine gives each
+tile's SMX offsets once the SMX ports are enabled in its config. Our NBC
+tile lists were generated without them (`dip_tdr.py --nbc` sets only
+`nbc_en`), and the HAL emulation with NBC alone leaves the SMX enables
+clear, so which SMX NBC and SEEE (sharpening) use is to be found on the
+phone. Next: allocate and map the SMX area, regenerate the tile lists
+with SMX, then NBC and SEEE.
+
+**The resizer: a small preview (2026-11-09).** The DIP's CRZ scales the
+frame down for IMG2O (0x330) in place of the full-size IMG3O. The node
+offers 960x720 (from the rear's 2336x1752) and 816x612 (from the front's
+1632x1224) besides the sensor modes (`crz_sizes` in `titan_camera.c`); for
+those the raw capture stays at the mode's size and the DIP job gets an
+output size (`dip_job.out_w/h`). What the HAL's `configPipe` does for an
+IMG2O port of 960x720 with a CRZ crop entry (`emu_dip_config.py --port 0x1e
+960 720 --only-port`; the frame's crop and resize list is FrameParams
++0xa8/+0xb0, 0x34-byte entries, group 1 CRZ, crop size +0x1c/+0x20,
+target +0x2c/+0x30), and what the driver writes:
+
+- `YUV_EN` bit 17 (CRZ), `DMA_EN` IMGI + IMG2O (bit 11), `TCM` 0x08180802
+  (IMG3O's bit 13 off, IMG2O's bit 11 on), `TCM2` bit 0 (CRZ).
+- CRZ at 0x5300: CONTROL 0xa3, IN (h << 16 | w), OUT, the horizontal and
+  vertical steps in 1/2^20 at 0x530c/0x5310; the offsets come in the tile
+  words. The step and algorithm are `CrzDrvImp::CalAlgoAndCStep`'s
+  (`libdip_drv`): 2x to 8x down is algorithm 1, step ((out - 1) << 20 +
+  in - 2) / (in - 1) (0x69242 and 0x691e9 for 2336x1752 to 960x720, as
+  the HAL's); less than 2x is algorithm 0 (6-tap, coefficient tables),
+  more than 8x algorithm 2. Only algorithm 1 is supported.
+- IMG2O: x size 2w - 1, y size h - 1, stride 2w | 0x01910000.
+- Tile lists: `dip_tdr.py --crz W H` (the `cdrz.*` fields of the tile
+  config, at 0x4c0-0x4ec as in `ISP_TPIPE_CONFIG`); 24 words a tile (an
+  8-word CRZ group), the HAL's list for 960x720 word for word. Lists for
+  each size with and without NBC and SEEE, keyed by output size
+  (`dip_find_tdr_out`).
+
+The DIP takes as long as for the full-size output (the work is the
+input's): 11.9 ms a rear frame, 14.5 with NBC, 6.2 / 6.8 for the front;
+300 rear frames clean. What it saves is the output (1.4 MB a frame instead
+of 8.2, about 41 MB/s at 30 fps instead of 245) and the GPU's upload and
+conversion. libcamera's simple pipeline offers only the sensor's sizes for
+a capture node, so `0001-titan-pocket.patch` adds a configuration for each
+of the driver's pairs (sensor size, node size) when the video node is
+`titan-camera`; `cam -s width=960,height=720` then streams 1382400-byte
+frames at 30 fps.
+
+Two traps on the way, both found the hard way. With every DIP interrupt
+source enabled (`dip_int_en` all ones) some `INT_STATUS` bit doesn't clear
+on read: an interrupt storm (3.8 million in seconds) that hung the phone
+once the clock went off under it; stopping a stream now turns the enables
+off and clears the status before it lets go of the interrupt. And a stream
+start that failed after the DIP was powered (no tile list) kept the ISP's
+clock and power reference: the DIP then wedged and only a reboot cleared
+it; that path now powers it off again.
+
+**Planned: a small preview and zero shutter lag.** The preview now has the
+DIP write the full 2336×1752 YUYV (8.2 MB a frame, about 245 MB/s at 30
+fps) for the GPU to scale to the screen. The plan: the sensor in its full
+mode (4672×3504, about 20 fps) with CAMSV writing a ring of the last few raw
+frames; the DIP's resizer (CRZ, `YUV_EN` bit 17, `PATH_SEL` 13:12) giving
+the preview at screen size (960×720, 1.4 MB a frame); at the shutter, the
+sharpest frame of the ring from before the press run once at full size
+with NBC and SEEE. The full-mode stream costs power while the camera is
+open (about 400 MB/s of raw writes).
+
 **Still open:** low light — at 1/100 s and full gain a dim indoor scene gives
 a photo of mean 7/255 and heavy chroma noise without the flash (noise
-reduction, NBC, is still blocked on SMX); the AA luma read 21 whether the
+reduction, NBC, now runs and removes most of the noise: see above); the AA luma read 21 whether the
 exposure was 1147 or 3816 lines in a very dark scene, so its black level may
 be off, which would make the AE under-expose — check on a lit scene with
 `ae_target`; the app should keep the screen awake while it's open (Weston's
@@ -1323,6 +1670,15 @@ from the device tree and upstream drivers:
 - **Kernel.** The media core is built as modules (`build.sh modules`; the
   camera driver needs `videodev`, `mc` and `videobuf2-*`), and
   `CONFIG_UDMABUF=y` for libcamera's software ISP.
+- **The focus motor in standby (2026-11-05).** The AK7371's supply
+  (VLDO28) also feeds the touchscreen, whose driver keeps it on in system
+  sleep, so dropping the camera's reference at stream stop left the motor
+  active, holding the lens with coil current until the next reboot. The
+  driver now walks the lens back to rest in steps (no click) and writes
+  standby (0x02 = 0x40) before powering the sensor off; the next start
+  wakes it as before. Checked on the phone: streaming, mode 0x00 at
+  position 0x40; stopped, 0x40 at 0. The rear sensor's bus is I2C 3 on
+  6.12 (2 on 4.14).
 - **Install.** The 6.12 system has no in-tree modules installed;
   `build612.sh` packs the ones the driver needs as
   `out612/media-modules.tar` (paths under `/lib/modules/<version>/`). Unpack

@@ -1,0 +1,166 @@
+/* Copied from titan_ui4.THEME_CSS and titan_water4.CSS: the same look as the Python apps */
+
+/* GTK's own widgets in the TitanWater look (the GTK 3 theme, ported); the
+   water controls draw themselves */
+@define-color titan_text #FFFFFF;
+@define-color titan_dim rgba(255, 255, 255, 0.78);
+@define-color titan_accent #FFD24A;
+@define-color titan_danger #FF6B7A;
+@define-color titan_ok #7BE07B;
+@define-color titan_ink #141821;
+@define-color titan_rim rgba(255, 255, 255, 0.62);
+@define-color titan_edge rgba(255, 255, 255, 0.36);
+@define-color theme_fg_color #FFFFFF;
+@define-color theme_text_color #FFFFFF;
+@define-color theme_bg_color #1B2C66;
+@define-color theme_base_color rgba(255, 255, 255, 0.06);
+@define-color theme_selected_bg_color rgba(255, 255, 255, 0.85);
+@define-color theme_selected_fg_color #141821;
+@define-color insensitive_fg_color rgba(255, 255, 255, 0.45);
+@define-color borders rgba(255, 255, 255, 0.30);
+
+* { font-family: "Atkinson Hyperlegible", sans-serif; outline-color: rgba(255, 255, 255, 0.55); }
+window.titan-app { background: #10204A; color: @titan_text; }
+label { color: @titan_text; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.40); }
+label:disabled { color: rgba(255, 255, 255, 0.45); text-shadow: none; }
+label selection { background-color: rgba(255, 255, 255, 0.85); color: @titan_ink; }
+
+/* the header pill (the design's app frame) */
+.titan-header {
+  min-height: 60px; padding: 0 7px; border-radius: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.40);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.20),
+                    rgba(255, 255, 255, 0.096) 55%, rgba(20, 26, 40, 0.20));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65), 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+.titan-title { font-size: 21px; font-weight: bold; }
+.titan-subtitle { font-size: 14px; color: @titan_dim; }
+/* a glass bar for other floating groups (the design's bottom segment bar) */
+.titan-bar {
+  padding: 5px; border-radius: 30px; border: 1px solid rgba(255, 255, 255, 0.40);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.20),
+                    rgba(255, 255, 255, 0.096) 55%, rgba(20, 26, 40, 0.20));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65), 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+label.titan-section { font-size: 14px; font-weight: bold; color: @titan_dim; }
+
+/* GTK's own buttons (dialogs, anything not yet a GlassButton): still glass */
+button {
+  min-height: 44px; padding: 0 16px; border-radius: 22px;
+  border: 1px solid @titan_rim; color: @titan_text;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+  background-color: rgba(255, 255, 255, 0.10); background-image: none;
+  box-shadow: inset 0 0 12px rgba(255, 255, 255, 0.26), 0 6px 12px rgba(0, 0, 0, 0.22);
+}
+button:hover { background-color: rgba(255, 255, 255, 0.14); }
+button:active, button:checked { background-color: rgba(255, 255, 255, 0.86); color: @titan_ink; text-shadow: none; }
+button:disabled { color: rgba(255, 255, 255, 0.40); background-color: rgba(255, 255, 255, 0.03); box-shadow: none; }
+button.flat { border-color: transparent; background: none; box-shadow: none; }
+button.suggested-action { color: @titan_ink; text-shadow: none; background-color: rgba(255, 210, 74, 0.92); }
+button.destructive-action { background-color: rgba(255, 90, 110, 0.55); }
+
+/* groups: pools of water */
+list, listview, .view, flowbox, gridview, textview text { background: none; color: @titan_text; }
+list row, listview row {
+  color: @titan_text; background: none; padding: 6px 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+list row:last-child { border-bottom: none; }
+list row:hover { background-color: rgba(255, 255, 255, 0.06); }
+list row:active { background-color: rgba(255, 255, 255, 0.12); }
+list row:selected, flowbox flowboxchild:selected, gridview child:selected {
+  background-color: rgba(255, 255, 255, 0.85); color: @titan_ink;
+}
+list row:selected label { color: @titan_ink; text-shadow: none; }
+flowbox flowboxchild { border-radius: 16px; padding: 0; }
+
+/* fields */
+entry, spinbutton, textview {
+  min-height: 46px; padding: 0 16px; border-radius: 23px;
+  border: 1px solid rgba(255, 255, 255, 0.50); color: @titan_text;
+  caret-color: @titan_accent; background-color: rgba(10, 16, 34, 0.22);
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.25), inset 0 0 12px rgba(255, 255, 255, 0.14);
+}
+entry:focus-within, spinbutton:focus-within {
+  border-color: rgba(255, 255, 255, 0.90);
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.25), inset 0 0 14px rgba(255, 255, 255, 0.26),
+              0 0 0 3px rgba(255, 255, 255, 0.16);
+}
+entry selection { background-color: rgba(255, 255, 255, 0.85); color: @titan_ink; }
+entry image { color: @titan_dim; }
+entry placeholder, entry > text > placeholder { color: rgba(255, 255, 255, 0.55); }
+
+/* bars */
+progressbar trough, levelbar trough {
+  min-height: 10px; border-radius: 9999px; border: 1px solid rgba(255, 255, 255, 0.40);
+  background-color: rgba(10, 16, 34, 0.25); box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.30);
+}
+progressbar progress, levelbar block.filled {
+  min-height: 10px; border-radius: 9999px; border: none;
+  background-image: linear-gradient(180deg, #FFFFFF, #7FD8FF);
+  box-shadow: 0 0 8px rgba(127, 216, 255, 0.5);
+}
+levelbar block.empty { background: none; border: none; }
+
+/* GTK's own switch, check, scale (where an app still uses one) */
+switch {
+  min-width: 64px; min-height: 34px; border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.50); color: transparent;
+  background-color: rgba(10, 16, 34, 0.25);
+}
+switch:checked { background-color: rgba(255, 255, 255, 0.80); }
+switch slider {
+  min-width: 32px; min-height: 32px; border-radius: 9999px; border: 1px solid @titan_rim;
+  background-color: rgba(255, 255, 255, 0.35); box-shadow: 0 4px 8px rgba(0, 0, 0, 0.30);
+}
+check, radio {
+  min-width: 26px; min-height: 26px; border: 1px solid @titan_rim; color: @titan_ink;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+check { border-radius: 9px; }
+radio { border-radius: 9999px; }
+check:checked, radio:checked { background-color: rgba(255, 255, 255, 0.90); }
+scale trough { min-height: 10px; border-radius: 9999px; background-color: rgba(10, 16, 34, 0.25); }
+scale highlight { border-radius: 9999px; background-color: rgba(255, 255, 255, 0.82); }
+scale slider { min-width: 34px; min-height: 34px; margin: -13px; border-radius: 9999px;
+  border: 1px solid @titan_rim; background-color: rgba(255, 255, 255, 0.25); }
+
+/* stacks and scrollers: nothing of their own */
+stack, scrolledwindow, viewport { background: none; }
+scrolledwindow undershoot, scrolledwindow overshoot { background: none; box-shadow: none; }
+scrollbar { background: none; border: none; }
+scrollbar slider { min-width: 8px; min-height: 40px; border-radius: 9999px;
+  background-color: rgba(255, 255, 255, 0.40); }
+
+/* floating: popovers, menus, tooltips, dialogs (dark glass) */
+popover > contents, popover > arrow, tooltip, window.dialog, window.messagedialog,
+.titan-dialog {
+  color: @titan_text; border-radius: 24px; border: 1px solid rgba(255, 255, 255, 0.40);
+  background-color: rgba(18, 24, 48, 0.94);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.0));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 12px 30px rgba(0, 0, 0, 0.45);
+}
+tooltip { border-radius: 14px; }
+.titan-scrim { background-color: rgba(6, 10, 24, 0.55); }
+popover modelbutton { min-height: 44px; padding: 0 16px; border-radius: 14px; }
+popover modelbutton:hover { background-color: rgba(255, 255, 255, 0.85); color: @titan_ink; }
+separator { background-color: rgba(255, 255, 255, 0.18); min-width: 1px; min-height: 1px; }
+.dim-label { color: @titan_dim; }
+spinner { color: @titan_text; }
+
+/* named looks the apps use */
+.titan-accent { color: @titan_accent; }
+.titan-danger, .danger, .error { color: @titan_danger; }
+.titan-ok, .ok { color: @titan_ok; }
+.titan-dim, .hint, .key { color: @titan_dim; }
+.badge {
+  padding: 2px 10px; border-radius: 9px; border: 1px solid rgba(255, 255, 255, 0.45);
+  color: @titan_dim; background-color: rgba(255, 255, 255, 0.06);
+}
+.badge.on { color: @titan_ink; text-shadow: none; background-color: rgba(255, 255, 255, 0.86); }
+
+
+.water-panel { border-radius: 24px; background: rgba(255,255,255,0.12);
+  border: 1px solid rgba(255,255,255,0.34);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.5), 0 10px 24px rgba(0,0,0,0.18); }
+.water-scroll scrollbar { opacity: 0; }

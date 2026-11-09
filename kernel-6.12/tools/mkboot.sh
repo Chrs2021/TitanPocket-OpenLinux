@@ -51,9 +51,17 @@ cd "$OUT/repack"
 #   IGNORE_UNUSED="clk pd regulator"; "" passes none);
 # - ignore_loglevel: everything reaches the console, so pstore keeps it all;
 # - DEBIAN=1 adds titan.root (firstlight-init boots Debian from titanroot)
-#   and mem_sleep_default=s2idle (Debian's power key suspends to "mem";
-#   deep suspend goes through the SPM firmware and needs mt6771_spm.deep=1,
-#   which EXTRA_CMDLINE can add);
+#   and the sleep Debian's power key gets when it writes "mem": deep sleep
+#   through the SPM firmware (mt6771_spm.deep=1 mem_sleep_default=deep),
+#   with the SPM's default wake sources less the SCP's (bit 11,
+#   mt6771_spm.wake_mask=0xe87d5ef: the sensor hub's SCP stays awake and
+#   its request would end every suspend at once; the modem's lines stay),
+#   the SCP's own sleep on (mt6771_scp.sleep=1) and the A73 buck cut in
+#   sleep (mt6771_spm.pcm_flags1=0x300, BIG_BUCK_OFF/ON): together 35 -> 23
+#   mA asleep with the modem stopped (2026-11-05, docs/power.md); any of
+#   them given in EXTRA_CMDLINE wins (e.g. mt6771_scp.sleep=0);
+#   SLEEP=s2idle gives suspend to idle instead (no SPM firmware), as
+#   before 2026-11-05;
 # - EXTRA_CMDLINE is appended as is (bisecting, e.g. initcall_blacklist=).
 # (dt_idle_states.off=1 would start the device tree's idle states disabled,
 # WFI only, for testing new ones from the shell; cpufreq.default_governor=
@@ -61,7 +69,30 @@ cd "$OUT/repack"
 # docs/mainline.md.)
 flags=
 for f in ${IGNORE_UNUSED-clk pd regulator}; do flags="$flags ${f}_ignore_unused"; done
-[ "${DEBIAN:-}" = 1 ] && flags="$flags titan.root mem_sleep_default=s2idle"
+if [ "${DEBIAN:-}" = 1 ]; then
+	flags="$flags titan.root"
+	case "${SLEEP:-deep}" in
+	s2idle) flags="$flags mem_sleep_default=s2idle" ;;
+	deep) flags="$flags mem_sleep_default=deep"
+	      case " ${EXTRA_CMDLINE:-} " in
+	      *" mt6771_spm.deep=1 "*) ;;
+	      *) flags="$flags mt6771_spm.deep=1" ;;
+	      esac
+	      case " ${EXTRA_CMDLINE:-} " in
+	      *" mt6771_spm.wake_mask="*) ;;
+	      *) flags="$flags mt6771_spm.wake_mask=0xe87d5ef" ;;
+	      esac
+	      case " ${EXTRA_CMDLINE:-} " in
+	      *" mt6771_scp.sleep="*) ;;
+	      *) flags="$flags mt6771_scp.sleep=1" ;;
+	      esac
+	      case " ${EXTRA_CMDLINE:-} " in
+	      *" mt6771_spm.pcm_flags1="*) ;;
+	      *) flags="$flags mt6771_spm.pcm_flags1=0x300" ;;
+	      esac ;;
+	*) echo "SLEEP: deep or s2idle" >&2; exit 1 ;;
+	esac
+fi
 sed -i '' "/^cmdline=/s/\$/$flags ignore_loglevel${EXTRA_CMDLINE:+ $EXTRA_CMDLINE}/" header
 grep '^cmdline=' header
 cp "$OUT/Image.gz" kernel

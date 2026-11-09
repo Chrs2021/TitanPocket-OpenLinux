@@ -338,6 +338,19 @@ be separated when the same four satellites fill every batch); the daemon
 now needs five satellites in two batches or more, and `solve_joint_t`
 takes a height prior.
 
+## When it fails (2026-11-04, written and tested offline, not yet on the phone)
+
+Reported in use: the service turning off, "searching" with no satellites, and satellites listed with no fix. From reading the code:
+
+- A Python exception in a session killed the daemon, and during systemd's 10 s restart `is-active` said `activating`, so the switch showed Location off. A session's exception, a bad frame or a failed solve no longer ends the daemon (only the kind of error and the line are logged: a message could hold a position), and `titan-location status` counts `activating` as on. `Requires=` from `titan-gps-driver` and `titan-wmt` can still stop it, which the journal will show.
+- "Searching" was shown whatever the daemon was doing: no position, no orbit data, the probe failing, or the chip silent, which it would have waited for without end. `/run/titan-gnss-open.status` now says which, with no position in it, and titan-location-gui shows it. Nothing from the probe for 90 s ends a session, its stderr is drained, and sessions that hear nothing back off up to 5 minutes (see Hazards).
+- The GSV sentences list every satellite above the horizon, from the orbits, heard or not, so "satellites" could be none received. The app now says used, heard and overhead.
+- The unit did not start gpsd, as titan-gnss's does; it does now.
+
+Not changed, to be measured: each 600 s session restart drops the fix until three batches are in again, and a fix over 200 km from the last position is rejected as an ambiguity with nothing to update that position, so a long trip with the GPS off would never get a fix.
+
+**Orbit data failover.** In order: the first of `BRDC_URLS` that serves a valid file (a login page also answers 200; only BKG's three were seen to serve it, as IGN timed out from here); the file up to 4 h old with the chip's own ephemeris; then the file up to 48 h old, GPS and BeiDou only, only to aim the search, with fixes from what the chip decodes from the sky. That last tier has not been tried on the air. For 3 h after midnight UTC it fetches the previous day's file, as the new one has little in it. With nothing at all the daemon waits and the app says so. Tested with fake probes and the real file: validation, each tier by file age, a corrupt file, a silent chip, garbage frames, 300 kB on stderr, a failed probe.
+
 ## Methods that work
 
 - **Bit flips on chip data** (`TITAN_MNLD_FLIP`, `TITAN_MNLD_FLIP_SATS`):

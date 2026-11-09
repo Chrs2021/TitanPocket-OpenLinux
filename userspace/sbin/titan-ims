@@ -14,11 +14,16 @@ the few headers in SAFE_HEADERS.
 The dialer talks to it on a Unix socket, /run/titan-ims.sock, in JSON lines:
   {"cmd": "dial", "number": ...}, {"cmd": "answer"|"hangup", "id": n}, {"cmd": "dtmf", "digit": ...},
   {"cmd": "mute", "on": bool}, {"cmd": "route", "device": "earpiece"|"speaker"|"headphones"},
-  {"cmd": "status"}; it sends {"ev": "registered"|"call"|"status"|"error", ...}.
+  {"cmd": "volume", "up": bool} (the earpiece's level, kept; answered {"ev": "volume", "handled": ...}),
+  {"cmd": "sms", "to": ..., "text": ...}, {"cmd": "status"}; it sends
+  {"ev": "registered"|"call"|"sms"|"sms-state"|"status"|"error", ...}.
 """
+import array
 import audioop
 import base64
+import collections
 import ctypes
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -29,9 +34,11 @@ import secrets
 import select
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 
@@ -42,11 +49,28 @@ ISIM_AID = "A0000000871004"
 ICSI_MMTEL = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
 USER_AGENT = "Titan-Pocket-Linux/1.0"
 CTL = "/run/titan-ims.sock"
+WAKE_AT = "/run/titan-wake-at"      # when titan-powerkey must wake the phone for us
+WAKE_LOCK = "titan-ims"
+SMS_DB = "/var/lib/titan-ims/messages.sqlite3"
 CARD = "titanpocket"
 UCM = "/usr/share/alsa/ucm2/Unihertz/titan-pocket/HiFi.conf"
-PLAY_PCM = "plughw:CARD=titanpocket,DEV=0"
+# the call's sound goes into PipeWire as a phone stream (pw-cat, raw on stdin), so it
+# shares the output with the ringtone and the UI sounds instead of fighting them for
+# the device: no suspended sinks, no player locked out (2026-11-06)
+# The jitter buffer: received frames wait in a queue (at most JB_MAX, 200 ms; older ones go
+# when a burst overfills it) and play out once JB_START have come; the playout keeps
+# JB_PIPE_MS of sound in the player's pipe, paced by the speaker as it drains it
+JB_START = 3
+JB_MAX = 10
+JB_PIPE_MS = 60
+PLAY_CMD = ["pw-cat", "-p", "--channels", "1", "--format", "s16", "--latency", "40ms",
+            "--media-role", "Phone", "-P", "{ media.name = \"Phone call\" }"]
 REC_PCM = "plughw:CARD=titanpocket,DEV=2"
-SPEAKER_GAIN = 0.5  # 6 dB of margin: this bypasses PipeWire's limiter for the loudspeaker
+EARPIECE_DB = -6        # dB: docs/audio.md's measured level, until the volume keys set one
+EARPIECE_RANGE = (-10, 8)   # the codec's handset gain, 1 dB steps
+EARPIECE_STEP = 2
+EARPIECE_STATE = "/var/lib/titan-ims/earpiece-db"
+SPEAKER_GAIN = 0.5  # 6 dB of margin on the loudspeaker (now behind PipeWire's limiter as well)
 ALLOW = "INVITE,ACK,OPTIONS,CANCEL,BYE,UPDATE,INFO,REFER,NOTIFY,MESSAGE,PRACK"
 MAX_REGISTER_TRIES = 3      # a carrier remembers failed attempts: stop early
 SAFE_HEADERS = ("warning", "retry-after", "min-expires", "server", "reason", "expires")
@@ -58,12 +82,29 @@ def log(s):
     print(s, flush=True)
 
 
+def stay_awake(seconds):
+    """a wake lock that lapses, so a daemon that dies doesn't keep the phone awake"""
+    try:
+        with open("/sys/power/wake_lock", "w") as f:
+            f.write("%s %d" % (WAKE_LOCK, seconds * 10 ** 9))
+    except OSError:
+        pass
+
+
 def run(*c, timeout=15):
     try:
-        p = subprocess.run(c, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout
+        p = subprocess.run(c, capture_output=True, timeout=timeout)
+        return p.returncode, p.stdout.decode(errors="replace")     # a tool's output may not be UTF-8
     except (OSError, subprocess.TimeoutExpired):
         return 1, ""
+
+
+def shape(uri):
+    """What kind of identity a URI is, with nothing of it: for logs"""
+    m = re.match(r"(sips?|tel):\+?(\d*)", uri or "")
+    if not m:
+        return "other"
+    return "%s:%s%d digits%s" % (m.group(1), "+" if "+" in uri[:6] else "", len(m.group(2)), "@domain" if "@" in uri else "")
 
 
 class At:
@@ -519,10 +560,32 @@ def csets(device, enable=True):
         run("amixer", "-q", "-c", CARD, "cset", "name=%s" % name, val)
 
 
-def pipewire_output(suspend):
-    """Every sink: the default one is a filter, and another below it holds the device"""
-    for line in run("pactl", "list", "short", "sinks", timeout=3)[1].splitlines():
-        run("pactl", "suspend-sink", line.split()[0], "1" if suspend else "0", timeout=3)
+def reopen_output():
+    """PipeWire opens the speaker PCM (DL1) again, so the route switched by csets takes:
+    the AFE's dynamic routing connects DL1 to the earpiece or the loudspeaker when the PCM
+    opens, and a ringtone still playing when the call starts has it open on the
+    loudspeaker. A brief suspend of the sink closes it; nothing is locked out."""
+    run("pactl", "suspend-sink", "titan-speaker", "1", timeout=3)
+    time.sleep(0.05)
+    run("pactl", "suspend-sink", "titan-speaker", "0", timeout=3)
+
+
+def earpiece_db():
+    try:
+        with open(EARPIECE_STATE) as f:
+            return max(EARPIECE_RANGE[0], min(EARPIECE_RANGE[1], int(f.read().strip())))
+    except (OSError, ValueError):
+        return EARPIECE_DB
+
+
+def set_earpiece_db(db):
+    try:
+        os.makedirs(os.path.dirname(EARPIECE_STATE), exist_ok=True)
+        with open(EARPIECE_STATE + ".new", "w") as f:
+            f.write("%d\n" % db)
+        os.replace(EARPIECE_STATE + ".new", EARPIECE_STATE)
+    except OSError as e:
+        log("earpiece level: %s" % e)
 
 
 class Media:
@@ -552,6 +615,8 @@ class Media:
         self.running = False
         self.threads = []
         self.play = self.rec = None
+        self.jb = collections.deque()       # received (FT, speech) frames, for play_loop
+        self.jb_lock = threading.Lock()
         self.seq = secrets.randbelow(65536)
         self.ts = secrets.randbelow(1 << 31)
         self.ssrc = secrets.randbits(32)
@@ -571,6 +636,10 @@ class Media:
         if self.running:
             csets(self.DEVICES[self.device], False)
             csets(name)
+            reopen_output()
+            self.earpiece_gain(device)
+        if device != self.device:
+            log("sound to the %s" % device)
         self.device = device
         self.gain = SPEAKER_GAIN if device == "speaker" else 1.0
 
@@ -583,27 +652,46 @@ class Media:
         csets(self.DEVICES[self.device])
         csets("Mic")
         run("amixer", "-q", "-c", CARD, "cset", "name=PGA Volume", "4,4")   # 24 dB, the preamplifier's top
+        reopen_output()
+        self.earpiece_gain(self.device)
         fmt = ["-q", "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", str(self.codec.rate)]
         self.fmt = fmt
-        # PipeWire holds the output for seconds after a sound, such as the ringtone, ends
-        pipewire_output(True)
         self.open_play()
         self.rec = subprocess.Popen(["arecord", "-D", REC_PCM, "--buffer-time=120000"] + fmt,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        for f in (self.rx_loop, self.tx_loop):
+        self.jb.clear()
+        for f in (self.rx_loop, self.tx_loop, self.play_loop):
             t = threading.Thread(target=f, daemon=True)
             t.start()
             self.threads.append(t)
-        log("audio started: %s, %s" % (self.codec.rate, "octet-aligned" if self.octet else "bandwidth-efficient"))
+        log("audio started: %s, %s, %s" % (self.codec.rate, "octet-aligned" if self.octet else "bandwidth-efficient", self.device))
+
+    def earpiece_gain(self, device):
+        """The handset gain, set after the earpiece has powered up: until kernel #111 the
+        codec driver left it at -40 dB, its power-down level, whatever was set before"""
+        if device == "earpiece":
+            # the raw value, 0..18 for -10..+8 dB ("sset Handset -6dB" reads as an option)
+            run("amixer", "-q", "-c", CARD, "cset", "name=Handset Volume", str(earpiece_db() - EARPIECE_RANGE[0]))
+
+    def volume(self, up):
+        """A volume key in a call: the earpiece's level, kept for later calls. False when
+        the sound is elsewhere (the loudspeaker and headphones follow PipeWire's volume)."""
+        if not self.running or self.device != "earpiece":
+            return False
+        db = earpiece_db() + (EARPIECE_STEP if up else -EARPIECE_STEP)
+        db = max(EARPIECE_RANGE[0], min(EARPIECE_RANGE[1], db))
+        set_earpiece_db(db)
+        self.earpiece_gain("earpiece")
+        return db
 
     def open_play(self):
         self.play_retry = time.time() + 0.25
-        self.play = subprocess.Popen(["aplay", "-D", PLAY_PCM, "--buffer-time=120000"] + self.fmt,
+        self.play = subprocess.Popen(PLAY_CMD + ["--rate", str(self.codec.rate), "-"],
                                      stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def write_play(self, pcm):
-        """To the earpiece. The player can fail while another program has the device: it
-        gets tried again, and the sound meanwhile is lost rather than the call's."""
+        """To the earpiece, through PipeWire. A player that stops (PipeWire restarting) is
+        started again, and the sound meanwhile is lost rather than the call."""
         p = self.play
         if p is None or p.poll() is not None:
             if p is not None:
@@ -634,14 +722,32 @@ class Media:
         for t in self.threads:
             t.join(2)
         self.threads = []
+        # pw-cat outlives SIGTERM while its input is open: close that, then make sure
+        for p in (self.rec, self.play):
+            if not p:
+                continue
+            for f in (p.stdin, p.stdout, p.stderr):
+                if f:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+            try:
+                p.wait(1)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
         self.rtp.close()
         if was:
             csets(self.DEVICES[self.device], False)
             csets("Mic", False)
             csets("Speaker")        # back to how normal sound expects it
-            pipewire_output(False)
-            log("audio stopped: %d sent, %d received, %d played, %d bad, %d player restarts" % (
-                self.stats["tx"], self.stats["rx"], self.stats.get("played", 0), self.stats["bad"], self.stats.get("replay", 0)))
+            reopen_output()
+            log("audio stopped: %d sent, %d received, %d played, %d bad, %d player restarts, peak %d, %d empty frames, "
+                "%d filled, %d dropped" % (
+                    self.stats["tx"], self.stats["rx"], self.stats.get("played", 0), self.stats["bad"],
+                    self.stats.get("replay", 0), self.stats.get("peak", 0), self.stats.get("no_data", 0),
+                    self.stats.get("fill", 0), self.stats.get("dropped", 0)))
 
     def send_rtp(self, pt, marker, ts, payload):
         with self.tx_lock:
@@ -687,8 +793,54 @@ class Media:
                 self.stats["other_pt"] = self.stats.get("other_pt", 0) + 1
                 continue
             self.stats["rx"] += 1
-            for ft, speech in self.codec.unpack(d[off:], self.octet):
-                self.write_play(self.codec.decode(ft, speech))
+            with self.jb_lock:
+                for frame in self.codec.unpack(d[off:], self.octet):
+                    self.jb.append(frame)
+                    self.stats["no_data"] = self.stats.get("no_data", 0) + (frame[0] > 9)
+                while len(self.jb) > JB_MAX:
+                    self.jb.popleft()
+                    self.stats["dropped"] = self.stats.get("dropped", 0) + 1
+
+    def backlog(self):
+        """Bytes waiting in the player's pipe, or None without a player"""
+        p = self.play
+        if p is None or p.poll() is not None:
+            return None
+        a = array.array("i", [0])
+        try:
+            fcntl.ioctl(p.stdin.fileno(), termios.FIONREAD, a, True)
+        except (OSError, ValueError):
+            return None
+        return a[0]
+
+    def play_loop(self):
+        """The jitter buffer's playout. Frames go into the player's pipe while it holds less
+        than JB_PIPE_MS of sound: the next received one, or when none is there (late, lost, or
+        the other side silent: with DTX it sends one comfort-noise frame in 160 ms) the
+        decoder's own fill for the slot, concealment or comfort noise. The speaker paces it,
+        so no clock drifts against another, and the player never runs short (a gap there is a
+        click). The decoder runs only here."""
+        while self.running:                 # until the first frames are in
+            with self.jb_lock:
+                if len(self.jb) >= JB_START:
+                    break
+            time.sleep(0.005)
+        target = self.codec.rate * 2 * JB_PIPE_MS // 1000
+        while self.running:
+            b = self.backlog()
+            if b is not None and b >= target:
+                time.sleep(0.005)
+                continue
+            with self.jb_lock:
+                frame = self.jb.popleft() if self.jb else None
+            if frame is None:
+                frame = (Codec.NO_DATA, b"")
+                self.stats["fill"] = self.stats.get("fill", 0) + 1
+            pcm = self.codec.decode(*frame)
+            self.stats["peak"] = max(self.stats.get("peak", 0), abs(min(struct.unpack("<%dh" % (len(pcm) // 2), pcm))))
+            self.write_play(pcm)
+            if b is None:
+                time.sleep(0.02)            # no player (starting again): a frame's time each
 
     def dtmf(self, digit):
         """RFC 4733, in a thread: three of each packet's end, for loss"""
@@ -746,6 +898,223 @@ def pick_codec(sdp):
             if name.upper() == want:
                 return pt, want, rate, fmtp
     return None
+
+
+# ---- SMS: TS 23.040's TPDUs in TS 24.011's RP messages, in SIP MESSAGE (TS 24.341) ----
+
+GSM7 = ("@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\x1bÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
+        "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà")
+GSM7_EXT = {0x0A: "\f", 0x14: "^", 0x28: "{", 0x29: "}", 0x2F: "\\", 0x3C: "[", 0x3D: "~", 0x3E: "]", 0x40: "|", 0x65: "€"}
+GSM7_EXT_REV = {v: k for k, v in GSM7_EXT.items()}
+RP_DATA_UP, RP_DATA_DOWN, RP_ACK_UP, RP_ACK_DOWN, RP_ERROR_UP, RP_ERROR_DOWN = 0, 1, 2, 3, 4, 5
+
+
+def gsm7_septets(text):
+    """text as GSM 7-bit septets, or None if a character is not in the alphabet"""
+    out = []
+    for ch in text:
+        i = GSM7.find(ch)
+        if i >= 0 and ch != "\x1b":
+            out.append(i)
+        elif ch in GSM7_EXT_REV:
+            out += [0x1B, GSM7_EXT_REV[ch]]
+        else:
+            return None
+    return out
+
+
+def gsm7_pack(septets, fill=0):
+    """Packed, after `fill` padding bits (they align the text after a user data header)"""
+    v, bits, out = 0, fill, bytearray()
+    for s in septets:
+        v |= s << bits
+        bits += 7
+        while bits >= 8:
+            out.append(v & 0xff)
+            v >>= 8
+            bits -= 8
+    if bits:
+        out.append(v & 0xff)
+    return bytes(out)
+
+
+def gsm7_unpack(data, count, fill=0):
+    v, bits, pos, out = 0, 0, 0, []
+    for b in data:
+        v |= b << bits
+        bits += 8
+    pos = fill
+    for _ in range(count):
+        out.append((v >> pos) & 0x7f)
+        pos += 7
+    text, esc = [], False
+    for s in out:
+        if esc:
+            text.append(GSM7_EXT.get(s, " "))
+            esc = False
+        elif s == 0x1B:
+            esc = True
+        else:
+            text.append(GSM7[s] if s < len(GSM7) else " ")
+    return "".join(text)
+
+
+def bcd(number):
+    """(type of number, semi-octets) of a phone number"""
+    ton = 0x91 if number.startswith("+") else 0x81
+    d = re.sub(r"\D", "", number)
+    if len(d) % 2:
+        d += "F"
+    return ton, bytes(int(d[i + 1] + d[i], 16) for i in range(0, len(d), 2))
+
+
+def unbcd(data):
+    return "".join("%X%X" % (b & 15, b >> 4) for b in data).rstrip("F")
+
+
+def sms_parts(text):
+    """(dcs, [(user data with header, user data length)]) of a message, in as many parts as it takes"""
+    sept = gsm7_septets(text)
+    ref = secrets.randbelow(256)
+    if sept is not None:
+        if len(sept) <= 160:
+            return 0x00, [(gsm7_pack(sept), len(sept))]
+        chunks, cur = [], []
+        i = 0
+        while i < len(sept):
+            n = 2 if sept[i] == 0x1B else 1     # an escape stays with its character
+            if len(cur) + n > 153:
+                chunks.append(cur)
+                cur = []
+            cur += sept[i:i + n]
+            i += n
+        chunks.append(cur)
+        return 0x00, [(bytes((5, 0, 3, ref, len(chunks), k + 1)) + gsm7_pack(c, 1), 7 + len(c))
+                      for k, c in enumerate(chunks)]
+    u = text.encode("utf-16-be")
+    if len(u) <= 140:
+        return 0x08, [(u, len(u))]
+    chunks, i = [], 0
+    while i < len(u):
+        end = min(i + 134, len(u))
+        if end < len(u) and 0xD8 <= u[end - 2] <= 0xDB:     # not between a surrogate pair
+            end -= 2
+        chunks.append(u[i:end])
+        i = end
+    return 0x08, [(bytes((5, 0, 3, ref, len(chunks), k + 1)) + c, 6 + len(c)) for k, c in enumerate(chunks)]
+
+
+def sms_submit(to, mr, dcs, ud, udl, header):
+    """An SMS-SUBMIT TPDU: relative validity of 4 days; header: ud starts with a user data header"""
+    first = 0x01 | 0x10 | (0x40 if header else 0)
+    ton, num = bcd(to)
+    return bytes((first, mr, len(re.sub(r"\D", "", to)), ton)) + num + bytes((0, dcs, 0xAA, udl)) + ud
+
+
+def rp_data_up(mr, smsc, tpdu):
+    ton, num = bcd(smsc)
+    return bytes((RP_DATA_UP, mr, 0, len(num) + 1, ton)) + num + bytes((len(tpdu),)) + tpdu
+
+
+def rp_ack_up(mr):
+    """RP-ACK with an empty SMS-DELIVER-REPORT"""
+    return bytes((RP_ACK_UP, mr, 0x41, 2, 0, 0))
+
+
+def parse_rp(body):
+    """(type, reference, TPDU or None, cause or None)"""
+    if len(body) < 2:
+        return None, None, None, None
+    t, mr = body[0], body[1]
+    if t == RP_DATA_DOWN:
+        i = 2
+        i += 1 + body[i]        # the service centre
+        i += 1 + body[i]        # the empty destination
+        n = body[i]
+        return t, mr, body[i + 1:i + 1 + n], None
+    if t in (RP_ERROR_DOWN, RP_ERROR_UP):
+        return t, mr, None, body[3] & 0x7f if len(body) > 3 and body[2] else None
+    return t, mr, None, None
+
+
+def parse_deliver(tp):
+    """An SMS-DELIVER: {sender, text, when, part: (ref, total, seq) or None}; None if it is not one"""
+    first = tp[0]
+    if first & 3 != 0:
+        return None
+    n = tp[1]
+    ton = tp[2]
+    oct_len = (n + 1) // 2
+    addr = tp[3:3 + oct_len]
+    if ton & 0x70 == 0x50:      # alphanumeric: packed GSM
+        sender = gsm7_unpack(addr, n * 4 // 7)
+    else:
+        sender = ("+" if ton & 0x70 == 0x10 else "") + unbcd(addr)
+    i = 3 + oct_len
+    dcs = tp[i + 1]
+    scts = tp[i + 2:i + 9]
+    udl = tp[i + 9]
+    ud = tp[i + 10:]
+    part, hdr = None, 0
+    if first & 0x40 and ud:
+        hdr = ud[0] + 1
+        j = 1
+        while j < hdr - 1:
+            iei, ln = ud[j], ud[j + 1]
+            v = ud[j + 2:j + 2 + ln]
+            if iei == 0 and ln == 3:
+                part = (v[0], v[1], v[2])
+            elif iei == 8 and ln == 4:
+                part = ((v[0] << 8) | v[1], v[2], v[3])
+            j += 2 + ln
+    alphabet = (dcs >> 2) & 1 if dcs & 0xF0 == 0xF0 else (dcs >> 2) & 3     # 0 GSM, 1 8-bit, 2 UCS2
+    if alphabet == 0:
+        fill = (7 - (hdr * 8) % 7) % 7
+        text = gsm7_unpack(ud[hdr:], udl - (hdr * 8 + 6) // 7, fill)
+    elif alphabet == 2:
+        text = ud[hdr:].decode("utf-16-be", "replace")
+    else:
+        text = ud[hdr:].decode("latin-1")
+    return {"sender": sender, "text": text, "scts": scts.hex(), "part": part}
+
+
+class Inbox:
+    """Messages on the phone, root's only: never in a log"""
+
+    def __init__(self, path=SMS_DB):
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        self.db = sqlite3.connect(path, timeout=5)
+        os.chmod(path, 0o600)
+        self.db.execute("PRAGMA journal_mode=WAL")      # the messaging app reads while this writes
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, at INTEGER, peer TEXT, dir TEXT, body TEXT, state TEXT);
+            CREATE TABLE IF NOT EXISTS parts (peer TEXT, ref INTEGER, total INTEGER, seq INTEGER, body TEXT, at INTEGER,
+                                              PRIMARY KEY (peer, ref, total, seq));
+        """)
+        self.db.commit()
+
+    def add(self, peer, direction, body, state):
+        c = self.db.execute("INSERT INTO messages (at, peer, dir, body, state) VALUES (?,?,?,?,?)",
+                            (int(time.time()), peer, direction, body, state))
+        self.db.commit()
+        return c.lastrowid
+
+    def set_state(self, mid, state):
+        self.db.execute("UPDATE messages SET state=? WHERE id=?", (state, mid))
+        self.db.commit()
+
+    def add_part(self, peer, part, text):
+        """The whole message once its last part is in, else None"""
+        ref, total, seq = part
+        self.db.execute("INSERT OR REPLACE INTO parts VALUES (?,?,?,?,?,?)", (peer, ref, total, seq, text, int(time.time())))
+        self.db.execute("DELETE FROM parts WHERE at < ?", (int(time.time()) - 7 * 86400,))
+        rows = self.db.execute("SELECT body FROM parts WHERE peer=? AND ref=? AND total=? ORDER BY seq", (peer, ref, total)).fetchall()
+        whole = None
+        if len(rows) == total:
+            whole = "".join(r[0] for r in rows)
+            self.db.execute("DELETE FROM parts WHERE peer=? AND ref=? AND total=?", (peer, ref, total))
+        self.db.commit()
+        return whole
 
 
 class Call:
@@ -818,6 +1187,11 @@ class Ua:
         self.sub_cseq = 0
         self.next_subscribe = 0
         self.next_ping = 0
+        self.notified = False
+        self.inbox = Inbox()
+        self.sms_mr = secrets.randbelow(256)
+        self.sms_out = {}         # RP reference -> [message id, parts still unconfirmed]
+        self.sms_calls = {}       # Call-ID of our MESSAGE -> RP reference
 
     # ---- transport ----
 
@@ -885,9 +1259,9 @@ class Ua:
         return ", ".join("ipsec-3gpp;prot=esp;mod=trans;spi-c=%d;spi-s=%d;port-c=%d;port-s=%d;alg=%s;ealg=%s" % (
             self.spi_c, self.spi_s, self.port_c, self.port_s, a, e) for a, e in OFFER)
 
-    def contact(self, port=None):
-        return '<sip:%s@[%s]:%d>;+sip.instance="<%s>";+g.3gpp.icsi-ref="%s";audio' % (
-            self.id.user, self.addr, port or self.port_s, self.id.instance, ICSI_MMTEL)
+    def contact(self, port=None, sms=False):
+        return '<sip:%s@[%s]:%d>;+sip.instance="<%s>";+g.3gpp.icsi-ref="%s";audio%s' % (
+            self.id.user, self.addr, port or self.port_s, self.id.instance, ICSI_MMTEL, ";+g.3gpp.smsip" if sms else "")
 
     def pani(self):
         p = self.id.cell_info(self.at)
@@ -904,7 +1278,7 @@ class Ua:
              "To: <%s>" % self.id.impu,
              "Call-ID: %s" % self.call_id,
              "CSeq: %d REGISTER" % self.cseq,
-             "Contact: %s" % self.contact(port),
+             "Contact: %s" % self.contact(port, sms=True),
              "Expires: %d" % expires,
              "Allow: %s" % ALLOW,
              "Supported: path,gruu,sec-agree",
@@ -1043,7 +1417,9 @@ class Ua:
                     self.sip = self.sip or u
         self.next_refresh = time.time() + max(60, self.expires * 0.6)
         self.registered = True
-        log("REGISTERED: %d s, tel %s, service routes %d" % (self.expires, "yes" if self.tel else "no", len(self.routes)))
+        log("REGISTERED: %d s, service routes %d; SIM identity %s; associated %s" % (
+            self.expires, len(self.routes), shape(self.id.impu),
+            ", ".join(shape(u) for a in m.all("p-associated-uri") for u in re.findall(r"<([^>]+)>", a)) or "none"))
         self.emit({"ev": "registered", "on": True})
 
     def my_uri(self):
@@ -1104,9 +1480,11 @@ class Ua:
                       "a=rtpmap:101 telephone-event/8000", "a=fmtp:101 0-15"]
         lines += ["a=ptime:20", "a=maxptime:40"]
         if call.qos_required or not body_for:
+            # in our offer, only our own side can be mandatory: 580 from the network otherwise
             lines += ["a=curr:qos local %s" % ("sendrecv" if call.qos_local else "none"),
                       "a=curr:qos remote %s" % ("sendrecv" if call.state == "qos-remote" else "none"),
-                      "a=des:qos mandatory local sendrecv", "a=des:qos mandatory remote sendrecv"]
+                      "a=des:qos mandatory local sendrecv",
+                      "a=des:qos %s remote sendrecv" % ("mandatory" if body_for else "optional")]
             if body_for and not call.qos_local:
                 lines.append("a=conf:qos remote sendrecv")
         lines.append("a=sendrecv")
@@ -1153,8 +1531,9 @@ class Ua:
             "P-Preferred-Identity: <%s>" % self.my_uri(),
             "P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel",
             'Accept-Contact: *;+g.3gpp.icsi-ref="%s"' % ICSI_MMTEL,
-            "Supported: 100rel,precondition,replaces", "Allow: %s" % ALLOW,
-            "Accept: application/sdp"))
+            "Supported: 100rel,precondition,replaces,timer", "Allow: %s" % ALLOW,
+            "Accept: application/sdp,application/3gpp-ims+xml",
+            "P-Early-Media: supported", "Session-Expires: 1800", "Min-SE: 90", "Privacy: none"))
         log("call %d: INVITE sent" % call.id)
 
     def set_state(self, call, state, reason=None):
@@ -1224,6 +1603,95 @@ class Ua:
         self.response(call.invite, code, reason, call, conn=call.conn)
         call.final_invite = True
 
+    # ---- SMS ----
+
+    def smsc(self):
+        for line in self.at.cmd("AT+CSCA?", 3):
+            m = re.match(r'\+CSCA: *"([^"]+)"', line)
+            if m:
+                v = m.group(1)
+                if re.fullmatch(r"(00[0-9A-F]{2})+", v):     # the modem's UCS2 form
+                    v = bytes.fromhex(v).decode("utf-16-be")
+                return v
+        return None
+
+    def sms_message(self, uri, body, extra=()):
+        """A MESSAGE to the service centre; (Call-ID)"""
+        cid = secrets.token_hex(12)
+        h = ["MESSAGE %s SIP/2.0" % uri, self.via(), "Max-Forwards: 70",
+             "Route: %s" % ", ".join(self.first_route() + self.routes),
+             "From: <%s>;tag=%s" % (self.my_uri(), secrets.token_hex(5)), "To: <%s>" % uri,
+             "Call-ID: %s" % cid, "CSeq: 1 MESSAGE", "P-Preferred-Identity: <%s>" % self.my_uri(),
+             'Accept-Contact: *;+g.3gpp.smsip', "Request-Disposition: no-fork", "Allow: %s" % ALLOW,
+             "Security-Verify: %s" % self.server, "Require: sec-agree", "Proxy-Require: sec-agree",
+             "User-Agent: %s" % USER_AGENT] + list(extra) + self.pani() + [
+             "Content-Type: application/vnd.3gpp.sms", "Content-Length: %d" % len(body)]
+        self.send(("\r\n".join(h) + "\r\n\r\n").encode() + body)
+        return cid
+
+    def sms_send(self, to, text):
+        if not self.registered or not text:
+            self.emit({"ev": "error", "text": "not registered" if not self.registered else "empty message"})
+            return
+        smsc = self.smsc()
+        if not smsc:
+            self.emit({"ev": "error", "text": "no service centre on the SIM"})
+            return
+        n = re.sub(r"[^\d+]", "", to)
+        if re.fullmatch(r"\d{10}", n):
+            n = "+1" + n
+        elif re.fullmatch(r"1\d{10}", n):
+            n = "+" + n
+        mid = self.inbox.add(n, "out", text, "sending")
+        dcs, parts = sms_parts(text)
+        uri = "tel:%s" % smsc if smsc.startswith("+") else "tel:+%s" % smsc
+        for ud, udl in parts:
+            self.sms_mr = (self.sms_mr + 1) & 0xff
+            mr = self.sms_mr
+            self.sms_out[mr] = mid
+            self.sms_calls[self.sms_message(uri, rp_data_up(mr, smsc, sms_submit(n, mr, dcs, ud, udl, len(parts) > 1)))] = mr
+        log("SMS: sending, %d part%s" % (len(parts), "" if len(parts) == 1 else "s"))
+        self.emit({"ev": "sms-state", "id": mid, "state": "sending"})
+
+    def sms_finish(self, mr, ok, why=""):
+        mid = self.sms_out.pop(mr, None)
+        if mid is None:
+            return
+        state = "sent" if ok else "failed"
+        self.inbox.set_state(mid, state)
+        log("SMS: %s%s" % (state, " (%s)" % why if why else ""))
+        self.emit({"ev": "sms-state", "id": mid, "state": state})
+
+    def on_message(self, m, conn):
+        """From the network: an SMS for us, or the outcome of one of ours. It is stored before it is acknowledged."""
+        if "vnd.3gpp.sms" not in (m.get("content-type") or ""):
+            self.response(m, 415, "Unsupported Media Type", conn=conn)
+            return
+        t, mr, tp, cause = parse_rp(m.body)
+        self.response(m, 200, "OK", conn=conn)
+        if t == RP_ACK_DOWN:
+            self.sms_finish(mr, True)
+        elif t == RP_ERROR_DOWN:
+            self.sms_finish(mr, False, "cause %s" % cause)
+        elif t == RP_DATA_DOWN:
+            d = None
+            try:
+                d = parse_deliver(tp)
+            except (IndexError, ValueError):
+                log("SMS: could not read one")
+            if d is not None:
+                text = self.inbox.add_part(d["sender"], d["part"], d["text"]) if d["part"] else d["text"]
+                if text is not None:
+                    mid = self.inbox.add(d["sender"], "in", text, "new")
+                    log("SMS: received")
+                    self.emit({"ev": "sms", "id": mid})
+            elif tp and tp[0] & 3 == 2:
+                log("SMS: a status report")
+            # the outcome goes to where it came from, in a MESSAGE of its own
+            u = re.search(r"<([^>]+)>", m.get("from") or "")
+            if u:
+                self.sms_message(u.group(1), rp_ack_up(mr), extra=("In-Reply-To: %s" % m.get("call-id"),))
+
     # ---- responses and requests from the network ----
 
     def response(self, req, code, reason, call=None, body=None, extra=(), conn=None):
@@ -1258,6 +1726,16 @@ class Ua:
         if method == "SUBSCRIBE":
             log("SUBSCRIBE: %d" % m.status)
             return
+        if method == "MESSAGE":
+            mr = self.sms_calls.pop(m.get("call-id"), None)
+            if m.status < 200:
+                if mr is not None:
+                    self.sms_calls[m.get("call-id")] = mr
+                return
+            log("SMS: %s" % m.describe())
+            if m.status >= 300 and mr is not None:
+                self.sms_finish(mr, False, "%d" % m.status)
+            return
         call = self.by_call_id.get(m.get("call-id"))
         if not call:
             return
@@ -1279,7 +1757,7 @@ class Ua:
         self.request(call, "UPDATE", self.sdp(call, True))
 
     def on_invite_status(self, call, m, n):
-        log("call %d: %d %s" % (call.id, m.status, (m.reason or "")[:40]))
+        log("call %d: %s" % (call.id, m.describe()))
         to = params(m.get("to") or "")
         if to.get("tag"):
             call.remote_tag = to["tag"]
@@ -1301,9 +1779,12 @@ class Ua:
         if m.status == 100:
             return
         if m.status < 300:
+            log("call %d: answered, headers: %s" % (call.id, ",".join(sorted(set(k for k, _ in m.h)))[:230]))
             self.dialog_from(call, m)
             if m.body:
-                self.use_answer(call, parse_sdp(m.body))
+                sdp = parse_sdp(m.body)
+                log("call %d: answer offers %s, preconditions %s" % (call.id, ",".join(c[1] for c in sdp["codecs"])[:40], sdp["qos"]))
+                self.use_answer(call, sdp)
             self.ack(call, n)
             call.final_invite = True
             self.session_timer(call, m)
@@ -1381,6 +1862,16 @@ class Ua:
                 self.end(call, "missed")
         elif method == "NOTIFY":
             self.response(m, 200, "OK", conn=conn)
+            uris = [u.decode(errors="replace") for t in re.findall(rb"<uri>([^<]+)</uri>|aor=\"([^\"]+)\"", m.body) for u in t if u]
+            if uris and not self.notified:
+                self.notified = True
+                log("reg event: %s" % ", ".join(sorted(set(shape(u) for u in uris))))
+                # a public identity with a number, if registration gave only the IMSI's
+                for u in uris:
+                    if not self.tel and u.startswith("tel:+"):
+                        self.tel = u
+                    elif u.startswith("sip:+"):     # E.164: what a call should present
+                        self.sip = u
             # the registration's own state: a contact's can be an old one of ours
             if re.search(rb'<registration\b[^>]*\bstate="terminated"', m.body):
                 log("the network ended the registration")
@@ -1388,7 +1879,7 @@ class Ua:
         elif method == "OPTIONS":
             self.response(m, 200, "OK", conn=conn, extra=("Allow: %s" % ALLOW,))
         elif method == "MESSAGE":
-            self.response(m, 488, "Not Acceptable Here", conn=conn)     # SMS over IMS: not yet
+            self.on_message(m, conn)
         else:
             self.response(m, 405 if not call else 200, "Method Not Allowed" if not call else "OK", conn=conn)
 
@@ -1475,6 +1966,8 @@ class Ua:
             self.answer(d.get("id"))
         elif cmd == "hangup":
             self.hangup(d.get("id"))
+        elif cmd == "sms":
+            self.sms_send(str(d.get("to", "")), str(d.get("text", "")))
         elif cmd in ("dtmf", "mute", "route"):
             call = next((x for x in self.calls.values() if x.state != "ended"), None)
             if call and call.media:
@@ -1484,6 +1977,16 @@ class Ua:
                     call.media.muted = bool(d.get("on"))
                 else:
                     call.media.route(str(d.get("device", "")))
+        elif cmd == "volume":
+            call = next((x for x in self.calls.values() if x.state != "ended"), None)
+            db = call.media.volume(bool(d.get("up"))) if call and call.media else False
+            reply = {"ev": "volume", "handled": db is not False}
+            if db is not False:
+                reply.update(device="earpiece", db=db)
+            try:
+                c.send((json.dumps(reply) + "\n").encode())
+            except OSError:
+                self.ctl_close(c)
         elif cmd == "status":
             calls = [{"id": x.id, "state": x.state, "dir": "in" if x.incoming else "out", "number": x.number}
                      for x in self.calls.values() if x.state != "ended"]
@@ -1501,7 +2004,17 @@ class Ua:
                 return
             self.dispatch(Msg(raw), c)
 
+    def wake_at(self):
+        """titan-powerkey's alarm: asleep, nothing else would renew the registration"""
+        try:
+            with open(WAKE_AT + ".new", "w") as f:
+                f.write("%d\n" % min(self.next_refresh, self.next_subscribe))
+            os.replace(WAKE_AT + ".new", WAKE_AT)
+        except OSError:
+            pass
+
     def dispatch(self, m, conn):
+        stay_awake(10)      # whatever it is needs an answer before the phone sleeps again
         if m.status is not None:
             self.on_status(m)
         else:
@@ -1511,13 +2024,21 @@ class Ua:
         self.ctl_open()
         self.subscribe()
         self.next_ping = time.time() + 30
+        woke_for = None
         while True:
             now = time.time()
             if now >= self.next_refresh:
+                stay_awake(20)
                 self.send(self.register_msg(True))
                 self.next_refresh = now + 120     # until the answer sets it
             if now >= self.next_subscribe:
+                stay_awake(20)
                 self.subscribe()
+            if (self.next_refresh, self.next_subscribe) != woke_for:
+                woke_for = (self.next_refresh, self.next_subscribe)
+                self.wake_at()
+            if any(c.state != "ended" for c in self.calls.values()):
+                stay_awake(30)      # a call: never asleep
             if now >= self.next_ping:
                 self.next_ping = now + 30
                 if self.at.cmd("AT", 3)[-1:] != ["OK"]:
@@ -1577,6 +2098,10 @@ class Ua:
             except (OSError, Reregister):
                 pass
         self.xfrm.clear()
+        try:
+            os.unlink(WAKE_AT)
+        except OSError:
+            pass
         for s in self.udp + list(self.bufs):
             s.close()
         for s in (self.listener, self.ctl):

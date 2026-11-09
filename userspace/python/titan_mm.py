@@ -136,6 +136,7 @@ class Client(GObject.Object):
         "call-added": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
         "call-removed": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
         "call-state": (GObject.SignalFlags.RUN_FIRST, None, (str, int, int)),
+        "text-added": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
     def __init__(self):
@@ -307,6 +308,8 @@ class Client(GObject.Object):
             self.emit("changed")
         elif kind == "call":
             self._ims_call(ev)
+        elif kind == "sms":
+            self.emit("text-added")
         elif kind == "error" and self.ims_dial_done:
             done, self.ims_dial_done = self.ims_dial_done, None
             done(None, ev.get("text", "call failed"))

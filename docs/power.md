@@ -370,6 +370,13 @@ pointed at the crash), SCSI cache syncs, battery ADC readings.
 
 ## Power button: `titan-powerkey`
 
+**On 6.12** (2026-11-05) the red key is the keypad's (`mt6779-keypad`, with
+the volume keys), not the power key's device (`mtk-pmic-keys`), so its
+presses arrived on the device read for the volume keys and were dropped:
+the screenshot chord did nothing from the move to 6.12 until it was fixed.
+A short press while a call rings declines it instead of locking (see
+desktop.md, "Calls and texts").
+
 `/usr/local/sbin/titan-powerkey` (`titan-powerkey.service`) reads
 `KEY_POWER` from `mtk-kpd`:
 
@@ -525,3 +532,135 @@ tagged `power-switch`, and logind's default is **poweroff**), so
   ([core] idle-time) locks and asks titan-powerkey for the screen off, and
   stays offscreen while it's off).
 - cpuidle/hotplug tuning, thermal limits.
+
+## The modem's cost, measured (2026-11-04)
+
+`tools/power/cellpower.py`: real SIM, unplugged, screen off (Wi-Fi and Bluetooth functions off by `titan-powerkey`), 10 minutes each after a minute's settling, phone awake throughout on the modem's wake lock. The counter's step is 1 mAh, about 6 mA over 10 minutes, so the sampled figure is the better comparison.
+
+| State | Coulomb counter | Sampled | CPU busy | Modem interrupts |
+|---|---|---|---|---|
+| Modem running, radio off | 119.9 mA | 116.6 mA | 0.2 % | none |
+| Registered on LTE | 113.9 mA | 115.9 mA | 0.2 % | CCIF 0.1/s |
+| + VoLTE registered | 119.9 mA | 118.7 mA | 0.3 % | CCIF 0.1/s, CLDMA few |
+| + data PDN, idle | 119.9 mA | 119.5 mA | 0.3 % | CCIF 0.1/s, CLDMA few |
+
+Idle LTE, VoLTE and data together cost about 3 mA, near the limit of this measurement. The cost is the phone not sleeping: deep sleep measured 53.9 mA with the radios off (an earlier run, without the modem running), so about 65 mA is at stake. The wake-ups are not what holds the current up: about 245 context switches a second, 90 of them `sugov:0`, at 0.2 % CPU. `titan-usb-storage` (0.40 % CPU, 2 wakes/s), `systemd-udevd` (0.32 %, 0.8/s), `weston-desktop-shell` (2 wakes/s) and two Python daemons (3 wakes/s) are the largest; their share of current was not measured. Not measured: active use, weak signal, and calls.
+
+## CPU frequency churn (2026-11-04)
+
+schedutil's default rate limit here is 1 ms. Screen on, unplugged, nothing in use: the little cluster changed frequency up to 315 times a second, and `sugov:0` slept about 46 times per change (read as waits on the voltage, not traced), up to 14,500 wakes a second, with CPU 0 in deep idle only 18-40 % of the time in the worst samples. Current sampled over 25 s, so noisy:
+
+| Limit, little / big | Current | Changes/s, little | `sugov:0` wakes/s | CPU 0 deep idle |
+|---|---|---|---|---|
+| 1 ms / 1 ms | 190-260 mA | 27-315 | 1,107-14,516 | 18-91 % |
+| 50 ms / 10 ms | 142-151 mA | 2 | 86-104 | 96 % |
+| 50 ms / 50 ms | 162 mA | 2 | 100 | 95 % |
+
+The churn at 1 ms came and went between samples; what sets it off was not found. With 50 / 10 ms the Rust messages app was unchanged, medians of 3: first frame 0.89 s against 0.88, opening a thread 127 ms against 124, scrolling 30.4 fps against 30.2. `mediatek-cpufreq` sets these for the MT6771 as `transition_delay_us`, which schedutil reads when it starts: a value written to sysfs is expected to be lost when a cluster's last CPU goes offline, in deep sleep. Not measured: the effect with the screen off, or in sleep, where it has none.
+
+## Sleep with the modem on
+
+**Status (2026-11-05, kernel #104).** A call wakes the phone from deep sleep and rings. The SPM slept 179 s with VoLTE registered (`debug 0x1913ff`, the full deep path), the modem's CCIF0 interrupt woke it (`r12 0x100`), the driver set CLDMA up again (the SPM's deep sleep resets its PDN registers; before that restore the modem asserted a minute or more after a deep sleep), and the call rang within 0.5 s of the resume: answered, 31 s, audio both ways, 1578/709 packets, 0 bad. One call so far, from the user's own phone. From s2idle (736 s asleep) a call rang the same way. What it draws: 39.0 mA in everyday standby (below, "Measured").
+
+Two settings make it work, both now the boot default (`DEBIAN=1 tools/mainline/mkboot.sh`): deep sleep (`mt6771_spm.deep=1 mem_sleep_default=deep`; until 2026-11-05 the default was s2idle, so the power key's "mem" never reached the SPM), and the SPM's wake mask without the sensor hub's line (`mt6771_spm.wake_mask=0xe87d5ef`). With the default mask the awake SCP ended every suspend at once: 48 suspends in 3 minutes, each `slept 0 ms`, `r12 0x800`. `titan-modem.service` skips its wake lock while `/var/lib/titan-modem/allow-sleep` exists; without that file the phone does not sleep with the modem on.
+
+The table's cases C to F are measured above with the phone held awake; A and B remain, with the real SIM, screen off, unplugged, with the gauge.
+
+| Case | Set-up | Answers |
+|---|---|---|
+| A | modem service stopped, radios off in sleep | the baseline: 53.9 mA measured earlier |
+| B | as A, `TITAN_SLEEP_RADIOS=on`, on 5 GHz | do the 4.14 Wi-Fi fixes hold on 6.12: `sleepstats.sh`, `wlan-rx-count.py` |
+| C | modem running, radio off | what the wake lock alone costs |
+| D | registered, no PDN up by us | LTE idle |
+| E | data PDN up, idle | what data's PDN adds |
+| F | `titan-ims` registered | what VoLTE adds: its 30 s modem check and TCP keepalive |
+
+For C to F, also: wakes per minute and their sources, CPU idle residency (`/sys/devices/system/cpu/cpu*/cpuidle`), interrupts on the modem's lines (CCIF, CLDMA), AT reports per minute, and packets on each `ccmni`.
+
+**In order, each measured against the last:**
+
+1. `titan-net` must not take Wi-Fi switched off at screen-off for a lost network, or `cell on` starts LTE data 15 s later. Read from the code, not yet seen.
+2. Fewer wake-ups while awake: unsolicited AT reports off with the screen (`AT+CSCON`, `AT+CEREG`, signal reports), ModemManager's signal polling (`titan-signal` asks for it every 15 s), and `titan-ims`'s 30 s check.
+3. The keepalive: the longest the carrier's P-CSCF allows on the TCP connection, by measurement. An expired connection means missed calls, so this errs short.
+4. Removing the wake lock: the modem must be able to wake the AP for a call or a text, so CCIF and CLDMA as wake interrupts, what the SPM's wake mask needs (`wake_mask`, modem bits), the driver's suspend and resume with `mdd.py`'s file service, and no packet lost across a resume. Deep sleep's 26 MHz and DRAM requests with the modem awake are to be read from the SPM's record.
+5. Tests for each step: a call and a text to a sleeping phone, from the user's own phone, ring within seconds, 20 of 20; data survives; a registration refresh during sleep.
+
+Modem traffic and any AT report that carries an identity or a cell stay out of logs.
+
+### Measured (2026-11-05, kernels #105 to #109)
+
+Unplugged, screen off, `titan-powerkey` driving the sleeps, the end held by
+the RTC alarm; the gauge's counter (0.5 mAh a count) at the start and end.
+Most runs wake every 5 minutes (`tools/power/sleepcost.sh`, `CYCLE=300`)
+and log each wake's SPM record and counter to disk at once, so a run that
+ends in a reset still says what it measured.
+
+| Set-up | Average | Asleep | Notes |
+|---|---|---|---|
+| modem stopped, every board chip off (`alloff.sh`), SCP awake, A73 buck on | 35 ±3 mA | | the board chips cost nothing measurable: the plain run was 33 |
+| as above, the touchpad's and fingerprint sensor's switch (GPIO 158) off too | under 1 count less | | not worth it; and as the touchpad's supply it would power-cycle it at every resume |
+| modem stopped, chips off, **SCP asleep** (`mt6771_scp.sleep=1`) and **A73 buck cut** (`mt6771_spm.pcm_flags1=0x300`) | **23.0 mA** | 98 % | 30 min, 6 sleeps of 296 s, all `debug 0x1910ff`; 4 counts each |
+| everyday standby: modem registered, VoLTE and data up, nothing switched off, SCP asleep, buck cut | **39.0 mA** | 93 % | 30 min, 13 sleeps; an undisturbed 5-minute sleep is 6 counts, about 36 mA |
+
+With the SCP awake the modem looked free (stopping it changed nothing): the
+SCP held the shared resources up either way. Asleep, the SCP no longer hides
+the modem's cost, about 12 mA. The SPM record doesn't show it: modem-on
+sleeps log `debug 0x1913ff`, which is still the full path down to the 26 MHz
+clock (bits 8-9 only say DRAM went first; spm-firmware.md). Wake-ups explain
+little of it: with the modem on the phone was awake about 8 s in 300 against
+4 s without, about 2 mA.
+
+The split (20 minutes each, 5-minute sleeps, all 98 % asleep, woken only by
+the RTC alarm):
+
+| Modem | Average |
+|---|---|
+| stopped | 23.0 mA |
+| running, radio off (ModemManager `disabled`) | 33.0 mA |
+| registered on LTE, no PDN, no VoLTE | 34.5 mA |
+| registered, VoLTE and data up (everyday) | 39.0 mA (93 % asleep) |
+
+About 10 mA is the modem merely powered: being on the network adds 1.5 mA
+(one count), VoLTE and data about 4.5 mA, mostly time awake. The SPM's records
+look the same either way (R13 `0x86040800` at each wake, `req_sta`
+`0x100000/0x120000`): the modem's 26 MHz, DRAM and RF-rail requests are down
+when it wakes the AP. So the cost is inside the modem's domain, its own sleep
+between paging wake-ups. Leads, from what the vendor's CCCI driver does and
+ours doesn't yet: the AP status and low-power notices (`ID_AP2MD_LOWPWR`,
+`CCMSG_ID_SYSMSGSVC_LOWPWR_APSTS_NOTIFY`), the `SMEM_USER_LOW_POWER` shared
+memory, the modem's 32 kHz sleep clock. For comparison, 4.14's 11.9 mA was
+with the modem not running at all.
+
+Both settings are in the boot command line now (`DEBIAN=1 mkboot.sh`, deep
+sleep). The sensor hub's sensors kept working with the SCP asleep
+(accelerometer, gyroscope, magnetometer and proximity read back), and with
+the screen off no IIO buffer is enabled, so nothing keeps it sampling.
+
+**The PMIC's sleep settings** (read after a resume with `pmicpoke`): Vcore
+sleep 0.60 V (awake 0.80), both CPU clusters and their SRAM rails 0.60 V,
+Vmodem 0.55 V, VSRAM_OTHERS 0.85 V; VS1, VS2 and VDRAM1 keep their awake
+levels. The sensor hub's hold (Vcore and VSRAM_OTHERS while the SCP's
+request is up) is 0.60 and 0.85 V, as 4.14 programs it, and the bucks
+follow the SPM's `SRCVOLTEN` (TOP_CLK_CON0 0x134 reads 0x3b0, bit 4 set).
+Whether the rails reach those levels in sleep is not measured: the PMIC's
+live readings are only readable awake. The vendor's PMIC low-power table
+(`PMIC_LP_INIT_SETTING`) matches ours, the modem's RF rails following its
+own clock request.
+
+**The SSPM's part.** The kernel tells the SSPM (the power co-processor) of
+each suspend and resume as the vendor's does (`SSPM_SPM_SUSPEND_PREPARE`,
+`SUSPEND`, `RESUME`, `POST_SUSPEND`); the vendor sends only timestamps and a
+GPS flag with them. With an SSPM, the vendor's kernel writes no PMIC sleep
+voltages itself. The Vcore command table the vendor gives the SSPM
+(`SPM_VCORE_PWARP_CMD`) goes to ATF here at boot (`VCOREFS_PWRAP_CMD`).
+
+**Resets on the way into sleep.** About one suspend in 35 ends in a reset
+(2 in about 70 with the breadcrumbs, both on 5-minute sleeps; none in 50
+back to back 20-second sleeps). The SoC's watchdog block says it was
+software-triggered, not an orderly reboot (`NONRST2` 0x40002000 against
+0x48002000 after a reboot), pstore is empty, and LK's `bootreason=SPM_reboot`
+says nothing: a plain reboot shows it too. The SPM driver leaves breadcrumbs
+in the MT6358 RTC (`RTC_SPAR0` bits 8-15 keep their value across a reset;
+mainline.md, "Suspend"): one reset stopped after the devices had suspended,
+the other inside the suspend call before the SSPM was told. The finer
+breadcrumbs since kernel #107 will say which call it is.

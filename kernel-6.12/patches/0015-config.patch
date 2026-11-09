@@ -6,15 +6,15 @@ A fragment on top of defconfig: make defconfig titanpocket.config.
 The media core stays modular for the out-of-tree camera driver; udmabuf
 is built in for libcamera.
 ---
- arch/arm64/configs/titanpocket.config | 162 ++++++++++++++++++++++++++
- 1 file changed, 162 insertions(+)
+ arch/arm64/configs/titanpocket.config | 164 ++++++++++++++++++++++++++
+ 1 file changed, 164 insertions(+)
 
 diff --git a/arch/arm64/configs/titanpocket.config b/arch/arm64/configs/titanpocket.config
 new file mode 100644
-index 0000000000000000000000000000000000000000..d3399ac14a0ccf40ef207e1fe2892c2b15f48bf6
+index 0000000000000000000000000000000000000000..a40b1df3c40e6479d7d96940abfc4abd2fabbf86
 --- /dev/null
 +++ b/arch/arm64/configs/titanpocket.config
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,164 @@
 +# Titan Pocket on top of arm64 defconfig:
 +#   make defconfig titanpocket.config
 +CONFIG_LOCALVERSION="-titanpocket"
@@ -60,6 +60,8 @@ index 0000000000000000000000000000000000000000..d3399ac14a0ccf40ef207e1fe2892c2b
 +# vibration motor: regulator-haptic on the MT6358 VIBR LDO
 +CONFIG_INPUT_MISC=y
 +CONFIG_INPUT_REGULATOR_HAPTIC=y
++# synthetic key presses (UI tests, keeping the screen awake in a test session)
++CONFIG_INPUT_UINPUT=y
 +# IR LED: PWM channel 0 in memory mode (our mtk-pwm-ir-tx), /dev/lirc0
 +CONFIG_RC_CORE=y
 +CONFIG_LIRC=y

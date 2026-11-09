@@ -203,6 +203,14 @@ framework's +1); every pass of a hand ~2-3 cm over the top edge gave a
 near/far pair. `titan_sensors.py` handles all of this: `Sensor("als")`
 gives lux, `Sensor("ps")` 0 near / 1 far.
 
+On Linux 6.12 the hub's own record reaches our driver (`mt6771-scp`): for
+proximity it is `{ u32 steps; s32 oneshot; }` (the vendor's
+`proximity_vec_t`), and the state is `oneshot`, 0 near / 1 far (the 4.14
+framework's +1 is not in it). `steps` reads 0 here. Until kernel #115
+(2026-11-09) the driver took word 0 and reported "near" for every change;
+it now reports `oneshot`: measured, far at rest (`in_proximity_raw` 1) and a
+near/far pair for each pass of a hand.
+
 ## microSD card
 
 On Linux 6.12 (2026-11-04) the slot is `mmc1` (`mediatek,mt8183-mmc` at `0x11240000`): `vmch` and `vmc` at 3.0 V as the stock driver has them, card detect on GPIO 3, pins 29-34. A 28.8 GB SDHC card

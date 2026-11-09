@@ -326,7 +326,7 @@ at 8 and 32 kHz. What the modem needs for real voice is in
 | Path | Route | State |
 |---|---|---|
 | Loudspeaker | DL1 -> I2S3 -> FS1860 | works (PipeWire sink) |
-| Earpiece | DL1 -> ADDA -> `RCV Mux` Voice Playback, `Handset Volume` | works: a -20 dBFS tone at -6 dB reached the main mic at -77 dBFS (-98 without), the back mic at -70 (-94) |
+| Earpiece | DL1 -> ADDA -> `RCV Mux` Voice Playback, `Handset Volume` | works: a -20 dBFS tone at -6 dB reached the main mic at -77 dBFS (-98 without), the back mic at -70 (-94); the driver left the gain at -40 dB after each power-down until kernel #111 (docs/modem.md, "Call volume") |
 | Main / back mic | AIN0 / AIN2 -> PGA -> ADC -> UL1 (`titan-mic`, hw:0,2) | work; floor about -72 dBFS at 18 dB PGA after a 100-200 ms power-on thump at the start of each capture |
 | Headset mic | AIN1 | not yet tested (needs a headset) |
 | Headphones | DL1 -> ADDA -> `HPL/HPR Mux` Audio Playback, `Headphone Volume` | works: a 3-pole plug detected as headphones; 440 Hz left and 660 Hz right tones (-22.5 dBFS at -6 dB) heard each in its own ear |
@@ -367,6 +367,39 @@ interrupt status has XPP at bit 6, AUD at 7 and MISC at 8, but
 jack, the RTC alarm) were never dispatched and, once enabled, the PMIC's
 level interrupt stormed (340398 times in a few minutes). Fixed by adding
 `MT6358_XPP_TOP`; worth sending upstream, as is the AFE's PCM rate fix.
+
+### A tone after deep sleep (fixed 2026-11-05, kernel #110)
+
+With deep sleep the boot default, waking the phone and popping the lock
+screen's bubble sometimes left a steady high tone on the loudspeaker until a
+reboot. The kernel logged `mtk_afe_pcm_pointer hw_ptr err` without end, the
+first one 0.5 s after the resume; `pcm0p` was `RUNNING` with `hw_ptr` 0 and
+the buffer full, so the DAC repeated one buffer.
+
+PipeWire keeps the speaker's PCM open (`SETUP`) while idle, which holds the
+AFE runtime-active, and the MT8183 AFE driver saves and restores its
+registers only in its runtime callbacks: nothing ran across a system sleep.
+s2idle kept the audio block powered; the SPM's deep sleep does not, so the
+first playback after it started the memif from reset values. Fixed in the
+kernel: `mt8183-afe-pcm.c` gets system-sleep callbacks
+(`pm_runtime_force_suspend`/`_resume`, so the regcache saves and restores
+the registers), and `mtk_afe_fe_prepare()` writes the buffer's addresses
+again on every prepare (the end address is a volatile register, outside the
+cache). Checked: 6 deep suspends, each followed by the pop, no tone and no
+`hw_ptr err`. While it's stuck, `pactl suspend-sink titan-speaker 1` (as root,
+`XDG_RUNTIME_DIR=/run/user/0`) stops the tone without a reboot.
+
+### A quiet earpiece (fixed 2026-11-06, kernel #111)
+
+The MT6358 driver's receiver power-down (`mt_rcv_event`, `PRE_PMD`) ramps
+`ZCD_CON3` to -40 dB, and its power-up never wrote the gain back: the
+earpiece came up at -40 dB, whatever `Handset Volume` had been set to while
+it was off, and the control then read -13 (18 minus the register's 0x1f).
+Upstream has the same code. The headphone path restores its gain from
+`ana_gain[]`; the receiver now does the same at the end of `PRE_PMU`, and
+`mt6358_codec_init_reg()` starts that gain at -10 dB (0 in the register
+would be +8 dB). Setting the control while the earpiece is powered took
+effect at once (checked: -6 dB read back during a silent stream).
 
 ## Known limitations / TODO
 

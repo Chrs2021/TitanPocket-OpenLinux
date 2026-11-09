@@ -11,12 +11,15 @@ import json
 import socket
 import subprocess
 import sys
+import time
 
 import titan_ui4 as ui
 import titan_water4 as water
 from gi.repository import GLib, Gtk
 
 TITAN_LOCATION = "/usr/local/bin/titan-location"
+STATUS = "/run/titan-gnss-open.status"   # what the receiver is really doing
+SEARCHING = "Searching for satellites…"
 GPSD = ("127.0.0.1", 2947)
 FIX = {0: "unknown", 1: "no fix yet", 2: "2D fix", 3: "3D fix"}
 
@@ -34,6 +37,32 @@ CSS = """
 def location_on():
     return subprocess.run([TITAN_LOCATION, "status"], capture_output=True,
                           text=True).stdout.strip() == "on"
+
+
+def receiver_state():
+    """(what to say, the status's fields) while there is no fix"""
+    try:
+        with open(STATUS) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return SEARCHING, {}
+    state = st.get("state")
+    if state == "no-clock":
+        return "Waiting for the clock to be set", st
+    if state == "no-position":
+        return "Needs a rough position first", st
+    if state == "no-orbits":
+        return "No orbit data: needs a network once", st
+    if state == "starting":
+        return "Starting the receiver…", st
+    if state == "restarting":
+        return ("Receiver restarting…" if st.get("chip_answered")
+                else "The GPS chip isn't answering: retrying"), st
+    if state == "tracking":
+        if st.get("orbit") == "search" and not st.get("orbits"):
+            return "Reading orbit data from the sky…", st
+        return "Hearing %d satellites: working out a fix…" % st.get("heard", 0), st
+    return (SEARCHING + (" (old orbit data)" if st.get("orbit") == "search" else "")), st
 
 
 def fmt_coord(v, pos, neg):
@@ -82,6 +111,7 @@ class LocationApp(ui.AppWindow):
                              "hint", wrap=True))
         self.body.append(ui.scroll(page))
 
+        self.fix_at = 0.0
         self.refresh_switch()
         GLib.timeout_add_seconds(3, self.refresh_switch)
         GLib.timeout_add_seconds(2, self.ensure_gpsd)
@@ -94,6 +124,11 @@ class LocationApp(ui.AppWindow):
             self.switch.set_active(on)
             if not on:
                 self.show_off()
+            elif time.monotonic() - self.fix_at > 10:   # no fix now: say why
+                text, st = receiver_state()
+                self.set_state(text, "wait")
+                if "heard" in st:
+                    self.vals["sats"].set_text("%d heard, %d strong" % (st["heard"], st.get("strong", 0)))
         return True
 
     def on_switch(self, sw, on):
@@ -108,7 +143,7 @@ class LocationApp(ui.AppWindow):
         self.busy = False
         self.refresh_switch()
         if self.switch.get_active():
-            self.set_state("Searching for satellites…", "wait")
+            self.set_state(receiver_state()[0], "wait")
 
     # ---- gpsd ----
 
@@ -166,8 +201,11 @@ class LocationApp(ui.AppWindow):
         if not self.switch.get_active():
             return
         mode = t.get("mode", 0)
-        self.set_state(FIX.get(mode, "?").capitalize() if mode >= 2 else
-                       "Searching for satellites…", "ok" if mode >= 2 else "wait")
+        if mode >= 2:
+            self.fix_at = time.monotonic()
+            self.set_state(FIX.get(mode, "?").capitalize(), "ok")
+        else:
+            self.set_state(receiver_state()[0], "wait")
         self.vals["lat"].set_text(fmt_coord(t.get("lat"), "N", "S"))
         self.vals["lon"].set_text(fmt_coord(t.get("lon"), "E", "W"))
         # above sea level (altHAE is above the WGS84 ellipsoid, ~30 m off here)
@@ -184,7 +222,9 @@ class LocationApp(ui.AppWindow):
         sats = s.get("satellites")
         if sats is not None:
             used = sum(1 for x in sats if x.get("used"))
-            self.vals["sats"].set_text("%d used / %d seen" % (used, len(sats)))
+            # the list is every satellite above the horizon, from the orbits: heard ones have a signal
+            heard = sum(1 for x in sats if x.get("ss"))
+            self.vals["sats"].set_text("%d used / %d heard / %d overhead" % (used, heard, len(sats)))
         elif "uSat" in s or "nSat" in s:
             self.vals["sats"].set_text("%d used / %d seen" % (s.get("uSat", 0), s.get("nSat", 0)))
 

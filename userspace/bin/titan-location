@@ -14,7 +14,9 @@ ENGINE=open
 [ -r "$CONF" ] && . "$CONF"
 
 unit() { if [ "$ENGINE" = libmnl ]; then echo titan-gnss; else echo titan-gnss-open; fi; }
-active() { systemctl -q is-active titan-gnss-open || systemctl -q is-active titan-gnss; }
+# "activating" counts: that is also a daemon waiting to be restarted, not a switched-off GPS
+running() { case "$(systemctl is-active "$1")" in active|activating) return 0 ;; esac; return 1; }
+active() { running titan-gnss-open || running titan-gnss; }
 
 case "${1:-status}" in
 on)	systemctl start "$(unit)" ;;

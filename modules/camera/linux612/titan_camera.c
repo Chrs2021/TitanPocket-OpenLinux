@@ -80,9 +80,59 @@ static bool hwisp = true;
 module_param(hwisp, bool, 0644);
 MODULE_PARM_DESC(hwisp, "offer the YUYV format (hardware ISP, pass 2) as well as raw Bayer");
 
-static bool nr;	/* noise reduction (NBC): needs SMX stripe buffers, WIP */
+static bool nr = true;	/* noise reduction (NBC/ANR): split mode, docs/camera.md */
 module_param(nr, bool, 0644);
 MODULE_PARM_DESC(nr, "noise reduction (NBC) in the hardware ISP YUYV path");
+static bool dip_split;	/* one DIP start per tile (dip_core.h dip_run) */
+module_param(dip_split, bool, 0644);
+MODULE_PARM_DESC(dip_split, "run the DIP one tile per start (always with nr)");
+static int dip_keep, dip_pad;	/* split: tile slot layout (dip_core.h) */
+static uint dip_padval = ~0u;
+module_param(dip_keep, int, 0644);
+module_param(dip_pad, int, 0644);
+module_param(dip_padval, uint, 0644);
+static uint dip_tcm2;	/* experiments: TCM2 (0x5c) override, 0 = auto */
+module_param(dip_tcm2, uint, 0644);
+MODULE_PARM_DESC(dip_tcm2, "DIP TCM2 override for experiments (0: auto)");
+static bool dip_map;	/* experiments: map the tile loader (dip_core.h) */
+module_param(dip_map, bool, 0644);
+static uint dip_tcm0 = DIP_TCM0, dip_tcm3, dip_map_xor;
+module_param(dip_map_xor, uint, 0644);
+module_param(dip_tcm0, uint, 0644);
+module_param(dip_tcm3, uint, 0644);
+/* ANR_CON1 bits the stock tables set for modules this driver doesn't run:
+ * SL2_LINK (24, the shading module's radius), LTM_LINK (20, LCE) and the
+ * ANR LUT (TABLE_EN 28, TBL_PRC 29; the HAL fills the LUT every frame).
+ * With either link set ANR waits for its partner and the DIP stalls. */
+static uint nr_con1_clr = 0x31100000;
+module_param(nr_con1_clr, uint, 0644);
+MODULE_PARM_DESC(nr_con1_clr, "bits cleared in NBC's ANR_CON1 (0x3700)");
+static uint nr_lut;	/* experiments: the ANR LUT (0x3300-0x36fc), the HAL fills it per frame */
+module_param(nr_lut, uint, 0644);
+static bool ee;	/* edge enhancement (SEEE's EE): docs/camera.md */
+module_param(ee, bool, 0644);
+MODULE_PARM_DESC(ee, "sharpening (SEEE edge enhancement) in the hardware ISP YUYV path");
+static bool nr_smx;	/* experiments: allocate SMX for NBC (unused by these tile lists) */
+module_param(nr_smx, bool, 0644);
+/* img_sel, the DIP's clock, set at every stream start. 0: automatic, 364 MHz
+ * (syspll_d3, the vendor's lower mmdvfs step) for the binned modes and 525 MHz
+ * (mmpll_d6, its upper step; needs Vcore OPP 0, which 6.12 holds) for full
+ * resolution, where at 364 MHz a frame with NBC (51 ms) is slower than the
+ * sensor's (50 ms). The DIP is compute-bound: its time scales with the clock. */
+static uint dip_rate;
+module_param(dip_rate, uint, 0644);
+static bool dip_poll;	/* wait for the DIP by polling (busy) instead of its interrupt */
+module_param(dip_poll, bool, 0644);
+/* experiments: more DIP interrupt enables. Not all: some INT_STATUS bit
+ * doesn't clear on read, and every source on is an interrupt storm */
+static uint dip_int_en, dip_cq_int_en;
+module_param(dip_int_en, uint, 0644);
+module_param(dip_cq_int_en, uint, 0644);
+static bool dip_trace;	/* experiments: each frame's START, time and interrupt status */
+module_param(dip_trace, bool, 0644);
+static bool dip_dbg;	/* experiments: the DIP debug port after good frames too */
+module_param(dip_dbg, bool, 0644);
+MODULE_PARM_DESC(nr_lut, "value for every word of NBC's ANR LUT (experiments; 0 as the HAL image)");
 
 /* auto white balance / exposure from the CAM A hardware statistics (AAO).
  * aa drives the DIP white balance from the per-block R/G/B averages (instead
@@ -100,7 +150,10 @@ static bool ae = true;
 module_param(ae, bool, 0644);
 MODULE_PARM_DESC(ae, "auto exposure/gain from the CAM A AA statistics");
 
-static unsigned int ae_target = 46;	/* 8-bit AA luma (~1/4 of the 10-bit raw) */
+/* 8-bit AA luma (~1/4 of the 10-bit raw) above black. 46 (mid-grey in linear terms) gave
+ * photos of mean Y ~49 in an ordinary room: the linear mean is pulled up by highlights;
+ * 80 gives ~75 with no clipping (measured 2026-11-09, once the OV16880's gain worked) */
+static unsigned int ae_target = 80;
 module_param(ae_target, uint, 0644);
 MODULE_PARM_DESC(ae_target, "target mean scene luma for auto exposure (0-255)");
 
@@ -163,6 +216,12 @@ struct sensor_desc {
 	bool has_focus;
 	u32 black;		/* black level, 10-bit */
 	u32 array_w, array_h;	/* active pixel array; every mode covers all of it */
+	/*
+	 * OV16880: the analogue gain is 0x350b, 0x40 = 1x, linear to 0xff (~4x), 0x350a = 0;
+	 * 0x3508/0x3509 change nothing in these modes (measured 2026-11-09: dark noise and a
+	 * torch-lit scene, raw). OV8865: 0x3508/0x3509, 0x80 = 1x.
+	 */
+	bool gain_350b;
 };
 
 #define TBL(t) t, ARRAY_SIZE(t)
@@ -179,7 +238,7 @@ static const struct sensor_mode ov8865_modes[] = {
 static const struct sensor_desc sensors[] = {
 	/* rotations checked on the phone held upright in portrait */
 	{ "ov16880", "rear", V4L2_CAMERA_ORIENTATION_BACK, 270, 0x36, 0, 1, TBL(ov16880_init),
-	  TBL(ov16880_modes), true, true, 64, 4672, 3504 },
+	  TBL(ov16880_modes), true, true, 64, 4672, 3504, true },
 	{ "ov8865", "front", V4L2_CAMERA_ORIENTATION_FRONT, 90, 0x10, 1, 5, TBL(ov8865_init),
 	  TBL(ov8865_modes), false, false, 16, 3264, 2448 },
 };
@@ -195,6 +254,7 @@ struct titan_sensor {
 	struct media_pad pad;
 	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *exposure, *gain, *vblank, *hblank, *pixel_rate, *focus;
+	u32 dgain;		/* the gain past the sensor's, in the DIP (512 = 1x; 0: none) */
 	struct device_node *np;	/* its child node of camsv1 */
 	struct i2c_adapter *adap;
 	struct regulator *dovdd, *avdd, *dvdd, *afvdd;
@@ -220,11 +280,22 @@ struct titan_buf {
 	dma_addr_t mva;		/* device address (IOMMU) */
 };
 
+/* the DIP (pass 2) device: titan-dip, bound by dip_probe */
+struct titan_dip {
+	void __iomem *regs;
+	struct clk *clk;
+	bool live;			/* clocked: the interrupt may read the registers */
+	int irq;
+	struct completion done;		/* CQ thread 0 done (dip_core.h dip_wait_job) */
+	u32 seen_int, seen_cq;		/* experiments: status bits the interrupt read (dip_trace) */
+};
+
 struct titan_cam {
 	struct platform_device *pdev;	/* the camsv1 node: our DMA device and IRQ */
 	struct device *dev;		/* &pdev->dev */
 	struct device *dip_dev;		/* the dip node: ISP power domain, larb 5 */
 	struct clk *dip_clk;
+	struct titan_dip *dipc;		/* the DIP device's state: its interrupt */
 	struct clk_bulk_data *clks;	/* camsv1's: seninf, CAM, CAMSV */
 	int nclks;
 	struct media_pipeline pipe;
@@ -272,6 +343,7 @@ struct titan_cam {
 	/* format */
 	const struct titan_fmt *fmt;
 	u32 width, height, stride;
+	u32 out_w, out_h;		/* the node's size: the frame's, or CRZ's (crz_sizes) */
 
 	/* hardware ISP (DIP, pass 2): CAMSV captures packed RAW10 into a raw
 	 * ring; a worker runs the DIP per frame into the YUYV vb2 buffer */
@@ -286,6 +358,8 @@ struct titan_cam {
 	} raw[3];
 	int rc, rn;			/* raw ring: index being filled / programmed next */
 	struct dip_buf tdr, desc;	/* DIP tile list + CQ descriptor */
+	struct dip_buf smx;		/* NBC's stripe memory (dip_core.h) */
+	bool nr, ee;			/* this stream runs NBC / SEEE: asked, and a tile list */
 	struct work_struct dip_work;
 	int dip_ready;			/* raw ring index ready for the DIP, -1 none */
 	bool dip_busy;
@@ -357,6 +431,16 @@ static void camsys_off(struct titan_cam *tc)
 
 /* imgsys power for the DIP (pass 2), on only while a hwisp stream runs:
  * the ISP domain and larb 5, through the dip node */
+/* the DIP's clock for this stream's mode (dip_rate) */
+static void dip_set_rate(struct titan_cam *tc)
+{
+	struct clk *mux = clk_get_parent(tc->dip_clk);
+	u32 rate = dip_rate ?: tc->width * tc->height > 8000000 ? 525000000 : 364000000;
+
+	if (mux && clk_set_rate(mux, rate))
+		dev_warn(tc->dev, "img clock: %u Hz not set\n", rate);
+}
+
 static int imgsys_on(struct titan_cam *tc)
 {
 	int ret;
@@ -371,6 +455,7 @@ static int imgsys_on(struct titan_cam *tc)
 		pm_runtime_put(tc->dip_dev);
 		return ret;
 	}
+	WRITE_ONCE(tc->dipc->live, true);
 	tc->imgsys_on = true;
 	return 0;
 }
@@ -379,6 +464,14 @@ static void imgsys_off(struct titan_cam *tc)
 {
 	if (!tc->imgsys_on)
 		return;
+	/* no interrupt may outlive the clock: enables off, status read-clear */
+	writel(0, tc->dip + 0x020);
+	writel(0, tc->dip + 0x024);
+	readl(tc->dip + DIP_INT_STATUS);
+	readl(tc->dip + DIP_CQ_STATUS);
+	readl(tc->dip + 0x038);
+	WRITE_ONCE(tc->dipc->live, false);
+	synchronize_irq(tc->dipc->irq);
 	clk_disable_unprepare(tc->dip_clk);
 	pm_runtime_put(tc->dip_dev);
 	tc->imgsys_on = false;
@@ -513,8 +606,24 @@ static int sensor_power_on(struct titan_sensor *s)
 
 static void sensor_power_off(struct titan_sensor *s)
 {
+	int pos;
+
 	if (!s->powered)
 		return;
+	/*
+	 * The motor's supply (vldo28) also feeds the touchscreen, which keeps
+	 * it on even in system sleep: dropping our reference leaves an active
+	 * AK7371 holding the lens with coil current. Walk the lens back to
+	 * rest (no click) and put it in standby (0x40) first.
+	 */
+	if (s->d->has_focus) {
+		for (pos = s->focus->val; pos > 0; pos -= 64) {
+			af_set(s, pos);
+			usleep_range(2000, 3000);
+		}
+		af_set(s, 0);
+		af_write(s, 0x02, 0x40);
+	}
 	gpiod_set_value_cansleep(s->reset, 1);
 	gpiod_set_value_cansleep(s->pwdn, 1);
 	reg_off(s, s->afvdd, 3);
@@ -527,6 +636,36 @@ static void sensor_power_off(struct titan_sensor *s)
 
 /* exposure (1/16 line units), gain and frame length as one group-hold
  * update; both OmniVision sensors use the same registers */
+#define OV16880_GAIN_MAX	0xff	/* ~4x: 0x350b's linear range */
+
+/*
+ * The gain control (128 = 1x, to 15.5x) to the sensor's registers, inside the caller's group
+ * hold. Where the sensor's analogue gain stops (OV16880: ~4x), the rest is digital, applied by
+ * the DIP with the white balance (dip_work_fn); the AE loop counts it (ae_step).
+ */
+static void sensor_gain_regs(struct titan_sensor *s, u32 gain)
+{
+	u32 a;
+
+	if (!s->d->gain_350b) {
+		s_write(s, 0x3508, gain >> 8);
+		s_write(s, 0x3509, gain & 0xff);
+		s->dgain = 0;
+		return;
+	}
+	a = clamp_t(u32, gain / 2, 0x40, OV16880_GAIN_MAX);	/* 128 -> 0x40 */
+	s_write(s, 0x350a, 0);
+	s_write(s, 0x350b, a);
+	s->dgain = gain * 256 / a;	/* gain / (2a) in 1/512 */
+	if (s->dgain <= 512)
+		s->dgain = 0;
+}
+
+static inline u32 sensor_dgain(const struct titan_sensor *s)
+{
+	return s && s->dgain ? s->dgain : 512;
+}
+
 static void sensor_apply_ctrls(struct titan_sensor *s)
 {
 	u32 e = s->exposure->val << 4;
@@ -538,8 +677,7 @@ static void sensor_apply_ctrls(struct titan_sensor *s)
 	s_write(s, 0x3500, e >> 16);
 	s_write(s, 0x3501, (e >> 8) & 0xff);
 	s_write(s, 0x3502, e & 0xff);
-	s_write(s, 0x3508, s->gain->val >> 8);
-	s_write(s, 0x3509, s->gain->val & 0xff);
+	sensor_gain_regs(s, s->gain->val);
 	s_write(s, 0x3208, 0x10);
 	s_write(s, 0x3208, 0xa0);
 }
@@ -1524,8 +1662,7 @@ static void ae_apply(struct titan_sensor *s, u32 exp, u32 gain)
 	s_write(s, 0x3500, e >> 16);
 	s_write(s, 0x3501, (e >> 8) & 0xff);
 	s_write(s, 0x3502, e & 0xff);
-	s_write(s, 0x3508, gain >> 8);
-	s_write(s, 0x3509, gain & 0xff);
+	sensor_gain_regs(s, gain);
 	s_write(s, 0x3208, 0x10);
 	s_write(s, 0x3208, 0xa0);
 }
@@ -1543,6 +1680,8 @@ static void ae_step(struct titan_cam *tc, u32 luma)
 
 	if (!s || s->ae_manual)	/* app drives exposure by hand: do not fight it */
 		return;
+	/* the statistics are raw: they miss the digital part of the gain (sensor_gain_regs) */
+	luma = (u32)div_u64((u64)luma * sensor_dgain(s), 512);
 	if (!tc->ae_exp) {	/* seed from the current sensor settings */
 		tc->ae_exp = s->exposure->val;
 		tc->ae_gain = s->gain->val;
@@ -1773,9 +1912,37 @@ static void dip_teardown(struct titan_cam *tc)
 		dipbuf_free(tc, &tc->raw[i]);
 	dipbuf_free(tc, &tc->tdr);
 	dipbuf_free(tc, &tc->desc);
+	dipbuf_free(tc, &tc->smx);
 }
 
 /* raw ring + tile list + CQ descriptor */
+/*
+ * Smaller YUYV sizes the node offers besides the sensor modes: the DIP's
+ * resizer (CRZ, out of IMG2O) scales the mode's frame down, here to about
+ * the screen's size, for a preview with a quarter or less of the memory
+ * traffic. CRZ's algorithm 1 covers 2x to 8x down (dip_core.h).
+ */
+static const struct crz_size {
+	u32 w, h, ow, oh;
+} crz_sizes[] = {
+	{ 2336, 1752, 960, 720 },	/* rear, binned */
+	{ 1632, 1224, 816, 612 },	/* front, binned */
+};
+
+static const struct crz_size *find_crz(u32 ow, u32 oh)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(crz_sizes); i++)
+		if (crz_sizes[i].ow == ow && crz_sizes[i].oh == oh)
+			return &crz_sizes[i];
+	return NULL;
+}
+
+/* the DIP job's CRZ output: 0 when the node takes the frame's own size */
+static u32 crz_w(struct titan_cam *tc) { return tc->out_w != tc->width ? tc->out_w : 0; }
+static u32 crz_h(struct titan_cam *tc) { return tc->out_w != tc->width ? tc->out_h : 0; }
+
 static int dip_setup(struct titan_cam *tc)
 {
 	size_t rawsz = tc->raw_stride * tc->height;
@@ -1789,9 +1956,20 @@ static int dip_setup(struct titan_cam *tc)
 	ret = dipbuf_alloc(tc, &tc->tdr, 0x10000);
 	if (!ret)
 		ret = dipbuf_alloc(tc, &tc->desc, CQ_SLOTS * 8);
+	/* NBC's stripe memory (SMX, ~41 MB): only for tiles split in rows, which
+	 * these lists don't use; kept for experiments (nr_smx) */
+	/* noise reduction where there's a tile list for it, else without */
+	tc->nr = nr && dip_find_tdr_out(tc->width, tc->height, tc->raw_stride, tc->black >= 0,
+					DIP_MOD_NBC | (ee ? DIP_MOD_SEEE : 0), crz_w(tc), crz_h(tc));
+	tc->ee = ee && dip_find_tdr_out(tc->width, tc->height, tc->raw_stride, tc->black >= 0,
+					DIP_MOD_SEEE | (tc->nr ? DIP_MOD_NBC : 0), crz_w(tc), crz_h(tc));
+	if (!ret && tc->nr && nr_smx)
+		ret = dipbuf_alloc(tc, &tc->smx, DIP_SMX_TOTAL);
 	if (ret)
 		goto err;
-	if (!dip_find_tdr(tc->width, tc->height, tc->raw_stride, tc->black >= 0, nr)) {
+	if (!dip_find_tdr_out(tc->width, tc->height, tc->raw_stride, tc->black >= 0,
+			      (tc->nr ? DIP_MOD_NBC : 0) | (tc->ee ? DIP_MOD_SEEE : 0),
+			      crz_w(tc), crz_h(tc))) {
 		dev_err(tc->dev, "no DIP tile list for %ux%u stride %u%s\n",
 			tc->width, tc->height, tc->raw_stride, tc->black >= 0 ? " +OBC2" : "");
 		ret = -EINVAL;
@@ -1848,21 +2026,37 @@ static void dip_work_fn(struct work_struct *w)
 			.width = tc->width, .height = tc->height, .stride = tc->raw_stride,
 			.sensor = tc->active && tc->active->d->has_focus ? 0 : 1,
 			.black = tc->black,
-			.nbc = nr,
-			.wb = { tc->wb[0], tc->wb[1], tc->wb[2] },
+			.nbc = tc->nr, .seee = tc->ee,
+			.out_w = crz_w(tc), .out_h = crz_h(tc),
+			.split = dip_split || tc->nr || tc->ee,	/* NBC's tiles: dip_split_layout */
+			.keep = dip_keep, .pad = dip_pad, .padval = dip_padval,
+			.tcm2 = dip_tcm2,
+			.probe = dip_map, .tcm0 = dip_tcm0, .tcm3 = dip_tcm3, .probe_xor = dip_map_xor,
+			.nbc_con1_clr = nr_con1_clr,
+			.nbc_lut = nr_lut,
+			.dbg = dip_dbg,
+			.int_en = dip_int_en, .cq_int_en = dip_cq_int_en,
+			.done = dip_poll ? NULL : &tc->dipc->done,
+			.wb = { min_t(u32, tc->wb[0] * sensor_dgain(tc->active) / 512, 8191),
+				min_t(u32, tc->wb[1] * sensor_dgain(tc->active) / 512, 8191),
+				min_t(u32, tc->wb[2] * sensor_dgain(tc->active) / 512, 8191) },
 			.in_mva = tc->raw[idx].mva, .out_mva = out->mva,
 			.tdr_mva = tc->tdr.mva, .tdr_vaddr = tc->tdr.vaddr,
+			.smx_mva = tc->smx.mva,
 			.desc_mva = tc->desc.mva, .desc_vaddr = tc->desc.vaddr,
 		};
-		ret = dip_program(tc->dip, &job);
-		if (!ret)
-			ret = dip_wait(tc->dip, 50000);
+		tc->dipc->seen_int = tc->dipc->seen_cq = 0;
+		ret = dip_run(tc->dip, &job, 50000);
+		if (dip_trace)
+			pr_info("dip: trace ret %d %lld us start %x int %08x cq %08x\n", ret,
+				ktime_us_delta(ktime_get(), t0), readl(tc->dip + DIP_CTL_START),
+				tc->dipc->seen_int, tc->dipc->seen_cq);
 		tc->dip_us = ktime_us_delta(ktime_get(), t0);
 		tc->dip_us_max = max(tc->dip_us_max, tc->dip_us);
 		out->vb.sequence = tc->sequence;
 		out->vb.field = V4L2_FIELD_NONE;
 		out->vb.vb2_buf.timestamp = ktime_get_ns();
-		vb2_set_plane_payload(&out->vb.vb2_buf, 0, tc->stride * tc->height);
+		vb2_set_plane_payload(&out->vb.vb2_buf, 0, tc->stride * tc->out_h);
 		vb2_buffer_done(&out->vb.vb2_buf,
 				ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
 		tc->dip_frames++;
@@ -1874,13 +2068,17 @@ static void dip_work_fn(struct work_struct *w)
 
 static void set_format(struct titan_cam *tc, const struct titan_fmt *fmt, u32 w, u32 h)
 {
+	const struct crz_size *c = fmt->dip ? find_crz(w, h) : NULL;
+
 	tc->fmt = fmt;
-	tc->width = w;
-	tc->height = h;
+	tc->out_w = w;
+	tc->out_h = h;
+	tc->width = c ? c->w : w;	/* the raw frame CAMSV captures */
+	tc->height = c ? c->h : h;
 	tc->stride = ALIGN(w * fmt->bytes, 16);
 	if (fmt->dip) {
 		/* CAMSV captures packed RAW10 for the DIP; the node outputs YUYV */
-		tc->raw_bytes = w * 10 / 8;
+		tc->raw_bytes = tc->width * 10 / 8;
 		tc->raw_stride = ALIGN(tc->raw_bytes, 16);
 	}
 }
@@ -1889,7 +2087,7 @@ static int queue_setup(struct vb2_queue *q, unsigned int *nbuf, unsigned int *np
 		       unsigned int sizes[], struct device *alloc_devs[])
 {
 	struct titan_cam *tc = vb2_get_drv_priv(q);
-	unsigned int size = tc->stride * tc->height;
+	unsigned int size = tc->stride * tc->out_h;
 
 	if (*nplanes)
 		return sizes[0] < size ? -EINVAL : 0;
@@ -1919,7 +2117,7 @@ static int buf_init(struct vb2_buffer *vb)
 static int buf_prepare(struct vb2_buffer *vb)
 {
 	struct titan_cam *tc = vb2_get_drv_priv(vb->vb2_queue);
-	unsigned int size = tc->stride * tc->height;
+	unsigned int size = tc->stride * tc->out_h;
 
 	if (vb2_plane_size(vb, 0) < size)
 		return -EINVAL;
@@ -1997,8 +2195,12 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
 		 * YUYV vb2 buffers (left queued). imgsys powers the DIP */
 		tc->black = s->d->black;
 		ret = imgsys_on(tc);
-		if (!ret)
+		if (!ret) {
+			dip_set_rate(tc);
 			ret = dip_setup(tc);
+			if (ret)	/* no tile list, no memory: let ISP power off again */
+				imgsys_off(tc);
+		}
 		if (ret) {
 			camsys_put(tc);
 			goto err_pipe;
@@ -2115,14 +2317,20 @@ static int vidioc_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
 	struct titan_cam *tc = video_drvdata(file);
 
-	fill_pix(tc->fmt, &f->fmt.pix, tc->width, tc->height);
+	fill_pix(tc->fmt, &f->fmt.pix, tc->out_w, tc->out_h);
 	return 0;
 }
 
-/* any size one of the sensors produces */
-static void nearest_size(u32 *w, u32 *h)
+/* any size one of the sensors produces, or (dip) a CRZ size */
+static void nearest_size(u32 *w, u32 *h, bool dip)
 {
 	u32 bw = 0, bh = 0, i, j;
+
+	for (i = 0; dip && i < ARRAY_SIZE(crz_sizes); i++)
+		if (!bw || abs((int)crz_sizes[i].ow - (int)*w) < abs((int)bw - (int)*w)) {
+			bw = crz_sizes[i].ow;
+			bh = crz_sizes[i].oh;
+		}
 
 	for (i = 0; i < NSENSORS; i++)
 		for (j = 0; j < sensors[i].nmodes; j++) {
@@ -2142,7 +2350,7 @@ static int vidioc_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	const struct titan_fmt *fmt = find_format(f->fmt.pix.pixelformat) ?: &formats[0];
 	u32 w = f->fmt.pix.width, h = f->fmt.pix.height;
 
-	nearest_size(&w, &h);
+	nearest_size(&w, &h, fmt->dip);
 	fill_pix(fmt, &f->fmt.pix, w, h);
 	return 0;
 }
@@ -2173,6 +2381,13 @@ static int vidioc_enum_framesizes(struct file *file, void *fh, struct v4l2_frmsi
 			fs->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 			fs->discrete.width = sensors[i].modes[j].width;
 			fs->discrete.height = sensors[i].modes[j].height;
+			return 0;
+		}
+	for (i = 0; find_format(fs->pixel_format)->dip && i < ARRAY_SIZE(crz_sizes); i++)
+		if (n++ == fs->index) {
+			fs->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+			fs->discrete.width = crz_sizes[i].ow;
+			fs->discrete.height = crz_sizes[i].oh;
 			return 0;
 		}
 	return -EINVAL;
@@ -2360,10 +2575,26 @@ static int sensor_add_device(struct titan_cam *tc, struct titan_sensor *s)
 
 /* the DIP (ISP pass 2): bound so that the IOMMU enables its larb 5 ports;
  * the camera driver runs it */
-struct titan_dip {
-	void __iomem *regs;
-	struct clk *clk;
-};
+
+/*
+ * The DIP's interrupt (SPI 268), enabled only for CQ thread 0 done: the
+ * frame or split tile has ended. CQ_STATUS and INT_STATUS are read-clear.
+ * The registers can be read only while the camera has the DIP clocked.
+ */
+static irqreturn_t dip_irq(int irq, void *data)
+{
+	struct titan_dip *dip = data;
+	u32 cq;
+
+	if (!READ_ONCE(dip->live))
+		return IRQ_NONE;
+	cq = readl(dip->regs + DIP_CQ_STATUS);
+	dip->seen_cq |= cq;
+	dip->seen_int |= readl(dip->regs + DIP_INT_STATUS);
+	if (cq & DIP_CQ_DONE)
+		complete(&dip->done);
+	return IRQ_HANDLED;
+}
 
 static int dip_probe(struct platform_device *pdev)
 {
@@ -2380,6 +2611,14 @@ static int dip_probe(struct platform_device *pdev)
 	dip->clk = devm_clk_get(dev, "dip");
 	if (IS_ERR(dip->clk))
 		return dev_err_probe(dev, PTR_ERR(dip->clk), "no clock\n");
+	init_completion(&dip->done);
+	ret = platform_get_irq(pdev, 0);
+	if (ret < 0)
+		return ret;
+	dip->irq = ret;
+	ret = devm_request_irq(dev, dip->irq, dip_irq, 0, "titan-dip", dip);
+	if (ret)
+		return dev_err_probe(dev, ret, "no interrupt\n");
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (!ret)
 		ret = devm_pm_runtime_enable(dev);
@@ -2433,6 +2672,7 @@ static int titan_get_dip(struct titan_cam *tc)
 				     "camsv1 and dip are not in one IOMMU domain\n");
 	tc->dip = dip->regs;
 	tc->dip_clk = dip->clk;
+	tc->dipc = dip;
 	return 0;
 }
 
