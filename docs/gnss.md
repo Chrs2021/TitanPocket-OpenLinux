@@ -1,4 +1,4 @@
-# GNSS (MT6631 CONNSYS GPS)
+# GNSS (the MT6771's CONNSYS GNSS, MT6631 RF)
 
 Status (2026-10-29): the receiver runs on MediaTek's closed navigation
 library, **libmnl.so**, hosted by **titan-mnld**, our own replacement for
@@ -234,7 +234,7 @@ escapes in the length and the body: DE DF → AA,  DE E0 → DE
 **The firmware patch.** 61440 bytes (0xF000), in libmnl.so at file offset
 0x3E0106 after an 8-byte header: `[u16 0x7800, its size in 16-bit words]
 [u16 0x8000] [u16 0x8004] [u16 0x007B]`. libmnl holds other images with the
-same header (another follows at 0x3EF106); the MT6631's is recognised by
+same header (another follows at 0x3EF106); this phone's (tagged `MT6771_DSP_0064_B183` at its end) is recognised by
 its CRC-32, 0x5A7874A9. It goes in 1400-byte blocks, a block whose escaped
 data would pass 1412 bytes as two halves (10 frames of 700), 49 frames in
 all. **Flow control:** the chip answers the header with `31`

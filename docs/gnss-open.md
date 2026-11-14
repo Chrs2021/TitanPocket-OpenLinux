@@ -9,7 +9,632 @@ page is the current summary and takes precedence where they differ (a few
 of gnss.md's early sections, like "Verdict: replacing libmnl with open
 code", are history now).
 
-Last updated 2026-10-30 (evening).
+Last updated 2026-11-10 (the section "Broken since the modem runs": cause, fix, first fixes with the modem on).
+
+---
+
+## Broken since the modem runs (2026-11-09; fixed 2026-11-10)
+
+**Summary.** The receiver must be told its clock's offset in the session's
+`10` frame, and the daemon sent the value for the crystal trim the phone
+powers on with (0x88: B = +27390 Hz). The modem sets its own trim (0xD4)
+when it boots, which stays until a power-off; with it the right value is
+near −200 Hz, and with the old one the chip tracks nothing. Measured with
+the modem running, 120 s sessions at one window: old clock, 0 tracked
+records; B = −90 Hz (what libmnl sends there, given the modem's
+calibration), 752 records from 9 satellites; B = −300 Hz, 706 from 9.
+
+The fix (`session.py` `CLOCKS`, `own02.offsets`, the daemon):
+
+- Two clocks, `modem` (A 27594, B −200 Hz) and `preloader` (the old frame,
+  byte for byte). The daemon starts with the one that last tracked
+  (`STATE/clock`, the modem's by default); a session with no satellite
+  tracked after 75 s ends and the next uses the other, with growing pauses
+  while neither tracks. A record counts as tracked from 10 dB-Hz: the wrong
+  clock gives a few records at −3.
+- **Whole hertz only** in the `10` frame: with 218.5 Hz in the BeiDou
+  group the chip tracked nothing at all.
+- BeiDou's and GLONASS's `02` offsets (−494, +483 + 13.4 k Hz) were the
+  old clock's 24.4 ppm on their carriers' distance from L1 (predicted −349
+  and +648 against GPS's −150; measured −344 and +633): with the modem's
+  clock all three take −150. Not yet confirmed on the air: no BeiDou or
+  GLONASS satellite has been tracked with the new clock (BeiDou scanned
+  over ±3 kHz in 200 Hz steps: none; GLONASS had no assignments then, next
+  item).
+- **Orbit file after midnight UTC**: for three hours the daemon used
+  yesterday's file alone, which ends at midnight, so GLONASS (orbits good
+  for an hour) had no assignments from 01:00 to 03:00 UTC every day. It now
+  appends what today's file has so far (assignments 12350 → 17110 at
+  02:45 UTC).
+
+State on the phone (kernel #124, modem registered): the daemon acquires
+5-10 GPS satellites within 12 s of a session's start; at the test window
+(night; Android's YGPS averaged 23 dB-Hz there) all but 1-3 are lost again
+within half a minute, so no fix there (five are needed). A fix with the
+modem running came later that night (below). The `preloader`
+clock is untested since the change (it needs a power-off with the modem
+kept off). Why weak satellites are lost after acquisition is open:
+libmnl switches a tracked satellite's `02` to track mode with its own
+Doppler three times a second, and our replayed script never does.
+
+**One session, fed as it goes, and a rough fix (2026-11-10, late).**
+
+- `titan-gps-probe -` takes the script on standard input, and the daemon
+  writes it 20 s at a time, 12 s ahead (`session.cycles`,
+  `own02.regenerate` per piece). A session no longer ends every 600 s (it
+  runs up to 6 h, with new orbits merged in as the file is renewed), so
+  the fix is not dropped every ten minutes and newly risen satellites get
+  assignments within 20 s. Measured on the phone: the script starts 0.8 s
+  after the service (about 4 s before), the first satellite is tracked
+  within 10 s, and one session ran 3 minutes across nine pieces. Not yet
+  run: an hour or more, and the orbit renewal inside a session.
+- A session that tracked satellites and then tracks none for 300 s ends,
+  and the next tries the other clock (the modem may have started
+  meanwhile). After a start the chip doesn't answer, the next try comes
+  10 s later (it was 30 s).
+- `snapfix.fix_from` is the fix rule, shared with `tools/gnss/replay.py`
+  (the rule over a recorded log, against a position kept in a local file;
+  it prints times and distances only). The rule was already quick with
+  enough sky: on the 2026-10-30 window recordings the first strong
+  satellite at 2-3 s, five at 4-5 s, the first fix at 7 s (131 m off, 11 m
+  median from 20 s on), 13 s and 29 s. New: with four satellites, a rough
+  fix with the height and the time error held (at the last full fix's
+  value; only while the kernel calls the clock synchronised), reported
+  with three times the DOP. Replayed with the sky cut to four satellites,
+  where the old rule gives nothing: first fix at 7 s, 46 m median (p90
+  81 m) on one recording, 13 s and 104 m (188 m) on another, none on the
+  third. Not yet seen live.
+- **Why there was still no fix at the test window that night**: every
+  batch held one satellite. One channel was fully locked (status bytes 6-7
+  `0261`, reporting every 500 ms with batch bytes `0010...`); the others
+  stayed half acquired (`4011`, `c011`, `0111`, with bytes 12-17 zero) at
+  15-17 dB-Hz and came and went. In October every tracked channel read
+  `0261` and shared one batch value three times a second, at 20-39 dB-Hz.
+  So at ~25 dB-Hz and below the chip does not bring satellites to the
+  state our fix needs; whether libmnl's track-mode `02` frames would, is
+  the open question. Bytes 6-7 look like the lock state: worth decoding.
+
+**Track-form `02` frames (2026-11-10/11, no clear effect).** libmnl,
+once the chip tracks a satellite, sends its `02` in a second form: bytes
+12-19 `[~30][00][u16 window 4 Hz, GLONASS 3][01 03][tail]`, the tail's
+bit 1 set while the chip's record is not in full lock (status bytes 6-7
+not `0261`); its Doppler is libmnl's own estimate, which differs from the
+record's by a steady per-satellite amount (-130 to +210 Hz in run6), so
+it was not copied. The daemon now writes the session 1 s at a time, 1.5 s
+ahead, and gives a satellite with a tracked record in the last 3 s that
+form, with the predicted Doppler (`own02.TRACK_02`, `regenerate(...,
+tracked=)`; `TITAN_GNSS_TRACK=0` turns it off). Alternating 3-minute runs
+at the window with the modem running (one session each):
+
+| Run (22:32-22:44) | Track form | Fixes | Mean satellites heard / strong | First fix |
+|---|---|---|---|---|
+| 1 | off | 75 | 7.0 / 6.3 | 17 s (rough) |
+| 2 | on | 72 | 6.8 / 6.1 | 11 s (rough) |
+| 3 | off | 0 | 3.2 / 2.4 | - |
+| 4 | on | 0 | 5.5 / 1.6 | - |
+
+The sky changed more between runs than the form did; no gain shown, none
+lost. Kept on. An earlier pair (22:19-22:31) is void: the receiver was
+reopened within ~1 s of the last close and two sessions in a row never
+measured; the daemon now leaves it closed REST = 10 s
+(`/run/titan-gnss-open.closed`, across daemon restarts too) and retries a
+session that tracks nothing once before switching clocks.
+
+**First fixes with the modem running (2026-11-10, 22:12 onward)**, at the
+window: a full fix 32 s into a session (5 satellites, residual 71 m rms),
+gpsd 3D with `eph` ~57 m and HDOP 3; rough four-satellite fixes from 6 s,
+11 s and 17 s after a session started. So the clock fix holds and the
+modem can stay on.
+
+**A moving phone (2026-11-12; installed on the phone that morning, not yet run there).** The fix
+averaged 60 s of batches as if the phone stood still: on a train it lagged
+half a window behind and reported 0 km/h. `snapfix.solve_joint_tv` solves
+the window for a position at the newest batch and a steady velocity (one
+time error, a bias per batch eliminated as before, the height prior, and a
+prior holding the velocity near zero, 50 m/s horizontal and 2 m/s
+vertical); `fix_from(motion=True)` takes it over the static solve when its
+horizontal speed passes 4 sigmas and 2 m/s, and the daemon then sends speed
+and course in RMC. `tools/gnss/replay.py --move VE,VN` replays a recording
+as if the phone moved at that velocity (each record's code phase shifted by
+the geometric range change from the recorded place); `--motion` turns the
+velocity solve on. On the three window recordings (2026-10-30), median
+horizontal error:
+
+| Recording | still: old / new | 8 m/s north: old / new | 28 m/s: old / new |
+|---|---|---|---|
+| regen | 11 / 11 m | 177 / 33 m | 745 / 46 m |
+| win | 41 / 41 m | 220 / 76 m | 802 / 77 m |
+| gnss | 79 / 79 m | 208 / 156 m | 809 / 212 m |
+
+Speed came out within 0.5 m/s of the truth at 8 and 28 m/s; standing
+still, no fix was taken as moving (at 3 sigmas and 1 m/s, 6 of 52 were,
+and the median grew to 14 m). Walking pace (1.4 m/s) stays below the
+threshold and is reported as still, with the old lag. The velocity solve
+costs ~15 ms a fix on the Mac (the robust static solve ~63 ms). Not
+covered: acceleration within the window (stations, bends), and real
+motion: the shift is synthetic.
+
+titan-mnld's default init still gives libmnl no crystal calibration, so
+the libmnl engine starts 24.7 ppm off unless `TITAN_MNLD_CALIB` is set.
+
+**Nothing tracked since 2026-11-12 (open).** On kernel #128, from about
+06:19 on 2026-11-12, the chip tracks no satellite (no `29` record with
+layout `A0`) at a place the user says has sky; at 06:06 the same boot had
+heard 7. Ruled out so far: the clock frame (B swept from −6200 to +5800 Hz,
+nothing), Wi-Fi on or off, `RG_SRCLKEN_IN3_EN`, and the phone's clock
+(0.13 s from NTP on 2026-11-13). The crystal measured +2.94 ppm against
+the Mac's clock on 2026-11-12 (−0.42 ppm on 2026-11-09).
+
+A traced libmnl session on 2026-11-13 (cold start, the modem's
+calibration passed in, 5 minutes, `tools/gnss/gps-capture.sh`) heard
+nothing either: 1590 `29` records, none tracked, gpsd mode 1 in all 296
+reports. With the calibration libmnl does not sweep: it held B at +702
+Hz, sliding to +564 Hz with its crystal model ($PMTKTSX1 +0.71 ppm, then
+about −0.04 ppm after 135 s), and sent no `02` assignments (no aiding
+data). The AGC values moved as before (~3500-3900 and ~6450-6700). This
+is weak evidence: the calibrated libmnl also tracked nothing on
+2026-11-10, when our own session tracked 9 satellites.
+
+Also ruled out (2026-11-13): suspend (the daemon held the phone awake
+from 05:50 to 07:54 on 2026-11-12, across the change), USB and charging
+(plugged in at the working and the failing times alike), and our own
+install at 06:18 that morning (the clock loop: with its gain at 0 the
+generated session is byte-identical to the one that worked at 06:06,
+checked over 40 cycles). Nothing else on the phone's disk changed between
+05:55 and 06:40. The chip's search is not swamped either: the untracked
+detections in the failing libmnl run sit at the same levels as in a
+working libmnl capture of 2026-10-29 (BeiDou median 26 against 25 dB-Hz,
+GPS 15 against 13, GLONASS 18 against 17), and they land on satellites
+below the horizon at scattered Dopplers, so they are the search's noise
+floor, not signals. What is left: the sky at that spot, or something
+outside the disk that changes over time, such as the modem's LTE band and
+its antenna tuner settings. Under Android the modem is told when GNSS
+runs; under Linux it is not. The airplane test of 2026-11-10 ran with the
+wrong clock frame, so it says nothing about this.
+
+**Not the modem (2026-11-13, 20:53-21:00, same spot).** With today's
+orbits (the phone's file was from 2026-11-12 07:59: the daemon only
+refreshes it while it runs, and `clock-sweep.py` reads the same file), a
+session with the modem registered tracked one satellite in full lock from
+23 s, G03 at ~16 dB-Hz, held it for 2 minutes and decoded its ephemeris
+from the sky; no fix. A fresh session with `titan-net airplane on` (modem
+`disabled`) tracked one satellite at 24 s and no more. The GPS LNA pin
+(GPIO155) goes from low to high when GPS opens and back when it closes, as
+on 2026-11-09. So the receiver works and hears the sky at this spot, but
+weakly: the strongest satellite is ~16 dB-Hz, where the chip does not
+bring others to full lock.
+
+**Android at the same spot is ~13 dB stronger (2026-11-13, 21:01-21:12).**
+Stock boot flashed for the test (then #128 back, checked by hash): a GPS
+fix 62 s after YGPS started, 24 satellites, the strongest four averaging
+29.3 dB-Hz (strongest 32, mean 21; YGPS averages GPS 22.8, GLONASS 24.0,
+BeiDou 21.4). Linux ten minutes before: one satellite at ~16 dB-Hz. So the
+sky is there and the loss is in how Linux runs the receiver. Same under
+both: the LNA pin (GPIO155 `0111000100`, driven high), the GPS supplies
+(VCN28 2.8 V, VCN18, VCN33 3.5 V on, VFE28 off), and every DCXO register
+but the live calibration words, the debug read-out mux and `DCXO_CW23`.
+
+Ruled out since, by A/B inside one session (same satellite, 90 s each):
+- `DCXO_CW23` bit 0, `XO_BB_LPM_CEL` (the crystal's hardware low-power
+  mode): Linux has 0x0003, Android 0x0002 (the vendor clock-buffer driver
+  clears the bit at boot; nothing in our 6.12 tree touches it). G03 read
+  14-20 dB-Hz at 0x0003 and 18-20 at 0x0002. Left at 0x0003.
+- The compositor (titan-comp, the display and GPU on MMPLL, whose half
+  frequency is 0.42 MHz from L1): G17 read 21-23 dB-Hz running and 21-23
+  stopped.
+
+A session's first minute shows up to 9 GPS satellites at 10-18 dB-Hz that
+are acquired but never reach full lock, beside one at ~25.
+
+Also ruled out: the kernel. The 2026-11-02 image (`boot-6.12-deep-ncs.img`,
+#86, built before the last good fix, with the same connectivity modules:
+`mtk_btif`, `wmt_drv` and `gps_drv` are byte-identical to that day's
+builds) gave the same picture at the same spot: G17 20-25 and G3 14-21
+dB-Hz, up to 9 more at 11-18 dB-Hz in the first minute, gone by 70 s.
+
+**Android's libmnl, traced (2026-11-13, 21:52-21:58).** strace on stock
+`mnld` (Debian's strace with its glibc, run through the loader on
+Android; SELinux left enforcing) during a YGPS session that held YGPS
+averages of 23-25 (GPS), 18-20 (GLONASS) and 21-23 (BeiDou) dB-Hz;
+capture in `out/gnss-cap/android-1113/` (local). What it shows:
+- **The clock frame moves.** B (first group) went from −444 Hz at 0.5 s
+  to +52 Hz at 58 s, +200 Hz at 133 s and +294 Hz at 6 minutes: +738 Hz,
+  in whole-Hz steps each second (largest 30 Hz). A moves with it (about
+  1.36 per Hz of B), and the groups are 800 (A) and ~590 Hz (B) apart, not
+  418 Hz as in our modem profile. Our daemon holds B at −200 Hz. A step
+  test on our session (B +200 Hz at 70 s) lost every tracked satellite at
+  once: B matters to within much less than 200 Hz. But copying libmnl's
+  curve does not help (below): its B is relative to its own aiding.
+- The daemon's own drift measure does not see this: with
+  `TITAN_GNSS_CLOCK_GAIN=1` it read +20 to +40 Hz from one satellite and
+  moved B only to about −160 Hz; the weak satellites still dropped at
+  ~75 s.
+- **Replays on our session** (a generated script straight to the probe,
+  4 minutes each, tracked = `29` records with layout `A0`): our fixed
+  clock tracked 13 GPS satellites from 20 to 80 s, then 12 of them were
+  lost together and only G19 (25-29 dB-Hz) stayed; Android's frames as
+  they are tracked nothing; our frames plus Android's change since its
+  start tracked 2-6 and nothing after 60 s. So the receiver's clock under
+  our session does not move as libmnl's frames do (no script change
+  happens near 80 s either: our `01` millisecond field wraps at 65.5 s,
+  but Android's does too).
+- **Correction: layout `A0` is not full lock.** In a 150 s run of the same
+  kind, only G17 and G19 (20-27 dB-Hz) reached the lock states (status
+  bytes 6-7 `0251`, then `0261`) and held them. G3, G4, G6, G12 and G25
+  (10-20 dB-Hz) cycled through detection states (`0100`, `0111`, `x011`,
+  `x019`, under layouts `80`, `58`, `20` and also `A0`) for 40-80 s and
+  never locked; then the chip stopped reporting them. The "13 tracked,
+  then lost together" above counts those detection records.
+- **What libmnl does with a detection.** G17 in the Android trace: the
+  `02` search centre is the ephemeris prediction (−1619.5 Hz) with a
+  512 Hz window until 2.0 s; at 2.5 s it moves to the chip's measured
+  Doppler (−1703.1 Hz, 84 Hz away) with a 101 Hz window, then follows the
+  measurement with windows of 96, 12, 7 and 4 Hz (7.5 s) and switches to
+  the track form at 12.6 s. Our daemon keeps every satellite on the
+  ephemeris prediction with a ±512 Hz window until the chip locks it on
+  its own, which happens only above ~20 dB-Hz. Answering detections this
+  way is the likely reason Android holds satellites at 15-20 dB-Hz.
+- In the trace libmnl's first move (2.5 s) shifts **every** GPS search
+  centre by the same −83.6 Hz, undetected satellites included, and moves B
+  by about as much: a receiver clock correction from the first detection
+  (G19 at 2.0 s). It narrows every window at once (46-139 Hz by
+  satellite), then to 12, 7, 4 Hz; G3, G17, G12 and G6 lock 1-6 s later at
+  20-28 dB-Hz. The record's Doppler and the `02` centre differ per
+  satellite (−188 to +169 Hz), so the record cannot simply be copied into
+  the search centre.
+- Fixed narrow windows on our session (2026-11-13, 22:50, 120 s each,
+  counting `0251`/`0261` only): centre geometric −150 Hz with 512 Hz
+  windows (ours) locked G19 and G4; geometric −234 Hz (libmnl's after its
+  correction) with 46 Hz locked up to three, G6, G19 and G12 at 18 dB-Hz;
+  the 101 Hz run never started (no detections at all). Repeated with more
+  points (22:58-23:08): −234 Hz / 101 Hz locked up to five (G4, G6, G17,
+  G19 and G9 at 14-16 dB-Hz); −200 Hz / 46 Hz one; −270 Hz / 46 Hz two;
+  −234 Hz staged down to 12 Hz (512, 101 at 2.5 s, 46 at 5 s, 12 at 8 s)
+  one. Narrow windows need a centre known better than ours.
+- **libmnl's centre moves through the session.** Its GPS `02` centre less
+  the geometric Doppler (today's orbits): −86 Hz at the start, −36 at
+  20 s, +39 at 60 s, +68 at 120 s, +81 to +89 from 200 s; about 0.21 Hz
+  per hertz of its B. The locked satellites' record Doppler less geometry
+  rose only ~+110 Hz over the same 6 minutes, with ~280 Hz jumps on single
+  satellites, so the records give no simple measure of that centre.
+- `own02.regenerate` takes `gps_offset` and `gps_window`, and the daemon
+  `TITAN_GNSS_GPS_OFFSET`, `TITAN_GNSS_GPS_WINDOW` and
+  `TITAN_GNSS_AIM_GAIN` (the centre moved by the measured drift times the
+  gain); defaults unchanged (−150 Hz, the template's 512 Hz), checked
+  byte-identical. A live daemon session with −234 Hz / 101 Hz (22:51)
+  heard nine GPS satellites in the first 20 s and held only G25 (14-19
+  dB-Hz) after that: no fix in 5.5 minutes. Runs minutes apart differ by
+  a few satellites as the sky moves, so the comparison needs runs
+  interleaved side by side; the phone runs the previous files.
+
+**Fixes again with the modem on (2026-11-14, 00:07).** What it took, in
+order (details in gnss-chip.md §6-8):
+- **The GPS search term and window.** Interleaved scripted runs (70-120 s
+  each, GPS satellites in full lock): −150 Hz / 512 Hz (ours until now)
+  0-2; −234 Hz / 101 Hz 1-5; −300 Hz 3-5; **−370 Hz 4-6** (up to six
+  locked in one burst, 119-171 bursts with four or more in two
+  minutes); −450 Hz 2. Raising B by 100 Hz did about what moving the term
+  by −100 Hz did.
+- **The acquisition controller** in the daemon (v1): GPS satellites not
+  yet locked are searched at geometric + a learned term with a 101 Hz
+  window; the term is dithered ±80 Hz while nothing new locks; each new
+  lock credits the term in use 3 s before, and the median becomes the
+  term (`/var/lib/titan-gnss-open/aim-<profile>`, saved as it is learned).
+  `TITAN_GNSS_AIM=0` gives the old behaviour.
+- **The track form only on full lock.** Layout `A0` is not lock; the
+  daemon had given detected satellites the 4 Hz track form. With
+  `TITAN_GNSS_TRACK=0` (search form only) a live session locked seven
+  GPS satellites and held four or five at once; with the track form on
+  detections, one.
+- **Fixes from locked records only, batched on bytes 20-24.** Detection
+  records' code phases put solutions tens of kilometres off, and byte 25
+  holds per-channel flag bits that split every satellite into a batch of
+  its own. Grouped on bytes 20-24, solves came out at 83-94 m rms.
+- **A synced clock.** The phone's clock was 167 ms ahead with no time
+  sync running; the quick fix holds the time error at 0 ± 0.05 s. With
+  `systemd-timesyncd` on (2026-11-14, over cellular data) the next
+  session fixed: first fix 69 s in (quick: G6, G9, G11, G21), more than 60
+  fixes over two minutes at 72-112 m residual rms, until G21 faded to 13
+  dB-Hz. The term learned itself to −330 Hz.
+
+Still to do: hold satellites past ~2 minutes (in every live run the
+weaker ones fade then: the term should follow the crystal as it warms),
+GLONASS and BeiDou with the same aim, and full (five-satellite) fixes.
+The track form is now off by default (`TITAN_GNSS_TRACK=1` turns it
+on): the live runs that held satellites and fixed ran without it.
+
+**After the first fixes (2026-11-14, 00:20-03:05).**
+- **The fade after ~2 minutes was our dither.** Scripted 3-minute runs
+  with the term ramped at 0, −40, +40, +80 Hz a minute: 0 and −40 held
+  four satellites together through 90-180 s (84 and 118 bursts with four
+  or more, means of two rounds), +40 and +80 none. In the daemon, once
+  nothing new locked the term swung ±80 Hz every 4 s, and with the search
+  form on locked satellites too, each swing put their signal at the edge
+  of the 101 Hz window. Locked satellites now keep the undithered term
+  (`own02.regenerate(gps_hold=)`).
+- **Learning by dither and credits is off by default**
+  (`TITAN_GNSS_AIM_LEARN=1`): live, two locks credited the +80 Hz step and
+  moved the term to −250 Hz, outside the region the side-by-side runs
+  found best. The term is fixed at −350 Hz. The warm-up ramp
+  (`TITAN_GNSS_AIM_RAMP`) and a drift gain (`TITAN_GNSS_AIM_GAIN`) exist,
+  at 0.
+- **Sky late at night:** live sessions at 00:50-01:05 locked four GPS
+  satellites over the session but never four at once (one strong, the
+  rest 14-17 dB-Hz); no fix. The fix needs four GPS satellites together
+  because each constellation's batch had its own clock bias and only
+  batches of four were used; the daemon now combines constellations
+  ("Mixing constellations" below).
+- **GLONASS was not searched at all:** our generator used a GLONASS orbit
+  for aiming only within an hour, and the broadcast file's newest is ~82
+  minutes old; now three hours (`own02.GLO_AGE`, deployed). Searched, it
+  locked 0-3 satellites a run; BeiDou none, with every form, centre and
+  time tried (gnss-chip.md §4).
+- **The clock frame is a curve:** gnss-chip.md §7.
+- **libmnl does not centre a satellite's search on the chip's Doppler**
+  (checked 2026-11-14 on the Android trace): its centres stay at geometry
+  plus the common term, within 2-7 Hz across 26 satellites, while the
+  record Doppler less the centre differs by satellite (G4 −162, G6 −31,
+  G9 −64, G17 +61 Hz, median over locked records, ±27 Hz record to
+  record) and wanders over minutes. Centring on the record Doppler would
+  put most windows ~100 Hz from where libmnl keeps them.
+- libmnl narrows each satellite's `02` window once it has it (G17: 512 Hz,
+  then 101, 96, 12, 7, 4 Hz by 7.5 s) and switches it to the track form
+  (`0x0301`) at ~12 s. Its `01` frame carries two fields that change
+  through the session where ours are fixed: the first u32 (0xffff, then
+  −83 … +87 as a signed value; ours 0x60) and the second (0x118e falling
+  to ~0x0f72, with flag bits 0x40000/0x50000 later; ours 0x111f).
+- Frames we leave out: `07` (89, from 6.5 s; SBAS search rotation) and
+  `0A` (9, from 7.6 s). `02` frames: 11,567 in 5.8 minutes.
+- The `08` header differs from ours in bytes 30 (150 against 200), 34-37,
+  46, 50, 54 and 56; ours was captured under titan-mnld.
+- `mnld` reads `/mnt/vendor/nvdata/APCFG/APRDEB/GPS` (the device path,
+  26 MHz, crystal type 0xff, zero LNA mode; created 2026-11-03), the
+  modem's `ML4A_000` and its EPO files; titan-mnld and our daemon read
+  none of the first.
+
+The rest of this section is the investigation, in the order it happened.
+An early reading in it ("Cause: the crystal settings...") is superseded by
+the above: the settings are fine, our clock value was not.
+
+
+**Cause: the crystal settings the modem leaves in the MT6358.** After a
+power-off, with the modem kept off (`titan-net voice off`, `cell off`) and
+the same kernel and parameters, the DCXO came up as on 2026-11-01 and
+under 4.14 (`XO_CDAC_FPM` 0x88, `XO_COFST_FPM` 3, `XO_AAC_FPM_SWEN` 0,
+`RG_SRCLKEN_IN3_EN` 1; only `DCXO_CW23` read 0 against 2), and the open
+daemon heard satellites again at the same window: 10 (3 strong) 30 s into
+the first session and 9 in the second, with two satellites tracked for
+minutes and ephemerides decoded from the sky (G32, G28). Too few strong
+ones there for a fix (five are needed). In the warm-rebooted boot before
+it, modem never started but its DCXO settings still in place (`CDAC`
+0xD4, `COFST` 0, `AAC` on), five minutes heard nothing, as in every
+session since 2026-11-03. The MT6358 keeps the DCXO registers through a
+warm reboot; only a power-off resets them.
+
+**First fix since 2026-11-02 (2026-11-10, 13:51 UTC):** with the modem
+still off after that power-off, on a moving train by a window, the open
+daemon reported a 3D fix: 5 satellites used, 6 heard, 28 overhead, gpsd's
+accuracy estimate ±74 m (seen in the Location app; not compared with a
+reference). Four minutes later, `cgps` on the phone: 3D fix, HDOP 1.10, PDOP
+2.80, gpsd's horizontal error estimate (`eph`) 20.9 m, GPS and GLONASS
+satellites in the sky view. Its speed read 0.0 km/h: the snapshot fix gives no velocity,
+and a moving phone is outside what its 60 s window assumes (see "When it
+fails").
+
+**Android, measured (2026-11-10, stock boot flashed for the test).**
+With the modem running, Android's clock-buffer driver reports capid 0xD4
+and the DCXO reads the modem's values: `CW05` 0x1d2c-0x1d34 (`COFST` 0),
+`CW09` 0x408f (`AAC` on), `CW23` 0x0002, `TOP_SPI_CON1` 1 (CONNSYS's
+clock request goes through the wrapper's DCXO channel, `DCXO_CONN_ADR`
+0x44e); `XO_WCN` is under software control and on. YGPS at the same
+window tracked satellites (average C/N0 GPS 23.1, GLONASS 28.5, BeiDou
+21.4 dB-Hz). A watch of the DCXO words through `pmic_access`
+(`out/modem/android-probe/dcxowatch`, every 0.4 ms for 30 s with the GPS
+on) saw no change in any of them except `CW11` bit 13 (`XO_EXTBUF7_EN_M`),
+which toggles a few times a second with the GPS off too. So the crystal
+does not flip under Android, and the modem's settings alone do not deafen
+the receiver: Android's GPS works with them. What differs is the engine's
+side: Android's mnld passes the modem's crystal calibration and runs with
+its own learned co-clock state, where ours start from the 0x88 era's clock
+(the `10` clock frame replayed by `session.py`, libmnl's state learned
+under 0x88). The `CW23` difference is not it: it read 0 in the cold boot
+where the GPS worked. libmnl's `$PMTKTSX1` under Android is in its log
+only truncated; the clock frame mnld sends there is not captured (no
+strace on that system).
+
+**Something keeps rewriting the DCXO.** `XO_32KDIV_NFRAC_FPM` (`CW05`
+bits 0-13) read 0x1d40 at power-on and on 2026-11-01, then 0x1d44
+(11-05), 0x1d4a (11-09) and 0x1d4c (11-10, warm boot, modem not
+started); `XO_32KDIV_NFRAC_LPM` (`CW06`) moved too. Snapshots can't show
+whether the trim or the oscillator mode also flip while the GPS runs;
+`modules/debug/pmicwatch` (read-only: samples the DCXO words and
+`TOP_SPI_CON1` every millisecond for a set time and logs each change)
+is built for that, not yet run.
+
+**One field at a time (2026-11-10, inconclusive).** With the modem off
+and the crystal at its power-on values, `modules/debug/pmicpoke` (writes
+one MT6358 register through the PMIC wrapper's regmap) applied each of the
+modem's settings alone for a 3.5-minute session, restoring after each
+(`/tmp/xotest.sh` on the phone): control (nothing changed) 0 satellites
+heard; `COFST` 0: 0; `AAC` on: 8 heard, 1 tracked; `CDAC` 0xD4: 0; all
+three: 0. The control hearing nothing, where two sessions 15 minutes
+earlier with the same settings heard 9-10, means the window's sky is too
+marginal for single sessions to separate the fields: repeat with controls
+interleaved, or outdoors.
+
+What follows is the earlier investigation.
+
+
+**GPS has not acquired a satellite since the modem started running under
+Linux.** The last fix (`STATE/position`) is from 2026-11-02 23:06, on a 6.12
+boot, so 6.12 itself worked. Checked on kernel #122 (2026-11-09), the phone
+by a window where earlier sessions tracked 10-19 satellites:
+
+- **Everything up to the chip works.** `titan-gps-driver` loads `gps_drv`,
+  `/dev/stpgps` appears, the chip answers the session header, takes all 49
+  patch chunks, and sends its usual status frames. The LNA pin (GPIO 155)
+  reads high while the device is open and low after (pinctrl debugfs). The
+  `conn` power domain is on. The phone didn't suspend during the tests.
+  `gps_drv.ko`, `wmt_drv.ko`, the probe and the patch are unchanged since
+  before the last fix.
+- **The chip searches but never tracks.** In 60 s the probe got 1052 `29`
+  records and none with layout byte `A0` (tracked); in the working logs
+  (`own02/own.log`, `window/*.log`) `A0` is most of them. So the daemon sees
+  no satellites (`heard: 0`; `above: 0` too, as the sky view is only worked
+  out after a first record).
+- **libmnl fails the same way.** A 4-minute libmnl session (warm, its
+  stored state) and a 4-minute cold start (its `mtkgps.dat` and `cache.dat`
+  moved to `/root/mnl-state-backup/` on the phone) gave no `A0` record and
+  no fix (gpsd mode 1 throughout). So it isn't our daemon.
+- **The crystal's trim moved.** The MT6358 DCXO registers (regmap debugfs)
+  differ from both the 4.14 dump and the 6.12 dump of 2026-11-01, which
+  agree with each other: `XO_CDAC_FPM` 0x88 → 0xD4, `XO_COFST_FPM` 3 → 0,
+  `XO_AAC_FPM_SWEN` 0 → 1. It was already 0xD4 in the dump of 2026-11-05.
+  Android runs at 0xD4 too ([modem.md](modem.md), "Radio on with a valid
+  SIM"), so it is the modem's calibrated cap ID, written when MD1 boots;
+  before the modem ran under Linux (2026-11-03/04) the crystal stayed at the
+  preloader's 0x88. Today's crystal: −0.42 ppm (the phone's
+  `CLOCK_MONOTONIC_RAW`, which counts the same 26 MHz, against the Mac's NTP
+  clock over 292 s, 0.06 ms residual). In the 0x88 era libmnl measured a
+  receiver drift of ~38.4 kHz (24.4 ppm) on L1, and the per-channel GLONASS
+  term showed the same 24 ppm. If that was crystal error, the receiver's clock moved by ~24 ppm, far
+  outside libmnl's ±2 ppm uncertainty (titan-mnld's init: 2000 ppb); the
+  cold-start result below argues against it being the cause.
+- **`10` is the clock frame.** Read as three groups `[u32 A][i32 B, 2^-16
+  Hz]`: on a cold start libmnl sends no `02` at all and steps B across
+  ±30 kHz in ~8.6 kHz bins of ~15 s (−2.1, +16.8, −21.1, −29.7, +25.4,
+  −10.8, +6.4 kHz, ...), the three groups 413 Hz apart; its first
+  byte is 0 then (1 in warm sessions). `session.py` replays B = +27.4 kHz
+  (`CLOCK_10`, the 0x88 era).
+- **Not fixed by B.** Our aided sessions with B at −11 kHz (the old
+  value less 38.4 kHz; also with the `02` window field at 4000), at
+  libmnl's coarse bins, and at −4.1 to −0.6 kHz in 500 Hz steps (A at
+  libmnl's cold 28696): no `A0` record in 60-90 s each. Either B is not
+  simply the search centre for aided searches, A or another field has to
+  agree with it, or something besides the clock changed when the modem
+  started (it now transmits on LTE: a shared antenna or front end, or a
+  co-existence signal, could desense the GPS).
+
+**libmnl's cold start doesn't find the sky either (2026-11-10).** 12
+minutes under strace by the same window, with libmnl's state from a cold
+start (`mtkgps.dat` holding no learned drift): it sent no `02`, swept B
+over −28 to +28 kHz about five times (+28.1, +0.2, −27.5 kHz, ... in
+~70 s cycles), and got no `A0` record and no fix (gpsd mode 1 in all 726
+reports). A search over every clock offset finding nothing means the
+clock is not the (only) cause: the signal doesn't reach the correlators.
+That also reads the 0x88-era numbers differently: B ≈ +27 kHz looks like
+the chip's nominal centre (cold libmnl starts at +28.1 kHz), not 24 ppm of
+crystal error.
+
+Where libmnl's frames differ from `session.py` and from its own 0x88-era
+run6 (the fix came at ~75 s there):
+
+| Frame | run6 (warm, fixed) | now (cold) | `session.py` |
+|---|---|---|---|
+| `10` byte 0 | 1 | 0 | 1 |
+| `10` A, B | 26636, +27.0 kHz, falling slowly | 33350, swept ±28 kHz | 27208, +27.4 kHz |
+| `01` u32 #1 | 97, then 65388 (i16 −148: the clock residual in Hz, as libmnl's `02` sit −145…152 Hz off) at the fix | 95, 221 | 0x60 |
+| `01` u32 #2 | ~3980, 69508 after the fix | 10000 | 0x111F |
+| `01` u16 at 10 | 0x0420 | 0x0200 | 0x0425 |
+| `05` | adds 0x0048=1, 0x000f=500, 0x0019=3, the `0c` stream | adds 0x0004 | run6's first ten |
+
+These follow libmnl's state (warm or cold, fixed or not) and explain no
+failure of both engines at once.
+
+**Not the LTE transmitter either (2026-11-10).** With `airplane on`
+(ModemManager: modem `disabled`, power state `low`; Wi-Fi and Bluetooth
+off) the daemon ran a normal session (16177 search assignments, today's
+orbit file) for 3 minutes: `heard: 0`, no record. Airplane mode off
+afterwards: modem registered again, data and `titan-ims` up.
+
+**A second fault, found on the way: offline, the daemon can aim at
+nothing.** With airplane mode on (no network), the orbit file it had was
+fetched at 04:05 UTC, early in the UTC day, so it held about four hours of
+ephemeris; at 11:35 UTC the "search" tier made **0 assignments** and the
+daemon ran an empty session, which can never succeed (status `searching`,
+`orbits: 0`). The 48 h fallback only helps if the file covers the hours
+before it; fetching the previous day's file as well, or keeping it, would.
+
+**What libmnl expects from the modem side (2026-11-10, from the local
+decompile in `out/gnss-re/`).** libmnl imports only libc and reaches the
+hardware only through `/dev/stpgps`; it drives no antenna switch, LNA
+supply or RF pin. Its modem-side inputs, all through mnld:
+
+- the clock type (co-clock or TCXO) and the LNA pin, from `/dev/stpgps`
+  ioctls (titan-mnld does both);
+- the modem's crystal calibration: stock mnld reads 16 bytes at offset
+  0x40 of the modem NVRAM file `CALIBRAT/ML4A_000` (on MT6771) into the
+  init block's clock-calibration fields (C0, C1 and two more), for
+  libmnl's co-clock temperature model. titan-mnld passes zeros (its
+  template was captured under Debian, without that file); this only
+  shapes libmnl's clock prediction;
+- modem time-sync hooks (`mtk_MD_HW_SW_*`), unused here (the driver logs
+  that this chip needs no GPS-modem sync);
+- its own co-clock learning files (`CoClock_Learn.dat`,
+  `CoClock_HeatDistin.dat`).
+
+So nothing libmnl needs from the modem would stop the signal reaching the
+correlators. Also checked: the MT6358's VFE28 ("front end") supply, which
+the modem's boot moved to hardware control, is off in every dump including
+4.14's with GPS working (its enable bit 0), so it isn't the GPS's; the
+modem node claims no pins through pinctrl. libmnl also has factory tests
+(`mtk_gps_set_jammer_test`, `…_cn0_test`, `…_chn_test`) that would measure
+the RF front end directly.
+
+**libmnl's own diagnostics (2026-11-10).** Logging the `$PMTK` sentences
+in libmnl's NMEA output (titan-mnld `TITAN_MNLD_PMTK`, below) shows two
+lines once a second: `$PMTKTSX1`, its crystal model, and `$PMTKAGC`, the
+RF front end's gain values. With titan-mnld's zero clock calibration the
+model put the crystal at **−24.68 ppm** (the measured value is −0.42
+ppm). With the modem's calibration passed in as stock mnld does
+(`TITAN_MNLD_CALIB`) it read **+0.96 ppm**, then refined to about −0.05
+ppm: within libmnl's ±2 ppm. Even so, 6 minutes by the window gave no fix
+and no satellite used (gpsd mode 1 in all 356 reports). The AGC values move
+second to second (~2900-3200 and ~6500-6650 in pairs), so the front end is
+powered and regulating. PMTK commands sent in through
+`mtk_gps_nmea_input` (`PMTK605`, and `PMTK837,<band>,1,0,1`, the
+single-frequency test: band 0 GPS L1, 1 GLONASS, 2 BeiDou B1) got no
+answer in the output, so the factory test has not run yet.
+
+**A boot without the modem (2026-11-10).** With `titan-net
+voice off` and `cell off` (nothing starts `titan-modem`), after a warm
+reboot on the same kernel and parameters: `titan_modem` not loaded, and
+the crystal trim **still 0xD4**: the MT6358 stays powered through a warm
+reboot and keeps its DCXO registers, so the modem's trim outlives it. Only
+a power-off (or the preloader on a cold boot) returns it to 0x88. The
+USB link dropped during the first run; over Wi-Fi, a 5-minute run in the
+same boot (fresh orbits, ~12800 assignments a session) heard nothing:
+`heard: 0` throughout. So the modem's running state is not the cause; its
+trim, left at 0xD4, is the one modem-side change still in place.
+
+**What else changed since the last fix (2026-11-10).** The device tree
+in `boot-6.12-deep-ncs.img` (built 2026-11-02 21:36, the last image before
+the fix at 23:06) against today's, phandles normalised: new are the NFC
+controller (`st21nfc`), the SD card slot (`mmc1`; a card is in and mounted,
+running UHS SDR50 at 96 MHz from MSDCPLL 384 MHz, VMC at 1.8 V), the flash
+LEDs, SMI larbs 2-4, the video encoder, VPU and SVS nodes, and the modem
+node. No change touches CONNSYS, BTIF, the GPS LNA pin or its supplies;
+`WMT_SOC.cfg` is unchanged since 2026-10-11. PLLs and clock muxes
+(APMIXED and TOPCKGEN read now, against the 2026-11-01 4.14 and 6.12
+captures): MMPLL is 3150 MHz and on in all three (its half, 1575.000 MHz,
+sits 0.42 MHz from L1, but it was so when GPS worked); the differences are
+the CPU PLLs (cpufreq), the camera's MIPI 26 MHz gates (`AP_PLL_CON8` bits
+6 and 11, off while the camera is idle), the SPM's PLL control bits and
+mux settings. None of the SD card's or the new PLLs' harmonics falls
+within a few MHz of L1, B1 or G1. Untested as desense sources: the SD
+card's bus (edges, not just harmonics of its clock) and the NFC
+controller.
+
+Next, in order: (1) the modem's static setup:
+its RF and antenna-switch pins (BPI) and front-end supplies, set when MD1
+boots (a boot with the modem not started is the clean comparison: GPS
+worked that way until 2026-11-02); (2) the crystal trim only after that.
+Tools: `tools/gnss/clock-sweep.py` (generated sessions with the `02`
+centres, the `10` clock or the window changed; counts `A0` records) and
+`tools/gnss/libmnl-drift.py` (a libmnl capture's `02` against the
+ephemeris, its `29` layouts, gpsd's modes); both run on the phone from
+`/tmp` and print no position. libmnl's state from before these tests is in
+`/root/mnl-state-backup/` (it holds a position: phone only).
 
 ---
 
@@ -49,7 +674,7 @@ titan-gnss → NMEA → UDP 127.0.0.1:10110 → gpsd -n → apps
 titan-gnss-open (Python)
   ├─ GPS broadcast ephemeris, fetched hourly (IGS merged file from BKG)
   ├─ our 02 search assignments (Doppler from ephemeris), rewritten into a replay script
-  ├─ titan-gps-probe (Rust): firmware patch + script → /dev/stpgps → MT6631
+  ├─ titan-gps-probe (Rust): firmware patch + script → /dev/stpgps → CONNSYS GNSS DSP
   ├─ reads the chip's 29 measurement records as they come
   └─ snapshot fix every 2 s over 30 s of batches → NMEA → UDP 10110 → gpsd
      (GGA, GSA, GSV, RMC; GSA and GSV between fixes too)
@@ -224,6 +849,23 @@ Code phase bit weights in chips (from bit flips against libmnl, exact to
   0.005 chip/s, and not the records' Doppler (off by up to 0.23 chip/s).
   So integrating the records' Doppler can't supply the fraction; the
   geometry (the joint fix itself) is the better smoother.
+- **libmnl's fraction is no measurement either** (2026-11-14, run6:
+  libmnl's measurement log beside the chip's records, 2026-10-29, ~2
+  minutes). For a pair of satellites, libmnl's time difference follows
+  the integral of its reported Doppler difference less ~0.05 chip/s and
+  jumps by ~2.2 chips every ~40 s (a sawtooth: Doppler carried forward,
+  pulled back to the whole chips now and then). Against the geometry
+  (broadcast orbits, libmnl's own median fix as the position, so if
+  anything in libmnl's favour), the pair differences scatter about their
+  mean by 94, 114 and 200 m rms for libmnl's times and 135-139 m for the
+  records' whole chips, and libmnl's error is correlated over tens of
+  seconds where the whole chips' rounding is fresh each second, so it
+  averages down more slowly. The chip reports no sub-chip phase that
+  libmnl reads (bit flips: only bytes 26-28 move its time); finer code
+  phase would have to come from the firmware itself. For a static phone
+  the joint fix's averaging over the window (~85 m / √epochs) is the
+  method; Doppler could add to it only while moving, with each
+  satellite's record offset estimated.
 - Byte 26's low bits (208-212) also count (464 chips together) but are
   always 0 in practice.
 
@@ -338,6 +980,71 @@ be separated when the same four satellites fill every batch); the daemon
 now needs five satellites in two batches or more, and `solve_joint_t`
 takes a height prior.
 
+### Mixing constellations (2026-11-14)
+
+Each batch is one constellation's and has its own clock bias, so a batch
+of n satellites gives n − 1 equations. Until 2026-11-14 the daemon used
+only batches of four or more, so a fix needed four satellites of one
+system locked together; at night only three GPS satellites held at once,
+and the one or two GLONASS satellites that locked beside them were
+wasted. Now:
+
+- **Batches of two or more go in** (`FIX_MIN_BATCH`, env
+  `TITAN_GNSS_MIN_BATCH`, default 2).
+- **The rule counts what the batches constrain:** `snapfix.counted`
+  counts satellites seen in two batches or more, less one for each
+  constellation past the first, and `snapfix.epochs` counts the
+  measurement times (batches within 0.3 s) with three equations or more.
+  A full fix needs 5 and 3 epochs; a quick fix (height and clock held)
+  needs 4 and 3 epochs. With one constellation and batches of four these
+  are the old rules. Three GPS and two GLONASS satellites count as four.
+- **GLONASS measurements weigh a quarter** (`snapfix.WEIGHT`, half the
+  amplitude): its chip is twice as long. On the window recording four
+  GLONASS satellites alone fixed at 105-136 m median, four GPS at 46 m.
+- **One shared clock bias is not possible yet:** a GLONASS or BeiDou
+  batch's bias less the nearest GPS batch's jumped by ~140 km between
+  pairings. The systems' records are not measured at one instant, and the
+  time tags (bytes 20-24) count per constellation; GLONASS channels carry
+  two tag groups of their own. Decoding the tags would save one equation
+  per constellation per epoch.
+- **GLONASS and BeiDou are aimed with the GPS term** (`offset=` to
+  `own02.regenerate`, the undithered term, −350 Hz under the modem's
+  trim): libmnl uses one common term for all three. Before, they were
+  aimed at −150 Hz with the template's 512 Hz window.
+
+Replayed over the 2026-10-30 window recording (`replay.py --only-per`
+keeps the first N satellites of each system), horizontal p50 / p90:
+
+| Satellites kept | Batches of 4 (before) | Now |
+|---|---|---|
+| all (G, R, C) | full 12 / 23 m | full 11 / 24 m, first fix 60 m off instead of 131 m |
+| G4 | quick 46 / 81 m | quick 48 / 81 m |
+| G3 R2 | no fix | quick 58 / 109 m, from 17 s |
+| G3 R3 | no fix | full 84 / 135 m |
+| G3 C2 | no fix | quick 88 / 163 m |
+| G2 R2 C2 | no fix | quick 78 / 142 m |
+| G3 R2 C2 | no fix | full 22 / 35 m |
+| R4 | quick 136 / 232 m | quick 104 / 235 m |
+
+On the earlier recording of the same evening (all satellites) the first
+full fix came at 18 s instead of 29 s, p90 120 m instead of 201 m.
+
+Live at the window (2026-11-14 09:03, 5 minutes, deployed): two GPS
+satellites locked (G10, G13 at 17-20 dB-Hz), no GLONASS or BeiDou, so no
+fix; the new rule's report said "0 times with 3+ equations, 2 satellites
+counted". Combining needs a third and fourth satellite to lock.
+
+**More samples would not have helped there.** The chip reports each locked
+satellite once a second (window recording: 0.93-1.01 records/s per
+satellite) and the daemon uses every one. Each is whole chips (~85 m rms
+rounding), and the rounding is fresh each second (the measurement instant
+moves within the code period: G19's chips 888, 975, 488, 960...), so a
+60 s window averages it to the ~11 m seen with many satellites. More
+records a second would sharpen a fix that has enough satellites; with
+two, every record repeats the same two lines of position and no rate
+gives a third. No frame that raises the rate is known (libmnl's sessions
+also run at 1/s).
+
 ## When it fails (2026-11-04, written and tested offline, not yet on the phone)
 
 Reported in use: the service turning off, "searching" with no satellites, and satellites listed with no fix. From reading the code:
@@ -347,7 +1054,7 @@ Reported in use: the service turning off, "searching" with no satellites, and sa
 - The GSV sentences list every satellite above the horizon, from the orbits, heard or not, so "satellites" could be none received. The app now says used, heard and overhead.
 - The unit did not start gpsd, as titan-gnss's does; it does now.
 
-Not changed, to be measured: each 600 s session restart drops the fix until three batches are in again, and a fix over 200 km from the last position is rejected as an ambiguity with nothing to update that position, so a long trip with the GPS off would never get a fix.
+(Since 2026-11-10 a session runs on instead of restarting every 600 s.) Not changed, to be measured: and a fix over 200 km from the last position is rejected as an ambiguity with nothing to update that position, so a long trip with the GPS off would never get a fix.
 
 **Orbit data failover.** In order: the first of `BRDC_URLS` that serves a valid file (a login page also answers 200; only BKG's three were seen to serve it, as IGN timed out from here); the file up to 4 h old with the chip's own ephemeris; then the file up to 48 h old, GPS and BeiDou only, only to aim the search, with fixes from what the chip decodes from the sky. That last tier has not been tried on the air. For 3 h after midnight UTC it fetches the previous day's file, as the new one has little in it. With nothing at all the daemon waits and the app says so. Tested with fake probes and the real file: validation, each tier by file age, a corrupt file, a silent chip, garbage frames, 300 kB on stderr, a failed probe.
 
@@ -380,8 +1087,8 @@ Not changed, to be measured: each 600 s session restart drops the fix until thre
 | Path | What |
 |---|---|
 | `userspace/titan-gnss-open/` | the open daemon, its unit, `install.sh` |
-| `userspace/titan-gps/` | Rust crate: `frame` (codec), `patch` (finds/cuts the patch), `titan-gps-probe` (runs a script, logs chip frames to stdout or `--log`; `--quiet` disables the log entirely). `build.sh` → `out/titan-gps-probe` (static aarch64 musl), tests included |
-| `userspace/titan-mnld/` | our libmnl host (C, 32-bit bionic); env switches `TITAN_MNLD_MEAS`, `_DBG`(`_TYPE`), `_MEMDUMP`, `_RAW`, `_DEBUG`, `_DROP`(`_AFTER`,`_B2`,`_ID`), `_FLIP`(`_SATS`,`_B2`,`_ID`,`_PERIOD`), `_WFLIP`(`_SV`,`_CON`,`_PERIOD`); all off unless set. `build.sh` → `out/titan-mnld` |
+| `userspace/titan-gps/` | Rust crate: `frame` (codec), `patch` (finds/cuts the patch), `titan-gps-probe` (runs a script, from a file or as a stream on standard input with `-`, logs chip frames to stdout or `--log`; `--quiet` disables the log entirely). `build.sh` → `out/titan-gps-probe` (static aarch64 musl), tests included |
+| `userspace/titan-mnld/` | our libmnl host (C, 32-bit bionic); env switches `TITAN_MNLD_MEAS`, `_DBG`(`_TYPE`), `_MEMDUMP`, `_RAW`, `_DEBUG`, `_DROP`(`_AFTER`,`_B2`,`_ID`), `_FLIP`(`_SATS`,`_B2`,`_ID`,`_PERIOD`), `_WFLIP`(`_SV`,`_CON`,`_PERIOD`), `_PMTK` (`SEC:PMTK...;...`: send PMTK sentences, log libmnl's `$PMTK` output), `_CALIB` (a file whose bytes 0x40-0x4f become the init block's clock calibration, as stock mnld reads the modem's `CALIBRAT/ML4A_000`); all off unless set. `build.sh` → `out/titan-mnld` |
 | `tools/gnss/stpgps-decode.py` | decode an strace capture (`--dump`, `--fd N` when strace attached after the open) |
 | `tools/gnss/stpgps-script.py` | capture → probe replay script (`--fd`, `--seconds`) |
 | `tools/gnss/gps-capture.sh` | on the phone (`/root/gps-capture.sh`): libmnl session with strace |
@@ -434,6 +1141,15 @@ Ephemeris source: `https://igs.bkg.bund.de/root_ftp/IGS/BRDC/<yyyy>/<ddd>/BRDC00
   `/dev/stpgps` is opened: use `--fd`.
 - The kernel log's timestamps don't follow the wall clock (no suspend
   time), and floods wrap the ring buffer quickly.
+- **titan-mnld aborts once process ids pass 65535.** 32-bit bionic libc
+  refuses to run (SIGABRT, "pthread_mutex_t ... accepts pid <= 65535")
+  and Debian sets `kernel.pid_max` to 4194304, so after some hours of
+  uptime the libmnl engine can't start. For a test, a runtime drop-in
+  that runs it in its own PID namespace works: `RootDirectory=` and
+  `BindPaths=` cleared, `BindPaths=/dev:/opt/android-gps/dev` (and
+  `/proc`, `/sys`), `ExecStart=/usr/bin/unshare --pid --fork --kill-child
+  /bin/sh -c "/usr/sbin/chroot /opt/android-gps /vendor/bin/titan-mnld;
+  exit $$?"` (2026-11-13; not in the unit file yet).
 - The Mac's shell is zsh: `$var` with spaces is not word-split in loops.
 - `pgrep -f name` inside an `ssh 'command'` matches the ssh command
   itself.
