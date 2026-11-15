@@ -11,9 +11,9 @@ let the bootloader's overlay apply.
 ---
  arch/arm64/boot/dts/mediatek/Makefile         |    3 +
  .../dts/mediatek/mt6771-lk-dtbo-labels.dtsi   |  210 ++
- .../mediatek/mt6771-unihertz-titan-pocket.dts | 1123 ++++++++++
+ .../mediatek/mt6771-unihertz-titan-pocket.dts | 1139 ++++++++++
  arch/arm64/boot/dts/mediatek/mt6771.dtsi      | 1983 +++++++++++++++++
- 4 files changed, 3319 insertions(+)
+ 4 files changed, 3335 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
 index 8fd7b2bb7a1590341e7bb4ea1ecf039ae3e8eb0d..d80f5fd16f5664930365fc17045cbe226c32fd4a 100644
@@ -256,7 +256,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..de68d3b86860a46986b52de785c77b07757f4c03
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771-unihertz-titan-pocket.dts
-@@ -0,0 +1,1123 @@
+@@ -0,0 +1,1139 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Unihertz Titan Pocket (MT6771, 720x720 DSI panel, QWERTY keyboard).
@@ -1288,6 +1288,21 @@ index 0000000000000000000000000000000000000000..de68d3b86860a46986b52de785c77b07
 +		};
 +	};
 +
++	/*
++	 * The sensors' 24 MHz clocks, which the bootloader leaves running on
++	 * all three pins. As clock outputs with the cameras off they raise the
++	 * GPS receiver's noise by about 10 dB, so they are GPIOs held low
++	 * (as under the vendor kernel) unless a sensor has power.
++	 */
++	camera_mclk_idle_pins: camera-mclk-idle-pins {
++		pins-mclk {
++			pinmux = <PINMUX_GPIO99__FUNC_GPIO99>,
++				 <PINMUX_GPIO100__FUNC_GPIO100>,
++				 <PINMUX_GPIO108__FUNC_GPIO108>;
++			output-low;
++		};
++	};
++
 +	camera_mclk_pins: camera-mclk-pins {
 +		pins-mclk {
 +			pinmux = <PINMUX_GPIO99__FUNC_CMMCLK0>,
@@ -1303,8 +1318,9 @@ index 0000000000000000000000000000000000000000..de68d3b86860a46986b52de785c77b07
 +};
 +
 +&camsv1 {
-+	pinctrl-names = "default";
-+	pinctrl-0 = <&camera_mclk_pins>;
++	pinctrl-names = "default", "mclk";
++	pinctrl-0 = <&camera_mclk_idle_pins>;
++	pinctrl-1 = <&camera_mclk_pins>;
 +	/* the SoC's cam_sel (as in mt6771.dtsi), then 24 MHz sensor clocks */
 +	assigned-clocks = <&topckgen CLK_TOP_MUX_CAM>,
 +			  <&topckgen CLK_TOP_MUX_CAMTG>,

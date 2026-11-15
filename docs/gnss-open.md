@@ -980,6 +980,333 @@ be separated when the same four satellites fill every batch); the daemon
 now needs five satellites in two batches or more, and `solve_joint_t`
 takes a height prior.
 
+### The signal gap is a 6.12 problem (2026-11-14)
+
+Locked satellites' C/N0 at the window, top four: Linux on the vendor 4.14
+kernel 2026-10-30 32.2 and 29.5 dB-Hz (19 and 12 satellites locked), Android
+2026-11-13 30.2 dB-Hz (31 locked), Linux on the 6.12 port since mid-November
+~20 dB-Hz (4-5 locked). The earlier "not the kernel" test (build #86) compared
+6.12 builds only. Ruled out on 6.12 since:
+
+- **The clock frame's B:** sessions with B at -350, -275, -200, -125 and
+  -50 Hz (search term moved with it), interleaved, two rounds of 120 s: the
+  same satellites read the same C/N0 at every B (G32 18-20, G25 16-22).
+- **The setup frames:** Android's are ours byte for byte but for the `08`
+  header's two varying fields.
+- **Vendor GPS hooks:** on MT6771 the vendor kernel does nothing for GPS:
+  DRAM frequency hopping for GPS exists only for MT6765/MT6768,
+  `mt_spm_for_gps_only` has no callers, `MTK_GPS_REGISTER_SETTING` is off,
+  and `clk_buf_ctrl(CLK_BUF_CONN)` only records the request (for the
+  buffers' low-power mode, whose CW23 bit was tested on 2026-11-13).
+
+Left: what the 6.12 port does differently in general (no DRAM frequency
+scaling: DRAM stays where the bootloader left it; CPU frequencies include
+1586 MHz, the little cores idling at 793 MHz; RF and clock setup).
+
+**What the two kernels leave in the PMIC** (the dumps of 2026-11-01 with
+GPS running, `out/mainline/captures/pmic414-gps.txt` and
+`pmic612-gps.txt`, names from the vendor `upmu_hw.h`): besides regulators
+that 6.12 leaves under software control (on) where 4.14 hands them to
+hardware low-power control, two settings in the GPS reference-clock path
+differ, neither tested yet:
+
+- `XO_EXTBUF7_EN_M` (`DCXO_CW11` bit 13, 0x7a2): the PMIC's seventh 26 MHz
+  output buffer is forced on under 6.12 (0xa000), off under 4.14 (0x8000).
+  The 2026-11-13 comparison with Android took `CW11` for the debug read-out
+  mux; on Android this bit toggled during GPS (2026-11-10).
+- `RG_VXO22_VOCAL` (`VXO22_ANA_CON0` bits 0-3, 0x1e24): the crystal
+  oscillator supply's trim is 4 under 4.14 (0x0104), 0 under 6.12 (0x0100):
+  our port does not apply that calibration. VXO22 was not among the
+  supplies measured on 2026-11-13.
+
+`tools/gnss/pmic-ab.py` (run on the phone, with `pmicpoke.ko` in /root)
+switches them in 90 s phases inside one session (base, buffer 7 off, base,
+VOCAL 4, base, both, base), prints each locked satellite's median C/N0 per
+phase, and restores what it found.
+
+**4.14 against 6.12 back to back (2026-11-14, 10:53-11:12, same spot).**
+The 4.14 boot image of 2026-10-31 (`backups/boot_k35_20261031.img`) flashed
+for the test, the same Debian root and the same daemon: the daemon locked 16
+satellites at once (8 GPS, 5 GLONASS, 3 BeiDou) at a median 25-28 dB-Hz
+(6.12 that morning: 1-5 at ~18). A 70 s probe session from the same
+generator on each kernel, minutes apart: 4.14 locked 12, top four 30.2
+dB-Hz (R4 29); 6.12 locked one (R4 20). `#128` flashed back and checked by
+hash. On 4.14 the chip often would not answer a second session soon after
+one (`no answer to the session header`) until the driver was restarted; and
+no fix was reported with 16 satellites (the daemon at 87 % CPU; the
+captures are kept to replay, `out/gnss-cap/k414-1114/`).
+
+Hardware state during each session (`tools/gnss/hwdump.sh`: PMIC, clock
+summary, regulators, the topckgen, infracfg, GPIO, SPM and apmixedsys
+blocks, CPU and devfreq state; `out/mainline/captures/hw-1114/`):
+
+- **The modem was not running on 4.14** (titan-modem fails there): its RF
+  and SIM supplies (`VFE28`, `VRF18`, `VRF12`, `VSIM1/2`) are off there, on
+  under 6.12. A confound to test first.
+- `RG_VXO22_VOCAL` 4 against 0 again; `DCXO_CW11` is 0xa000 on both today.
+- The CPU PLLs: under 6.12 the little cluster at 793 MHz runs its PLL at
+  1586 MHz (con1 0x810f4000: 26 MHz x 61, /2), 10.6 MHz from L1; the 4.14
+  dump has a PLL at 1586 MHz too, so registers alone don't separate them.
+
+Tested on 6.12 since, each inside one GPS session in 90 s phases, the same
+satellites compared (2026-11-14, 11:20-11:55): none changed C/N0.
+
+- `RG_VXO22_VOCAL` 4 (as 4.14) against 0: no change (all records median
+  17-20 dB-Hz, p90 30, in every phase).
+- CPUs pinned to 1014 MHz (no PLL near 1586 MHz) against schedutil: no
+  change.
+- MMPLL (3150 MHz, twice L1): 6.12 clocks the multimedia bus (`mm_sel`,
+  topckgen `CLK_CFG_0` bits 8-10) from MMPLL/7 at 450 MHz, so MMPLL runs
+  all the time (the compositor's screen-off only turns the backlight off;
+  the CRTC stays on); the vendor kernel had it on UNIVPLL/2/2 at 312 MHz.
+  Switching to the vendor's source with MMPLL's enable bit cleared
+  (`tools/gnss/mmpll-ab.py`) left every satellite where it was (G28 24/25,
+  G31 20/21, R4 22/22).
+- The modem: Android runs it (registered on LTE) at ~30 dB-Hz, and airplane
+  mode on 6.12 gained nothing (2026-11-13).
+- The panel supplies (GPIO175/177) and reset (GPIO45) differ only because
+  the panel was off in the 4.14 dump.
+
+So the 4.14 boot of 2026-11-14 differed in more than the kernel: panel,
+GPU (MFGPLL), display PLLs and the modem all off. Still to separate: 6.12
+with the display pipeline and GPU fully off, and CONNSYS's own registers
+(the AFE the WMT driver programs), which the dumps leave out.
+
+CONNSYS on 6.12, checked since (2026-11-14 afternoon): the GPS supplies
+(VCN18, VCN28) are identical in all four PMIC dumps, mode and low-power
+bits included; VCN33 differs in its voltage code only (3.5 V measured on
+both, 2026-11-13). The connectivity drivers are the same source on both
+kernels (our build); the 6.12-only branches are headers, debug output, the
+CONN power domain through genpd, the regulators and the clock-buffer
+request (a no-op, as the vendor's records only). `WMT_SOC.cfg` (shared
+root): `co_clock_flag=1`, `wmt_gps_lna_enable=0`, `wmt_gps_lna_pin=0`.
+The AFE block (0x180B6000), read during a GPS session, holds what the
+driver writes (`WBG_PLL_03` 0x000c1df0, `WBG_GPS_02` 0x110a2000). The
+MT6631's RF registers are set by the CONNSYS firmware over its own bus,
+from the same firmware and configuration on both kernels.
+
+**On 4.14 again (2026-11-14, 14:45-15:25):** DRAM is not it. The vendor
+kernel's points are DRAM 3600, 3200, 3200 and 1600 Mbps (`/sys/power/vcorefs`);
+it ran at 3600 for the first ~40 s of a session and 1600 after, and the
+satellites were as strong in both (G16 29/30, G27 24/28). Nor is the display
+being on: with the panel powered (`fb0` unblanked) a 10-minute session
+held G16 29-33, G27 24-35, all records 22-28 dB-Hz.
+
+**The display link rate.** The display PHY's PLL (`MIPITX`, 0x11E50000;
+`tools/gnss/dsipll.py`): the vendor kernel drives the panel at 460.0 Mbps
+(`CON0` 0x8d89d89d, /8; the link clock 230 MHz, its 7th harmonic 1610 MHz,
+34.6 MHz from L1); our 6.12 driver computes 449.4 Mbps from the panel timing
+(`CON0` 0x8a440e7e; clock 224.7 MHz, 7 x 224.7 = 1572.8 MHz, 2.6 MHz under
+L1). Neither spreads it (`CON2` 0x80000001, `CON3` 0x80008000 on both: the
+vendor's spread-spectrum is off for this panel). On 6.12 the link never
+stops (the compositor's screen-off keeps the CRTC on). `tools/gnss/dsi-ab.py`
+switches the rate live inside a GPS session, as the vendor's
+`mipi_clk_change` does (`CON0`, then toggle `CON1` bit 0).
+Result (2026-11-14 15:20-15:31, fresh orbits): no change, G16 17-19 at
+both rates, G27 22/23, G8 20/18 (4.14 an hour earlier: G16 29-33, G27
+24-35, G8 24-27). An earlier run of it was void: the orbit file was 4.5 h
+old and the generator wrote no `02` frames (the A/B tools now refuse to run
+without them).
+
+**The audio PLLs.** Under 6.12 APLL1 (180.6336 MHz) and APLL2 (196.608 MHz,
+from 3145.728 MHz) run though nothing uses them (no PCM open; the clock
+framework counts them unused): `clk_ignore_unused` on our boot line keeps
+whatever the bootloader left on. Under 4.14 they are off. APLL2 lands on
+1572.864 MHz twice over (8 x 196.608, and its oscillator / 2), 2.56 MHz
+under L1. `tools/gnss/apll-ab.py` clears their enable bits in 90 s phases.
+Result: no change (all records 17-23 dB-Hz on and off). Also no change
+(`tools/gnss/idle-ab.py`): the SPM cluster idle states (`mcdi-cpu`,
+`mcdi-cluster`) disabled, WFI only: G16 16-17 and G27 25-28 in every phase.
+The camera is off on 6.12 (clocks and supplies unused). The 4.14 GPS module
+is not richer than ours (its size is debug data). The panel's link rate
+differs because the vendor panel driver hard-codes `PLL_CLOCK = 230` (460
+Mbps, `ssc_disable = 1`) while ours gives the timing (848 x 736 at 60 Hz)
+and the DSI driver derives 449.3 Mbps.
+
+Eleven direct tests have not moved C/N0 on 6.12. Next: whether the loss is
+noise or gain. The chip's once-a-second status frames differ steadily
+between the two 70 s captures (`out/gnss-cap/k414-1114/`): frame `42`
+bytes 6 and 16 (u16: 4.14 24662 and 13089, 6.12 22653 and 11143), `30`
+byte 10 (26716, 22600), `2c` byte 22 (25213, 44007), `4e` byte 12 (247,
+12791), `37` bytes 28-34. libmnl prints a `$PMTKAGC` report; which field it
+reads would say whether the receiver turned its gain down (a jammer) or up
+(a weak front end).
+Checked (2026-11-14): libmnl's `$PMTKAGC`, `$PMTKAG2` and `PMTKAGC,`
+belong to its assisted-GPS messages (the output in `mtk_gps_agps_msg_init`),
+not automatic gain control; no libmnl string names a gain or noise field.
+(`tools/gnss/thumb-xref.py` finds the code that loads a string in a Thumb
+PIC library: `ldr rX, [pc, #]` ... `add rX, pc`; libmnl's virtual addresses
+are its file offsets + 0x2000, the decompile's are + 0x10000 more.)
+
+**Display, GPU and audio drivers all off at once** (2026-11-14 16:08-16:15,
+6.12, unbound live through sysfs: DRM, panel, DSI and its PHY, the display
+blocks, panfrost, the sound card and the AFE; the compositor stopped; the
+display link PLL, GPU PLL and panel off afterwards): no change (baseline
+G27 20, G8 19; stripped G8 19, G27 18). The PMIC's bucks match on both
+kernels (mode and frequency registers). Left in the dumps: infracfg
+`0x10001f00` (`AP2CONN_OSC_EN`) bit 11 is set under 4.14 (0x01c01a24) and
+clear under 6.12 (0x01c01224); our WMT code reads it as the BT CVSD
+interrupt mask and logs "BT CVSD interrupt unmasked" at every power-on.
+`tools/gnss/osc-ab.py` sets it in 90 s phases.
+Result: no change (set: G2 21, G8 19; clear: G2 19/15, G8 17/15).
+
+**Without `clk_ignore_unused`** (#128 with only that word removed from the
+boot header, `out/mainline/boot-6.12-128-noclkignore.img`): the kernel
+gates a clock the UFS needs, the root partition's superblock read fails
+with an I/O error, and the ramdisk stays in first light (telnet on
+172.16.42.1). That is why our Debian images carry the option. #128 flashed
+back and checked. The infra clock gates differ widely between the kernels
+(infracfg `0x10001090`: 4.14 0x8baffb00, most gated; 6.12 0x00407800, most
+running), so a test of them would have to gate unused clocks one by one.
+Also: Wi-Fi was off in every 6.12 GPS run today and on in the strong 4.14
+runs.
+
+The infra gates one by one: `out/mainline/captures/hw-1114/infra-gates.txt`
+lists all 97 (`clk-mt8183.c` `GATE_INFRA0-3`) with their state on 4.14 and
+6.12 and the 6.12 enable counts: 47 run on both; 31 are off on 4.14 and on
+under 6.12, all but `infra_disppwm` unused by any 6.12 driver. Gating those
+30 live (the framework already counts them off) left the phone running and
+storage readable. `tools/gnss/gate-ab.py` gates them in a GPS session:
+group A (PWMs, IR, SPI 0-5, UART 2/3, idle I2C buses, ICUSB), then also
+group B (the SD/eMMC self clocks, `gce_26m`, `cpum`, `uart1`).
+Result (2026-11-14 16:44-16:55): at most a few dB, inconsistent: G8 (the
+one satellite through all phases) base 24/25/20/18, A 28, A+B 22 and 23;
+G27 base 19/17, A 20, A+B 16. Not the 10 dB. One STP transmit timeout
+(retried) in the kernel log during the run, perhaps group B. All restored.
+
+**How CONNSYS runs on each kernel** (the WMT driver's
+`wmt_core_dump_func_state` lines; 4.14 from the journal of 2026-10-19):
+under 4.14 Bluetooth powers the chip 18.9 s after boot and Wi-Fi joins
+0.14 s later; the chip stays on (`b:2 w:2 wmt:2`) and GPS joins it
+(`status(b:2 f:0 g:2 w:2 lpbk:2 … wmt:2)`). Under 6.12 `titan-bt` is
+stopped about two minutes after boot and Wi-Fi does not come up, so the
+chip is off between GPS sessions (`wmt:0`) and every session cold-starts
+it with GPS alone (`b:0 g:2 w:0`). With Wi-Fi, or Bluetooth and Wi-Fi, on
+under 6.12, our probe's session never starts ("no answer to the session
+header", 4 of 4 tries), so GPS joining a running chip, the 4.14 and
+Android case, is untested on 6.12. Not the cause: the "GPS LNA pin
+number(-1)" line (6.12; 4.14 prints 155) is the number a vendor helper
+reports; the LNA is switched through the device-tree states on both
+(GPIO155 low with GPS off, high with it on); libmnl's ioctls 10 and 11
+after opening the device are read-only queries (`RTC_FLAG`,
+`CO_CLOCK_FLAG`).
+
+**The session start on a running chip, fixed (2026-11-14):** libmnl opens
+`/dev/stpgps`, runs six ioctls, starts its reader and writes the header
+~60 ms after the open (Android trace); the probe wrote it the moment the
+open returned. On a cold chip the open takes 1-2 s (the chip powers up)
+and that worked; with Bluetooth or Wi-Fi running the open returns in ~30
+ms and the header went unanswered. `titan-gps-probe` now waits 100 ms
+after the open (`TITAN_GPS_OPEN_SETTLE_MS`); installed (the previous one as
+`.prev-settle`). First session with Bluetooth and Wi-Fi on (`b:2 g:2 w:2`):
+started at once; G8 28, G2 18, G1 16, all records median 18, p90 28 (cold
+sessions: median 17-18, p90 25-26).
+
+Also ruled out on 6.12 since (2026-11-14 evening):
+- Bluetooth and Wi-Fi on (GPS joining a running chip, as 4.14 and Android
+  run it) against off, alternating, two rounds: no difference (off G8
+  26/22, G2 22/21; on G8 22/15, G2 17/17).
+- Userspace: a session with the compositor, modem stack, sensor client,
+  charge controller, keyboard and power-key daemons, Bluetooth, Wi-Fi, USB
+  storage and the user session stopped: G1 20 before and after.
+- The CONNSYS patch: both kernels load the same two (314092 and 229368
+  bytes, built 2021-03-04, `PhVer 0x00f7`); the WMT config is the shared
+  file; the CONNSYS interface pins match.
+- The connectivity driver source: the 4.14 modules (built 2026-10-11/13)
+  match the 2026-10-26 commit; what changed since for 6.12 is API updates
+  (`ioremap`, time types, thermal and remove callbacks) and two STP fixes
+  (acknowledge dropped packets, accept zero-checksum assert frames).
+
+**CONNSYS's own registers (2026-11-14 evening).** The WMT driver's debug
+file reads them through the firmware: after `echo DB9DB9 >
+/proc/driver/wmt_dbg`, `b ADDR MASK` sends a register-read command over STP
+and logs the answer (`c ADDR VALUE` writes). Addresses are the connectivity
+MCU's: 0x80000000 is the chip configuration block (chip id 0x788 at +8).
+`tools/gnss/connreg.py` wraps it (about 300 reads a second; a GPS session
+running beside it is not disturbed). The RF chip (MT6631) is reached through
+the SPI master at 0x81026000: a request (register | bit 12 to read | set
+<< 13) written to the top slot's address register (+0x50), the answer at
++0x58. Set 5 is the chip's top registers (32 bits, every 4; 0x024 reads
+0x66318b01), set 4 the GPS RF registers (16 bits in the upper half; 0x500
+to 0x51b are in use, and 0x508 holds the 0x0210 the firmware's own last
+write left in the GPS slot). Sets 1 and 2 hold values too (Bluetooth/Wi-Fi
+and FM by the look of it); 0, 3, 6 and 7 read empty.
+
+`tools/gnss/conndump.sh` runs one session and from 32 s in dumps the top and
+GPS sets twice, the other sets, and nine CONNSYS pages (0x80000, 0x80021,
+0x80024, 0x80026, 0x80030, 0x81020, 0x81021, 0x81024, 0x81026). On 6.12
+(`out/mainline/captures/conn-1114/612-a/`): both passes identical in every
+top and GPS register, so a difference from 4.14 will stand out; the session
+was as weak as ever (median 18 dB-Hz, four locked at 16-19).
+
+Two reads reboot the phone (watchdog, about a minute; noted under Hazards):
+the firmware-side read of 0x80050000, and an AP-side read (debug command
+`17`, or `/dev/mem`) of a CONNSYS address outside the blocks the drivers
+map. Also seen: one STP transmit timeout (retried) when the debug file
+powers GPS on (`7 2 1`).
+
+### The 10 dB found: the camera clock pins (2026-11-14)
+
+**The same dump on 4.14** (`backups/boot_k35_20261031.img` flashed, #128
+back afterwards and checked by hash; `conn-1114/414-a/`; that session:
+median 25 dB-Hz, 15 locked). Bluetooth and Wi-Fi run there, so the CONNSYS
+pages differ widely and the firmware's own use of the SPI top slot spoils
+a read now and then (0x00000007). In the RF chip's GPS set two registers
+differ: 0x508 (4.14 0x028e, 6.12 0x0210) and 0x505 (0x5887, 0x5e07).
+
+**0x508 is the receiver's gain** (bits 7-5 by the look of it, the low five
+bits hover at 0x0c-0x10): the firmware sets it at the session's start and
+moves it after. Watched once a second (`tools/gnss/agcmon.py`): on 4.14 it
+stayed where it started through four sessions (0x028e, 0x02ce, 0x02ce,
+0x02cf); on 6.12 it started alike (0x028e, 0x026f) and fell to 0x020f/0x0210
+within 3 s, and a value written over it was replaced at once. With the LNA
+switched off (GPIO155 low for 30 s) it rose to 0x02f0, so higher is more
+gain: on 6.12 the receiver ran at its lowest gain because about 10 dB more
+power came in through the LNA. Noise, not lost gain.
+
+With that as a one-second indicator, no change from: storage traffic (a 3
+GB direct read), all cores busy, cores 1-7 offline, airplane mode. Then the
+pins whose function differs between the kernels' GPIO dumps
+(`hw-1114/k414/gpio.txt` against `k612`), switched to plain GPIO inside a
+session: **GPIO99, 100 and 108, the camera sensors' clock outputs (CMMCLK0,
+1, 2).** With the three as GPIOs the satellites came up within seconds (12
+locked, G1 28-30, C29 33) and fell back when the clocks returned (G1 20).
+GPIO99 (the rear camera) alone gives most of it (G1 27); 100 or 108 alone
+little. PWM_A (GPIO90), the I2S pins (170-174) and the audio pins (136-139)
+made no difference.
+
+The cause: the bootloader leaves the 24 MHz sensor clocks running,
+`clk_ignore_unused` keeps them, and our device tree muxed GPIO99 and 100 as
+clock outputs in the camera node's default state (GPIO108 came muxed from
+the bootloader). All three pins toggle with no camera ever opened (sampled
+through the GPIO block's input register: high in 40-50 % of reads), into
+unpowered sensors beside the GPS antenna. The vendor kernel holds the pins
+as GPIOs, low. Setting the gate bits I took for the `camtg` muxes
+(topckgen 0x70 and 0x80) did not stop the pins.
+
+A whole session with the pins as GPIOs (6.12 #128, 150 s): median 25-26
+dB-Hz, p90 30-32, 15 satellites locked (G17 30-35, G1 28-33, C3 29-32), the
+gain at 0x02ce throughout: the same as 4.14 that evening.
+
+**The fix:** the camera node's `default` pin state is now the three pins as
+GPIOs driven low, and a new `mclk` state has the two clocks; the camera
+driver (`modules/camera/linux612/titan_camera.c`) selects `mclk` when the
+first sensor is powered and `default` when the last is off (with a device
+tree that has no `mclk` state it behaves as before).
+`out/mainline/boot-6.12-128-mclk.img` is #128 with only the device tree
+replaced (kernel, ramdisk and command line identical, checked by unpacking).
+
+**Flashed and checked (2026-11-14, 19:25-19:35).** With
+`boot-6.12-128-mclk.img` (partition hash checked) and the new
+`titan_camera.ko` (the previous one beside it as `.prev-mclk`): after boot
+the three pins are GPIOs, outputs, low in 500 of 500 reads. First session,
+120 s, nothing switched by hand: median 25 dB-Hz, p90 29-31, 18 satellites
+locked (G1 38-40, C29 28-31, R12 28-30), the gain starting at 0x02ae. Both
+cameras through libcamera (`cam -c 1` and `-c 2`, YUYV): 20 frames each at
+29-31 fps with picture content; during a 150-frame rear stream GPIO99 is
+the clock again (mode 1, high in 260 of 500 reads), and all three are low
+GPIOs once it stops. While a camera is open the GPS loses the 10 dB again.
+
 ### Mixing constellations (2026-11-14)
 
 Each batch is one constellation's and has its own clock bias, so a batch
@@ -1129,6 +1456,13 @@ Ephemeris source: `https://igs.bkg.bund.de/root_ftp/IGS/BRDC/<yyyy>/<ddd>/BRDC00
   Bluetooth came back by themselves after a minute; GPS opens failed until
   then. The probe now stops a session when the header isn't answered or a
   chunk fails 3 tries.
+- **Two CONNSYS register reads reboot the phone** (2026-11-14, twice): the
+  firmware-side read of 0x80050000 (`wmt_dbg` command `b`; the driver's own
+  comment says this chip cannot access 0x80050078), and AP-side reads of
+  CONNSYS addresses the drivers don't map (0x18021010 or 0x18070008, through
+  command `17`). `connreg.py` syncs the address to its output before each
+  read, so the last line names the culprit. Pages not yet tried: 0x80070,
+  0x81027, 0x81030, 0x81040, 0x81050, 0x81060, 0x81080.
 - **Don't suspend with the GPS running.** A resume while the probe runs
   can crash the connectivity chip (BTIF write fails, `tx_timeout`, whole-
   chip reset, Wi-Fi gone until it ends): twice in about 315 suspend/resume

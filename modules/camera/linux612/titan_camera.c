@@ -53,6 +53,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
@@ -315,6 +316,15 @@ struct titan_cam {
 	struct mutex sensor_lock;	/* sensor modes (not tc->lock: link validation
 					 * runs under it, inside start_streaming) */
 	int pm_count;		/* camsys power users: buffers mapped, streaming */
+	/*
+	 * The sensors' 24 MHz clock pins. The bootloader leaves the clocks
+	 * running, and as clock outputs with no sensor powered they cost the
+	 * GPS receiver 10 dB (docs/gnss-open.md): "default" holds the pins low
+	 * as GPIOs, "mclk" drives the clocks while a sensor has power.
+	 */
+	struct pinctrl *pctl;
+	struct pinctrl_state *pins_idle, *pins_mclk;
+	atomic_t mclk_users;
 
 	/* buffers */
 	spinlock_t qlock;
@@ -579,6 +589,8 @@ static int sensor_power_on(struct titan_sensor *s)
 	ret = clk_prepare_enable(s->mclk);	/* 24 MHz (assigned-clock-parents) */
 	if (ret)
 		return ret;
+	if (atomic_inc_return(&s->tc->mclk_users) == 1 && s->tc->pins_mclk)
+		pinctrl_select_state(s->tc->pctl, s->tc->pins_mclk);
 	gpiod_set_value_cansleep(s->pwdn, 1);
 	gpiod_set_value_cansleep(s->reset, 1);
 	s->powered = true;	/* from here power_off undoes a partial sequence */
@@ -630,6 +642,8 @@ static void sensor_power_off(struct titan_sensor *s)
 	reg_off(s, s->dvdd, 2);
 	reg_off(s, s->avdd, 1);
 	reg_off(s, s->dovdd, 0);
+	if (atomic_dec_and_test(&s->tc->mclk_users) && s->tc->pins_mclk)
+		pinctrl_select_state(s->tc->pctl, s->tc->pins_idle);
 	clk_disable_unprepare(s->mclk);
 	s->powered = false;
 }
@@ -2697,6 +2711,14 @@ static int titan_probe(struct platform_device *pdev)
 	INIT_WORK(&tc->dip_work, dip_work_fn);
 	tc->pdev = pdev;
 	tc->dev = dev;
+	/* without an "mclk" state (an older device tree) "default" is the clocks */
+	tc->pctl = devm_pinctrl_get(dev);
+	if (!IS_ERR(tc->pctl)) {
+		tc->pins_idle = pinctrl_lookup_state(tc->pctl, PINCTRL_STATE_DEFAULT);
+		tc->pins_mclk = pinctrl_lookup_state(tc->pctl, "mclk");
+		if (IS_ERR(tc->pins_idle) || IS_ERR(tc->pins_mclk))
+			tc->pins_mclk = NULL;
+	}
 
 	tc->camsv = devm_platform_ioremap_resource_byname(pdev, "camsv");
 	if (IS_ERR(tc->camsv))
