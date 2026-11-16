@@ -349,6 +349,11 @@ sends vendor command **0xFC7A** with 7 bytes from the NVRAM record (bytes
 
 ### Using it
 
+The phone's Bluetooth settings app, `titan-bluetooth`
+(../desktop.md), switches it
+on and off, makes the phone visible, scans, and pairs as BlueZ's agent.
+From a shell:
+
 ```sh
 systemctl status titan-bt bluetooth
 btmgmt info                     # hci0, address, settings

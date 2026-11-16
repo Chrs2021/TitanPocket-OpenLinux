@@ -1,0 +1,3305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 19/22] net: wwan: add the MT6771 modem (MD1)
+
+titan_modem boots the modem image the bootloader loaded, runs the CCCI
+handshakes over CCIF, carries the AT channels as WWAN ports (a 27.010
+mux, as on Android) and the network data over CLDMA as ccmniN
+interfaces, and handles the modem's exception handshake with a
+devcoredump of each crash. Its NVRAM file service runs in userspace on
+/dev/titan-modem. CLDMA's registers are set up again after the SPM's deep
+sleep resets them, and a stalled uplink queue is resumed and, if it stays
+stalled, flushed.
+---
+ drivers/net/wwan/Kconfig              |   17 +
+ drivers/net/wwan/Makefile             |    1 +
+ drivers/net/wwan/mt6771/Makefile      |    2 +
+ drivers/net/wwan/mt6771/titan_modem.c | 3235 +++++++++++++++++++++++++
+ 4 files changed, 3255 insertions(+)
+
+diff --git a/drivers/net/wwan/Kconfig b/drivers/net/wwan/Kconfig
+index 410b0245114e892808f1a445e34f954376e5d2ae..e718ce454cde5d17f54ef242e216dad27b54fcf1 100644
+--- a/drivers/net/wwan/Kconfig
++++ b/drivers/net/wwan/Kconfig
+@@ -105,6 +105,23 @@ config IOSM
+ 
+ 	  If unsure, say N.
+ 
++config MTK_MT6771_MODEM
++	tristate "MediaTek MT6771 modem (MD1)"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on OF && MFD_SYSCON && PM
++	select WANT_DEV_COREDUMP
++	help
++	  The LTE modem built into the MediaTek MT6771 (Helio P60/P70):
++	  boots the image the bootloader loaded, runs the CCCI handshakes
++	  over CCIF, the AT channels as WWAN ports (a 27.010 mux), the
++	  network data over CLDMA as ccmniN interfaces, and the modem's
++	  exception handshake, with a devcoredump of each crash. Its NVRAM
++	  file service runs in userspace on /dev/titan-modem; the modem
++	  runs while that device is open.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called titan_modem.
++
+ config MTK_T7XX
+ 	tristate "MediaTek PCIe 5G WWAN modem T7xx device"
+ 	depends on PCI
+diff --git a/drivers/net/wwan/Makefile b/drivers/net/wwan/Makefile
+index 3960c0ae2445cde1827a3c9e4cbdc6269c231e64..544537c4139e6efc86ee5c073f48870a5b7abb4e 100644
+--- a/drivers/net/wwan/Makefile
++++ b/drivers/net/wwan/Makefile
+@@ -14,3 +14,4 @@ obj-$(CONFIG_QCOM_BAM_DMUX) += qcom_bam_dmux.o
+ obj-$(CONFIG_RPMSG_WWAN_CTRL) += rpmsg_wwan_ctrl.o
+ obj-$(CONFIG_IOSM) += iosm/
+ obj-$(CONFIG_MTK_T7XX) += t7xx/
++obj-$(CONFIG_MTK_MT6771_MODEM) += mt6771/
+diff --git a/drivers/net/wwan/mt6771/Makefile b/drivers/net/wwan/mt6771/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..b87597741f71a6f66c8690096673e8a323fc30f2
+--- /dev/null
++++ b/drivers/net/wwan/mt6771/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_MTK_MT6771_MODEM) += titan_modem.o
+diff --git a/drivers/net/wwan/mt6771/titan_modem.c b/drivers/net/wwan/mt6771/titan_modem.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac5c74717765cdd1f4762e16dde8a5b2ac9bcfcf
+--- /dev/null
++++ b/drivers/net/wwan/mt6771/titan_modem.c
+@@ -0,0 +1,3235 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6771 modem (MD1): power it on, start the image LK left in memory, do
++ * the boot handshake, and pass the modem's packets to userspace.
++ *
++ * LK loads and checks the modem image, sets the MD's memory protection
++ * and address remap, and describes all of it in a tag block that /chosen's
++ * ccci,modem_info_v2 points to (the vendor's ccci_util parses the same).
++ * What is left to the kernel, as in the vendor eccci driver (mt6771/
++ * md_sys1_platform.c, hif/ccci_hif_ccif.c, ccci_modem.c):
++ *
++ *  - the CCIF ring buffers in the non-cached AP/MD shared memory (the
++ *    modem gen 6293's control, AT, file and log channels all use CCIF;
++ *    CLDMA carries only network data),
++ *  - the modem's clock mode and 26 MHz request, its PLLs, and the boot
++ *    slave release (the MD1 power domain itself is the scpsys driver's,
++ *    switched through runtime PM),
++ *  - handshake 1: the modem posts its feature query in the CCIF SRAM and
++ *    raises CCIF channel 15; the AP answers with its runtime data (where
++ *    each shared memory region is, the time, a random seed, ...) the same
++ *    way. Handshake 2 is a control channel message once the modem has
++ *    finished starting, which needs the AP to serve its NVRAM files.
++ *
++ * Everything after handshake 1 is a CCCI packet (a 16-byte header with
++ * the channel, then the payload) on one of eight CCIF rings; /dev/titan-
++ * modem reads and writes them, one packet per call, for a userspace
++ * daemon (the file server, RPC). The kernel keeps the control channel's
++ * boot and exception messages and forwards the other packets, except
++ * the AT channel once the daemon asks (TITAN_MD_AT_PORT, after its own
++ * start-up commands): from then it is a 27.010 mux, as on Android, with a
++ * WWAN AT port for each channel (at_dlci).
++ *
++ * The modem runs while /dev/titan-modem is open: the first open powers it
++ * on and boots it, the close stops it and powers it off. A crash (an
++ * exception the modem reports on CCIF, or its watchdog) runs the vendor's
++ * exception handshake so the modem finishes its record, saves that record
++ * and the debug areas as a devcoredump, and ends the session: reads fail
++ * with -EIO until the daemon closes the device; opening it again restarts
++ * the modem.
++ */
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/devcoredump.h>
++#include <linux/dma-mapping.h>
++#include <linux/if_arp.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
++#include <linux/miscdevice.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/netdevice.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/pm_wakeup.h>
++#include <linux/poll.h>
++#include <linux/random.h>
++#include <linux/rtnetlink.h>
++#include <linux/regmap.h>
++#include <linux/seq_file.h>
++#include <linux/skbuff.h>
++#include <linux/timekeeping.h>
++#include <linux/unaligned.h>
++#include <linux/vmalloc.h>
++#include <linux/workqueue.h>
++#include <linux/wwan.h>
++
++/* INFRACFG_AO */
++#define INFRA_RST0		0x150	/* PD domain resets: CCIF0 bit 8 */
++#define INFRA_RST1		0x154
++#define CCIF0_RST		BIT(8)
++#define PROTECTEN_STA1		0x228
++#define PROTECTEN_1_STA1	0x258
++#define PROTECTEN_SET		0x2a0
++#define PROTECTEN_1_SET		0x2a8
++#define PROTECTEN_1_CLR		0x2ac
++#define AP2MD_DUMMY		0x370
++#define MD_SRCCLKENA		0xf0c
++/* bus protection: AP->MD is bit 7 of PROTECTEN, MD->AP bit 6 of _1 (the power
++ * domain sets and clears them too, with MD1's step 2, bits 3 and 4)
++ */
++#define PROT_PERI2MD		BIT(7)
++#define PROT_MD2PERI		BIT(6)
++
++/* modem-side registers (offsets into the DT reg windows) */
++#define MD_BOOT_VECTOR_EN_OFF	0x24	/* into "md-boot" */
++#define WDT_MD_MODE_KEY		0x55000030	/* "md-rgu" + 0 */
++
++/* CCIF */
++#define APCCIF_BUSY		0x04
++#define APCCIF_TCHNUM		0x0c
++#define APCCIF_RCHNUM		0x10
++#define APCCIF_ACK		0x14
++#define APCCIF_CHDATA		0x100
++#define CCIF_SRAM_SIZE		512
++#define CCIF_SRAM		15	/* the handshake, both ways */
++
++/* CCCI channels (ccci_core.h) */
++#define CCCI_CONTROL_RX		0
++#define CCCI_CONTROL_TX		1
++#define CCCI_SYSTEM_TX		3
++#define CCCI_PCM_TX		5
++#define CCCI_UART1_TX		8
++#define CCCI_UART2_RX		10
++#define CCCI_UART2_TX		12
++#define CCCI_FS_TX		15
++#define CCCI_RPC_TX		33
++#define CCCI_IMSV_UL		52
++#define CCCI_IMSC_UL		54
++#define CCCI_IMSA_UL		56
++#define CCCI_IMSDC_UL		58
++#define CCCI_IPC_TX		36
++#define CCCI_MD_LOG_TX		61
++#define CCCI_STATUS_TX		67
++#define CCCI_CH_MAX		128
++
++/* control channel messages (mtk_ccci_common.h) */
++#define MD_INIT_START_BOOT	0x0
++#define MD_EX			0x4
++#define MD_EX_REC_OK		0x6
++#define MD_EX_PASS		0x8
++#define MD_INIT_CHK_ID		0x5555ffff
++#define MD_EX_CHK_ID		0x45584350	/* "EXCP" */
++#define MD_EX_REC_OK_CHK_ID	0x45524543	/* "EREC" */
++/* a CCCI control/system message carries the magic in data[0] (ccci_core.h) */
++#define CCCI_MAGIC_NUM		0xffffffff
++/* AP low-power status to the modem (mtk_ccci_common.h, vendor ID_AP2MD_LOWPWR):
++ * without it the modem never learns the AP has suspended and stays in a
++ * higher-power idle. 1 << 0 entering suspend, 1 << 1 resumed. */
++#define CCMSG_LOWPWR_APSTS_NOTIFY	0x128
++#define LOWPWR_AP_SUSPEND	(1 << 0)
++#define LOWPWR_AP_RESUME	(1 << 1)
++
++struct ccci_header {
++	u32 data[2];
++	u16 channel;
++	u16 seq_num:15;
++	u16 assert_bit:1;
++	u32 reserved;
++} __packed;
++
++/* the handshake (ccci_modem.h); feature masks are support:4, version:4 */
++#define FEATURE_COUNT		64
++#define MD_FEATURE_QUERY_PATTERN 0x49434343
++#define AP_FEATURE_QUERY_PATTERN 0x43434349
++
++enum { F_NOT_EXIST, F_NOT_SUPPORT, F_MUST, F_OPTIONAL, F_BACKWARD };
++
++enum {
++	BOOT_INFO = 0, EXCEPTION_SHARE_MEMORY, CCIF_SHARE_MEMORY,
++	SMART_LOGGING_SHARE_MEMORY, MD1MD3_SHARE_MEMORY,
++	MISC_INFO_HIF_DMA_REMAP, MISC_INFO_RTC_32K_LESS,
++	MISC_INFO_RANDOM_SEED_NUM, MISC_INFO_GPS_COCLOCK, MISC_INFO_SBP_ID,
++	MISC_INFO_CCCI, MISC_INFO_CLIB_TIME, MISC_INFO_C2K,
++	MD_IMAGE_START_MEMORY, CCISM_SHARE_MEMORY, CCB_SHARE_MEMORY,
++	DHL_RAW_SHARE_MEMORY, DT_NETD_SHARE_MEMORY, DT_USB_SHARE_MEMORY,
++	EE_AFTER_EPOF, AP_CCMNI_MTU, MISC_INFO_CUSTOMER_VAL = 21,
++	CCCI_FAST_HEADER = 22, MISC_INFO_C2K_MEID = 24, LWA_SHARE_MEMORY = 25,
++	AUDIO_RAW_SHARE_MEMORY = 26, MULTI_MD_MPU = 27,
++	CCISM_SHARE_MEMORY_EXP = 28, MD_PHY_CAPTURE = 29,
++	MD_CONSYS_SHARE_MEMORY = 30, MD_USIP_SHARE_MEMORY = 31,
++	MD_MTEE_SHARE_MEMORY_ENABLE = 32, MD_POS_SHARE_MEMORY = 33,
++	UDC_RAW_SHARE_MEMORY = 34,
++};
++
++struct md_query_ap_feature {
++	u32 head_pattern;
++	u8 feature_set[FEATURE_COUNT];
++	u32 tail_pattern;
++	u8 reserved[152];
++} __packed;
++
++struct ap_query_md_feature_v2_1 {
++	u32 head_pattern;
++	u8 feature_set[FEATURE_COUNT];
++	u32 share_memory_support;	/* 2: multiple MD MPU regions */
++	u32 ap_runtime_data_addr;
++	u32 ap_runtime_data_size;
++	u32 md_runtime_data_addr;
++	u32 md_runtime_data_size;
++	u32 noncached_mpu_start_addr;
++	u32 noncached_mpu_total_size;
++	u32 cached_mpu_start_addr;
++	u32 cached_mpu_total_size;
++	u32 reserve_addr[12];
++	u32 tail_pattern;
++} __packed;
++
++/* the CCIF SRAM during handshake 1 */
++#define SRAM_DL_HEADER		0
++#define SRAM_MD_QUERY		16
++#define SRAM_UP_HEADER		(SRAM_MD_QUERY + sizeof(struct md_query_ap_feature))
++#define SRAM_AP_DATA		(SRAM_UP_HEADER + 16)
++
++struct rt_feature {
++	u8 feature_id;
++	u8 support_info;
++	u8 reserved[2];
++	u32 data_len;
++} __packed;
++
++/* the CCIF ring buffers (hif/ccci_ringbuf.c) */
++#define CCCI_RBF_HEADER		0xee0000ee
++#define CCCI_RBF_FOOTER		0xff0000ff
++#define CCIF_PKG_HEADER		0xaabbaabb
++#define CCIF_PKG_FOOTER		0xccddeeff
++/* rx read, write, length, then tx: 24 bytes after the 8-byte guard */
++#define RB_RX_READ		0
++#define RB_RX_WRITE		4
++#define RB_RX_LEN		8
++#define RB_TX_READ		12
++#define RB_TX_WRITE		16
++#define RB_TX_LEN		20
++#define RB_BUF			24
++#define RINGBUF_CTL_LEN		(8 + RB_BUF + 8)
++#define QUEUE_NUM		8
++/* the modem's exception channels (ccif_hif_platform.h, RINGQ_EXP_BASE 15). Channel 20
++ * is its peer wake-up, raised every 2 ms or so once its radio is up: no exception
++ */
++#define CCIF_EX_MASK		GENMASK(19, 16)
++#define CCIF_SEQ_ERROR		21
++/* the exception handshake on those channels (modem_sys1.c md_cd_ee_handshake) */
++#define D2H_EX_INIT		16
++#define D2H_EX_INIT_DONE	17
++#define D2H_EX_CLEARQ_DONE	18
++#define D2H_EX_ALLQ_RESET	19
++#define H2D_EX_ACK		16
++#define H2D_EX_CLEARQ_ACK	17
++/* the vendor's force_assert (CCIF_INTERRUPT): channel 21 from the AP side, which
++ * the modem takes as a sequence error and asserts on; debugfs force_assert
++ */
++#define H2D_FORCE_ASSERT	21
++#define EE_STEP_MS		5000	/* the modem's own limit is 10 s */
++#define EE_MSG_MS		10000	/* MD_EX_REC_OK, then MD_EX_PASS */
++#define EE_PKG_MAX		SZ_16K
++
++static const int rx_queue_size[QUEUE_NUM] = {
++	80 * 1024, 80 * 1024, 40 * 1024, 80 * 1024,
++	20 * 1024, 20 * 1024, 64 * 1024, 0,
++};
++static const int tx_queue_size[QUEUE_NUM] = {
++	128 * 1024, 40 * 1024, 8 * 1024, 40 * 1024,
++	20 * 1024, 20 * 1024, 64 * 1024, 0,
++};
++static const int rx_exp_size[QUEUE_NUM] = {
++	12 * 1024, 32 * 1024, 8 * 1024, 0, 0, 0, 8 * 1024, 0,
++};
++static const int tx_exp_size[QUEUE_NUM] = {
++	12 * 1024, 32 * 1024, 8 * 1024, 0, 0, 0, 8 * 1024, 0,
++};
++
++/* the non-cached shared memory (ccci_modem.c md1_6293_noncacheable_fat) */
++#define SMEM_MDCCCI_DBG		0
++#define SMEM_MDSS_DBG		(2 * 1024)
++#define SMEM_MDSS_DBG_SIZE	(10 * 1024)
++#define SMEM_RUNTIME_DATA	(58 * 1024)
++#define SMEM_RUNTIME_AP_SIZE	0x800
++#define SMEM_RUNTIME_MD_SIZE	0x800
++#define SMEM_DBM_SIZE		160
++#define SMEM_DBM		(64 * 1024 - SMEM_DBM_SIZE - 2 * 8)
++#define SMEM_CCISM_SCP		(64 * 1024)
++#define SMEM_CCISM_SCP_SIZE	(32 * 1024)
++#define SMEM_CCB_CTRL		(96 * 1024)
++#define SMEM_CCB_CTRL_SIZE	(4 * 1024)
++#define SMEM_NETD		(100 * 1024)
++#define SMEM_USB		(104 * 1024)
++#define SMEM_AUDIO		(108 * 1024)
++#define SMEM_AUDIO_SIZE		(52 * 1024)
++#define SMEM_CCISM_MCU		(160 * 1024)
++#define SMEM_CCISM_EXP		(881 * 1024)
++#define SMEM_CCISM_EXP_SIZE	(121 * 1024)
++#define SMEM_LWA		(1024 * 1024)
++#define EE_SMEM_TOTAL_SIZE	(64 * 1024)
++/* the cached part: CCB users in the first 2 MB, the DHL log after */
++#define CCB_CTRL_PART		(2 * 1024 * 1024)
++#define CCB_USERS_SIZE		0x178000	/* DHL 0x70000, MDM, META */
++#define CCB_HDR_PATTERN		0xeeff0011
++
++/*
++ * The CCB buffers (MT6771 ccb_configs): page and buffer sizes, modem to
++ * AP (DL) and AP to modem (UL). The DHL user's control, exception, PS
++ * and three hardware-logger buffers, padding, then the MD monitor and
++ * META users; the data follows the same order from the CCB start.
++ */
++static const struct { u32 dl_page, ul_page, dl_size, ul_size; } ccb_bufs[] = {
++	{ 1024, 1024, 32 * 1024, 32 * 1024 },		/* DHL control */
++	{ 20 * 1024, 128, 6 * 20 * 1024, 128 },		/* exception */
++	{ 512, 1024, 72 * 512, 32 * 1024 },		/* PS */
++	{ 512, 128, 64 * 512, 128 },			/* hw logger 1 */
++	{ 512, 128, 64 * 512, 128 },			/* hw logger 2 */
++	{ 512, 128, 256 * 512, 128 },			/* hw logger 3 */
++	{ 128, 128, 128, 128 }, { 128, 128, 128, 128 },
++	{ 128, 128, 128, 128 }, { 128, 128, 128, 128 },
++	{ 128, 128, 128, 128 }, { 128, 128, 128, 128 },
++	{ 128, 128, 128, 128 }, { 128, 128, 128, 128 },
++	{ 128, 128, 128, 128 }, { 128, 128, 128, 128 },
++	{ 128, 128, 128, 128 }, { 128, 128, 5 * 128, 128 },
++	{ 512, 1024, 32 * 512, 16 * 1024 },		/* MD monitor */
++	{ 65 * 1024, 63 * 1024, 8 * 65 * 1024, 8 * 63 * 1024 },	/* META */
++};
++#define CCMNI_MTU		(3584 - 16)
++
++/* LK's tags (ccci_util_lib_fo.c), with the vendor structs' padding */
++struct ccci_tag_v2 {
++	char name[64];
++	u32 data_offset;
++	u32 data_size;
++	u32 next_tag_offset;
++};
++
++struct lk_modem_info {
++	u64 base;
++	u32 size;
++	u8 md_id, err, md_type, ver;
++	u32 reserved[2];
++} __packed;
++
++struct lk_smem_layout {
++	u64 base;
++	u32 ap_md1_offset, ap_md1_size;
++	u32 ap_md3_offset, ap_md3_size;
++	u32 md1_md3_offset, md1_md3_size;
++	u32 total;
++};
++
++struct lk_ccb_layout {
++	u64 base;
++	u32 size;
++};
++
++/* /chosen ccci,modem_info_v2: LK writes its struct as is (little endian) */
++struct lk_info_v2 {
++	__le64 base;
++	__le32 size;
++	__le32 err;
++	__le32 version;
++	__le32 tag_num;
++	__le32 ld_flag;
++} __packed;
++
++#define RX_QUEUE_MAX		512	/* packets waiting for userspace */
++#define AT_TX_MAX		1024	/* AT payload bytes per packet */
++/* /dev/titan-modem: hand the AT channel to a WWAN port (after handshake 2) */
++#define TITAN_MD_AT_PORT	_IO('t', 0x01)
++
++/*
++ * The AT channels: 3GPP 27.010 basic mode on CCCI UART2, as Android's
++ * gsm0710muxd, one WWAN port per channel in this order. The modem's stacks each have
++ * their own commands and URCs: DLCIs from the daemon's table for two SIMs, checked
++ * against the modem under Android (DLCI 59 carries the RIL's radio commands). cmd1
++ * comes first: ModemManager takes the first port as its primary, and noti, where the
++ * URCs arrive, does not take commands well.
++ */
++static const u8 at_dlci[] = {
++	3, 2, 1, 4, 5, 26, 61, 60, 59, 58, 43,	/* SIM 1: cmd1 noti cmd4 cmd2 cmd3
++						 * atci cmd7 cmd8 cmd9 cmd10 cmd11 */
++	8, 7, 6, 9, 10, 27, 57, 56, 55, 54, 42,	/* SIM 2, the same */
++	45, 44,					/* nwcmd nwurc */
++};
++#define AT_CHANS	ARRAY_SIZE(at_dlci)
++
++#define MUX_FLAG	0xf9
++#define MUX_EA		0x01
++#define MUX_CR		0x02
++#define MUX_PF		0x10
++#define MUX_SABM	0x2f
++#define MUX_UA		0x63
++#define MUX_DM		0x0f
++#define MUX_DISC	0x43
++#define MUX_UIH		0xef
++#define MUX_MSC		0xe3	/* modem status, on DLCI 0: type with C/R and EA */
++#define MUX_N1		512	/* AT+CMUX's frame size */
++#define MUX_RX_SIZE	(2 * MUX_N1 + 16)
++
++struct titan_md;
++
++struct at_chan {
++	struct titan_md *md;
++	struct wwan_port *port;
++	u8 dlci;		/* 0: the raw channel (mux=0) */
++	bool up;		/* the modem accepted the DLCI */
++	bool open;		/* userspace has the port */
++};
++
++enum at_state {
++	AT_DAEMON,		/* UART2 goes to the daemon, on /dev/titan-modem */
++	AT_CMUX,		/* waiting for AT+CMUX's answer */
++	AT_MUX,			/* UART2 carries frames */
++	AT_RAW,			/* one port on the raw channel (mux=0) */
++};
++
++/*
++ * CLDMA, the modem's network data path (hif/ccci_hif_cldma.c, mt6771/cldma_reg.h),
++ * on AP memory: this modem generation has four uplink queues and one downlink. A
++ * descriptor's flags are bit 0 owned by the hardware, bit 7 interrupt when done. Data
++ * is raw IP: uplink descriptors name the interface, and a downlink buffer starts with
++ * a struct lhif_header that does.
++ */
++#define CLDMA_INFRA_RST0_AO	0x140
++#define CLDMA_INFRA_RST1_AO	0x144
++#define CLDMA_INFRA_RST0_PD	0x150
++#define CLDMA_INFRA_RST1_PD	0x154
++#define CLDMA_RST_AO		BIT(6)
++#define CLDMA_RST_PD		BIT(2)
++/* AO */
++#define CLDMA_UL_START_BK(i)	(0x004 + 4 * (i))
++#define CLDMA_SO_CFG		0x400
++#define CLDMA_SO_START(i)	(0x404 + 4 * (i))
++#define CLDMA_SO_STATUS		0x414
++#define CLDMA_DL_MTU		0x418
++#define CLDMA_L2RIMCR0		0x804
++#define CLDMA_L2RIMSR0		0x808
++/* PDN */
++#define CLDMA_UL_START(i)	(0x000 + 4 * (i))
++#define CLDMA_UL_START_CMD	0x030
++#define CLDMA_UL_RESUME_CMD	0x034
++#define CLDMA_UL_STOP_CMD	0x038
++#define CLDMA_UL_CURRENT(i)	(0x014 + 4 * (i))
++#define CLDMA_UL_STATUS		0x028
++#define CLDMA_SO_START_CMD	0x404
++#define CLDMA_SO_RESUME_CMD	0x408
++#define CLDMA_L2TISAR0		0x800
++#define CLDMA_L2TIMCR0		0x808
++#define CLDMA_L2TIMSR0		0x80c
++#define CLDMA_L3TIMCR0		0x820
++#define CLDMA_L3TIMCR1		0x824
++#define CLDMA_L2RISAR0		0x830
++#define CLDMA_L3RIMCR0		0x848
++#define CLDMA_L3RIMCR1		0x84c
++#define CLDMA_IP_BUSY		0x860
++
++#define CLDMA_ALL_QUEUES	0x0f
++#define CLDMA_TX_DONE		0x00f
++#define CLDMA_TX_ALL		0xfff		/* done, queue empty, error */
++#define CLDMA_TX_ERROR		0xf00
++#define CLDMA_RX_DONE		0x1
++#define CLDMA_RX_ALL		0x7		/* done, queue empty, error */
++#define CLDMA_RX_ERROR		0x4
++#define CLDMA_GPD_HWO		0x01
++#define CLDMA_GPD_IOC		0x80
++
++#define CLDMA_TXQ		4
++#define CLDMA_TX_GPDS		128		/* queue 0; the others idle */
++#define CLDMA_RX_GPDS		256
++#define CLDMA_RX_BUF		3584		/* SKB_4K */
++#define CCMNI_COUNT		8
++#define CCMNI_NAPI_BUDGET	64
++
++struct cldma_tgpd {
++	u8 flags;
++	u8 debug;
++	u8 msb;
++	u8 netif;
++	u32 next;
++	u32 data;
++	u16 len;
++	u16 psn;
++} __packed;
++
++struct cldma_rgpd {
++	u8 flags;
++	u8 unused;
++	u16 allow_len;
++	u32 next;
++	u32 data;
++	u16 len;
++	u8 msb;
++	u8 unused2;
++} __packed;
++
++struct lhif_header {
++	u16 pdcp_count;
++	u8 flow_f;
++	u8 netif_type;		/* interface in bits 0-4 */
++} __packed;
++
++struct cldma {
++	void __iomem *ao, *pdn;
++	int irq;
++	struct cldma_tgpd *tgpd;
++	struct cldma_rgpd *rgpd;
++	dma_addr_t tgpd_dma, rgpd_dma;
++
++	struct sk_buff *tx_skb[CLDMA_TX_GPDS];
++	dma_addr_t tx_dma[CLDMA_TX_GPDS];
++	u32 tx_head, tx_tail;	/* free-running */
++	/* the uplink watch: no descriptor finished for this long with some in flight */
++	struct delayed_work tx_watch;
++	u32 tx_watch_tail;
++	unsigned int tx_watch_ticks, tx_stalls, tx_flushes;
++	spinlock_t tx_lock;
++	bool tx_started;
++	bool running;
++
++	struct sk_buff *rx_skb[CLDMA_RX_GPDS];
++	dma_addr_t rx_dma[CLDMA_RX_GPDS];
++	u32 rx_next;
++
++	struct net_device *napi_dev;
++	struct napi_struct napi;
++	struct net_device *net[CCMNI_COUNT];
++};
++
++struct ccmni {
++	struct titan_md *md;
++	u8 id;
++};
++
++/* the modem's life on one open of /dev/titan-modem */
++enum md_state {
++	MD_OFF,			/* powered off */
++	MD_BOOTING,		/* released, handshakes not done */
++	MD_READY,		/* handshake 2 done */
++	MD_EXCEPTION,		/* the exception handshake is running */
++	MD_DEAD,		/* crashed and recorded: close to stop it */
++};
++
++struct titan_md {
++	struct device *dev;
++	struct regmap *infra, *apmixed;
++	void __iomem *ap_ccif, *md_ccif;
++	/* MD-internal blocks the boot sequence reaches (all AP-visible) */
++	void __iomem *md_pll, *md_clksw, *md_rgu, *md_boot, *md_cfg;
++	int irq, irq_ex, irq_wdt;
++
++	struct mutex lock;		/* start and stop */
++	enum md_state state;
++	struct work_struct ee_work;
++	bool ee_wdt;			/* the watchdog, not an exception */
++	struct completion ee_rec_ok, ee_pass;
++	bool wake_armed;		/* its interrupts wake the AP */
++	void *ee_pkg;			/* MD_EX_REC_OK's payload */
++	u32 ee_pkg_len;
++
++	phys_addr_t img_base, smem_base, ccb_base;
++	u32 img_size, img_raw_size, smem_size, ccb_size, ccb_md_offset;
++	u32 smem_md_view, ccb_md_view;
++	void __iomem *smem;		/* write-combined alias */
++	void __iomem *rings[QUEUE_NUM];	/* in use: normal or exception */
++	void __iomem *norm_rings[QUEUE_NUM], *exp_rings[QUEUE_NUM];
++	u32 ccism_size, ccism_exp_size;
++
++	bool powered, hs1_done, ready;
++	unsigned long rchnum;
++	struct delayed_work watch;
++	int watch_ticks;
++	struct work_struct rx_work;
++	spinlock_t tx_lock;
++	u16 tx_seq[CCCI_CH_MAX];
++
++	struct dentry *debugfs;
++	struct debugfs_blob_wrapper smem_blob, sram_blob, ccb_blob, dsp_blob;
++	u8 img_type;		/* LK's modem type (12: ULWCTG) */
++	void *ccb;		/* the cached region, write-combined */
++	u8 sram_copy[CCIF_SRAM_SIZE];
++
++	struct miscdevice misc;
++	struct sk_buff_head rxq;
++	wait_queue_head_t rx_wait;
++	atomic_t open;
++
++	struct cldma cl;
++
++	/* the AT channels as WWAN ports, from TITAN_MD_AT_PORT */
++	struct work_struct at_work;
++	struct at_chan at[AT_CHANS];
++	enum at_state at_state;
++	u8 mux_rx[MUX_RX_SIZE];
++	u32 mux_rx_len;
++	struct completion mux_done;
++	u8 mux_wait_dlci;
++	bool mux_ok;
++};
++
++static struct titan_md *tmd;
++
++/*
++ * The booting start id (ccci_modem.c get_booting_start_id): boot mode in
++ * bits 0-7 (NORMAL_BOOT_ID 0, META_BOOT_ID 1, factory 2), logging mode in
++ * 8-15, the logger wait time in 16-31. Only for experiments: META mode
++ * tolerates a blank NVRAM (no IMEI, no calibration).
++ */
++static uint boot_id;
++module_param(boot_id, uint, 0444);
++
++/* offer the CCB (see ap_feature); and its users' total size */
++static bool ccb = true;
++module_param(ccb, bool, 0444);
++static uint ccb_users = CCB_USERS_SIZE;
++module_param(ccb_users, uint, 0444);
++
++/* cldma=0: leave it stopped and add no network interfaces, for testing (the modem
++ * will not attach)
++ */
++static bool cldma = true;
++module_param(cldma, bool, 0444);
++
++/* mux=0: one WWAN port on the raw channel, for testing */
++static bool mux = true;
++module_param(mux, bool, 0444);
++
++/* optional features to answer "not supported" (bit = feature id), to test */
++static unsigned long long decline;
++module_param(decline, ullong, 0444);
++
++/* the CLDMA and CCIF0-2 infra clocks, by the DT node's clock-names */
++static const char * const clk_names[] = {
++	"cldma", "ccif-ap", "ccif-md",
++	"ccif1-ap", "ccif1-md", "ccif2-ap", "ccif2-md",
++};
++
++/* ---- LK's description of the modem ---- */
++
++static int find_tag(void *blk, u32 len, const char *name, void *out, u32 size)
++{
++	u32 off = 0;
++
++	while (off + sizeof(struct ccci_tag_v2) <= len) {
++		struct ccci_tag_v2 *t = blk + off;
++
++		if (!strncmp(t->name, name, sizeof(t->name))) {
++			if (t->data_size != size ||
++			    t->data_offset + size > len)
++				return -EINVAL;
++			memcpy(out, blk + t->data_offset, size);
++			return 0;
++		}
++		if (t->next_tag_offset <= off)
++			break;
++		off = t->next_tag_offset;
++	}
++	return -ENOENT;
++}
++
++static int read_lk_tags(struct titan_md *md)
++{
++	struct device *dev = md->dev;
++	const struct lk_info_v2 *info;
++	struct lk_smem_layout smem;
++	struct lk_ccb_layout ccb;
++	struct lk_modem_info hdr;
++	struct device_node *np;
++	u32 ld_flag, len;
++	void *blk;
++	int ret, plen;
++
++	np = of_find_node_by_path("/chosen");
++	info = of_get_property(np, "ccci,modem_info_v2", &plen);
++	of_node_put(np);
++	if (!info || plen < sizeof(*info))
++		return dev_err_probe(dev, -ENODEV, "no ccci,modem_info_v2\n");
++	if (le32_to_cpu(info->err) || !(le32_to_cpu(info->ld_flag) & 1))
++		return dev_err_probe(dev, -ENODEV,
++				     "LK did not load the modem (%#x, %#x)\n",
++				     le32_to_cpu(info->err),
++				     le32_to_cpu(info->ld_flag));
++
++	len = le32_to_cpu(info->size);
++	blk = memremap(le64_to_cpu(info->base), len, MEMREMAP_WB);
++	if (!blk)
++		return -ENOMEM;
++	ret = find_tag(blk, len, "hdr_tbl_inf", &hdr, sizeof(hdr)) ?:
++	      find_tag(blk, len, "smem_layout", &smem, sizeof(smem)) ?:
++	      find_tag(blk, len, "ccb_info", &ccb, sizeof(ccb)) ?:
++	      find_tag(blk, len, "md1_smem_cahce_offset", &md->ccb_md_offset,
++		       sizeof(u32)) ?:
++	      find_tag(blk, len, "md1img", &md->img_raw_size, sizeof(u32)) ?:
++	      find_tag(blk, len, "hdr_count", &ld_flag, sizeof(ld_flag));
++	memunmap(blk);
++	if (ret)
++		return dev_err_probe(dev, ret, "LK tags\n");
++	if (hdr.err || !ld_flag)
++		return dev_err_probe(dev, -ENODEV, "modem image error %d\n",
++				     hdr.err);
++
++	md->img_base = hdr.base;
++	md->img_size = hdr.size;
++	md->img_type = hdr.md_type;
++	md->smem_base = smem.base + smem.ap_md1_offset;
++	md->smem_size = smem.ap_md1_size;
++	md->ccb_base = ccb.base;
++	md->ccb_size = ccb.size;
++	/* the modem's bank 4 view (ccci_modem.c ccci_md_config) */
++	md->smem_md_view = 0x40000000 + md->smem_base -
++			   round_down(md->smem_base, SZ_32M);
++	md->ccb_md_view = 0x40000000 + md->ccb_md_offset + md->ccb_base -
++			  round_down(md->ccb_base, SZ_1M);
++	dev_info(dev, "image %pa+%#x (%#x, type %u); shared %pa+%#x at %#x, cached %pa+%#x at %#x\n",
++		 &md->img_base, md->img_size, md->img_raw_size, hdr.md_type,
++		 &md->smem_base, md->smem_size, md->smem_md_view,
++		 &md->ccb_base, md->ccb_size, md->ccb_md_view);
++	if (md->smem_size < SMEM_CCISM_EXP + SMEM_CCISM_EXP_SIZE ||
++	    md->ccb_size < CCB_CTRL_PART)
++		return -EINVAL;
++	return 0;
++}
++
++/*
++ * The shared memory is ordinary RAM that LK reserves without no-map, so
++ * it is in the kernel's cacheable linear map and cannot be ioremapped.
++ * The modem does not snoop the AP's caches, and each ring's control words
++ * for both directions share a cache line, so it is used through a
++ * write-combined alias, as the vendor driver does (vmap_reserved_mem),
++ * after dropping whatever the linear alias holds of it.
++ */
++static void *wc_map(struct device *dev, phys_addr_t base, size_t size)
++{
++	unsigned int i, n = size >> PAGE_SHIFT;
++	struct page **pages;
++	dma_addr_t dma;
++	void *va;
++
++	dma = dma_map_page(dev, phys_to_page(base), 0, size, DMA_FROM_DEVICE);
++	if (dma_mapping_error(dev, dma))
++		return NULL;
++	dma_unmap_page(dev, dma, size, DMA_FROM_DEVICE);
++
++	pages = kmalloc_array(n, sizeof(*pages), GFP_KERNEL);
++	if (!pages)
++		return NULL;
++	for (i = 0; i < n; i++)
++		pages[i] = phys_to_page(base + i * PAGE_SIZE);
++	va = vmap(pages, n, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
++	kfree(pages);
++	return va;
++}
++
++static int map_smem(struct titan_md *md)
++{
++	md->smem = (void __iomem *)wc_map(md->dev, md->smem_base,
++					  md->smem_size);
++	/*
++	 * The cached region (CCB users, the DHL log): cleared before each
++	 * boot, and in debugfs, the way the modem wrote it.
++	 */
++	md->ccb = wc_map(md->dev, md->ccb_base, md->ccb_size);
++	return md->smem && md->ccb ? 0 : -ENOMEM;
++}
++
++/* ---- the ring buffers ---- */
++
++static void __iomem *ring_create(void __iomem *buf, int rx, int tx)
++{
++	int len = RINGBUF_CTL_LEN + rx + tx;
++
++	memset_io(buf, 0, len);
++	writel(CCCI_RBF_HEADER, buf);
++	writel(CCCI_RBF_HEADER, buf + 4);
++	writel(CCCI_RBF_FOOTER, buf + len - 4);
++	writel(CCCI_RBF_FOOTER, buf + len - 8);
++	writel(rx, buf + 8 + RB_RX_LEN);
++	writel(tx, buf + 8 + RB_TX_LEN);
++	return buf + 8;
++}
++
++static u32 init_ring_set(void __iomem *p, const int *rx, const int *tx,
++			 void __iomem **rings)
++{
++	u32 total = 0;
++	int i;
++
++	for (i = 0; i < QUEUE_NUM; i++) {
++		void __iomem *rb = ring_create(p + total, rx[i], tx[i]);
++
++		if (rings)
++			rings[i] = rb;
++		total += RINGBUF_CTL_LEN + rx[i] + tx[i];
++	}
++	return total;
++}
++
++/*
++ * The CCB buffer headers, 64 bytes each in the control block: a DL half
++ * and a UL half, each ending with the page size, the buffer size and a
++ * pattern. Android's ccci_mdinit writes them (libccci_util
++ * ccci_ccb_init_users) before it starts the modem; without them the
++ * modem's buffer manager waits and asserts.
++ */
++static void init_ccb_headers(struct titan_md *md)
++{
++	void __iomem *h = md->smem + SMEM_CCB_CTRL;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(ccb_bufs); i++, h += 64) {
++		writel(ccb_bufs[i].dl_page, h + 0x14);
++		writel(ccb_bufs[i].dl_size, h + 0x18);
++		writel(CCB_HDR_PATTERN, h + 0x1c);
++		writel(ccb_bufs[i].ul_page, h + 0x34);
++		writel(ccb_bufs[i].ul_size, h + 0x38);
++		writel(CCB_HDR_PATTERN, h + 0x3c);
++	}
++}
++
++/*
++ * The speech shared memory (AUDIO_RAW_SHARE_MEMORY), formatted as the
++ * stock audio HAL does once per boot (SpeechExtMemCCCI::formatShareMemory):
++ * 32-byte guards of 0x0a at both ends, the AP and modem flags, then three
++ * rings (offset, size, read and write index): speech parameters, AP data
++ * and modem data; the AP flag's bit 0 says the AP side is formatted.
++ */
++static const u32 sph_shm_rings[][2] = {
++	{ 0x80, 0x3000 }, { 0x3080, 0x2000 }, { 0x5080, 0x7f60 },
++};
++
++static void init_audio_shm(struct titan_md *md)
++{
++	void __iomem *p = md->smem + SMEM_AUDIO;
++	int i;
++
++	for (i = 0; i < 32; i += 4) {
++		writel(0x0a0a0a0a, p + i);
++		writel(0x0a0a0a0a, p + SMEM_AUDIO_SIZE - 32 + i);
++	}
++	for (i = 0; i < ARRAY_SIZE(sph_shm_rings); i++) {
++		writel(sph_shm_rings[i][0], p + 0x28 + i * 16);
++		writel(sph_shm_rings[i][1], p + 0x2c + i * 16);
++	}
++	writel(0x7c, p + 0x7c);
++	writel(1, p + 0x20);
++}
++
++static void init_rings(struct titan_md *md)
++{
++	/* the modem clears the shared memory itself after its first boot */
++	memset_io(md->smem, 0, md->smem_size);
++	/*
++	 * The cached region too, as the vendor's first boot does
++	 * (clear_smem_region): the CCB users' buffer headers live there,
++	 * and left as LK found the DRAM (mostly 0xff), the modem's
++	 * shared-memory buffer manager asserted (ccci_shm_bm.c:584).
++	 */
++	if (md->ccb)
++		memset(md->ccb, 0, md->ccb_size);
++	if (ccb)
++		init_ccb_headers(md);
++	init_audio_shm(md);
++	md->ccism_size = init_ring_set(md->smem + SMEM_CCISM_MCU,
++				       rx_queue_size, tx_queue_size,
++				       md->norm_rings);
++	/* used by the modem for its exception dump only */
++	md->ccism_exp_size = init_ring_set(md->smem + SMEM_CCISM_EXP,
++					   rx_exp_size, tx_exp_size,
++					   md->exp_rings);
++	memcpy(md->rings, md->norm_rings, sizeof(md->rings));
++}
++
++static void ring_copy_from(void __iomem *buf, u32 len, u32 pos, void *dst,
++			   u32 n)
++{
++	u32 first = min(n, len - pos);
++
++	memcpy_fromio(dst, buf + pos, first);
++	if (n > first)
++		memcpy_fromio(dst + first, buf, n - first);
++}
++
++static void ring_copy_to(void __iomem *buf, u32 len, u32 pos, const void *src,
++			 u32 n)
++{
++	u32 first = min(n, len - pos);
++
++	memcpy_toio(buf + pos, src, first);
++	if (n > first)
++		memcpy_toio(buf, src + first, n - first);
++}
++
++/*
++ * The next packet the modem wrote: its length, or a negative error. Each
++ * packet is 0xaabbaabb, its length, the data padded to 8 bytes, and a
++ * footer of two 0xccddeeff.
++ */
++static int ring_peek(void __iomem *rb, u32 *pos)
++{
++	u32 read = readl(rb + RB_RX_READ), write = readl(rb + RB_RX_WRITE);
++	u32 len = readl(rb + RB_RX_LEN), hdr[2], ftr[2], full, fpos;
++	int avail = write - read;
++
++	if (avail < 0)
++		avail += len;
++	if (avail < 16 + sizeof(struct ccci_header))
++		return -EAGAIN;
++	ring_copy_from(rb + RB_BUF, len, read, hdr, 8);
++	if (hdr[0] != CCIF_PKG_HEADER)
++		return -EBADMSG;
++	full = ALIGN(hdr[1], 8) + 16;
++	if (full > avail)
++		return -EAGAIN;
++	fpos = (read + full - 8) % len;
++	ring_copy_from(rb + RB_BUF, len, fpos, ftr, 8);
++	if (ftr[0] != CCIF_PKG_FOOTER || ftr[1] != CCIF_PKG_FOOTER)
++		return -EBADMSG;
++	*pos = (read + 8) % len;
++	return hdr[1];
++}
++
++static void ring_consume(void __iomem *rb, u32 n)
++{
++	u32 read = readl(rb + RB_RX_READ), len = readl(rb + RB_RX_LEN);
++
++	writel((read + ALIGN(n, 8) + 16) % len, rb + RB_RX_READ);
++}
++
++static int ring_write(void __iomem *rb, const void *data, u32 n)
++{
++	u32 read = readl(rb + RB_TX_READ), write = readl(rb + RB_TX_WRITE);
++	u32 len = readl(rb + RB_TX_LEN), rx_len = readl(rb + RB_RX_LEN);
++	u32 hdr[2] = { CCIF_PKG_HEADER, n };
++	u32 ftr[2] = { CCIF_PKG_FOOTER, CCIF_PKG_FOOTER };
++	void __iomem *buf = rb + RB_BUF + rx_len;
++	u32 need = ALIGN(n, 8) + 16;
++	int room;
++
++	if (!len || n > len)
++		return -EINVAL;
++	room = (read <= write ? len - write + read : read - write) - 1;
++	if (need >= room)
++		return -EBUSY;
++	ring_copy_to(buf, len, write, hdr, 8);
++	write = (write + 8) % len;
++	ring_copy_to(buf, len, write, data, n);
++	write = (write + ALIGN(n, 8)) % len;
++	ring_copy_to(buf, len, write, ftr, 8);
++	write = (write + 8) % len;
++	wmb();
++	writel(write, rb + RB_TX_WRITE);
++	return 0;
++}
++
++/* ---- CCIF ---- */
++
++static void ccif_reset(struct titan_md *md)
++{
++	int i;
++
++	/* clears CCIF0's busy, channel and interrupt state, not its SRAM */
++	regmap_write(md->infra, INFRA_RST0, CCIF0_RST);
++	regmap_write(md->infra, INFRA_RST1, CCIF0_RST);
++	for (i = 0; i < CCIF_SRAM_SIZE; i += 4) {
++		writel(0, md->ap_ccif + APCCIF_CHDATA + i);
++		writel(0, md->md_ccif + APCCIF_CHDATA + i);
++	}
++	/* the modem's boot trace goes to the first 60 bytes; the end says
++	 * where its debug area is (ccci_platform.c ccci_reset_ccif_hw)
++	 */
++	writel(0x7274626e, md->ap_ccif + APCCIF_CHDATA + CCIF_SRAM_SIZE - 12);
++	writel(md->smem_md_view + SMEM_MDSS_DBG,
++	       md->ap_ccif + APCCIF_CHDATA + CCIF_SRAM_SIZE - 8);
++	writel(SMEM_MDSS_DBG_SIZE,
++	       md->ap_ccif + APCCIF_CHDATA + CCIF_SRAM_SIZE - 4);
++}
++
++static void ccif_send(struct titan_md *md, int ch)
++{
++	if (readl(md->ap_ccif + APCCIF_BUSY) & BIT(ch))
++		return;	/* still pending: the modem reads the ring anyway */
++	writel(BIT(ch), md->ap_ccif + APCCIF_BUSY);
++	writel(ch, md->ap_ccif + APCCIF_TCHNUM);
++}
++
++static irqreturn_t ccif_isr(int irq, void *data)
++{
++	struct titan_md *md = data;
++	u32 ch = readl(md->ap_ccif + APCCIF_RCHNUM);
++
++	/* the data queues here; the exception channels on irq_ex */
++	writel(ch & 0xffff, md->ap_ccif + APCCIF_ACK);
++	set_mask_bits(&md->rchnum, 0, ch);
++	if (ch & BIT(CCIF_SRAM))
++		mod_delayed_work(system_wq, &md->watch, 0);
++	if (ch & GENMASK(QUEUE_NUM - 1, 0))
++		queue_work(system_highpri_wq, &md->rx_work);
++	/* the vendor's other channels (sequence error, CCB wake-up, ...) */
++	if (ch & GENMASK(14, QUEUE_NUM))
++		dev_info_ratelimited(md->dev, "CCIF channels %#x\n",
++				     ch & (u32)GENMASK(14, QUEUE_NUM));
++	return IRQ_HANDLED;
++}
++
++/* the CCIF SRAM takes 32-bit accesses only: byte stores are lost */
++static void sram_write(void __iomem *dst, const void *src, size_t n)
++{
++	const u32 *p = src;
++	size_t i;
++
++	for (i = 0; i < n / 4; i++)
++		writel(p[i], dst + 4 * i);
++}
++
++static void sram_read(void *dst, const void __iomem *src, size_t n)
++{
++	u32 *p = dst;
++	size_t i;
++
++	for (i = 0; i < n / 4; i++)
++		p[i] = readl(src + 4 * i);
++}
++
++/* CCIF0's second interrupt: the modem's exception channels (16 and up) */
++static irqreturn_t ccif_ex_isr(int irq, void *data)
++{
++	struct titan_md *md = data;
++	u32 ch = readl(md->ap_ccif + APCCIF_RCHNUM);
++
++	writel(ch & ~0x7fffU, md->ap_ccif + APCCIF_ACK);
++	set_mask_bits(&md->rchnum, 0, ch & ~0x7fffU);
++	if ((ch & BIT(D2H_EX_INIT)) && READ_ONCE(md->state) < MD_EXCEPTION) {
++		pm_wakeup_event(md->dev, EE_STEP_MS * 4 + EE_MSG_MS * 2);
++		queue_work(system_unbound_wq, &md->ee_work);
++	}
++	if (ch & BIT(CCIF_SEQ_ERROR))
++		mod_delayed_work(system_wq, &md->watch, 0);
++	return IRQ_HANDLED;
++}
++
++/* the modem's watchdog fired: it is gone, with no handshake to run */
++static irqreturn_t md_wdt_isr(int irq, void *data)
++{
++	struct titan_md *md = data;
++
++	if (READ_ONCE(md->state) < MD_EXCEPTION) {
++		md->ee_wdt = true;
++		pm_wakeup_event(md->dev, EE_MSG_MS);
++		queue_work(system_unbound_wq, &md->ee_work);
++	}
++	return IRQ_HANDLED;
++}
++
++/* ---- handshake 1: the AP's runtime data ---- */
++
++static u8 ap_feature(int id)
++{
++	switch (id) {
++	case BOOT_INFO: case EXCEPTION_SHARE_MEMORY: case CCIF_SHARE_MEMORY:
++	case CCISM_SHARE_MEMORY: case CCISM_SHARE_MEMORY_EXP:
++	case MD_CONSYS_SHARE_MEMORY: case DHL_RAW_SHARE_MEMORY:
++	case LWA_SHARE_MEMORY:
++	case DT_NETD_SHARE_MEMORY: case DT_USB_SHARE_MEMORY:
++	case AUDIO_RAW_SHARE_MEMORY: case MISC_INFO_HIF_DMA_REMAP:
++	case MULTI_MD_MPU: case MISC_INFO_RANDOM_SEED_NUM:
++	case MISC_INFO_GPS_COCLOCK: case MISC_INFO_SBP_ID: case MISC_INFO_CCCI:
++	case MISC_INFO_CLIB_TIME: case MISC_INFO_C2K: case EE_AFTER_EPOF:
++	case AP_CCMNI_MTU:
++		return F_MUST;
++	case MD_IMAGE_START_MEMORY: case MD_MTEE_SHARE_MEMORY_ENABLE:
++		return F_OPTIONAL;
++	case CCB_SHARE_MEMORY:
++		/*
++		 * The CCB (cross-core buffers for the DHL log, the MD monitor
++		 * and META), with its buffer headers (init_ccb_headers):
++		 * without them the modem's buffer manager asserted
++		 * (ccci_shm_bm.c:584). ccb=0 leaves it out.
++		 */
++		return ccb ? F_MUST : F_NOT_SUPPORT;
++	case MD_PHY_CAPTURE: case MD1MD3_SHARE_MEMORY: case UDC_RAW_SHARE_MEMORY:
++	case MD_POS_SHARE_MEMORY: case MISC_INFO_CUSTOMER_VAL:
++	case MISC_INFO_C2K_MEID: case SMART_LOGGING_SHARE_MEMORY:
++	case MD_USIP_SHARE_MEMORY:
++		return F_NOT_SUPPORT;
++	case MISC_INFO_RTC_32K_LESS:
++		/* this board has the 32 kHz crystal (RTC_SPAR0 bit 6) */
++		return F_NOT_SUPPORT;
++	default:
++		return F_NOT_EXIST;
++	}
++}
++
++/*
++ * The RATs of a "universal binary" image by its type, from modem_ultg
++ * (8) on, in the modem's bit order (0 G, 1 T, 2 C, 3 W, 4 Lt, 5 Lf,
++ * 6 NR): ccci_util_lib_fo.c legacy_ubin_rat_map, compatible_convert and
++ * ap_rat_bitmap_to_md_bitmap folded together. Sent with the SBP ID.
++ */
++static const u8 ubin_rats[] = {
++	0x33, 0x39, 0x3b, 0x3d, 0x3f,		/* ultg ulwg ulwtg ulwcg ulwctg */
++	0x13, 0x29, 0x2d, 0x37, 0x17,		/* ulttg ulfwg ulfwcg ulctg ultctg */
++	0x19, 0x1d, 0x23, 0x27,			/* ultwg ultwcg ulftg ulfctg */
++	0x79, 0x7b, 0x7f, 0x7d, 0x57,		/* unlwg unlwtg unlwctg unlwcg unltctg */
++};
++
++/* one feature's data, or a negative error; len is its size in bytes */
++static int feature_data(struct titan_md *md, int id, u32 *d)
++{
++	struct timespec64 ts;
++
++	switch (id) {
++	case BOOT_INFO:
++		/* boot channel, start id (normal boot unless boot_id) */
++		d[0] = CCCI_CONTROL_RX;
++		d[1] = boot_id;
++		d[2] = d[3] = 0;
++		return 16;
++	case EXCEPTION_SHARE_MEMORY:
++		d[0] = md->smem_md_view + SMEM_MDCCCI_DBG;
++		d[1] = EE_SMEM_TOTAL_SIZE;
++		return 8;
++	case CCIF_SHARE_MEMORY:
++		d[0] = md->smem_md_view + SMEM_CCISM_MCU;
++		d[1] = md->ccism_size;
++		return 8;
++	case CCISM_SHARE_MEMORY:
++		d[0] = md->smem_md_view + SMEM_CCISM_SCP;
++		d[1] = SMEM_CCISM_SCP_SIZE;
++		return 8;
++	case CCISM_SHARE_MEMORY_EXP:
++		d[0] = md->smem_md_view + SMEM_CCISM_EXP;
++		d[1] = md->ccism_exp_size;
++		return 8;
++	case CCB_SHARE_MEMORY:
++		d[0] = md->smem_md_view + SMEM_CCB_CTRL;
++		d[1] = SMEM_CCB_CTRL_SIZE;
++		d[2] = md->ccb_md_view;
++		d[3] = ccb_users;
++		return 16;
++	case DHL_RAW_SHARE_MEMORY:
++		d[0] = md->ccb_md_view + CCB_CTRL_PART;
++		d[1] = md->ccb_size - CCB_CTRL_PART;
++		return 8;
++	case MD_CONSYS_SHARE_MEMORY:
++		/*
++		 * Empty, at the end of the cached area: this LK has no cached
++		 * layout table (md1_bank4_cache_info), so the vendor gives the
++		 * whole area to the CCB and CONSYS size 0 after it
++		 * (cshare_memory_info_parsing, OLD_LK_CSMEM). Overlapping the
++		 * CCB users, it made the modem's shared-memory buffer manager
++		 * assert (ccci_shm_bm.c:584, measured).
++		 */
++		d[0] = md->ccb_md_view + md->ccb_size;
++		d[1] = 0;
++		return 8;
++	case LWA_SHARE_MEMORY:
++		d[0] = md->smem_md_view + SMEM_LWA;
++		d[1] = 0;
++		return 8;
++	case DT_NETD_SHARE_MEMORY:
++		d[0] = md->smem_md_view + SMEM_NETD;
++		d[1] = 4096;
++		return 8;
++	case DT_USB_SHARE_MEMORY:
++		d[0] = md->smem_md_view + SMEM_USB;
++		d[1] = 4096;
++		return 8;
++	case AUDIO_RAW_SHARE_MEMORY:
++		d[0] = md->smem_md_view + SMEM_AUDIO;
++		d[1] = SMEM_AUDIO_SIZE;
++		return 8;
++	case MD_IMAGE_START_MEMORY:
++		d[0] = md->img_base;
++		d[1] = md->img_raw_size;
++		return 8;
++	case MULTI_MD_MPU:
++		return 0;
++	case MISC_INFO_RANDOM_SEED_NUM:
++		d[0] = get_random_u32();
++		d[1] = d[2] = d[3] = 0;
++		return 16;
++	case MISC_INFO_CCCI:
++		/* sequence check, MD status polling */
++		d[0] = BIT(0) | BIT(1);
++		d[1] = d[2] = d[3] = 0;
++		return 16;
++	case MISC_INFO_CLIB_TIME:
++		ktime_get_real_ts64(&ts);
++		d[0] = lower_32_bits(ts.tv_sec);
++		d[1] = upper_32_bits(ts.tv_sec);
++		d[2] = d[3] = 0;	/* time zone, DST */
++		return 16;
++	case MISC_INFO_C2K:
++		/* the image (type 12) has CDMA2000 */
++		d[0] = BIT(2);
++		d[1] = d[2] = d[3] = 0;
++		return 16;
++	case AP_CCMNI_MTU:
++		d[0] = CCMNI_MTU;
++		return 4;
++	case MD_MTEE_SHARE_MEMORY_ENABLE:
++		d[0] = 0;
++		return 4;
++	case MISC_INFO_SBP_ID:
++		/* SBP code 0 (none set), the image's RATs (the vendor's world
++		 * mode bitmap; 0 told the modem it had none)
++		 */
++		d[0] = 0;
++		d[1] = md->img_type >= 8 &&
++		       md->img_type - 8 < ARRAY_SIZE(ubin_rats) ?
++		       ubin_rats[md->img_type - 8] : 0;
++		d[2] = d[3] = 0;
++		return 16;
++	case MISC_INFO_HIF_DMA_REMAP: case MISC_INFO_RTC_32K_LESS:
++	case MISC_INFO_GPS_COCLOCK: case EE_AFTER_EPOF:
++		d[0] = d[1] = d[2] = d[3] = 0;
++		return 16;
++	default:
++		/* asked for, but nothing to say: an empty region */
++		d[0] = d[1] = 0;
++		return 8;
++	}
++}
++
++static int send_runtime_data(struct titan_md *md)
++{
++	void __iomem *sram = md->ap_ccif + APCCIF_CHDATA;
++	void __iomem *rt = md->smem + SMEM_RUNTIME_DATA;
++	struct ap_query_md_feature_v2_1 ap = { };
++	struct md_query_ap_feature q;
++	struct ccci_header h;
++	u32 off = 0, d[4];
++	int i, len;
++
++	sram_read(&h, sram + SRAM_DL_HEADER, sizeof(h));
++	sram_read(&q, sram + SRAM_MD_QUERY, sizeof(q));
++	dev_info(md->dev, "HS1: %08x %08x ch %u res %08x\n",
++		 h.data[0], h.data[1], h.channel, h.reserved);
++	print_hex_dump(KERN_INFO, "titan-modem HS1 features: ",
++		       DUMP_PREFIX_OFFSET, 32, 1, q.feature_set,
++		       FEATURE_COUNT, false);
++	if (q.head_pattern != MD_FEATURE_QUERY_PATTERN ||
++	    q.tail_pattern != MD_FEATURE_QUERY_PATTERN) {
++		dev_err(md->dev, "HS1 patterns %08x %08x\n",
++			q.head_pattern, q.tail_pattern);
++		return -EPROTO;
++	}
++
++	/* the feature list, in the AP half of the runtime data region */
++	for (i = 0; i < FEATURE_COUNT; i++) {
++		u8 mdf = q.feature_set[i], mask = mdf & 0xf, ver = mdf >> 4;
++		struct rt_feature f = { .feature_id = i };
++
++		switch (mask) {
++		case F_NOT_EXIST:
++			f.support_info = mdf;
++			break;
++		case F_MUST:
++			if (ap_feature(i) < F_MUST) {
++				dev_err(md->dev,
++					"modem needs feature %d\n", i);
++				return -EOPNOTSUPP;
++			}
++			f.support_info = mdf;
++			break;
++		case F_OPTIONAL:
++			/* the AP's versions are all 0 */
++			f.support_info = (ver == 0 && ap_feature(i) >= F_MUST &&
++					  !(decline & BIT_ULL(i))) ?
++					 F_MUST : F_NOT_SUPPORT;
++			break;
++		case F_BACKWARD:
++			f.support_info = F_MUST;
++			break;
++		}
++		len = (f.support_info & 0xf) == F_MUST ?
++		      feature_data(md, i, d) : 0;
++		if (off + sizeof(f) + len > SMEM_RUNTIME_AP_SIZE)
++			return -ENOSPC;
++		f.data_len = len;
++		memcpy_toio(rt + off, &f, sizeof(f));
++		memcpy_toio(rt + off + sizeof(f), d, len);
++		off += sizeof(f) + len;
++	}
++
++	/* the database of the modem's power budget: guards, zeros */
++	writel(0x44444444, md->smem + SMEM_DBM);
++	writel(0x44444444, md->smem + SMEM_DBM + 4);
++	memset_io(md->smem + SMEM_DBM + 8, 0, SMEM_DBM_SIZE);
++	writel(0x44444444, md->smem + SMEM_DBM + 8 + SMEM_DBM_SIZE);
++	writel(0x44444444, md->smem + SMEM_DBM + 12 + SMEM_DBM_SIZE);
++
++	/* where all that is, in the CCIF SRAM */
++	ap.head_pattern = AP_FEATURE_QUERY_PATTERN;
++	ap.share_memory_support = 2;
++	ap.ap_runtime_data_addr = md->smem_md_view + SMEM_RUNTIME_DATA;
++	ap.ap_runtime_data_size = SMEM_RUNTIME_AP_SIZE;
++	ap.md_runtime_data_addr = ap.ap_runtime_data_addr +
++				  SMEM_RUNTIME_AP_SIZE;
++	ap.md_runtime_data_size = SMEM_RUNTIME_MD_SIZE;
++	ap.noncached_mpu_start_addr = md->smem_md_view;
++	ap.noncached_mpu_total_size = md->smem_size;
++	ap.cached_mpu_start_addr = md->ccb_md_view;
++	ap.cached_mpu_total_size = md->ccb_size;
++	ap.feature_set[1] = 1 << 4;	/* MPU size includes MD1-MD3 smem */
++	ap.tail_pattern = AP_FEATURE_QUERY_PATTERN;
++	sram_write(sram + SRAM_AP_DATA, &ap, sizeof(ap));
++
++	memset(&h, 0, sizeof(h));
++	h.data[1] = sizeof(ap) + sizeof(h);
++	h.channel = CCCI_CONTROL_TX;
++	h.reserved = MD_INIT_CHK_ID;
++	sram_write(sram + SRAM_UP_HEADER, &h, sizeof(h));
++	wmb();
++	ccif_send(md, CCIF_SRAM);
++	dev_info(md->dev, "runtime data sent (%u bytes of features)\n",
++		 off);
++	return 0;
++}
++
++/* ---- packets ---- */
++
++static int tx_queue(u16 ch)
++{
++	switch (ch) {
++	case CCCI_CONTROL_TX: case CCCI_SYSTEM_TX: case CCCI_STATUS_TX:
++	case CCCI_PCM_TX:
++		return 0;
++	case CCCI_MD_LOG_TX:
++		return 2;
++	case CCCI_FS_TX:
++		return 4;
++	case CCCI_UART2_TX:
++		return 5;
++	/* the IMS channels (port_cfg.c: ccci_imsv, _imsc, _imsa, _imsdc) */
++	case CCCI_IMSV_UL: case CCCI_IMSC_UL: case CCCI_IMSA_UL:
++	case CCCI_IMSDC_UL:
++		return 6;
++	default:
++		return 1;
++	}
++}
++
++static int md_send(struct titan_md *md, struct ccci_header *h, u32 len)
++{
++	unsigned long flags;
++	int q, ret;
++
++	if (h->channel >= CCCI_CH_MAX)
++		return -EINVAL;
++	q = tx_queue(h->channel);
++	spin_lock_irqsave(&md->tx_lock, flags);
++	h->seq_num = md->tx_seq[h->channel];
++	/* file and RPC replies are asserted only while the modem boots */
++	h->assert_bit = !(md->ready && (h->channel == CCCI_FS_TX ||
++					h->channel == CCCI_RPC_TX));
++	ret = ring_write(md->rings[q], h, len);
++	if (!ret) {
++		md->tx_seq[h->channel]++;
++		ccif_send(md, q);
++	}
++	spin_unlock_irqrestore(&md->tx_lock, flags);
++	return ret;
++}
++
++/* tell the modem the AP's low-power status, so it can enter its own deep idle
++ * (vendor sends this from its suspend path; see docs/power.md) */
++static void md_notify_lowpwr(struct titan_md *md, u32 status)
++{
++	struct ccci_header h = {};
++
++	if (READ_ONCE(md->state) != MD_READY || !cldma)
++		return;
++	h.data[0] = CCCI_MAGIC_NUM;
++	h.data[1] = CCMSG_LOWPWR_APSTS_NOTIFY;
++	h.channel = CCCI_SYSTEM_TX;
++	h.reserved = status;
++	if (md_send(md, &h, sizeof(h)) == 0)
++		dev_info(md->dev, "low-power notify: AP %s\n",
++			 status == LOWPWR_AP_SUSPEND ? "suspend" : "resume");
++}
++
++/* a control message to the modem: the magic, the message, its check id */
++static int control_send(struct titan_md *md, u32 msg, u32 id)
++{
++	struct ccci_header h = {};
++
++	h.data[0] = CCCI_MAGIC_NUM;
++	h.data[1] = msg;
++	h.channel = CCCI_CONTROL_TX;
++	h.reserved = id;
++	return md_send(md, &h, sizeof(h));
++}
++
++/* the exception messages, once the handshake has switched the rings */
++static void ee_message(struct titan_md *md, struct ccci_header *h, u32 len)
++{
++	if (READ_ONCE(md->state) != MD_EXCEPTION) {
++		dev_err(md->dev, "exception message %#x outside an exception\n",
++			h->data[1]);
++		return;
++	}
++	switch (h->data[1]) {
++	case MD_EX:
++		if (h->reserved != MD_EX_CHK_ID)
++			break;
++		/* the vendor answers with the same message */
++		control_send(md, MD_EX, MD_EX_CHK_ID);
++		return;
++	case MD_EX_REC_OK:
++		if (h->reserved != MD_EX_REC_OK_CHK_ID)
++			break;
++		/* its exception record, kept for the core dump */
++		len -= sizeof(*h);
++		kfree(md->ee_pkg);
++		md->ee_pkg = kmemdup(h + 1, min_t(u32, len, EE_PKG_MAX),
++				     GFP_KERNEL);
++		md->ee_pkg_len = md->ee_pkg ? min_t(u32, len, EE_PKG_MAX) : 0;
++		complete(&md->ee_rec_ok);
++		return;
++	case MD_EX_PASS:
++		complete(&md->ee_pass);
++		return;
++	}
++	dev_err(md->dev, "exception message %#x with id %#x\n", h->data[1],
++		h->reserved);
++}
++
++static void control_rx(struct titan_md *md, struct ccci_header *h, u32 len)
++{
++	switch (h->data[1]) {
++	case MD_INIT_START_BOOT:
++		if (h->reserved != MD_INIT_CHK_ID && !md->ready) {
++			md->ready = true;
++			WRITE_ONCE(md->state, MD_READY);
++			dev_info(md->dev, "HS2: modem ready\n");
++		}
++		break;
++	case MD_EX:
++	case MD_EX_REC_OK:
++	case MD_EX_PASS:
++		ee_message(md, h, len);
++		break;
++	default:
++		dev_info(md->dev, "control %08x %08x res %08x\n",
++			 h->data[0], h->data[1], h->reserved);
++	}
++}
++
++/* ---- the AT channels ---- */
++
++static int at_send_raw(struct titan_md *md, const u8 *d, u32 len)
++{
++	struct ccci_header *h;
++	u32 off, n;
++	int ret = 0;
++
++	if (READ_ONCE(md->state) >= MD_EXCEPTION)
++		return -EIO;
++	h = kmalloc(sizeof(*h) + AT_TX_MAX, GFP_KERNEL);
++	if (!h)
++		return -ENOMEM;
++	for (off = 0; off < len && !ret; off += n) {
++		n = min_t(u32, len - off, AT_TX_MAX);
++		memset(h, 0, sizeof(*h));
++		h->data[1] = sizeof(*h) + n;
++		h->channel = CCCI_UART2_TX;
++		memcpy(h + 1, d + off, n);
++		ret = md_send(md, h, sizeof(*h) + n);
++	}
++	kfree(h);
++	return ret;
++}
++
++/* 27.010's frame check, over the header: CRC-8, reflected, complemented */
++static u8 mux_fcs(const u8 *b, int n)
++{
++	u8 f = 0xff;
++	int i;
++
++	while (n--) {
++		f ^= *b++;
++		for (i = 0; i < 8; i++)
++			f = f & 1 ? (f >> 1) ^ 0xe0 : f >> 1;
++	}
++	return 0xff - f;
++}
++
++static int mux_send(struct titan_md *md, u8 dlci, u8 ctrl, const u8 *d, u32 n)
++{
++	u8 f[MUX_N1 + 7], *p = f;
++	u32 hdr;
++
++	*p++ = MUX_FLAG;
++	*p++ = (dlci << 2) | MUX_CR | MUX_EA;
++	*p++ = ctrl;
++	if (n < 128) {
++		*p++ = (n << 1) | MUX_EA;
++	} else {
++		*p++ = n << 1;
++		*p++ = n >> 7;
++	}
++	hdr = p - f - 1;
++	if (n)
++		memcpy(p, d, n);
++	p += n;
++	*p++ = mux_fcs(f + 1, hdr);
++	*p++ = MUX_FLAG;
++	return at_send_raw(md, f, p - f);
++}
++
++static void mux_frame(struct titan_md *md, u8 dlci, u8 ctrl, u8 *d, u32 n)
++{
++	struct sk_buff *skb;
++	int i;
++
++	switch (ctrl & ~MUX_PF) {
++	case MUX_UA:
++	case MUX_DM:
++		if (dlci == md->mux_wait_dlci) {
++			md->mux_ok = (ctrl & ~MUX_PF) == MUX_UA;
++			complete(&md->mux_done);
++		}
++		return;
++	case MUX_UIH:
++		break;
++	default:
++		return;
++	}
++	if (!dlci) {
++		/* the modem's modem status: answered, with C/R clear. Its flow
++		 * control bit is not obeyed: AT text is short and acknowledged.
++		 */
++		if (n && d[0] == MUX_MSC) {
++			d[0] &= ~MUX_CR;
++			mux_send(md, 0, MUX_UIH, d, n);
++		}
++		return;
++	}
++	for (i = 0; i < AT_CHANS; i++) {
++		struct at_chan *c = &md->at[i];
++
++		if (c->dlci != dlci)
++			continue;
++		/* dropped before the port exists, and while nobody has it open */
++		if (!READ_ONCE(c->port) || !READ_ONCE(c->open))
++			return;
++		skb = alloc_skb(n, GFP_KERNEL);
++		if (skb) {
++			skb_put_data(skb, d, n);
++			wwan_port_rx(c->port, skb);
++		}
++		return;
++	}
++}
++
++/* frames from the stream: CCCI packets do not keep to their boundaries */
++static void mux_rx(struct titan_md *md, const u8 *d, u32 len)
++{
++	u8 *b = md->mux_rx;
++	u32 have, off, n, used;
++
++	if (len > MUX_RX_SIZE - md->mux_rx_len) {
++		dev_err_ratelimited(md->dev, "mux: receive overflow\n");
++		md->mux_rx_len = 0;
++		if (len > MUX_RX_SIZE)
++			return;
++	}
++	memcpy(b + md->mux_rx_len, d, len);
++	have = md->mux_rx_len + len;
++	used = 0;
++	for (;;) {
++		/* to a flag, and past repeated ones (frames may share one) */
++		while (used < have && b[used] != MUX_FLAG)
++			used++;
++		while (used + 1 < have && b[used + 1] == MUX_FLAG)
++			used++;
++		if (have - used < 5)
++			break;
++		if (b[used + 3] & MUX_EA) {
++			n = b[used + 3] >> 1;
++			off = 4;
++		} else {
++			n = (b[used + 3] >> 1) | (b[used + 4] << 7);
++			off = 5;
++		}
++		if (n > MUX_N1) {
++			used++;
++			continue;
++		}
++		if (have - used < off + n + 2)
++			break;
++		if (b[used + off + n + 1] != MUX_FLAG ||
++		    b[used + off + n] != mux_fcs(b + used + 1, off - 1)) {
++			used++;
++			continue;
++		}
++		mux_frame(md, b[used + 1] >> 2, b[used + 2], b + used + off, n);
++		/* the closing flag may open the next frame */
++		used += off + n + 1;
++	}
++	md->mux_rx_len = have - used;
++	memmove(b, b + used, md->mux_rx_len);
++}
++
++static void at_rx(struct titan_md *md, struct sk_buff *skb)
++{
++	struct at_chan *c = &md->at[0];
++
++	switch (md->at_state) {
++	case AT_CMUX: {
++		u32 n = min_t(u32, skb->len, MUX_RX_SIZE - 1 - md->mux_rx_len);
++
++		memcpy(md->mux_rx + md->mux_rx_len, skb->data, n);
++		md->mux_rx_len += n;
++		md->mux_rx[md->mux_rx_len] = 0;
++		if (strstr((char *)md->mux_rx, "+CMUX: READY")) {
++			/* frames from here on */
++			md->mux_ok = true;
++			md->mux_rx_len = 0;
++			WRITE_ONCE(md->at_state, AT_MUX);
++			complete(&md->mux_done);
++		} else if (strstr((char *)md->mux_rx, "ERROR")) {
++			complete(&md->mux_done);
++		}
++		break;
++	}
++	case AT_MUX:
++		mux_rx(md, skb->data, skb->len);
++		break;
++	default:
++		/* dropped while nobody has the port open */
++		if (READ_ONCE(c->open)) {
++			wwan_port_rx(c->port, skb);
++			return;
++		}
++	}
++	kfree_skb(skb);
++}
++
++static int at_start(struct wwan_port *port)
++{
++	struct at_chan *c = wwan_port_get_drvdata(port);
++
++	WRITE_ONCE(c->open, true);
++	return 0;
++}
++
++static void at_stop(struct wwan_port *port)
++{
++	struct at_chan *c = wwan_port_get_drvdata(port);
++
++	WRITE_ONCE(c->open, false);
++}
++
++/* AT text to the modem, in frames or as it is */
++static int at_tx(struct wwan_port *port, struct sk_buff *skb)
++{
++	struct at_chan *c = wwan_port_get_drvdata(port);
++	u32 off, n;
++	int ret = 0;
++
++	if (!c->dlci) {
++		ret = at_send_raw(c->md, skb->data, skb->len);
++	} else if (!c->up) {
++		ret = -EIO;
++	} else {
++		for (off = 0; off < skb->len && !ret; off += n) {
++			n = min_t(u32, skb->len - off, MUX_N1);
++			ret = mux_send(c->md, c->dlci, MUX_UIH, skb->data + off, n);
++		}
++	}
++	if (!ret)
++		consume_skb(skb);
++	return ret;
++}
++
++static const struct wwan_port_ops at_ops = {
++	.start = at_start,
++	.stop = at_stop,
++	.tx = at_tx,
++};
++
++static int mux_open_dlci(struct titan_md *md, u8 dlci)
++{
++	reinit_completion(&md->mux_done);
++	md->mux_ok = false;
++	WRITE_ONCE(md->mux_wait_dlci, dlci);
++	mux_send(md, dlci, MUX_SABM | MUX_PF, NULL, 0);
++	if (!wait_for_completion_timeout(&md->mux_done, HZ) || !md->mux_ok)
++		return -EIO;
++	return 0;
++}
++
++/* mux mode on the raw channel, and every DLCI, as gsm0710muxd */
++static int mux_start(struct titan_md *md)
++{
++	static const char cmux[] = "AT+CMUX=0,0,5,512\r";
++	int i, up = 0;
++	u8 msc[4];
++
++	reinit_completion(&md->mux_done);
++	md->mux_ok = false;
++	md->mux_rx_len = 0;
++	WRITE_ONCE(md->at_state, AT_CMUX);
++	at_send_raw(md, (const u8 *)cmux, sizeof(cmux) - 1);
++	if (!wait_for_completion_timeout(&md->mux_done, 3 * HZ) || !md->mux_ok) {
++		dev_err(md->dev, "mux: AT+CMUX not accepted\n");
++		return -EIO;
++	}
++	msleep(50);		/* the OK after READY is not a frame */
++	if (mux_open_dlci(md, 0)) {
++		dev_err(md->dev, "mux: the control channel did not open\n");
++		return -EIO;
++	}
++	for (i = 0; i < AT_CHANS; i++) {
++		struct at_chan *c = &md->at[i];
++
++		if (mux_open_dlci(md, c->dlci)) {
++			dev_err(md->dev, "mux: DLCI %d did not open\n", c->dlci);
++			continue;
++		}
++		c->up = true;
++		up++;
++		/* our status: flow control off, ready, DTR and RTS */
++		msc[0] = MUX_MSC;
++		msc[1] = (2 << 1) | MUX_EA;
++		msc[2] = (c->dlci << 2) | MUX_CR | MUX_EA;
++		msc[3] = 0x0d;
++		mux_send(md, 0, MUX_UIH, msc, sizeof(msc));
++	}
++	dev_info(md->dev, "mux: %d of %zu channels\n", up, AT_CHANS);
++	return 0;
++}
++
++static void at_work(struct work_struct *w)
++{
++	struct titan_md *md = container_of(w, struct titan_md, at_work);
++	int i, n = mux ? AT_CHANS : 1;
++
++	if (md->at[0].port)
++		return;
++	if (mux) {
++		if (mux_start(md)) {
++			WRITE_ONCE(md->at_state, AT_DAEMON);
++			return;
++		}
++	}
++	/* a channel that did not open keeps its port: the numbers stay the table's */
++	for (i = 0; i < n; i++) {
++		struct at_chan *c = &md->at[i];
++		struct wwan_port *port;
++
++		c->md = md;
++		port = wwan_create_port(md->dev, WWAN_PORT_AT, &at_ops, NULL, c);
++		if (IS_ERR(port)) {
++			dev_err(md->dev, "AT port %d: %pe\n", i, port);
++			return;
++		}
++		WRITE_ONCE(c->port, port);
++	}
++	if (!mux)
++		WRITE_ONCE(md->at_state, AT_RAW);
++}
++
++static void rx_work(struct work_struct *w)
++{
++	struct titan_md *md = container_of(w, struct titan_md, rx_work);
++	int q, n;
++	u32 pos;
++
++	/* look at every queue: an interrupt can cover several packets */
++	set_mask_bits(&md->rchnum, GENMASK(QUEUE_NUM - 1, 0), 0);
++	for (q = 0; q < QUEUE_NUM; q++) {
++		void __iomem *rb = md->rings[q];
++
++		while ((n = ring_peek(rb, &pos)) >= 0) {
++			struct sk_buff *skb = alloc_skb(n, GFP_KERNEL);
++			struct ccci_header *h;
++
++			if (!skb)
++				return;
++			ring_copy_from(rb + RB_BUF, readl(rb + RB_RX_LEN), pos,
++				       skb_put(skb, n), n);
++			ring_consume(rb, n);
++			h = (struct ccci_header *)skb->data;
++			if (h->channel == CCCI_CONTROL_RX)
++				control_rx(md, h, n);
++			if (h->channel == CCCI_UART2_RX &&
++			    READ_ONCE(md->at_state) != AT_DAEMON) {
++				skb_pull(skb, sizeof(*h));
++				at_rx(md, skb);
++				continue;
++			}
++			if (skb_queue_len(&md->rxq) >= RX_QUEUE_MAX)
++				kfree_skb(skb_dequeue(&md->rxq));
++			skb_queue_tail(&md->rxq, skb);
++			wake_up_interruptible(&md->rx_wait);
++		}
++		if (n == -EBADMSG)
++			dev_err_ratelimited(md->dev,
++					    "queue %d: bad packet\n", q);
++	}
++}
++
++static int md_start(struct titan_md *md);
++static void md_stop(struct titan_md *md);
++
++/* the first open boots the modem; one user at a time */
++static int md_open(struct inode *inode, struct file *f)
++{
++	struct titan_md *md = tmd;
++	int ret;
++
++	if (atomic_cmpxchg(&md->open, 0, 1))
++		return -EBUSY;
++	mutex_lock(&md->lock);
++	ret = md_start(md);
++	mutex_unlock(&md->lock);
++	if (ret) {
++		atomic_set(&md->open, 0);
++		return ret;
++	}
++	f->private_data = md;
++	return stream_open(inode, f);
++}
++
++static int md_release(struct inode *inode, struct file *f)
++{
++	struct titan_md *md = f->private_data;
++
++	mutex_lock(&md->lock);
++	md_stop(md);
++	mutex_unlock(&md->lock);
++	atomic_set(&md->open, 0);
++	return 0;
++}
++
++static bool md_dead(struct titan_md *md)
++{
++	return READ_ONCE(md->state) == MD_DEAD;
++}
++
++static ssize_t md_read(struct file *f, char __user *buf, size_t count,
++		       loff_t *ppos)
++{
++	struct titan_md *md = f->private_data;
++	struct sk_buff *skb;
++	ssize_t ret;
++
++	while (!(skb = skb_dequeue(&md->rxq))) {
++		if (md_dead(md))
++			return -EIO;
++		if (f->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		if (wait_event_interruptible(md->rx_wait,
++					     !skb_queue_empty(&md->rxq) ||
++					     md_dead(md)))
++			return -ERESTARTSYS;
++	}
++	if (count < skb->len) {
++		skb_queue_head(&md->rxq, skb);
++		return -EMSGSIZE;
++	}
++	ret = copy_to_user(buf, skb->data, skb->len) ? -EFAULT : skb->len;
++	kfree_skb(skb);
++	return ret;
++}
++
++static ssize_t md_write(struct file *f, const char __user *buf, size_t count,
++			loff_t *ppos)
++{
++	struct titan_md *md = f->private_data;
++	void *pkt;
++	int ret;
++
++	if (count < sizeof(struct ccci_header) || count > SZ_64K)
++		return -EINVAL;
++	if (READ_ONCE(md->state) >= MD_EXCEPTION)
++		return -EIO;
++	if (!md->hs1_done)
++		return -EAGAIN;
++	pkt = memdup_user(buf, count);
++	if (IS_ERR(pkt))
++		return PTR_ERR(pkt);
++	ret = md_send(md, pkt, count);
++	kfree(pkt);
++	return ret ?: count;
++}
++
++static long md_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
++{
++	struct titan_md *md = f->private_data;
++
++	if (cmd != TITAN_MD_AT_PORT)
++		return -ENOTTY;
++	if (READ_ONCE(md->state) >= MD_EXCEPTION)
++		return -EIO;
++	if (!md->ready)
++		return -EAGAIN;
++	/* not waited for: the daemon has files to serve meanwhile */
++	schedule_work(&md->at_work);
++	return 0;
++}
++
++static __poll_t md_poll(struct file *f, poll_table *wait)
++{
++	struct titan_md *md = f->private_data;
++
++	poll_wait(f, &md->rx_wait, wait);
++	if (md_dead(md) && skb_queue_empty(&md->rxq))
++		return EPOLLERR | EPOLLHUP;
++	return (skb_queue_empty(&md->rxq) ? 0 : EPOLLIN | EPOLLRDNORM) |
++	       EPOLLOUT | EPOLLWRNORM;
++}
++
++/*
++ * The speech shared memory (AUDIO_RAW_SHARE_MEMORY) for the speech
++ * daemon, as Android's /dev/ccci_raw_audio: it writes the speech
++ * parameters into the parameter ring there.
++ */
++static int md_mmap(struct file *f, struct vm_area_struct *vma)
++{
++	struct titan_md *md = f->private_data;
++	unsigned long size = vma->vm_end - vma->vm_start;
++
++	if (vma->vm_pgoff || size > SMEM_AUDIO_SIZE)
++		return -EINVAL;
++	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
++	return remap_pfn_range(vma, vma->vm_start,
++			       PHYS_PFN(md->smem_base + SMEM_AUDIO), size,
++			       vma->vm_page_prot);
++}
++
++static const struct file_operations md_fops = {
++	.owner = THIS_MODULE,
++	.open = md_open,
++	.release = md_release,
++	.read = md_read,
++	.write = md_write,
++	.poll = md_poll,
++	.unlocked_ioctl = md_ioctl,
++	.mmap = md_mmap,
++};
++
++/*
++ * Decode the modem's exception record. On a crash the modem fills an
++ * overview at the start of the MDSS_DBG shared-memory region (the vendor's
++ * mdee_dumper_v3.h layout): a per-core reason array, then a brief-main-info
++ * block whose type says assert or fatal, then the details. This turns it
++ * into one log line instead of hand offsets in debugfs.
++ */
++#define EX_OVERVIEW		SMEM_MDSS_DBG	/* the record's start in smem */
++#define EX_CORE_NUM		8		/* MD_CORE_TOTAL_NUM (gen 6293) */
++#define EX_CORE_NAME		11		/* MD_CORE_NAME_LEN */
++#define EX_INFO_OFF		(8 + EX_CORE_NUM * (EX_CORE_NAME + 1))
++#define EX_CONTENT_OFF		(EX_INFO_OFF + 8)
++#define EX_TYPE_ASSERT		0x50		/* ASSERT_FAIL_EXCEPTION */
++
++static void decode_exception(struct titan_md *md)
++{
++	void __iomem *ov = md->smem + EX_OVERVIEW;
++	char core[EX_CORE_NAME + 1] = {};
++	char file[256];
++	u16 ex_type;
++	int i;
++
++	ex_type = readw(ov + EX_INFO_OFF);
++	/* the offending core's name, from the per-core reason array */
++	for (i = 0; i < EX_CORE_NUM; i++) {
++		void __iomem *r = ov + 8 + i * (EX_CORE_NAME + 1);
++
++		if (readb(r + EX_CORE_NAME)) {	/* is_offender */
++			memcpy_fromio(core, r, EX_CORE_NAME);
++			break;
++		}
++	}
++	if (ex_type == EX_TYPE_ASSERT) {
++		u32 line = readl(ov + EX_CONTENT_OFF + 256);
++		u32 p1 = readl(ov + EX_CONTENT_OFF + 260);
++		u32 p2 = readl(ov + EX_CONTENT_OFF + 264);
++		u32 p3 = readl(ov + EX_CONTENT_OFF + 268);
++
++		memcpy_fromio(file, ov + EX_CONTENT_OFF, sizeof(file));
++		file[sizeof(file) - 1] = 0;
++		dev_err(md->dev,
++			"modem assert on %s: %s:%u params %#x %#x %#x\n",
++			core[0] ? core : "?", file, line, p1, p2, p3);
++	} else {
++		u32 c1 = readl(ov + EX_CONTENT_OFF);
++		u32 c2 = readl(ov + EX_CONTENT_OFF + 4);
++		u32 c3 = readl(ov + EX_CONTENT_OFF + 8);
++		u32 pc = readl(ov + EX_CONTENT_OFF + 0x24);
++		u32 lr = readl(ov + EX_CONTENT_OFF + 0x28);
++
++		dev_err(md->dev,
++			"modem fatal on %s (type %#x): codes %#x %#x %#x pc %#x lr %#x\n",
++			core[0] ? core : "?", ex_type, c1, c2, c3, pc, lr);
++	}
++}
++
++/* the modem's progress until handshake 1, then the handshake itself */
++static void watch_work(struct work_struct *w)
++{
++	struct titan_md *md = container_of(w, struct titan_md, watch.work);
++	u32 trace[6], s0, s1;
++
++	/* not exceptions (ee_work has those): acknowledged, as the vendor does */
++	if (test_and_clear_bit(CCIF_SEQ_ERROR, &md->rchnum))
++		dev_err_ratelimited(md->dev, "the modem saw a sequence error\n");
++	set_mask_bits(&md->rchnum, ~(0xffffUL | CCIF_EX_MASK), 0);
++	if (READ_ONCE(md->state) != MD_BOOTING)
++		return;
++	if (test_and_clear_bit(CCIF_SRAM, &md->rchnum) && !md->hs1_done) {
++		md->hs1_done = !send_runtime_data(md);
++		return;
++	}
++	s0 = readl(md->md_cfg);		/* MD1_CFG boot status 0, 1 */
++	s1 = readl(md->md_cfg + 4);
++	sram_read(trace, md->ap_ccif + APCCIF_CHDATA, sizeof(trace));
++	dev_info(md->dev, "t+%d.%ds: boot stats %08x %08x, trace %*ph\n",
++		 md->watch_ticks / 2, md->watch_ticks % 2 * 5, s0, s1,
++		 (int)sizeof(trace), trace);
++	if (++md->watch_ticks < 40)
++		schedule_delayed_work(&md->watch, HZ / 2);
++	else
++		dev_warn(md->dev, "no HS1 after 20 s\n");
++}
++
++/* ---- CLDMA and the network interfaces ---- */
++
++static void cldma_hw_reset(struct titan_md *md)
++{
++	regmap_write(md->infra, CLDMA_INFRA_RST0_AO, CLDMA_RST_AO);
++	regmap_write(md->infra, CLDMA_INFRA_RST1_AO, CLDMA_RST_AO);
++	regmap_write(md->infra, CLDMA_INFRA_RST0_PD, CLDMA_RST_PD);
++	regmap_write(md->infra, CLDMA_INFRA_RST1_PD, CLDMA_RST_PD);
++}
++
++/* this modem generation's mask registers need the opposite one cleared first */
++static void cldma_rx_mask(struct cldma *cl, u32 reg, u32 other, u32 val)
++{
++	writel(readl(cl->ao + other) & ~val, cl->ao + other);
++	writel(val, cl->ao + reg);
++}
++
++static void ccmni_wake_all(struct cldma *cl)
++{
++	int i;
++
++	for (i = 0; i < CCMNI_COUNT; i++)
++		if (cl->net[i] && netif_queue_stopped(cl->net[i]))
++			netif_wake_queue(cl->net[i]);
++}
++
++static void cldma_tx_clean(struct titan_md *md)
++{
++	struct cldma *cl = &md->cl;
++	unsigned long flags;
++
++	spin_lock_irqsave(&cl->tx_lock, flags);
++	while (cl->tx_tail != cl->tx_head) {
++		u32 i = cl->tx_tail % CLDMA_TX_GPDS;
++		struct sk_buff *skb = cl->tx_skb[i];
++
++		if (READ_ONCE(cl->tgpd[i].flags) & CLDMA_GPD_HWO)
++			break;
++		dma_rmb();
++		dma_unmap_single(md->dev, cl->tx_dma[i], skb->len, DMA_TO_DEVICE);
++		dev_sw_netstats_tx_add(skb->dev, 1, skb->len);
++		cl->tx_skb[i] = NULL;
++		cl->tx_tail++;
++		dev_consume_skb_any(skb);
++	}
++	if (cl->tx_head - cl->tx_tail < CLDMA_TX_GPDS - 1)
++		ccmni_wake_all(cl);
++	spin_unlock_irqrestore(&cl->tx_lock, flags);
++}
++
++static int cldma_rx_fill(struct titan_md *md, u32 i)
++{
++	struct cldma *cl = &md->cl;
++	struct sk_buff *skb;
++	dma_addr_t dma;
++
++	skb = napi_alloc_skb(&cl->napi, CLDMA_RX_BUF);
++	if (!skb)
++		return -ENOMEM;
++	dma = dma_map_single(md->dev, skb->data, CLDMA_RX_BUF, DMA_FROM_DEVICE);
++	if (dma_mapping_error(md->dev, dma)) {
++		dev_kfree_skb_any(skb);
++		return -ENOMEM;
++	}
++	cl->rx_skb[i] = skb;
++	cl->rx_dma[i] = dma;
++	return 0;
++}
++
++/* a descriptor back to the hardware, with its buffer as it stands */
++static void cldma_rx_give(struct cldma *cl, u32 i)
++{
++	struct cldma_rgpd *g = &cl->rgpd[i];
++
++	g->data = lower_32_bits(cl->rx_dma[i]);
++	g->allow_len = CLDMA_RX_BUF;
++	g->len = 0;
++	dma_wmb();
++	WRITE_ONCE(g->flags, CLDMA_GPD_IOC | CLDMA_GPD_HWO);
++}
++
++static void cldma_rx_one(struct titan_md *md, struct sk_buff *skb, u32 len)
++{
++	struct cldma *cl = &md->cl;
++	struct lhif_header *h;
++	struct net_device *dev;
++	u8 id;
++
++	skb_put(skb, min_t(u32, len, CLDMA_RX_BUF));
++	if (skb->len <= sizeof(*h))
++		goto drop;
++	h = (struct lhif_header *)skb->data;
++	id = h->netif_type & 0x1f;
++	skb_pull(skb, sizeof(*h));
++	dev = id < CCMNI_COUNT ? cl->net[id] : NULL;
++	if (!dev || !netif_running(dev))
++		goto drop;
++	switch (skb->data[0] >> 4) {
++	case 4:
++		skb->protocol = htons(ETH_P_IP);
++		break;
++	case 6:
++		skb->protocol = htons(ETH_P_IPV6);
++		break;
++	default:
++		goto drop;
++	}
++	skb->dev = dev;
++	skb_reset_mac_header(skb);
++	skb_reset_network_header(skb);
++	dev_sw_netstats_rx_add(dev, skb->len);
++	napi_gro_receive(&cl->napi, skb);
++	return;
++drop:
++	dev_kfree_skb_any(skb);
++}
++
++static int cldma_poll(struct napi_struct *napi, int budget)
++{
++	struct cldma *cl = container_of(napi, struct cldma, napi);
++	struct titan_md *md = container_of(cl, struct titan_md, cl);
++	int done = 0;
++
++	cldma_tx_clean(md);
++	while (done < budget) {
++		u32 i = cl->rx_next % CLDMA_RX_GPDS;
++		struct sk_buff *skb = cl->rx_skb[i];
++		dma_addr_t dma = cl->rx_dma[i];
++
++		if (READ_ONCE(cl->rgpd[i].flags) & CLDMA_GPD_HWO)
++			break;
++		dma_rmb();
++		/* out of memory: the packet is lost, the buffer stays */
++		if (cldma_rx_fill(md, i)) {
++			dma_sync_single_for_device(md->dev, dma, CLDMA_RX_BUF,
++						   DMA_FROM_DEVICE);
++		} else {
++			dma_unmap_single(md->dev, dma, CLDMA_RX_BUF,
++					 DMA_FROM_DEVICE);
++			cldma_rx_one(md, skb, READ_ONCE(cl->rgpd[i].len));
++		}
++		cldma_rx_give(cl, i);
++		cl->rx_next++;
++		done++;
++	}
++	wmb();
++	/* the hardware stops at a descriptor it does not own */
++	if (done && !(readl(cl->ao + CLDMA_SO_STATUS) & 1))
++		writel(1, cl->pdn + CLDMA_SO_RESUME_CMD);
++	if (done < budget && napi_complete_done(napi, done)) {
++		writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMCR0);
++		cldma_rx_mask(cl, CLDMA_L2RIMCR0, CLDMA_L2RIMSR0, CLDMA_RX_ALL);
++	}
++	return done;
++}
++
++static irqreturn_t cldma_isr(int irq, void *data)
++{
++	struct titan_md *md = data;
++	struct cldma *cl = &md->cl;
++	u32 tx = readl(cl->pdn + CLDMA_L2TISAR0);
++	u32 rx = readl(cl->pdn + CLDMA_L2RISAR0);
++
++	if (!tx && !rx)
++		return IRQ_NONE;
++	writel(tx, cl->pdn + CLDMA_L2TISAR0);
++	writel(rx, cl->pdn + CLDMA_L2RISAR0);
++	writel(readl(cl->pdn + CLDMA_IP_BUSY), cl->pdn + CLDMA_IP_BUSY);
++	if ((tx & CLDMA_TX_ERROR) || (rx & CLDMA_RX_ERROR))
++		dev_err_ratelimited(md->dev, "CLDMA error: %08x %08x\n", tx, rx);
++	writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMSR0);
++	cldma_rx_mask(cl, CLDMA_L2RIMSR0, CLDMA_L2RIMCR0, CLDMA_RX_ALL);
++	napi_schedule(&cl->napi);
++	return IRQ_HANDLED;
++}
++
++/*
++ * The uplink watch. Seen twice on 2026-11-14/15: queue 0 stops being served with every
++ * descriptor owned by the hardware (UL_STATUS active, the current pointer on the oldest one,
++ * no error, CLDMA_IP_BUSY 1). From then on nothing is sent, and the modem holds its 26 MHz
++ * and bus requests to the SPM, so the phone's deep sleep stops at its first step. The cause
++ * is not known. A stall is descriptors in flight and none finished for CLDMA_TX_STALL_S; then
++ * a resume command first, and CLDMA_TX_STALL_S later the queue is stopped, what was in flight
++ * dropped, and the queue set up again from the next descriptor. The drop is untested against
++ * a real stall: tx_flush=0 leaves it at the report.
++ */
++#define CLDMA_TX_WATCH_S	5
++#define CLDMA_TX_STALL_S	30
++static bool tx_flush = true;
++module_param(tx_flush, bool, 0644);
++MODULE_PARM_DESC(tx_flush, "Drop the uplink ring and restart queue 0 when it stalls");
++
++static void cldma_tx_flush(struct titan_md *md)
++{
++	struct cldma *cl = &md->cl;
++	unsigned long flags;
++	u32 n = 0, a, v;
++
++	writel(CLDMA_ALL_QUEUES, cl->pdn + CLDMA_UL_STOP_CMD);
++	if (readl_poll_timeout(cl->pdn + CLDMA_UL_STATUS, v, !(v & CLDMA_ALL_QUEUES),
++			       1000, 100000))
++		dev_warn(md->dev, "CLDMA uplink did not stop: status %08x\n", v);
++	spin_lock_irqsave(&cl->tx_lock, flags);
++	while (cl->tx_tail != cl->tx_head) {
++		u32 i = cl->tx_tail % CLDMA_TX_GPDS;
++		struct sk_buff *skb = cl->tx_skb[i];
++
++		WRITE_ONCE(cl->tgpd[i].flags, CLDMA_GPD_IOC);
++		dma_unmap_single(md->dev, cl->tx_dma[i], skb->len, DMA_TO_DEVICE);
++		dev_core_stats_tx_dropped_inc(skb->dev);
++		cl->tx_skb[i] = NULL;
++		cl->tx_tail++;
++		dev_kfree_skb_any(skb);
++		n++;
++	}
++	wmb();
++	a = cl->tgpd_dma + (cl->tx_head % CLDMA_TX_GPDS) * sizeof(*cl->tgpd);
++	writel(a, cl->pdn + CLDMA_UL_START(0));
++	writel(a, cl->ao + CLDMA_UL_START_BK(0));
++	cl->tx_started = false;
++	writel(readl(cl->pdn + CLDMA_IP_BUSY), cl->pdn + CLDMA_IP_BUSY);
++	cl->tx_flushes++;
++	ccmni_wake_all(cl);
++	spin_unlock_irqrestore(&cl->tx_lock, flags);
++	dev_warn(md->dev, "CLDMA uplink flushed: %u packets dropped, IP_BUSY %x\n",
++		 n, readl(cl->pdn + CLDMA_IP_BUSY));
++}
++
++static void cldma_tx_watch(struct work_struct *work)
++{
++	struct cldma *cl = container_of(to_delayed_work(work), struct cldma, tx_watch);
++	struct titan_md *md = container_of(cl, struct titan_md, cl);
++	u32 flight = cl->tx_head - cl->tx_tail;
++
++	/* not running, or the PDN half reset by a deep sleep and not yet set up again */
++	if (!cl->running || !readl(cl->pdn + CLDMA_UL_START(0)))
++		return;
++	if (!flight || cl->tx_tail != cl->tx_watch_tail) {
++		cl->tx_watch_tail = cl->tx_tail;
++		cl->tx_watch_ticks = 0;
++		if (!flight)
++			return;		/* the next transmit starts the watch again */
++	} else if (++cl->tx_watch_ticks == CLDMA_TX_STALL_S / CLDMA_TX_WATCH_S) {
++		cl->tx_stalls++;
++		dev_warn(md->dev, "CLDMA uplink stalled: %u in flight, status %08x, current %08x, start %08x, busy %x, L2TISAR0 %08x; resuming\n",
++			 flight, readl(cl->pdn + CLDMA_UL_STATUS),
++			 readl(cl->pdn + CLDMA_UL_CURRENT(0)),
++			 readl(cl->pdn + CLDMA_UL_START(0)),
++			 readl(cl->pdn + CLDMA_IP_BUSY),
++			 readl(cl->pdn + CLDMA_L2TISAR0));
++		writel(1, cl->pdn + CLDMA_UL_RESUME_CMD);
++		napi_schedule(&cl->napi);
++	} else if (cl->tx_watch_ticks == 2 * CLDMA_TX_STALL_S / CLDMA_TX_WATCH_S) {
++		if (tx_flush) {
++			cl->tx_watch_ticks = 0;
++			cldma_tx_flush(md);
++			return;
++		}
++	}
++	schedule_delayed_work(&cl->tx_watch, CLDMA_TX_WATCH_S * HZ);
++}
++
++static netdev_tx_t ccmni_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct ccmni *n = netdev_priv(dev);
++	struct titan_md *md = n->md;
++	struct cldma *cl = &md->cl;
++	unsigned long flags;
++	dma_addr_t dma;
++	u32 i;
++
++	if (skb_linearize(skb) || skb->len > CLDMA_RX_BUF)
++		goto drop;
++	dma = dma_map_single(md->dev, skb->data, skb->len, DMA_TO_DEVICE);
++	if (dma_mapping_error(md->dev, dma))
++		goto drop;
++	spin_lock_irqsave(&cl->tx_lock, flags);
++	if (!cl->running) {
++		spin_unlock_irqrestore(&cl->tx_lock, flags);
++		dma_unmap_single(md->dev, dma, skb->len, DMA_TO_DEVICE);
++		goto drop;
++	}
++	if (cl->tx_head - cl->tx_tail >= CLDMA_TX_GPDS) {
++		netif_stop_queue(dev);
++		spin_unlock_irqrestore(&cl->tx_lock, flags);
++		dma_unmap_single(md->dev, dma, skb->len, DMA_TO_DEVICE);
++		return NETDEV_TX_BUSY;
++	}
++	i = cl->tx_head++ % CLDMA_TX_GPDS;
++	cl->tx_skb[i] = skb;
++	cl->tx_dma[i] = dma;
++	cl->tgpd[i].data = lower_32_bits(dma);
++	cl->tgpd[i].len = skb->len;
++	cl->tgpd[i].netif = n->id;
++	cl->tgpd[i].debug = 1;
++	dma_wmb();
++	WRITE_ONCE(cl->tgpd[i].flags, CLDMA_GPD_IOC | CLDMA_GPD_HWO);
++	wmb();
++	if (cl->tx_started) {
++		writel(1, cl->pdn + CLDMA_UL_RESUME_CMD);
++	} else {
++		writel(CLDMA_ALL_QUEUES, cl->pdn + CLDMA_UL_START_CMD);
++		cl->tx_started = true;
++	}
++	readl(cl->pdn + CLDMA_UL_RESUME_CMD);
++	if (cl->tx_head - cl->tx_tail >= CLDMA_TX_GPDS)
++		netif_stop_queue(dev);
++	spin_unlock_irqrestore(&cl->tx_lock, flags);
++	schedule_delayed_work(&cl->tx_watch, CLDMA_TX_WATCH_S * HZ);
++	return NETDEV_TX_OK;
++drop:
++	dev_core_stats_tx_dropped_inc(dev);
++	dev_kfree_skb_any(skb);
++	return NETDEV_TX_OK;
++}
++
++static const struct net_device_ops ccmni_ops = {
++	.ndo_start_xmit = ccmni_xmit,
++	.ndo_get_stats64 = dev_get_tstats64,
++};
++
++static void ccmni_setup(struct net_device *dev)
++{
++	dev->netdev_ops = &ccmni_ops;
++	dev->type = ARPHRD_NONE;
++	dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
++	dev->mtu = 1500;
++	dev->min_mtu = 68;
++	dev->max_mtu = CCMNI_MTU;
++	dev->tx_queue_len = 1000;
++	dev->needs_free_netdev = false;
++	dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
++}
++
++static void ccmni_remove(struct titan_md *md)
++{
++	int i;
++
++	for (i = 0; i < CCMNI_COUNT; i++) {
++		if (!md->cl.net[i])
++			continue;
++		unregister_netdev(md->cl.net[i]);
++		free_netdev(md->cl.net[i]);
++		md->cl.net[i] = NULL;
++	}
++}
++
++static int ccmni_add(struct titan_md *md)
++{
++	int i, ret;
++
++	for (i = 0; i < CCMNI_COUNT; i++) {
++		struct net_device *dev;
++		struct ccmni *n;
++
++		dev = alloc_netdev(sizeof(*n), "ccmni%d", NET_NAME_ENUM, ccmni_setup);
++		if (!dev) {
++			ret = -ENOMEM;
++			goto err;
++		}
++		SET_NETDEV_DEV(dev, md->dev);
++		n = netdev_priv(dev);
++		n->md = md;
++		n->id = i;
++		ret = register_netdev(dev);
++		if (ret) {
++			free_netdev(dev);
++			goto err;
++		}
++		md->cl.net[i] = dev;
++	}
++	return 0;
++err:
++	ccmni_remove(md);
++	return ret;
++}
++
++static int cldma_show(struct seq_file *m, void *unused)
++{
++	struct titan_md *md = dev_get_drvdata(m->private);
++	struct cldma *cl = &md->cl;
++
++	seq_printf(m, "SO_CFG %08x SO_STATUS %08x, rx %u, tx %u, tx in flight %u\n",
++		   readl(cl->ao + CLDMA_SO_CFG), readl(cl->ao + CLDMA_SO_STATUS),
++		   cl->rx_next, cl->tx_head, cl->tx_head - cl->tx_tail);
++	seq_printf(m, "uplink stalls %u, flushed %u\n", cl->tx_stalls, cl->tx_flushes);
++	return 0;
++}
++
++/* the rings, once, before the modem runs */
++static int cldma_alloc(struct titan_md *md)
++{
++	struct cldma *cl = &md->cl;
++	struct platform_device *pdev = to_platform_device(md->dev);
++	u32 i, n = CLDMA_TX_GPDS + CLDMA_TXQ - 1;
++	int ret = 0;
++
++	cl->ao = devm_platform_ioremap_resource_byname(pdev, "cldma-ao");
++	if (IS_ERR(cl->ao))
++		return PTR_ERR(cl->ao);
++	cl->pdn = devm_platform_ioremap_resource_byname(pdev, "cldma-pdn");
++	if (IS_ERR(cl->pdn))
++		return PTR_ERR(cl->pdn);
++	cl->irq = platform_get_irq_byname(pdev, "cldma");
++	if (cl->irq < 0)
++		return cl->irq;
++	spin_lock_init(&cl->tx_lock);
++	INIT_DELAYED_WORK(&cl->tx_watch, cldma_tx_watch);
++	cl->napi_dev = alloc_netdev_dummy(0);
++	if (!cl->napi_dev)
++		return -ENOMEM;
++	netif_napi_add(cl->napi_dev, &cl->napi, cldma_poll);
++
++	cl->tgpd = dmam_alloc_coherent(md->dev, n * sizeof(*cl->tgpd),
++				       &cl->tgpd_dma, GFP_KERNEL);
++	cl->rgpd = dmam_alloc_coherent(md->dev, CLDMA_RX_GPDS * sizeof(*cl->rgpd),
++				       &cl->rgpd_dma, GFP_KERNEL);
++	if (!cl->tgpd || !cl->rgpd)
++		return -ENOMEM;
++	/* uplink: queue 0's ring, then an empty one each for the others */
++	for (i = 0; i < CLDMA_TX_GPDS; i++) {
++		cl->tgpd[i].flags = CLDMA_GPD_IOC;
++		cl->tgpd[i].next = cl->tgpd_dma +
++				   ((i + 1) % CLDMA_TX_GPDS) * sizeof(*cl->tgpd);
++	}
++	for (; i < n; i++) {
++		cl->tgpd[i].flags = CLDMA_GPD_IOC;
++		cl->tgpd[i].next = cl->tgpd_dma + i * sizeof(*cl->tgpd);
++	}
++	/* downlink: a ring of buffers, the hardware's to fill */
++	local_bh_disable();
++	for (i = 0; i < CLDMA_RX_GPDS; i++) {
++		cl->rgpd[i].next = cl->rgpd_dma +
++				   ((i + 1) % CLDMA_RX_GPDS) * sizeof(*cl->rgpd);
++		ret = cldma_rx_fill(md, i);
++		if (ret)
++			break;
++		cldma_rx_give(cl, i);
++	}
++	local_bh_enable();
++	if (ret)
++		return ret;
++	ret = devm_request_irq(md->dev, cl->irq, cldma_isr, IRQF_NO_AUTOEN,
++			       "titan-modem-cldma", md);
++	if (ret)
++		return ret;
++	debugfs_create_devm_seqfile(md->dev, "cldma", md->debugfs, cldma_show);
++	return ccmni_add(md);
++}
++
++static void cldma_free(struct titan_md *md)
++{
++	struct cldma *cl = &md->cl;
++	u32 i;
++
++	ccmni_remove(md);
++	if (cl->napi_dev) {
++		netif_napi_del(&cl->napi);
++		free_netdev(cl->napi_dev);
++		cl->napi_dev = NULL;
++	}
++	for (i = 0; i < CLDMA_RX_GPDS; i++) {
++		if (!cl->rx_skb[i])
++			continue;
++		dma_unmap_single(md->dev, cl->rx_dma[i], CLDMA_RX_BUF,
++				 DMA_FROM_DEVICE);
++		dev_kfree_skb_any(cl->rx_skb[i]);
++		cl->rx_skb[i] = NULL;
++	}
++	for (i = 0; i < CLDMA_TX_GPDS; i++) {
++		if (!cl->tx_skb[i])
++			continue;
++		dma_unmap_single(md->dev, cl->tx_dma[i], cl->tx_skb[i]->len,
++				 DMA_TO_DEVICE);
++		dev_kfree_skb_any(cl->tx_skb[i]);
++		cl->tx_skb[i] = NULL;
++	}
++}
++
++/*
++ * The rings as cldma_alloc left them, for the next boot: in-flight uplink
++ * buffers dropped, every downlink descriptor the hardware's again. With
++ * CLDMA stopped and reset.
++ */
++static void cldma_rings_reset(struct titan_md *md)
++{
++	struct cldma *cl = &md->cl;
++	unsigned long flags;
++	u32 i;
++
++	spin_lock_irqsave(&cl->tx_lock, flags);
++	for (i = 0; i < CLDMA_TX_GPDS + CLDMA_TXQ - 1; i++) {
++		if (i < CLDMA_TX_GPDS && cl->tx_skb[i]) {
++			dma_unmap_single(md->dev, cl->tx_dma[i],
++					 cl->tx_skb[i]->len, DMA_TO_DEVICE);
++			dev_kfree_skb_any(cl->tx_skb[i]);
++			cl->tx_skb[i] = NULL;
++		}
++		cl->tgpd[i].flags = CLDMA_GPD_IOC;
++	}
++	cl->tx_head = cl->tx_tail = 0;
++	cl->tx_started = false;
++	spin_unlock_irqrestore(&cl->tx_lock, flags);
++	for (i = 0; i < CLDMA_RX_GPDS; i++)
++		cldma_rx_give(cl, i);
++	cl->rx_next = 0;
++	ccmni_wake_all(cl);
++}
++
++/* cldma_reset and cldma_start */
++static void cldma_start(struct titan_md *md)
++{
++	struct cldma *cl = &md->cl;
++	int i;
++
++	writel(CLDMA_RX_BUF, cl->ao + CLDMA_DL_MTU);
++	writel(readl(cl->ao + CLDMA_SO_CFG) | 1, cl->ao + CLDMA_SO_CFG);
++	for (i = 0; i < CLDMA_TXQ; i++) {
++		u32 a = cl->tgpd_dma +
++			(i ? CLDMA_TX_GPDS + i - 1 : 0) * sizeof(*cl->tgpd);
++
++		writel(a, cl->pdn + CLDMA_UL_START(i));
++		writel(a, cl->ao + CLDMA_UL_START_BK(i));
++	}
++	writel(cl->rgpd_dma, cl->ao + CLDMA_SO_START(0));
++	wmb();
++	writel(CLDMA_ALL_QUEUES, cl->pdn + CLDMA_SO_START_CMD);
++	readl(cl->pdn + CLDMA_SO_START_CMD);
++	napi_enable(&cl->napi);
++	enable_irq(cl->irq);
++	writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMCR0);
++	cldma_rx_mask(cl, CLDMA_L2RIMCR0, CLDMA_L2RIMSR0, CLDMA_RX_ALL);
++	writel(~0U, cl->pdn + CLDMA_L3TIMCR0);
++	writel(~0U, cl->pdn + CLDMA_L3TIMCR1);
++	writel(~0U, cl->pdn + CLDMA_L3RIMCR0);
++	writel(~0U, cl->pdn + CLDMA_L3RIMCR1);
++	cl->running = true;
++	dev_info(md->dev, "CLDMA started: SO_CFG %08x\n",
++		 readl(cl->ao + CLDMA_SO_CFG));
++}
++
++/*
++ * The SPM's deep sleep resets the block in the PDN domain and not the always-on one (measured:
++ * UL_START 0, the transmit interrupts masked; SO_CFG, SO_START and the receive masks kept). So
++ * nothing could be sent after a sleep, and the modem asserted some time later
++ * (errc_chm_main.c:8825, as when CLDMA was never started). Set it up again before anything can
++ * transmit, the uplink from its oldest unfinished descriptor.
++ */
++static void cldma_restore(struct titan_md *md)
++{
++	struct cldma *cl = &md->cl;
++	unsigned long flags;
++	int i;
++
++	if (!cl->running || readl(cl->pdn + CLDMA_UL_START(0)))
++		return;
++	spin_lock_irqsave(&cl->tx_lock, flags);
++	for (i = 0; i < CLDMA_TXQ; i++) {
++		u32 a = cl->tgpd_dma + (i ? CLDMA_TX_GPDS + i - 1 :
++					cl->tx_tail % CLDMA_TX_GPDS) * sizeof(*cl->tgpd);
++
++		writel(a, cl->pdn + CLDMA_UL_START(i));
++		writel(a, cl->ao + CLDMA_UL_START_BK(i));
++	}
++	wmb();
++	writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMCR0);
++	writel(~0U, cl->pdn + CLDMA_L3TIMCR0);
++	writel(~0U, cl->pdn + CLDMA_L3TIMCR1);
++	writel(~0U, cl->pdn + CLDMA_L3RIMCR0);
++	writel(~0U, cl->pdn + CLDMA_L3RIMCR1);
++	writel(CLDMA_ALL_QUEUES, cl->pdn + CLDMA_SO_RESUME_CMD);
++	cl->tx_started = cl->tx_head != cl->tx_tail;
++	if (cl->tx_started)
++		writel(CLDMA_ALL_QUEUES, cl->pdn + CLDMA_UL_START_CMD);
++	readl(cl->pdn + CLDMA_UL_RESUME_CMD);
++	spin_unlock_irqrestore(&cl->tx_lock, flags);
++	dev_info(md->dev, "CLDMA set up again after deep sleep: %u to send\n",
++		 cl->tx_head - cl->tx_tail);
++}
++
++static void cldma_stop(struct titan_md *md)
++{
++	struct cldma *cl = &md->cl;
++	unsigned long flags;
++
++	if (!cl->running)
++		return;
++	spin_lock_irqsave(&cl->tx_lock, flags);
++	cl->running = false;
++	spin_unlock_irqrestore(&cl->tx_lock, flags);
++	cancel_delayed_work_sync(&cl->tx_watch);
++	disable_irq(cl->irq);
++	napi_disable(&cl->napi);
++	writel(CLDMA_TX_ALL, cl->pdn + CLDMA_L2TIMSR0);
++	cldma_rx_mask(cl, CLDMA_L2RIMSR0, CLDMA_L2RIMCR0, CLDMA_RX_ALL);
++}
++
++/* ---- MD1 power and boot (md_sys1_platform.c, clk-mt6771-pg.c) ---- */
++
++static int prot_set(struct titan_md *md, u32 set, u32 sta, u32 mask)
++{
++	u32 v;
++
++	regmap_write(md->infra, set, mask);
++	return regmap_read_poll_timeout(md->infra, sta, v,
++					(v & mask) == mask, 10, 100000);
++}
++
++static int prot_clr(struct titan_md *md, u32 clr, u32 sta, u32 mask)
++{
++	u32 v;
++
++	regmap_write(md->infra, clr, mask);
++	return regmap_read_poll_timeout(md->infra, sta, v,
++					!(v & mask), 10, 100000);
++}
++
++static int md1_pll_init(struct titan_md *md)
++{
++	void __iomem *pll = md->md_pll, *clksw = md->md_clksw;
++	u32 v;
++	int ret, i;
++
++	/* the PLL block reads its version once it is out of reset */
++	ret = readl_poll_timeout(pll, v, v, 1000, 200000);
++	if (ret)
++		return ret;
++	dev_info(md->dev, "MD PLL version %#x\n", v);
++
++	/* clock square 1's low-pass filter, for the 26 MHz quality */
++	regmap_set_bits(md->apmixed, 0x0, BIT(1));
++	udelay(100);
++	/* md_srclkena_ack settle time: 147 32k periods */
++	writel(0x02020e93, pll + 0x4);
++	writel(0x801713b1, pll + 0x60);
++	writel(0x80171400, pll + 0x58);
++	writel(0x80229e00, pll + 0x50);
++	writel(0x80204e00, pll + 0x48);
++	writel(0x80213c00, pll + 0x40);
++	ret = readl_poll_timeout(pll + 0xc00, v, !(v & BIT(14)), 10, 100000);
++	if (ret)
++		return ret;
++	writel(readl(pll + 0x64) & ~BIT(7), pll + 0x64);
++	writel(0x04c43100, pll + 0x104);
++	for (i = 0; i < 50; i++) {
++		writel(0x100010, pll + 0x10);
++		msleep(20);
++		if (readl(pll + 0x10) == 0x100010)
++			break;
++	}
++	if (i == 50)
++		return -ETIMEDOUT;
++	ret = readl_poll_timeout(clksw + 0x84, v, v & BIT(15), 1000, 1000000);
++	if (ret)
++		return ret;
++	writel(readl(clksw + 0x24) | 0x3, clksw + 0x24);
++	writel(readl(clksw + 0x24) | 0x58103fc, clksw + 0x24);
++	writel(readl(clksw + 0x28) | 0x10, clksw + 0x28);
++	writel(0x1, clksw + 0x20);
++	writel(0xffff, pll + 0x314);
++	writel(0xffff, pll + 0x318);
++	/* the vendor's record that the MD PLLs are set up */
++	writel(0x62930000, pll + 0xf00);
++	return 0;
++}
++
++static int md_power_on(struct titan_md *md)
++{
++	int ret;
++
++	/* the MD1 power domain (scpsys, which also ungates the modem's
++	 * clocks in topckgen's CLK_MODE), through runtime PM
++	 */
++	ret = pm_runtime_resume_and_get(md->dev);
++	if (ret) {
++		dev_err(md->dev, "MD1 domain: %d\n", ret);
++		return ret;
++	}
++	md->powered = true;
++
++	/* MD->AP closed while the AP sets the modem up */
++	regmap_clear_bits(md->infra, AP2MD_DUMMY, BIT(0));
++	ret = prot_set(md, PROTECTEN_1_SET, PROTECTEN_1_STA1, PROT_MD2PERI);
++	if (ret) {
++		dev_err(md->dev, "MD2PERI: %d\n", ret);
++		return ret;
++	}
++
++	/* the modem's 26 MHz request: srclkena 0 and its ack (0x21) */
++	regmap_update_bits(md->infra, MD_SRCCLKENA, 0xff, 0x21);
++
++	ret = md1_pll_init(md);
++	if (ret) {
++		dev_err(md->dev, "MD PLLs: %d\n", ret);
++		return ret;
++	}
++
++	/* the modem's watchdog off until it runs (WDT mode at md-rgu + 0) */
++	writel(WDT_MD_MODE_KEY, md->md_rgu);
++	return 0;
++}
++
++static int md_let_go(struct titan_md *md)
++{
++	int ret;
++
++	writel(1, md->md_boot + MD_BOOT_VECTOR_EN_OFF);
++
++	/* from here the AP keeps out of the modem; the modem may reach in */
++	ret = prot_set(md, PROTECTEN_SET, PROTECTEN_STA1, PROT_PERI2MD) ?:
++	      prot_clr(md, PROTECTEN_1_CLR, PROTECTEN_1_STA1, PROT_MD2PERI);
++	regmap_set_bits(md->infra, AP2MD_DUMMY, BIT(0));
++	return ret;
++}
++
++static void md_power_off(struct titan_md *md)
++{
++	int ret;
++
++	ret = pm_runtime_put_sync(md->dev);
++	if (ret < 0)
++		dev_err(md->dev, "MD1 domain off: %d\n", ret);
++	regmap_update_bits(md->infra, MD_SRCCLKENA, 0xff, 0);
++	md->powered = false;
++}
++
++/* ---- the exception handshake and the core dump ---- */
++
++/* the modem's next step in the handshake, on its exception channels */
++static bool ee_wait(struct titan_md *md, int ch)
++{
++	int i;
++
++	for (i = 0; i < EE_STEP_MS / 10; i++) {
++		if (test_bit(ch, &md->rchnum))
++			return true;
++		msleep(10);
++	}
++	dev_err(md->dev, "exception handshake: no channel %d (CCIF %#lx)\n",
++		ch, md->rchnum);
++	return false;
++}
++
++/*
++ * The CCIF queues onto the exception rings, empty, and the sequence numbers
++ * from 0 (md_ccif_switch_ringbuf, md_ccif_reset_queue): the modem sends its
++ * exception messages there once it has reset its side.
++ */
++static void ee_switch_rings(struct titan_md *md)
++{
++	unsigned long flags;
++	int q;
++
++	flush_work(&md->rx_work);
++	spin_lock_irqsave(&md->tx_lock, flags);
++	for (q = 0; q < QUEUE_NUM; q++) {
++		void __iomem *rb = md->exp_rings[q];
++
++		writel(0, rb + RB_RX_READ);
++		writel(0, rb + RB_RX_WRITE);
++		writel(0, rb + RB_TX_READ);
++		writel(0, rb + RB_TX_WRITE);
++		md->rings[q] = rb;
++	}
++	memset(md->tx_seq, 0, sizeof(md->tx_seq));
++	spin_unlock_irqrestore(&md->tx_lock, flags);
++}
++
++/*
++ * The core dump: "TMDCORE1", u32 version 1, u32 sections; each section a
++ * 16-byte name, u32 length, the data padded to 4 bytes. Read it with
++ * tools/modem/mdcore.py. It can hold what the modem had in its debug areas:
++ * it stays on the phone.
++ */
++struct ee_section {
++	const char *name;
++	const void *data;
++	const void __iomem *io;
++	u32 len;
++};
++
++static void ee_coredump(struct titan_md *md, const char *reason)
++{
++	const struct ee_section sec[] = {
++		{ "reason", reason, NULL, strlen(reason) },
++		{ "rec_ok", md->ee_pkg, NULL, md->ee_pkg_len },
++		{ "ccif_sram", md->sram_copy, NULL, CCIF_SRAM_SIZE },
++		{ "mdccci_dbg", NULL, md->smem + SMEM_MDCCCI_DBG,
++		  SMEM_MDSS_DBG - SMEM_MDCCCI_DBG },
++		{ "mdss_dbg", NULL, md->smem + SMEM_MDSS_DBG,
++		  SMEM_MDSS_DBG_SIZE },
++	};
++	size_t size = 16;
++	u8 *buf, *p;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(sec); i++)
++		size += 20 + ALIGN(sec[i].len, 4);
++	buf = vzalloc(size);
++	if (!buf)
++		return;
++	memcpy(buf, "TMDCORE1", 8);
++	put_unaligned_le32(1, buf + 8);
++	put_unaligned_le32(ARRAY_SIZE(sec), buf + 12);
++	p = buf + 16;
++	for (i = 0; i < ARRAY_SIZE(sec); i++) {
++		strscpy_pad(p, sec[i].name, 16);
++		put_unaligned_le32(sec[i].len, p + 16);
++		if (sec[i].io)
++			memcpy_fromio(p + 20, sec[i].io, sec[i].len);
++		else if (sec[i].len)
++			memcpy(p + 20, sec[i].data, sec[i].len);
++		p += 20 + ALIGN(sec[i].len, 4);
++	}
++	dev_coredumpv(md->dev, buf, size, GFP_KERNEL);
++}
++
++/*
++ * A crash (modem_sys1.c md_cd_ee_handshake, fsm/ccci_fsm.c EXCEPTION_EE).
++ * The modem raises D2H_EX_INIT; the AP stops its data path and acks; the
++ * modem says its init is done and its queues cleared; the AP resets CLDMA,
++ * moves CCIF to the exception rings and acks again; the modem resets all
++ * queues. Then, on the control channel: MD_EX (answered with MD_EX),
++ * MD_EX_REC_OK with its record, MD_EX_PASS when its own dump is done. The
++ * watchdog has no handshake. Either way the modem is gone: the record goes
++ * to the log and a core dump, and the session ends.
++ */
++static void ee_work(struct work_struct *w)
++{
++	struct titan_md *md = container_of(w, struct titan_md, ee_work);
++	bool wdt = md->ee_wdt, hs = false, rec_ok = false, pass = false;
++	char reason[96];
++
++	if (READ_ONCE(md->state) == MD_OFF)
++		return;
++	WRITE_ONCE(md->state, MD_EXCEPTION);
++	if (wdt) {
++		dev_err(md->dev, "modem watchdog\n");
++	} else {
++		dev_err(md->dev, "modem exception: the handshake\n");
++		if (cldma)
++			cldma_stop(md);
++		ccif_send(md, H2D_EX_ACK);
++		if (ee_wait(md, D2H_EX_INIT_DONE) &&
++		    ee_wait(md, D2H_EX_CLEARQ_DONE)) {
++			/* the vendor gives the modem's log time to flush */
++			msleep(2000);
++			if (cldma)
++				cldma_hw_reset(md);
++			ee_switch_rings(md);
++			ccif_send(md, H2D_EX_CLEARQ_ACK);
++			hs = ee_wait(md, D2H_EX_ALLQ_RESET);
++		}
++		if (hs) {
++			rec_ok = wait_for_completion_timeout(&md->ee_rec_ok,
++					msecs_to_jiffies(EE_MSG_MS));
++			pass = wait_for_completion_timeout(&md->ee_pass,
++					msecs_to_jiffies(EE_MSG_MS));
++		}
++	}
++	sram_read(md->sram_copy, md->ap_ccif + APCCIF_CHDATA, CCIF_SRAM_SIZE);
++	if (!wdt)
++		decode_exception(md);
++	snprintf(reason, sizeof(reason),
++		 "%s; handshake %s, record %s, pass %s; CCIF %#lx",
++		 wdt ? "watchdog" : "exception", hs ? "done" : "incomplete",
++		 rec_ok ? "received" : "missing", pass ? "received" : "missing",
++		 md->rchnum);
++	dev_err(md->dev, "modem stopped: %s\n", reason);
++	ee_coredump(md, reason);
++	WRITE_ONCE(md->state, MD_DEAD);
++	wake_up_interruptible(&md->rx_wait);
++}
++
++/* debugfs force_assert: make the running modem assert, as the vendor's
++ * force_md_assert does, to exercise the handshake and the core dump
++ */
++static ssize_t force_assert_write(struct file *f, const char __user *buf,
++				  size_t count, loff_t *ppos)
++{
++	struct titan_md *md = f->private_data;
++
++	if (READ_ONCE(md->state) != MD_READY)
++		return -EAGAIN;
++	dev_warn(md->dev, "asserting the modem on request\n");
++	ccif_send(md, H2D_FORCE_ASSERT);
++	return count;
++}
++
++static const struct file_operations force_assert_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = force_assert_write,
++	.llseek = noop_llseek,
++};
++
++/* ---- a session: from the open of /dev/titan-modem to its close ---- */
++
++static int md_start(struct titan_md *md)
++{
++	int i, ret;
++
++	/* what the last session left goes */
++	md->hs1_done = md->ready = false;
++	md->rchnum = 0;
++	md->watch_ticks = 0;
++	md->ee_wdt = false;
++	kfree(md->ee_pkg);
++	md->ee_pkg = NULL;
++	md->ee_pkg_len = 0;
++	reinit_completion(&md->ee_rec_ok);
++	reinit_completion(&md->ee_pass);
++	memset(md->tx_seq, 0, sizeof(md->tx_seq));
++	skb_queue_purge(&md->rxq);
++	md->at_state = AT_DAEMON;
++	md->mux_rx_len = 0;
++	md->mux_ok = false;
++	for (i = 0; i < AT_CHANS; i++)
++		md->at[i].up = md->at[i].open = false;
++
++	init_rings(md);
++	ccif_reset(md);
++	enable_irq(md->irq);
++	enable_irq(md->irq_ex);
++	if (cldma) {
++		cldma_hw_reset(md);
++		cldma_rings_reset(md);
++	}
++	ret = md_power_on(md);
++	if (ret) {
++		if (md->powered)
++			md_power_off(md);
++		disable_irq(md->irq);
++		disable_irq(md->irq_ex);
++		return ret;
++	}
++	WRITE_ONCE(md->state, MD_BOOTING);
++	ret = md_let_go(md);
++	dev_info(md->dev, "modem released (%d)\n", ret);
++	if (cldma)
++		cldma_start(md);
++	if (md->irq_wdt > 0)
++		enable_irq(md->irq_wdt);
++	schedule_delayed_work(&md->watch, HZ / 2);
++	return 0;
++}
++
++static void md_stop(struct titan_md *md)
++{
++	int i;
++
++	if (md->state == MD_OFF)
++		return;
++	/* no new exception work, and the running one finished */
++	if (md->irq_wdt > 0)
++		disable_irq(md->irq_wdt);
++	disable_irq(md->irq_ex);
++	cancel_work_sync(&md->ee_work);
++	if (cldma)
++		cldma_stop(md);
++	disable_irq(md->irq);
++	cancel_delayed_work_sync(&md->watch);
++	cancel_work_sync(&md->rx_work);
++	cancel_work_sync(&md->at_work);
++	for (i = 0; i < AT_CHANS; i++) {
++		if (md->at[i].port) {
++			wwan_remove_port(md->at[i].port);
++			md->at[i].port = NULL;
++		}
++	}
++	if (md->powered)
++		md_power_off(md);
++	WRITE_ONCE(md->state, MD_OFF);
++	skb_queue_purge(&md->rxq);
++	wake_up_interruptible(&md->rx_wait);
++	dev_info(md->dev, "modem powered off\n");
++}
++
++/* ---- setup ---- */
++
++static struct regmap *syscon_phandle(struct device *dev, const char *name)
++{
++	struct regmap *map = syscon_regmap_lookup_by_phandle(dev->of_node,
++							     name);
++
++	if (IS_ERR(map))
++		dev_err(dev, "syscon %s: %pe\n", name, map);
++	return map;
++}
++
++static int get_resources(struct titan_md *md)
++{
++	struct platform_device *pdev = to_platform_device(md->dev);
++	void __iomem **io[] = { &md->ap_ccif, &md->md_ccif, &md->md_pll,
++				&md->md_clksw, &md->md_rgu, &md->md_boot,
++				&md->md_cfg };
++	static const char * const io_names[] = { "ap-ccif", "md-ccif",
++		"md-pll", "md-clksw", "md-rgu", "md-boot", "md-cfg" };
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(io); i++) {
++		*io[i] = devm_platform_ioremap_resource_byname(pdev,
++							       io_names[i]);
++		if (IS_ERR(*io[i]))
++			return PTR_ERR(*io[i]);
++	}
++
++	md->infra = syscon_phandle(md->dev, "mediatek,infracfg");
++	md->apmixed = syscon_phandle(md->dev, "mediatek,apmixedsys");
++	if (IS_ERR(md->infra) || IS_ERR(md->apmixed))
++		return -ENODEV;
++
++	/* CLDMA and the CCIF0-2 infra clocks, enabled for the driver's life */
++	for (i = 0; i < ARRAY_SIZE(clk_names); i++) {
++		struct clk *c = devm_clk_get_enabled(md->dev, clk_names[i]);
++
++		if (IS_ERR(c))
++			return dev_err_probe(md->dev, PTR_ERR(c),
++					     "clock %s\n", clk_names[i]);
++	}
++
++	md->irq = platform_get_irq_byname(pdev, "ccif");
++	md->irq_ex = platform_get_irq_byname(pdev, "ccif-ex");
++	if (md->irq < 0 || md->irq_ex < 0)
++		return -EINVAL;
++	/* the modem's watchdog (vendor IRQ_MDWDT), optional */
++	md->irq_wdt = platform_get_irq_byname_optional(pdev, "md-wdt");
++	return 0;
++}
++
++static int titan_md_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct titan_md *md;
++	int i, ret;
++
++	md = devm_kzalloc(dev, sizeof(*md), GFP_KERNEL);
++	if (!md)
++		return -ENOMEM;
++	md->dev = dev;
++	platform_set_drvdata(pdev, md);
++	mutex_init(&md->lock);
++	INIT_DELAYED_WORK(&md->watch, watch_work);
++	INIT_WORK(&md->rx_work, rx_work);
++	INIT_WORK(&md->at_work, at_work);
++	INIT_WORK(&md->ee_work, ee_work);
++	init_completion(&md->mux_done);
++	init_completion(&md->ee_rec_ok);
++	init_completion(&md->ee_pass);
++	for (i = 0; i < AT_CHANS; i++)
++		md->at[i].dlci = mux ? at_dlci[i] : 0;
++	spin_lock_init(&md->tx_lock);
++	skb_queue_head_init(&md->rxq);
++	init_waitqueue_head(&md->rx_wait);
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++	ret = read_lk_tags(md) ?: get_resources(md) ?: map_smem(md);
++	if (ret)
++		return ret;
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		goto err_smem;
++
++	/* off until a session starts */
++	ret = devm_request_irq(dev, md->irq, ccif_isr, IRQF_NO_AUTOEN,
++			       "titan-modem-ccif", md);
++	if (!ret)
++		ret = devm_request_irq(dev, md->irq_ex, ccif_ex_isr,
++				       IRQF_NO_AUTOEN, "titan-modem-ccif-ex",
++				       md);
++	if (!ret && md->irq_wdt > 0)
++		ret = devm_request_irq(dev, md->irq_wdt, md_wdt_isr,
++				       IRQF_NO_AUTOEN, "titan-modem-wdt", md);
++	if (ret)
++		goto err_smem;
++	device_init_wakeup(dev, true);
++
++	/* the shared memory and the CCIF SRAM, for the modem's debug areas */
++	md->debugfs = debugfs_create_dir("titan-modem", NULL);
++	md->smem_blob.data = (void __force *)md->smem;
++	md->smem_blob.size = md->smem_size;
++	debugfs_create_blob("smem", 0400, md->debugfs, &md->smem_blob);
++	md->sram_blob.data = md->sram_copy;
++	md->sram_blob.size = CCIF_SRAM_SIZE;
++	debugfs_create_blob("sram", 0400, md->debugfs, &md->sram_blob);
++	if (md->ccb) {
++		md->ccb_blob.data = md->ccb;
++		md->ccb_blob.size = md->ccb_size;
++		debugfs_create_blob("ccb", 0400, md->debugfs, &md->ccb_blob);
++	}
++	debugfs_create_file("force_assert", 0200, md->debugfs, md,
++			    &force_assert_fops);
++	/* the start of the DSP image's place (md1rom check header: +0x7000000) */
++	md->dsp_blob.data = devm_memremap(dev, md->img_base + 0x7000000, SZ_64K,
++					  MEMREMAP_WB);
++	if (!IS_ERR(md->dsp_blob.data)) {
++		md->dsp_blob.size = SZ_64K;
++		debugfs_create_blob("dsp", 0400, md->debugfs, &md->dsp_blob);
++	}
++
++	if (cldma) {
++		ret = cldma_alloc(md);
++		if (ret)
++			goto err_cldma;
++	}
++
++	/* last: an open starts the modem */
++	tmd = md;			/* the misc device's single instance */
++	md->misc.minor = MISC_DYNAMIC_MINOR;
++	md->misc.name = "titan-modem";
++	md->misc.fops = &md_fops;
++	md->misc.mode = 0600;
++	ret = misc_register(&md->misc);
++	if (ret)
++		goto err_misc;
++	dev_info(dev, "ready: the modem starts when /dev/titan-modem is opened\n");
++	return 0;
++
++err_misc:
++	tmd = NULL;
++err_cldma:
++	if (cldma)
++		cldma_free(md);
++	debugfs_remove_recursive(md->debugfs);
++err_smem:
++	vunmap((void __force *)md->smem);
++	if (md->ccb)
++		vunmap(md->ccb);
++	return ret;
++}
++
++static void titan_md_remove(struct platform_device *pdev)
++{
++	struct titan_md *md = platform_get_drvdata(pdev);
++
++	misc_deregister(&md->misc);
++	mutex_lock(&md->lock);
++	md_stop(md);
++	mutex_unlock(&md->lock);
++	if (cldma)
++		cldma_free(md);
++	tmd = NULL;
++	debugfs_remove_recursive(md->debugfs);
++	vunmap((void __force *)md->smem);
++	if (md->ccb)
++		vunmap(md->ccb);
++	skb_queue_purge(&md->rxq);
++	kfree(md->ee_pkg);
++}
++
++static const struct of_device_id titan_md_of_match[] = {
++	{ .compatible = "mediatek,mt6771-modem" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, titan_md_of_match);
++
++/*
++ * Across suspend the modem runs on its own and needs nothing done, but its interrupts must wake
++ * the AP: a call, a text or its file service's request arrives on them. The SPM's default wake
++ * mask has the lines (R12_CCIF0, R12_CCIF1, R12_MD2AP_PEER, R12_MD1_WDT, R12_CLDMA).
++ */
++static void md_irq_wake(struct titan_md *md, bool on)
++{
++	int irqs[] = { md->irq, md->irq_ex, md->irq_wdt, md->cl.irq };
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(irqs); i++)
++		if (irqs[i] > 0)
++			irq_set_irq_wake(irqs[i], on);
++}
++
++static int titan_md_suspend(struct device *dev)
++{
++	struct titan_md *md = dev_get_drvdata(dev);
++
++	if (READ_ONCE(md->state) == MD_OFF)
++		return 0;
++	/* a running modem keeps MD1 on (the domain is ACTIVE_WAKEUP) */
++	device_set_wakeup_path(dev);
++	md_notify_lowpwr(md, LOWPWR_AP_SUSPEND);	/* CLDMA is still up here */
++	md->wake_armed = device_may_wakeup(dev);
++	if (md->wake_armed)
++		md_irq_wake(md, true);
++	return 0;
++}
++
++static int titan_md_resume(struct device *dev)
++{
++	struct titan_md *md = dev_get_drvdata(dev);
++
++	if (READ_ONCE(md->state) == MD_OFF)
++		return 0;
++	if (md->wake_armed) {
++		md_irq_wake(md, false);
++		md->wake_armed = false;
++	}
++	md_notify_lowpwr(md, LOWPWR_AP_RESUME);		/* CLDMA restored in resume_noirq */
++	return 0;
++}
++
++/* before interrupts return: the network can transmit from then on */
++static int titan_md_resume_noirq(struct device *dev)
++{
++	cldma_restore(dev_get_drvdata(dev));
++	return 0;
++}
++
++static const struct dev_pm_ops titan_md_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(titan_md_suspend, titan_md_resume)
++	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, titan_md_resume_noirq)
++};
++
++static struct platform_driver titan_md_driver = {
++	.probe = titan_md_probe,
++	.remove = titan_md_remove,
++	.driver = {
++		.name = "titan-modem",
++		.of_match_table = titan_md_of_match,
++		.pm = pm_sleep_ptr(&titan_md_pm_ops),
++	},
++};
++module_platform_driver(titan_md_driver);
++
++MODULE_DESCRIPTION("MT6771 modem: boot, CCCI over CCIF, AT mux, CLDMA, exceptions");
++MODULE_LICENSE("GPL");

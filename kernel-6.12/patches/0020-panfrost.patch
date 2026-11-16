@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 20/22] drm/panfrost: unprepare the GPU clock for system suspend
+
+Panfrost's system suspend disabled the GPU's clock and kept it
+prepared. A MediaTek PLL is switched in prepare and unprepare, so the
+gate closed and the PLL (the MT6771's MFGPLL) kept running through the
+sleep. It now unprepares the clock for a system suspend and prepares it
+at resume; runtime suspend is unchanged.
+---
+ drivers/gpu/drm/panfrost/panfrost_device.c | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_device.c b/drivers/gpu/drm/panfrost/panfrost_device.c
+index a45e4addcc19a391c74c6a0c084b2be7a0f61373..87ef0bb6c5827e99e57d069ced3d7558232d25af 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_device.c
++++ b/drivers/gpu/drm/panfrost/panfrost_device.c
+@@ -446,12 +446,12 @@ static int panfrost_device_resume(struct device *dev)
+ 	}
+ 
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS)) {
+-		ret = clk_enable(pfdev->clock);
++		ret = clk_prepare_enable(pfdev->clock);
+ 		if (ret)
+ 			goto err_clk;
+ 
+ 		if (pfdev->bus_clock) {
+-			ret = clk_enable(pfdev->bus_clock);
++			ret = clk_prepare_enable(pfdev->bus_clock);
+ 			if (ret)
+ 				goto err_bus_clk;
+ 		}
+@@ -465,10 +465,10 @@ static int panfrost_device_resume(struct device *dev)
+ 
+ err_resume:
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS) && pfdev->bus_clock)
+-		clk_disable(pfdev->bus_clock);
++		clk_disable_unprepare(pfdev->bus_clock);
+ err_bus_clk:
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS))
+-		clk_disable(pfdev->clock);
++		clk_disable_unprepare(pfdev->clock);
+ err_clk:
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_VREG_OFF))
+ 		dev_pm_opp_set_opp(dev, NULL);
+@@ -484,11 +484,17 @@ static int panfrost_device_suspend(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Unprepared, not only disabled: a MediaTek PLL is switched in
++	 * prepare and unprepare, so clk_disable() alone gated the GPU's
++	 * clock and left MFGPLL running through the system's sleep (MT6771,
++	 * read in the suspend path, 2026-11-15).
++	 */
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS)) {
+ 		if (pfdev->bus_clock)
+-			clk_disable(pfdev->bus_clock);
++			clk_disable_unprepare(pfdev->bus_clock);
+ 
+-		clk_disable(pfdev->clock);
++		clk_disable_unprepare(pfdev->clock);
+ 	}
+ 
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_VREG_OFF))

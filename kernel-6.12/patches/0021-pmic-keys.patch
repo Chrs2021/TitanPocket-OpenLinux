@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 21/22] Input: mtk-pmic-keys: the MT6358's reset register has the MT6331's layout
+
+The MT6358's TOP_RST_MISC has the MT6331's bits (MediaTek's upmu_hw.h).
+With the MT6397 masks the long-press setup cleared bit 5, the deglitch
+on the PMIC's watchdog reset input, which the preloader sets at every
+boot.
+---
+ drivers/input/keyboard/mtk-pmic-keys.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/input/keyboard/mtk-pmic-keys.c b/drivers/input/keyboard/mtk-pmic-keys.c
+index 486ca8ff86f8303e4306e244a5562294defb7001..750dc3953f70b61fff356555b9c9420c37915c01 100644
+--- a/drivers/input/keyboard/mtk-pmic-keys.c
++++ b/drivers/input/keyboard/mtk-pmic-keys.c
+@@ -104,17 +104,25 @@ static const struct mtk_pmic_regs mt6357_regs = {
+ 	.rst_lprst_mask = MTK_PMIC_RST_DU_MASK,
+ };
+ 
++/*
++ * The MT6358's TOP_RST_MISC has the MT6331's layout (MediaTek's upmu_hw.h:
++ * RG_HOMEKEY_RST_EN bit 8, RG_PWRKEY_RST_EN bit 9, RG_PWRKEY_RST_TD bits
++ * 13:12), not the MT6397's. With the MT6397 masks the long-press setup
++ * below cleared bit 5, RG_WDTRSTB_DEB, the deglitch on the PMIC's watchdog
++ * reset input, which the preloader turns on at every boot (measured on the
++ * Titan Pocket: 0x1005 where MediaTek's kernel leaves 0x0221).
++ */
+ static const struct mtk_pmic_regs mt6358_regs = {
+ 	.keys_regs[MTK_PMIC_PWRKEY_INDEX] =
+ 		MTK_PMIC_KEYS_REGS(MT6358_TOPSTATUS,
+ 				   0x2, MT6358_PSC_TOP_INT_CON0, 0x5,
+-				   MTK_PMIC_PWRKEY_RST),
++				   MTK_PMIC_MT6331_PWRKEY_RST),
+ 	.keys_regs[MTK_PMIC_HOMEKEY_INDEX] =
+ 		MTK_PMIC_KEYS_REGS(MT6358_TOPSTATUS,
+ 				   0x8, MT6358_PSC_TOP_INT_CON0, 0xa,
+-				   MTK_PMIC_HOMEKEY_RST),
++				   MTK_PMIC_MT6331_HOMEKEY_RST),
+ 	.pmic_rst_reg = MT6358_TOP_RST_MISC,
+-	.rst_lprst_mask = MTK_PMIC_RST_DU_MASK,
++	.rst_lprst_mask = MTK_PMIC_MT6331_RST_DU_MASK,
+ };
+ 
+ struct mtk_pmic_keys_info {

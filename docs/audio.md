@@ -187,6 +187,17 @@ stream volumes; WirePlumber remembers them.
 `titan-mixer` uses `pactl` (`pulseaudio-utils`): `pactl subscribe` for live
 updates, JSON listings, `set-sink-input-*`.
 
+The earpiece has its own level, apart from the master: the codec's handset
+gain (`Handset Volume`, -10 to +8 dB in 1 dB steps), used only by calls.
+`titan-ims` keeps it in `/var/lib/titan-ims/earpiece-db` and sets it when a
+call starts on the earpiece; the volume keys in a call and the Sound app's
+"Earpiece" slider change it (docs/modem.md, "Call volume"). Measured 2026-11-15 with no call (a -20 dBFS 1 kHz tone through
+PipeWire on the earpiece route, the main mic at 24 dB preamp, 1.5 s
+Goertzel at 1 kHz): -10 dB gave -78.6 dBFS at the mic, -7 dB -75.4, -4 dB
+-72.7, against -101.6 and -106.5 dBFS of silence, so the control's 3 dB
+steps come out as about 3 dB. (Start the tone before the capture: capture
+overruns by about 0.5 s when DL1 starts.)
+
 ### UI sounds (2026-10-28)
 
 `userspace/debian/sounds/gen-sounds.py` synthesizes them at build time into

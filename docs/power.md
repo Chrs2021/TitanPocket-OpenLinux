@@ -639,7 +639,9 @@ the screen off no IIO buffer is enabled, so nothing keeps it sampling.
 **The PMIC's sleep settings** (read after a resume with `pmicpoke`): Vcore
 sleep 0.60 V (awake 0.80), both CPU clusters and their SRAM rails 0.60 V,
 Vmodem 0.55 V, VSRAM_OTHERS 0.85 V; VS1, VS2 and VDRAM1 keep their awake
-levels. The sensor hub's hold (Vcore and VSRAM_OTHERS while the SCP's
+levels. Read awake these miss the SSPM's part: for each suspend it lowers
+VSRAM_OTHERS's sleep target to 0.60 V and puts VS1 into low power on
+SRCLKEN0, undoing both on resume ([sspm-firmware.md](sspm-firmware.md)). The sensor hub's hold (Vcore and VSRAM_OTHERS while the SCP's
 request is up) is 0.60 and 0.85 V, as 4.14 programs it, and the bucks
 follow the SPM's `SRCVOLTEN` (TOP_CLK_CON0 0x134 reads 0x3b0, bit 4 set).
 Whether the rails reach those levels in sleep is not measured: the PMIC's
@@ -653,6 +655,10 @@ each suspend and resume as the vendor's does (`SSPM_SPM_SUSPEND_PREPARE`,
 GPS flag with them. With an SSPM, the vendor's kernel writes no PMIC sleep
 voltages itself. The Vcore command table the vendor gives the SSPM
 (`SPM_VCORE_PWARP_CMD`) goes to ATF here at boot (`VCOREFS_PWRAP_CMD`).
+What the SSPM does with them is decoded in
+[sspm-firmware.md](sspm-firmware.md): `SUSPEND` reprograms VSRAM_OTHERS and
+VS1 as above and stops the MT6358 RTC's clocks until `RESUME`;
+`SUSPEND_PREPARE`, `POST_SUSPEND` and the Vcore table command do nothing.
 
 **Resets on the way into sleep.** About one suspend in 35 ends in a reset
 (2 in about 70 with the breadcrumbs, both on 5-minute sleeps; none in 50
@@ -683,3 +689,47 @@ bit per step) and the step the RTC held going into the sleep ("held"):
 every reset since #107 showed step 10, the last one written before the
 SSPM is asked to suspend, which the SSPM's own PMIC work may stop the
 later ones from reaching.
+On #120 no atomic step reached the RTC at all (a driver bug, fixed in #121,
+2026-11-09; power-testing.md, "Resets during a run"), so its resets can't
+be placed. On #121 the steps inside the SSPM's suspend (12, 6, 7) still
+don't reach the RTC, so step 10 spans the SSPM call, the sleep and the
+wake: the resets "at step 10" may be in the sleep itself, which fits the
+PMIC-level reading above. `tools/power/sleepcrash.py` tallies the resets
+(27 of 30 at step 10, 1 in 104 suspends with today's parameters).
+
+**The SSPM's side of that window** (static analysis of its firmware,
+[sspm-firmware.md](sspm-firmware.md), 2026-11-09): from the doorbell until
+it answers `RESUME`, the SSPM keeps the RTC's main and 32k clocks gated
+(`SCK_TOP_CKPDN_CON0` bits 4-5), which is why steps 12, 6 and 7 never
+commit. It also sets VSRAM_OTHERS's sleep target to 0.60 V (level with
+Vcore's) and VS1's low-power control. It cuts no rail and touches no
+wrapper, reset or power-off setting, and it switches its own watchdog off
+for the window. That page lists the PMIC writes in order and the tests
+they suggest. Kernel #123 (`out/mainline/boot-6.12-123.img`, built
+2026-11-09, flashed 2026-11-10) writes step 12 before the doorbell, so it lands,
+and keeps VS1 at full power in sleep by clearing the SSPM's SRCLKEN0
+low-power enable right after its answer (`mt6771_spm.vs1_sleep_lp=1`
+restores the SSPM's setting).
+
+**The cause** (2026-11-11). The preloader's own records, which LK saves to
+the `expdb` partition, show every sleep reset that day as a watchdog
+reset requested by the SPM (`[RGU] STA 0x2`, `POFFSTS` 0x400 "AP
+Watchdog"), followed by a cold reset that LK always adds after a watchdog
+reset. The SPM's PCM watchdog was armed at about 30 s from before the SSPM
+call until the suspend call re-armed it. Kernel #126 (flashed 2026-11-11)
+arms it at the sleep timer's 36 h limit instead (`mt6771_spm.pcm_wdt_timer`)
+and fixes a PMIC reset-input setting that `mtk-pmic-keys` had cleared.
+Whether the resets stop is not measured yet (power-testing.md,
+"Resets during a run").
+
+## Rails, domains and clocks (2026-11-15)
+
+[power-rails.md](power-rails.md) maps every MT6358 rail, the SoC's power
+domains, the PLLs and the unused clocks, with who switches each in a deep
+sleep, and compares 6.12 with 4.14 and with the vendor's suspend table.
+Two results so far. The modem's uplink ring can jam, after which the modem
+never drops its clock request and every sleep stops at DRAM self-refresh:
+48.8 mA over one night against 39.0 mA. And 6.12 does not hand the main
+PLLs to the SPM for sleep as 4.14 does; with the hand-over applied at run
+time the phone sleeps and wakes, and its effect on current is still to be
+measured.

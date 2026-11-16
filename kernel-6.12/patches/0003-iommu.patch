@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 03/22] iommu: mediatek: MT6771 data with the VPU's fixed IOVA window
+
+The MT6771's VPU (two Vision P6 DSPs) runs firmware linked to fixed
+IOVAs (0x7da00000-0x82600000). The MT6771 gets the MT8183's data plus a
+second IOVA region there that no port uses, so mtk_iommu reserves it for
+every master and the VPU driver can map its firmware at those addresses.
+---
+ drivers/iommu/mtk_iommu.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/drivers/iommu/mtk_iommu.c b/drivers/iommu/mtk_iommu.c
+index 5ebf31f50c06a1db6c6d05275b9ad720c1c71bb1..3b6ac3a89336f6452b6b88638d9d71fc0a47148e 100644
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@ -1597,6 +1597,35 @@ static const struct mtk_iommu_plat_data mt8183_data = {
+ 	.larbid_remap = {{0}, {4}, {5}, {6}, {7}, {2}, {3}, {1}},
+ };
+ 
++/*
++ * MT6771: the MT8183's, plus one IOVA window kept out of the DMA allocator
++ * for every master: the VPU (Vision P6 DSP) firmware is linked to fixed
++ * addresses there (MediaTek's VPU_MVA_RESET_VECTOR 0x7da00000 to
++ * VPU_MVA_RESERVED_END 0x82600000) and its driver maps them itself. No
++ * port is in the second region, so every master stays in the first.
++ */
++static const struct mtk_iommu_iova_region mt6771_regions[] = {
++	{ .iova_base = 0,		.size = MTK_IOMMU_IOVA_SZ_4G },
++	{ .iova_base = 0x7da00000,	.size = 0x82600000 - 0x7da00000 },
++};
++
++static const unsigned int mt6771_larb_region_msk[][MTK_LARB_NR_MAX] = {
++	[0] = { ~0, ~0, ~0, ~0, ~0, ~0, ~0, ~0 },
++	[1] = { 0 },
++};
++
++static const struct mtk_iommu_plat_data mt6771_data = {
++	.m4u_plat     = M4U_MT8183,
++	.flags        = RESET_AXI | MTK_IOMMU_TYPE_MM,
++	.inv_sel_reg  = REG_MMU_INV_SEL_GEN1,
++	.banks_num    = 1,
++	.banks_enable = {true},
++	.iova_region  = mt6771_regions,
++	.iova_region_nr = ARRAY_SIZE(mt6771_regions),
++	.iova_region_larb_msk = mt6771_larb_region_msk,
++	.larbid_remap = {{0}, {4}, {5}, {6}, {7}, {2}, {3}, {1}},
++};
++
+ static const unsigned int mt8186_larb_region_msk[MT8192_MULTI_REGION_NR_MAX][MTK_LARB_NR_MAX] = {
+ 	[0] = {~0, ~0, ~0},			/* Region0: all ports for larb0/1/2 */
+ 	[1] = {0, 0, 0, 0, ~0, 0, 0, ~0},	/* Region1: larb4/7 */
+@@ -1791,6 +1820,7 @@ static const struct of_device_id mtk_iommu_of_ids[] = {
+ 	{ .compatible = "mediatek,mt6795-m4u", .data = &mt6795_data},
+ 	{ .compatible = "mediatek,mt8167-m4u", .data = &mt8167_data},
+ 	{ .compatible = "mediatek,mt8173-m4u", .data = &mt8173_data},
++	{ .compatible = "mediatek,mt6771-m4u", .data = &mt6771_data},
+ 	{ .compatible = "mediatek,mt8183-m4u", .data = &mt8183_data},
+ 	{ .compatible = "mediatek,mt8186-iommu-mm",    .data = &mt8186_data_mm}, /* mm: m4u */
+ 	{ .compatible = "mediatek,mt8188-iommu-infra", .data = &mt8188_data_infra},

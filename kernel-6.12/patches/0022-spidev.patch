@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 22/22] spi: spidev: add the Titan Pocket's fingerprint sensor
+
+The Sunwave fingerprint sensor on SPI0 is driven from userspace
+through spidev, so spidev accepts its compatible.
+---
+ drivers/spi/spidev.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/spi/spidev.c b/drivers/spi/spidev.c
+index 661b84f3ee62222c251bef5f68c69551883697e6..944ca4a90eb7608e25a8321abecb0fa4967cd6b6 100644
+--- a/drivers/spi/spidev.c
++++ b/drivers/spi/spidev.c
+@@ -683,6 +683,7 @@ static const struct class spidev_class = {
+ static const struct spi_device_id spidev_spi_ids[] = {
+ 	{ .name = "bh2228fv" },
+ 	{ .name = "dh2228fv" },
++	{ .name = "titan-pocket-fingerprint" },
+ 	{ .name = "jg10309-01" },
+ 	{ .name = "ltc2488" },
+ 	{ .name = "sx1301" },
+@@ -720,6 +721,7 @@ static const struct of_device_id spidev_dt_ids[] = {
+ 	{ .compatible = "micron,spi-authenta", .data = &spidev_of_check },
+ 	{ .compatible = "rohm,bh2228fv", .data = &spidev_of_check },
+ 	{ .compatible = "rohm,dh2228fv", .data = &spidev_of_check },
++	{ .compatible = "unihertz,titan-pocket-fingerprint", .data = &spidev_of_check },
+ 	{ .compatible = "semtech,sx1301", .data = &spidev_of_check },
+ 	{ .compatible = "silabs,em3581", .data = &spidev_of_check },
+ 	{ .compatible = "silabs,si3210", .data = &spidev_of_check },

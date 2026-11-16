@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 01/16] soc: mediatek: add MT6771 MCDI, SPM, SCP and LK framebuffer drivers
+Subject: [PATCH 01/22] soc: mediatek: add MT6771 MCDI, SPM, SCP and LK framebuffer drivers
 
 mtk-mcdi: keeps the SSPM's available-CPU mask in step with the online
 CPUs and pauses MCDI (and cpuidle) across hotplug as MediaTek's kernel
@@ -25,12 +25,12 @@ console before the display driver binds.
 ---
  drivers/soc/mediatek/Kconfig          |   44 +
  drivers/soc/mediatek/Makefile         |    4 +
- drivers/soc/mediatek/mt6771-scp.c     | 1238 +++++++++++++++++++++++++
- drivers/soc/mediatek/mt6771-spm.c     |  719 ++++++++++++++
+ drivers/soc/mediatek/mt6771-scp.c     | 1323 +++++++++++++++++++++++++
+ drivers/soc/mediatek/mt6771-spm.c     | 1235 +++++++++++++++++++++++
  drivers/soc/mediatek/mtk-lk-fb.c      |  249 +++++
  drivers/soc/mediatek/mtk-mcdi.c       |  196 ++++
  include/linux/soc/mediatek/mtk-mcdi.h |   13 +
- 7 files changed, 2463 insertions(+)
+ 7 files changed, 3064 insertions(+)
 
 diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
 index 1b7afb19ccd637471ad82ad833f589cb0f9405b1..cc73ddf801462547795930636f466c91eb5a83e9 100644
@@ -114,10 +114,10 @@ index 6830512848fd0feb2d559894ac1b88397b487e91..e02ca4c3f3ef7dd57b0ee87c32237f18
  obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
 diff --git a/drivers/soc/mediatek/mt6771-scp.c b/drivers/soc/mediatek/mt6771-scp.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597ab175c0fb
+index 0000000000000000000000000000000000000000..88b26d57b977cad41e0c6a47c945dd334d55f953
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-scp.c
-@@ -0,0 +1,1238 @@
+@@ -0,0 +1,1323 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SCP (Cortex-M4, MediaTek's tinysys firmware) and its sensor hub
@@ -154,6 +154,8 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 + * vendor's scp_dvfs.c does and that test lacked: the SCP's clock mux on its
 + * request (IPI_SCP_PLL_CTRL). The MT6358's sensor hub supply levels (and
 + * SRCVOLTEN low power) are set at every boot, as there.
++ * While the AP is suspended the SCP goes to its no-wakeup sleep
++ * (mt6771_scp.suspend_mode): each of its IPIs is otherwise an SPM wake.
 + *
 + * Each sensor is an IIO device: read once (enabled for the read) or
 + * through a buffer. Several programs read the same sensor at once (the
@@ -179,6 +181,7 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +#include <linux/of_reserved_mem.h>
 +#include <linux/platform_device.h>
 +#include <linux/regmap.h>
++#include <linux/seq_file.h>
 +#include <linux/timekeeping.h>
 +#include <linux/workqueue.h>
 +#include <asm/arch_timer.h>
@@ -191,7 +194,9 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +#define SCP_GIPC_IN		0x028
 +#define  HOST_TO_SCP_A		BIT(0)
 +#define SCP_DEBUG_PC		0x0b4
++#define SCP_CPU_SLEEP_STATUS	0x114	/* bit 0 asleep, bit 1 deep */
 +/* clock control */
++#define SCP_SLEEP_DEBUG		0x028
 +#define SCP_SRAM_PDN		0x02c
 +/*
 + * MT6358 sensor hub mode (vendor scp_dvfs.c mt_pmic_sshub_init(), run at
@@ -241,6 +246,11 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +#define IPI_LOGGER_INIT_A	4
 +#define IPI_SENSOR		8
 +#define IPI_DVFS_SLEEP		21
++/* its modes (vendor scp_dvfs.h) */
++#define SCP_SLEEP_OFF		0
++#define SCP_SLEEP_ON		1
++#define SCP_SLEEP_NO_WAKEUP	2
++#define SCP_SLEEP_NO_CONDITION	3
 +#define IPI_SCP_A_READY		12
 +#define IPI_CHRE		24
 +#define IPI_CHREX		25
@@ -392,6 +402,7 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +	u8 rcv[SHARE_OBJ_SIZE];
 +	unsigned int rcv_len;
 +	unsigned int rcv_id;
++	u32 rcv_count[IPI_NR];	/* IPIs from the SCP, by id: each also woke the SPM */
 +
 +	bool ready;
 +	bool hub_up;
@@ -435,6 +446,23 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 + */
 +static bool scp_sleep;
 +module_param_named(sleep, scp_sleep, bool, 0444);
++/*
++ * The SCP's sleep mode while the AP is suspended (with mt6771_scp.sleep):
++ * 2, no-wakeup, by default. Every IPI from the SCP also raises
++ * R12_SCP_SPM_IRQ_B (its send writes SCP_TO_SPM), a wake in deep sleep; in
++ * mode 2 its sensors and timers can't wake it, so it sends nothing until
++ * we wake it on resume (docs/scp-firmware.md). 1 keeps its wakes (an SCP
++ * sensor event can then wake the phone), -1 leaves the mode alone.
++ */
++/*
++ * -1 (leave the SCP's sleep alone) by default: its no-wakeup sleep (2)
++ * saves the SCP's own power and stops its SPM wakes, but the SCP did not
++ * come back from it on the phone (the AP's awake handshake timed out and
++ * the hub was dead until a reboot, 2026-11-09). Needs the resume wake path
++ * sorted before 2 is safe. Modes: 0 off, 1 on, 2 no-wakeup, 3 no-condition.
++ */
++static int scp_suspend_mode = -1;
++module_param_named(suspend_mode, scp_suspend_mode, int, 0644);
 +MODULE_PARM_DESC(sleep, "Leave the SCP's sleep on (needs the SPM firmware: mt6771_spm.deep=1)");
 +
 +/* ---- SCP IPI ---- */
@@ -700,6 +728,26 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +	.read = scp_log_read,
 +	.llseek = noop_llseek,
 +};
++
++/*
++ * The firmware's IPI send (drivers/common/ipi/v02/src/scp_ipi.c) writes
++ * SCP_TO_SPM before it interrupts us, so every IPI counted here also raised
++ * R12_SCP_SPM_IRQ_B: in deep sleep, a wake (docs/scp-firmware.md).
++ */
++static int scp_stats_show(struct seq_file *m, void *unused)
++{
++	struct mt6771_scp *scp = m->private;
++	int i;
++
++	seq_printf(m, "sleep status 0x%x, sleep debug 0x%x, sleep %d, suspend mode %d\n",
++		   readl(scp->cfg + SCP_CPU_SLEEP_STATUS), readl(scp->clkctrl + SCP_SLEEP_DEBUG),
++		   scp_sleep, scp_suspend_mode);
++	for (i = 0; i < IPI_NR; i++)
++		if (scp->rcv_count[i])
++			seq_printf(m, "ipi %2d: %u\n", i, scp->rcv_count[i]);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(scp_stats);
 +
 +/* ---- sensor hub ---- */
 +
@@ -998,8 +1046,10 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +		id = readl(obj);
 +		len = min_t(u32, readl(obj + 4), SHARE_DATA_SIZE);
 +		memcpy_fromio(scp->rcv, obj + SHARE_DATA, len);
-+		if (id < IPI_NR)
++		if (id < IPI_NR) {
++			scp->rcv_count[id]++;
 +			scp_dispatch(scp, id, scp->rcv, len);
++		}
 +	}
 +	writel(status & (SCP_IRQ_SCP2HOST | SCP_IRQ_WDT), scp->cfg + SCP_A_TO_HOST);
 +	return IRQ_HANDLED;
@@ -1206,6 +1256,7 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +	struct reserved_mem *rmem;
 +	struct device_node *np;
 +	struct mt6771_scp *scp;
++	struct dentry *dbg;
 +	struct clk *clk;
 +	int ret;
 +
@@ -1331,9 +1382,10 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +		dev_warn(dev, "SCP not ready (PC %#x)\n",
 +			 readl(scp->cfg + SCP_DEBUG_PC));
 +	platform_set_drvdata(pdev, scp);
++	dbg = debugfs_create_dir("mt6771-scp", NULL);
 +	if (scp->log)
-+		debugfs_create_file("log", 0400, debugfs_create_dir("mt6771-scp", NULL),
-+				    scp, &scp_log_fops);
++		debugfs_create_file("log", 0400, dbg, scp, &scp_log_fops);
++	debugfs_create_file("stats", 0400, dbg, scp, &scp_stats_fops);
 +	return 0;
 +}
 +
@@ -1343,10 +1395,43 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +};
 +MODULE_DEVICE_TABLE(of, mt6771_scp_of_match);
 +
++static int scp_set_sleep_mode(struct mt6771_scp *scp, s32 mode)
++{
++	int ret = scp_ipi_send(scp, IPI_DVFS_SLEEP, &mode, sizeof(mode));
++
++	if (ret)
++		dev_warn(scp->dev, "SCP sleep mode %d not set: %d\n", mode, ret);
++	return ret;
++}
++
++/* not fatal either way: a failed switch costs power, not the suspend */
++static int mt6771_scp_suspend(struct device *dev)
++{
++	struct mt6771_scp *scp = dev_get_drvdata(dev);
++
++	if (scp && scp->ready && scp_sleep && scp_suspend_mode >= SCP_SLEEP_OFF &&
++	    scp_suspend_mode <= SCP_SLEEP_NO_CONDITION && scp_suspend_mode != SCP_SLEEP_ON)
++		scp_set_sleep_mode(scp, scp_suspend_mode);
++	return 0;
++}
++
++static int mt6771_scp_resume(struct device *dev)
++{
++	struct mt6771_scp *scp = dev_get_drvdata(dev);
++
++	if (scp && scp->ready && scp_sleep && scp_suspend_mode >= SCP_SLEEP_OFF &&
++	    scp_suspend_mode <= SCP_SLEEP_NO_CONDITION && scp_suspend_mode != SCP_SLEEP_ON)
++		scp_set_sleep_mode(scp, SCP_SLEEP_ON);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(mt6771_scp_pm, mt6771_scp_suspend, mt6771_scp_resume);
++
 +static struct platform_driver mt6771_scp_driver = {
 +	.probe = mt6771_scp_probe,
 +	.driver = {
 +		.name = "mt6771-scp",
++		.pm = pm_sleep_ptr(&mt6771_scp_pm),
 +		.of_match_table = mt6771_scp_of_match,
 +		/* waits up to SCP_READY_TIMEOUT_MS for the SCP */
 +		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
@@ -1358,10 +1443,10 @@ index 0000000000000000000000000000000000000000..d7a808aeb6c5ebb564f1ce6026f5597a
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/soc/mediatek/mt6771-spm.c b/drivers/soc/mediatek/mt6771-spm.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e375767d50
+index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6fb000c830
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-spm.c
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,1235 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SPM: resource requests and system suspend.
@@ -1392,6 +1477,8 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 + */
 +#include <linux/arm-smccc.h>
 +#include <linux/bits.h>
++#include <linux/clk-provider.h>
++#include <linux/cpufreq.h>
 +#include <linux/delay.h>
 +#include <linux/io.h>
 +#include <linux/iopoll.h>
@@ -1403,8 +1490,10 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +#include <linux/platform_device.h>
 +#include <linux/psci.h>
 +#include <linux/regmap.h>
++#include <linux/sizes.h>
 +#include <linux/soc/mediatek/mtk-mcdi.h>
 +#include <linux/soc/mediatek/mtk_sip_svc.h>
++#include <linux/string.h>
 +#include <linux/suspend.h>
 +
 +#define SPM_SRC_REQ		0x0b8
@@ -1467,7 +1556,7 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 + */
 +#define SPM_SUSPEND_FLAGS	0x80098
 +#define PCM_WDT_SEC		30
-+#define PCM_TIMER_MAX		(0xffffffff - PCM_WDT_SEC * 32768)
++#define PCM_TIMER_MAX		(0xffffffff - PCM_WDT_SEC * 32768)	/* ATF's clamp */
 +
 +/*
 + * SSPM IPI pin 6 (SPM_SUSPEND): mailbox 1, slots 2-9, doorbell bit 1
@@ -1518,9 +1607,244 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +module_param(wake_mask, uint, 0644);
 +MODULE_PARM_DESC(wake_mask, "SPM suspend wake sources (R12 bits), 0 for ATF's");
 +
++/*
++ * The SSPM's SUSPEND puts VS1 into low power while SRCLKEN0 is down
++ * (BUCK_VS1_OP_EN bit 1, OP_CFG bit 1; its RESUME clears the enable again;
++ * docs/sspm-firmware.md). Off by default here: the enable is cleared again
++ * as soon as the SSPM answers, so VS1 sleeps at full power, to see whether
++ * the sleep resets follow it.
++ */
++static bool vs1_sleep_lp;
++module_param(vs1_sleep_lp, bool, 0644);
++MODULE_PARM_DESC(vs1_sleep_lp, "Leave VS1 in the SSPM's low-power mode in suspend (else full power)");
++
++/*
++ * The SPM's watchdog, armed before the SSPM is told and the suspend set up.
++ * ATF's SPM_ARGS_PCM_WDT writes this into PCM_TIMER_VAL and arms the
++ * watchdog 30 s past it; the suspend call re-arms it past the real sleep
++ * timer (PCM_TIMER_MAX here). MediaTek's kernel passes 30. Every deep-sleep
++ * reset logged on 2026-11-11 (7 of 7, the preloader's records in expdb)
++ * was this watchdog (TOPRGU status 0x2, SPM_RST), between arming it and the
++ * wake; with the maximum the window has the same 36 h limit as the sleep.
++ */
++static uint pcm_wdt_timer = PCM_TIMER_MAX;
++module_param(pcm_wdt_timer, uint, 0644);
++MODULE_PARM_DESC(pcm_wdt_timer, "PCM_TIMER_VAL when the SPM watchdog is armed (30: the vendor's)");
++
 +static bool deep;
 +module_param(deep, bool, 0444);
 +MODULE_PARM_DESC(deep, "Start the SPM firmware and suspend through it");
++
++/*
++ * PLL sleep control (APMIXEDSYS AP_PLL_CON3 and AP_PLL_CON4): a set bit
++ * keeps a PLL or clock squarer under software control, a clear one hands it
++ * to the SPM, whose firmware then switches it with the sleep ladder
++ * (SPM_PLL_CON, the VRF18 step) and with a cluster's power. The reset value
++ * is all software, and that is what 6.12 ran with (0x07ffffff): nothing the
++ * firmware switched off took effect. MediaTek's kernel clears
++ *  - at boot, the bits of MPLL, CCIPLL, MAINPLL and the two clock squarers
++ *    (clk-mt6771.c mtk_apmixedsys_init(): CON3 &= 0x007d5550, CON4 &= 0x7f5);
++ *  - while a cluster is online, its CPU PLL's bits (mtk_cpuhp_mt6771.c:
++ *    "Switch LL/L cluster to HW mode", mp_enter_suspend(id, 1)); 4.14 reads
++ *    CON3 0x00044440 awake on this phone, both clusters in hardware mode.
++ * 0: leave the registers as the bootloader set them. 1: the boot-time
++ * bits, applied at probe and before each suspend from the values found at
++ * probe, so a write to the parameter takes effect at the next suspend,
++ * either way. 2: those, and the CPU PLLs' bits from just before the sleep
++ * until just after the wake, on the one CPU left running. Not while awake:
++ * set from userspace on #128 (2026-11-15) the phone slept and woke six
++ * times and then hung awake after eight minutes; MediaTek's hotplug code
++ * switches a cluster's PLL off and its frequency hopping around the mode
++ * change, and its DVFS runs in the SSPM, none of which 6.12 does.
++ */
++#define AP_PLL_CON3		0x00c
++#define AP_PLL_CON4		0x010
++#define AP_PLL_CON8		0x020
++#define PLL_CON3_BOOT_MASK	0x007d5550
++#define PLL_CON4_BOOT_MASK	0x000007f5
++#define PLL_CON3_CPU_BITS	(0x00780000 | 0x00011110)	/* mp0, mp1 */
++#define PLL_CON4_CPU_BITS	(0x00002000 | 0x00000001)
++/*
++ * 2 by default from #134: on #132 (2026-11-15) 90 two-minute sleeps at 2
++ * were all clean, against 1 hung wake (step 13) in 45 at 0 on the same boot.
++ */
++static uint pll_sleep = 2;
++module_param(pll_sleep, uint, 0644);
++MODULE_PARM_DESC(pll_sleep, "PLLs under the SPM's sleep control: 0 none, 1 the vendor's boot set, 2 and the CPU PLLs across a suspend");
++
++/*
++ * TVDPLL feeds only DPI, which this phone does not have; the bootloader
++ * leaves it running and clk_ignore_unused keeps it. MediaTek's kernel
++ * switches it off at boot (mtk_apmixedsys_init()).
++ */
++#define TVDPLL_CON0		0x260
++#define TVDPLL_PWR_CON0		0x26c
++static bool tvdpll_off = true;
++module_param(tvdpll_off, bool, 0444);
++MODULE_PARM_DESC(tvdpll_off, "Switch the unused TVDPLL off at boot");
++
++/*
++ * The two audio PLLs: the bootloader leaves them running too, and until the
++ * audio driver has used and released them once they stay on, through every
++ * sleep (read in the suspend path on #132). MediaTek's kernel switches them
++ * off at boot in the same place. Only when the clock framework counts no
++ * user: the AFE prepares them itself when it plays or records.
++ */
++#define APLL1_CON0		0x2a0
++#define APLL1_PWR_CON0		0x2b0
++#define APLL2_CON0		0x2b4
++#define APLL2_PWR_CON0		0x2c4
++static bool apll_off = true;
++module_param(apll_off, bool, 0444);
++MODULE_PARM_DESC(apll_off, "Switch the audio PLLs off at boot when nothing uses them");
++
++static struct regmap *apmixed_regmap, *topck_regmap, *infracfg_regmap;
++static u32 pll_con3_boot, pll_con4_boot;
++
++/*
++ * Only ever clears the bits it owns, and sets back only those that were set
++ * at probe: #130 wrote the whole of both words from their probe-time values
++ * before every suspend, pll_sleep 0 included, and its first deep sleep never
++ * woke (2026-11-15). AP_PLL_CON4 bits 12-13 change by themselves while
++ * awake, so a stale copy of that word is not harmless.
++ */
++static u32 pll_sleep_done;	/* the level the registers are at */
++
++static void spm_pll_sleep_apply(bool asleep)
++{
++	u32 level = min(pll_sleep, 2U);
++	bool cpu = level >= 2 && asleep;
++
++	if (!apmixed_regmap || (!level && !pll_sleep_done))
++		return;
++	if (level >= 1) {
++		regmap_clear_bits(apmixed_regmap, AP_PLL_CON3,
++				  ~PLL_CON3_BOOT_MASK & 0x07ffffff);
++		regmap_clear_bits(apmixed_regmap, AP_PLL_CON4,
++				  ~PLL_CON4_BOOT_MASK & 0x0000ffff & ~PLL_CON4_CPU_BITS & ~0x3000);
++	} else {
++		/* back to what probe found, for the bits level 1 cleared */
++		regmap_set_bits(apmixed_regmap, AP_PLL_CON3,
++				pll_con3_boot & ~PLL_CON3_BOOT_MASK & 0x07ffffff);
++		regmap_set_bits(apmixed_regmap, AP_PLL_CON4,
++				pll_con4_boot & ~PLL_CON4_BOOT_MASK & 0x0000ffff &
++				~PLL_CON4_CPU_BITS & ~0x3000);
++	}
++	if (cpu) {
++		regmap_clear_bits(apmixed_regmap, AP_PLL_CON3, PLL_CON3_CPU_BITS);
++		regmap_clear_bits(apmixed_regmap, AP_PLL_CON4, PLL_CON4_CPU_BITS);
++	} else if (pll_sleep_done >= 2) {
++		regmap_set_bits(apmixed_regmap, AP_PLL_CON3,
++				pll_con3_boot & PLL_CON3_CPU_BITS);
++		regmap_set_bits(apmixed_regmap, AP_PLL_CON4,
++				pll_con4_boot & PLL_CON4_CPU_BITS);
++	}
++	pll_sleep_done = cpu ? 2 : level ? 1 : 0;
++}
++
++/*
++ * What is clocked going into the sleep, read just before PSCI: the PLLs'
++ * enable and power bits, the sleep-control and 26 MHz-feed words, the
++ * top-level muxes (bit 7 of each byte: mux off) and the infra gates (set:
++ * gated). Logged after the wake, next to the SPM's line.
++ */
++static const u16 pll_con0[] = { 0x200, 0x210, 0x220, 0x230, 0x240, 0x250,
++				0x260, 0x270, 0x280, 0x290, 0x2a0, 0x2b4 };
++static const u16 pll_pwr[] = { 0x20c, 0x21c, 0x22c, 0x23c, 0x24c, 0x25c,
++			       0x26c, 0x27c, 0x28c, 0x29c, 0x2b0, 0x2c4 };
++static const u16 infra_cg_sta[] = { 0x090, 0x094, 0x0ac, 0x0c8 };
++static struct {
++	u32 pll_en, pll_pwr, con3, con4, con8;
++	u32 cfg[11], cg[ARRAY_SIZE(infra_cg_sta)];
++} clk_snap;
++
++static void spm_clk_snapshot(void)
++{
++	u32 v;
++	int i;
++
++	if (!apmixed_regmap || !topck_regmap || !infracfg_regmap)
++		return;
++	clk_snap.pll_en = clk_snap.pll_pwr = 0;
++	for (i = 0; i < ARRAY_SIZE(pll_con0); i++) {
++		regmap_read(apmixed_regmap, pll_con0[i], &v);
++		clk_snap.pll_en |= (v & 1) << i;
++		regmap_read(apmixed_regmap, pll_pwr[i], &v);
++		clk_snap.pll_pwr |= (v & 1) << i;
++	}
++	regmap_read(apmixed_regmap, AP_PLL_CON3, &clk_snap.con3);
++	regmap_read(apmixed_regmap, AP_PLL_CON4, &clk_snap.con4);
++	regmap_read(apmixed_regmap, AP_PLL_CON8, &clk_snap.con8);
++	for (i = 0; i < ARRAY_SIZE(clk_snap.cfg); i++)
++		regmap_read(topck_regmap, 0x040 + 0x10 * i, &clk_snap.cfg[i]);
++	for (i = 0; i < ARRAY_SIZE(infra_cg_sta); i++)
++		regmap_read(infracfg_regmap, infra_cg_sta[i], &clk_snap.cg[i]);
++}
++
++static void spm_clk_report(void)
++{
++	char cfg[11 * 9 + 1];
++	int i, n = 0;
++
++	if (!apmixed_regmap || !topck_regmap || !infracfg_regmap)
++		return;
++	for (i = 0; i < ARRAY_SIZE(clk_snap.cfg); i++)
++		n += scnprintf(cfg + n, sizeof(cfg) - n, " %08x", clk_snap.cfg[i]);
++	/*
++	 * PLL bits: 0 armpll_ll, 1 armpll_l, 2 main, 3 univ, 4 mfg, 5 msdc,
++	 * 6 tvd, 7 mm, 8 mpll, 9 cci, 10 apll1, 11 apll2. cfg: CLK_CFG_0-10.
++	 */
++	pr_info("mt6771-spm: clocks at suspend: pll en 0x%03x pwr 0x%03x, con3 0x%x con4 0x%x con8 0x%x, cfg%s, infra cg 0x%08x 0x%08x 0x%08x 0x%08x\n",
++		clk_snap.pll_en, clk_snap.pll_pwr, clk_snap.con3, clk_snap.con4,
++		clk_snap.con8, cfg, clk_snap.cg[0], clk_snap.cg[1],
++		clk_snap.cg[2], clk_snap.cg[3]);
++}
++
++/* The vendor's order: enable off, isolate, power off */
++static void spm_pll_off(unsigned int con0, unsigned int pwr)
++{
++	regmap_clear_bits(apmixed_regmap, con0, BIT(0));
++	regmap_set_bits(apmixed_regmap, pwr, BIT(1));
++	regmap_clear_bits(apmixed_regmap, pwr, BIT(0));
++}
++
++/* Off, unless the clock framework counts a user for it */
++static bool spm_pll_off_unused(const char *name, unsigned int con0, unsigned int pwr)
++{
++	struct clk *clk = __clk_lookup(name);
++
++	if (clk && __clk_get_enable_count(clk))
++		return false;
++	spm_pll_off(con0, pwr);
++	return true;
++}
++
++static void spm_clk_init(struct device *dev)
++{
++	bool aplls = false;
++	u32 v;
++
++	apmixed_regmap = syscon_regmap_lookup_by_compatible("mediatek,mt6771-apmixedsys");
++	topck_regmap = syscon_regmap_lookup_by_compatible("mediatek,mt6771-topckgen");
++	infracfg_regmap = syscon_regmap_lookup_by_compatible("mediatek,mt6771-infracfg");
++	if (IS_ERR(apmixed_regmap) || IS_ERR(topck_regmap) || IS_ERR(infracfg_regmap)) {
++		dev_warn(dev, "no clock syscons: PLL sleep control and the clock report are off\n");
++		apmixed_regmap = topck_regmap = infracfg_regmap = NULL;
++		return;
++	}
++	regmap_read(apmixed_regmap, AP_PLL_CON3, &pll_con3_boot);
++	regmap_read(apmixed_regmap, AP_PLL_CON4, &pll_con4_boot);
++	spm_pll_sleep_apply(false);
++	if (tvdpll_off)
++		spm_pll_off(TVDPLL_CON0, TVDPLL_PWR_CON0);
++	if (apll_off)
++		aplls = spm_pll_off_unused("apll1", APLL1_CON0, APLL1_PWR_CON0) &
++			spm_pll_off_unused("apll2", APLL2_CON0, APLL2_PWR_CON0);
++	regmap_read(apmixed_regmap, AP_PLL_CON3, &v);
++	dev_info(dev, "AP_PLL_CON3 0x%x (boot 0x%x), CON4 boot 0x%x, pll_sleep %u, TVDPLL %s, APLLs %s\n",
++		 v, pll_con3_boot, pll_con4_boot, pll_sleep,
++		 tvdpll_off ? "off" : "left", aplls ? "off" : "left");
++}
 +
 +/*
 + * MT6358 rails in low power while the SoC sleeps (vendor pmic_initial_setting.c
@@ -1582,6 +1906,9 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +#define RTC_BBPU_CBUSY		BIT(6)
 +#define MT6358_RTC_SPAR0	0x5b8
 +#define MT6358_RTC_WRTGR	0x5c2
++#define MT6358_BUCK_VS1_OP_EN		0x1690
++#define MT6358_BUCK_VS1_OP_EN_CLR	0x1694
++#define VS1_HW0_OP_EN		BIT(1)	/* follows SRCLKEN0 */
 +#define CRUMB_MASK		GENMASK(15, 8)
 +#define PWRAP_WACS2_CMD		0xc20
 +#define PWRAP_WACS2_RDATA	0xc24
@@ -1603,7 +1930,11 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +	CRUMB_ATF_ARGS,		/* wake mask and PCM WDT set in ATF */
 +	CRUMB_SSPM_ASK,		/* MCDI paused, asking the SSPM to suspend */
 +	CRUMB_SSPM_NOANS,	/* the SSPM did not answer: suspend aborted */
-+	CRUMB_SSPM_RUNG,	/* its mailbox rung, waiting for the answer */
++	CRUMB_SSPM_RUNG,	/* the command written, its mailbox about to be rung */
++	/* marks only (spm_mark): the RTC can't take these */
++	MARK_PSCI,		/* 13: the suspend set in ATF, into PSCI */
++	MARK_HELD,		/* 14: back, our SPM requests set again */
++	MARK_WDT_OFF,		/* 15: MCDI running again, the SPM's watchdog off */
 +};
 +
 +static const char *const crumb_names[] = {
@@ -1613,16 +1944,36 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +	"back from the SPM's wake", "SSPM resumed",
 +	"ATF args set, pausing MCDI", "MCDI paused, SSPM asked to suspend",
 +	"SSPM did not answer: suspend aborted",
-+	"SSPM mailbox rung, waiting for its answer",
++	"SSPM command written, ringing its mailbox",
 +};
 +
 +static struct regmap *crumb_map;
 +static unsigned int crumb_count;
 +
++/*
++ * The same steps where a watchdog reset keeps them: TOPRGU's NONRST_REG, a
++ * plain register write, so it works at every step, also while the SSPM has
++ * the RTC's clocks gated. The resets in the SPM's sleep are its watchdog
++ * (30 s, set by the SPM firmware itself at each wake for the CPU to come
++ * back and switch it off); the preloader prints "[RGU] NONRST_REG:" before
++ * it overwrites it, and LK saves that log to expdb. 0x5c in the top byte,
++ * then the suspends completed, then the step.
++ */
++static void __iomem *rgu_base;
++#define RGU_NONRST_REG		0x20
++
++static void spm_mark(unsigned int step)
++{
++	if (rgu_base)
++		writel(0x5c000000 | (crumb_count & 0xffff) << 8 | step,
++		       rgu_base + RGU_NONRST_REG);
++}
++
 +static void spm_crumb(unsigned int step)
 +{
 +	u32 v;
 +
++	spm_mark(step);
 +	if (!crumb_map)
 +		return;
 +	regmap_update_bits(crumb_map, MT6358_RTC_SPAR0, CRUMB_MASK,
@@ -1634,21 +1985,35 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +
 +static void __iomem *pwrap_base;
 +
-+/* one WACS2 transfer, interrupts off; the RDATA word's low 16 bits */
++/*
++ * One WACS2 transfer, interrupts off; a read's RDATA word's low 16 bits.
++ * Only a read stops in WFVLDCLR: a write goes back to idle, and the next
++ * transfer's idle poll waits for it (pwrap_write16). Waiting for WFVLDCLR
++ * after a write timed out every time (kernel #120: "crumbs lost 0x17e0" on
++ * every suspend) and skipped the RTC_WRTGR that commits the breadcrumb.
++ */
++static u32 wacs2_last;	/* the RDATA word a timed-out transfer saw last */
++
++/* -EBUSY: the wrapper never went idle; -ETIMEDOUT: a read's data never came */
 +static int wacs2(u32 cmd, u32 *rdata)
 +{
 +	u32 v;
 +
 +	if (readl_poll_timeout_atomic(pwrap_base + PWRAP_WACS2_RDATA, v,
 +				      WACS_FSM(v) == WACS_FSM_IDLE && (v & WACS_SYNC_IDLE),
-+				      1, 10000))
-+		return -ETIMEDOUT;
++				      1, 10000)) {
++		wacs2_last = v;
++		return -EBUSY;
++	}
 +	writel(cmd, pwrap_base + PWRAP_WACS2_CMD);
++	if (!rdata)
++		return 0;
 +	if (readl_poll_timeout_atomic(pwrap_base + PWRAP_WACS2_RDATA, v,
-+				      WACS_FSM(v) == WACS_FSM_WFVLDCLR, 1, 10000))
++				      WACS_FSM(v) == WACS_FSM_WFVLDCLR, 1, 10000)) {
++		wacs2_last = v;
 +		return -ETIMEDOUT;
-+	if (rdata)
-+		*rdata = v & 0xffff;
++	}
++	*rdata = v & 0xffff;
 +	writel(1, pwrap_base + PWRAP_WACS2_VLDCLR);
 +	return 0;
 +}
@@ -1660,28 +2025,102 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 + */
 +static u32 crumb_failed;
 +
++/*
++ * Why each atomic step failed, for the line after the resume: on #121 the
++ * steps from ringing the SSPM until it is told of the resume (12, 6, 7)
++ * never reached the RTC while 5, 9, 10 and 8 did: the SSPM gates the RTC's
++ * clocks from SUSPEND to RESUME. Step 12 is now written before the
++ * doorbell; 6 and 7 still can't land. Per step: where it
++ * stopped, the WACS2 RDATA word (or RTC_BBPU) then, and the RTC_BBPU polls
++ * (a good step's count is the commit's margin).
++ */
++enum {
++	CRUMB_OK, CRUMB_RD_BUSY, CRUMB_RD_NODATA, CRUMB_WR_BUSY, CRUMB_TRIG_BUSY,
++	CRUMB_POLL_BUSY, CRUMB_POLL_NODATA, CRUMB_RTC_BUSY,
++};
++static const char *const crumb_why_names[] = {
++	"ok", "SPAR0 read: wrapper busy", "SPAR0 read: no data",
++	"SPAR0 write: wrapper busy", "WRTGR write: wrapper busy",
++	"BBPU read: wrapper busy", "BBPU read: no data", "RTC busy",
++};
++static u8 crumb_why[16];
++static u32 crumb_rdata[16];
++static u16 crumb_polls[16];
++static u16 crumb_done;		/* the atomic steps tried this suspend */
++
 +static void spm_crumb_atomic(unsigned int step)
 +{
 +	u32 v;
-+	int i;
++	int i = 0, ret, why;
 +
++	spm_mark(step);
++	/*
++	 * From the SSPM's SUSPEND to its RESUME the RTC can't commit (its
++	 * clocks are gated): steps 6 and 7 never landed and each cost the
++	 * 10000 polls, awake, with the SPM's watchdog running after a wake.
++	 */
++	if (step == CRUMB_SSPM_DOWN || step == CRUMB_BACK)
++		return;
 +	if (!crumb_map || !pwrap_base)
 +		return;
-+	if (wacs2((MT6358_RTC_SPAR0 >> 1) << 16, &v))
++	crumb_done |= BIT(step);
++	ret = wacs2((MT6358_RTC_SPAR0 >> 1) << 16, &v);
++	if (ret) {
++		why = ret == -EBUSY ? CRUMB_RD_BUSY : CRUMB_RD_NODATA;
 +		goto fail;
++	}
 +	v = (v & ~CRUMB_MASK) | (crumb_count & 0xf) << 12 | step << 8;
-+	if (wacs2(BIT(31) | (MT6358_RTC_SPAR0 >> 1) << 16 | v, NULL) ||
-+	    wacs2(BIT(31) | (MT6358_RTC_WRTGR >> 1) << 16 | 1, NULL))
++	why = CRUMB_WR_BUSY;
++	if (wacs2(BIT(31) | (MT6358_RTC_SPAR0 >> 1) << 16 | v, NULL))
++		goto fail;
++	why = CRUMB_TRIG_BUSY;
++	if (wacs2(BIT(31) | (MT6358_RTC_WRTGR >> 1) << 16 | 1, NULL))
 +		goto fail;
 +	for (i = 0; i < 10000; i++) {
-+		if (wacs2((MT6358_RTC_BBPU >> 1) << 16, &v))
++		ret = wacs2((MT6358_RTC_BBPU >> 1) << 16, &v);
++		if (ret) {
++			why = ret == -EBUSY ? CRUMB_POLL_BUSY : CRUMB_POLL_NODATA;
 +			goto fail;
-+		if (!(v & RTC_BBPU_CBUSY))
++		}
++		if (!(v & RTC_BBPU_CBUSY)) {
++			crumb_why[step] = CRUMB_OK;
++			crumb_polls[step] = i;
 +			return;
++		}
 +		udelay(1);
 +	}
++	why = CRUMB_RTC_BUSY;
++	wacs2_last = v;
 +fail:
 +	crumb_failed |= BIT(step);
++	crumb_why[step] = why;
++	crumb_rdata[step] = wacs2_last;
++	crumb_polls[step] = i;
++}
++
++/* one line: each atomic step in the order tried, ok/polls or why it failed */
++static void spm_crumb_report(void)
++{
++	static const u8 order[] = { 5, 9, 10, 12, 11, 6, 7, 8 };
++	char buf[400];
++	int i, k = 0;
++
++	if (!crumb_failed)
++		return;
++	for (i = 0; i < ARRAY_SIZE(order); i++) {
++		unsigned int s = order[i];
++
++		if (!(crumb_done & BIT(s)))
++			continue;
++		if (crumb_why[s] == CRUMB_OK)
++			k += scnprintf(buf + k, sizeof(buf) - k, "%s%u ok/%u",
++				       k ? ", " : "", s, crumb_polls[s]);
++		else
++			k += scnprintf(buf + k, sizeof(buf) - k, "%s%u %s/%u (0x%x)",
++				       k ? ", " : "", s, crumb_why_names[crumb_why[s]],
++				       crumb_polls[s], crumb_rdata[s]);
++	}
++	pr_info("mt6771-spm: crumbs: %s\n", buf);
 +}
 +
 +/* the breadcrumb step the RTC holds now, or -1 when it can't be read */
@@ -1692,6 +2131,23 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +	if (!pwrap_base || wacs2((MT6358_RTC_SPAR0 >> 1) << 16, &v))
 +		return -1;
 +	return v >> 8 & 0xf;
++}
++
++/*
++ * Undo the SSPM's VS1 low power for this sleep (vs1_sleep_lp): one write to
++ * the CLR register, straight through WACS2 like the atomic breadcrumbs, then
++ * a read back. Returns 0, or what the read back saw (-1 if it failed).
++ */
++static int spm_vs1_full_power(void)
++{
++	u32 v;
++
++	if (!pwrap_base)
++		return -1;
++	if (wacs2(BIT(31) | (MT6358_BUCK_VS1_OP_EN_CLR >> 1) << 16 | VS1_HW0_OP_EN, NULL) ||
++	    wacs2((MT6358_BUCK_VS1_OP_EN >> 1) << 16, &v))
++		return -1;
++	return v & VS1_HW0_OP_EN ? v : 0;
 +}
 +
 +static int spm_crumb_notify(struct notifier_block *nb, unsigned long ev,
@@ -1722,6 +2178,11 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 + */
 +#define MT6358_PONSTS		0x00c
 +#define MT6358_POFFSTS		0x00e
++#define MT6358_TOP_RST_MISC	0x14c
++#define  WDTRSTB_EN		BIT(0)	/* the SoC watchdog's reset pin resets the PMIC */
++#define  WDTRSTB_STATUS		BIT(2)	/* ... and it has, since the latch was cleared */
++#define  WDTRSTB_STATUS_CLR	BIT(3)
++#define  WDTRSTB_DEB		BIT(5)	/* that input deglitched (the preloader sets it) */
 +#define MT6358_TOP_RST_STATUS	0x152
 +
 +static void spm_bits(char *buf, size_t len, u32 v, const char *const *names, int n)
@@ -1742,7 +2203,7 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +	char ponb[64], poffb[96];
 +	struct device_node *np;
 +	void __iomem *wdt;
-+	u32 on = 0, off = 0, rst = 0, sta = 0, nr1 = 0, nr2 = 0;
++	u32 on = 0, off = 0, rst = 0, sta = 0, nr1 = 0, nr2 = 0, misc;
 +
 +	regmap_read(pmic, MT6358_PONSTS, &on);
 +	regmap_read(pmic, MT6358_POFFSTS, &off);
@@ -1760,6 +2221,122 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +	spm_bits(poffb, sizeof(poffb), off, poff, ARRAY_SIZE(poff));
 +	dev_info(dev, "last boot ended: PMIC power-on 0x%x (%s), power-off 0x%x (%s), top rst 0x%x; WDT sta 0x%x, nonrst 0x%x/0x%x (stage %u, last stage %u)\n",
 +		 on, ponb, off, poffb, rst, sta, nr1, nr2, nr2 >> 29 & 7, nr2 >> 26 & 7);
++	/*
++	 * The watchdog reset pin's side of it. The latch is cleared here, so
++	 * a set bit at the next boot means the PMIC saw the pin low after
++	 * this point (the preloader doesn't clear it). The deglitch should
++	 * read on: the preloader sets it, and the stock mtk-pmic-keys cleared
++	 * it (wrong bit layout for the MT6358; 0x1005 on 6.12 where 4.14
++	 * reads 0x0221), so every 6.12 boot up to #124 ran with it off.
++	 */
++	if (!regmap_read(pmic, MT6358_TOP_RST_MISC, &misc)) {
++		dev_info(dev, "last boot's PMIC reset pin: TOP_RST_MISC 0x%x (WDTRSTB %s, deglitch %s, %s)\n",
++			 misc, misc & WDTRSTB_EN ? "on" : "off",
++			 misc & WDTRSTB_DEB ? "on" : "OFF",
++			 misc & WDTRSTB_STATUS ? "seen low" : "not seen");
++		regmap_set_bits(pmic, MT6358_TOP_RST_MISC, WDTRSTB_STATUS_CLR);
++		regmap_clear_bits(pmic, MT6358_TOP_RST_MISC, WDTRSTB_STATUS_CLR);
++	}
++}
++
++/*
++ * What the preloader saw of the last boot's end. It reads the PMIC's
++ * power-off cause and status (pmic_check_rst: POFFSTS, the power-good and
++ * over-current shutdown status, the thermal status) and the watchdog's,
++ * logs them, and clears them: by the time the kernel runs POFFSTS reads 0.
++ * Its log of this boot is still in the buffer LK hands on: /chosen
++ * "log_store" gives an SRAM header that points to the DRAM buffer and the
++ * preloader's part of it (MediaTek's drivers/misc/mediatek/log_store). The
++ * lines that say why the phone restarted go to the kernel log, where
++ * titan-sleeplog keeps them.
++ */
++#define LOG_SRAM_SIG	0xabcd1234
++#define LOG_CUR_SIG	0xcdab3412
++#define LOG_BUF_MAX	SZ_1M
++#define LOG_LINES_MAX	40
++
++struct log_sram_header {
++	u32 sig, reboot_count, save_to_emmc;
++	/* the DRAM buffer */
++	u32 dram_sig, flag, buf_addr, buf_size, buf_offsize, buf_point;
++	u32 klog_addr, klog_size, atf_log_addr, atf_log_len;
++	/* this boot's log in it: the preloader's part, then LK's */
++	u32 cur_sig, cur_size, off_pl, sz_pl, pl_flag, off_lk, sz_lk, lk_flag;
++};
++
++static const char *const preloader_keys[] = {
++	"[PMIC]TOP_RST_STATUS", "[PMIC]PONSTS", "[PMIC]POFFSTS", "[PMIC]PGSTATUS",
++	"[PMIC]PSOCSTATUS", "[PMIC]BUCK_OC_SDN", "[PMIC]THERMALSTATUS",
++	"[PMIC]STRUP_CON4", "[PMIC]TOP_RST_MISC", "[pmic_check_rst]",
++	"[PMIC]just_rst", "[RGU] rst from", "[RGU] STA", "[RGU] NONRST_REG",
++	"[RGU] g_rgu_status", "[RGU] bypass pwrkey", "WDT normal boot",
++	"WDT reboot bypass", "Long Pressed Reboot", "detect abnormal boot",
++};
++
++static void spm_preloader_report(struct device *dev)
++{
++	struct device_node *chosen = of_find_node_by_path("/chosen");
++	const __be32 *prop;
++	struct log_sram_header h;
++	void __iomem *sram;
++	const char *log, *p, *end;
++	u32 addr;
++	int len, lines = 0;
++
++	prop = of_get_property(chosen, "log_store", &len);
++	of_node_put(chosen);
++	if (!prop || len < 8) {
++		dev_info(dev, "last boot's preloader log: no log_store from LK\n");
++		return;
++	}
++	/* LK writes the two words as it holds them, little-endian */
++	addr = le32_to_cpup((const __le32 *)prop);
++	if (addr & 3 || !addr)
++		addr = be32_to_cpup(prop);
++	sram = ioremap(addr, sizeof(h));
++	if (!sram)
++		return;
++	memcpy_fromio(&h, sram, sizeof(h));
++	iounmap(sram);
++	if (h.sig != LOG_SRAM_SIG || h.cur_sig != LOG_CUR_SIG || !h.buf_addr ||
++	    !h.sz_pl || h.off_pl > LOG_BUF_MAX || h.sz_pl > LOG_BUF_MAX) {
++		dev_info(dev, "last boot's preloader log: bad header at 0x%x (sig 0x%x/0x%x, buffer 0x%x+0x%x, preloader 0x%x+0x%x)\n",
++			 addr, h.sig, h.cur_sig, h.buf_addr, h.buf_size, h.off_pl, h.sz_pl);
++		return;
++	}
++	log = memremap(h.buf_addr + h.off_pl, h.sz_pl, MEMREMAP_WB);
++	if (!log) {
++		dev_info(dev, "last boot's preloader log: can't map 0x%x+0x%x\n",
++			 h.buf_addr + h.off_pl, h.sz_pl);
++		return;
++	}
++	for (p = log, end = log + h.sz_pl; p < end && lines < LOG_LINES_MAX; ) {
++		const char *nl = memchr(p, '\n', end - p) ?: end;
++		int i;
++
++		for (i = 0; i < ARRAY_SIZE(preloader_keys); i++) {
++			const char *k = strnstr(p, preloader_keys[i], nl - p);
++			char line[100], *c;
++			int n;
++
++			if (!k)
++				continue;
++			n = min_t(int, nl - k, sizeof(line) - 1);
++			memcpy(line, k, n);
++			line[n] = 0;
++			for (c = line; *c; c++)
++				if (*c < ' ' || *c > '~')
++					*c = ' ';
++			dev_info(dev, "last boot's end, preloader: %s\n", line);
++			lines++;
++			break;
++		}
++		p = nl + 1;
++	}
++	if (!lines)
++		dev_info(dev, "last boot's preloader log: 0x%x bytes at 0x%x, no reset lines\n",
++			 h.sz_pl, h.buf_addr + h.off_pl);
++	memunmap((void *)log);
 +}
 +
 +/* the last boot's breadcrumb, then a clean slate */
@@ -1775,8 +2352,12 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +		 step, step < ARRAY_SIZE(crumb_names) ? crumb_names[step] : "?",
 +		 v >> 12 & 0xf);
 +	spm_reset_report(dev, pmic);
++	spm_preloader_report(dev);
 +	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6771-pwrap");
 +	pwrap_base = of_iomap(np, 0);
++	of_node_put(np);
++	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6771-wdt");
++	rgu_base = of_iomap(np, 0);
 +	of_node_put(np);
 +	crumb_map = pmic;
 +	spm_crumb(0);
@@ -1830,9 +2411,14 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +	writel(cmd, sspm_slots + 4 * SSPM_SPM_SLOT);
 +	for (i = 1; i < SSPM_SPM_LEN; i++)
 +		writel(0, sspm_slots + 4 * (SSPM_SPM_SLOT + i));
-+	writel(SSPM_SPM_IRQ, sspm_ctrl + SSPM_MBOX_IN_IRQ);
++	/*
++	 * Before the doorbell: SUSPEND gates the RTC's clocks until RESUME
++	 * (docs/sspm-firmware.md), so a breadcrumb after it never commits and
++	 * leaves the RTC with a write pending through the sleep.
++	 */
 +	if (cmd == SSPM_SPM_SUSPEND)
 +		spm_crumb_atomic(CRUMB_SSPM_RUNG);
++	writel(SSPM_SPM_IRQ, sspm_ctrl + SSPM_MBOX_IN_IRQ);
 +
 +	ret = readl_poll_timeout_atomic(sspm_ctrl + SSPM_MBOX_OUT_IRQ, val,
 +					val & SSPM_SPM_IRQ, 1, 500000);
@@ -1895,9 +2481,10 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +	u32 r12, wake_sta, r13, timer, debug, pc, pwr, fail;
 +	u32 req_in, idle_in, src_in, req, idle, mask, mask2;
 +	unsigned long wake_src;
-+	int ret;
++	int ret, vs1;
 +
 +	crumb_failed = 0;
++	crumb_done = 0;
 +	spm_crumb_atomic(CRUMB_ENTER);
 +	ret = mt6771_spm_domains_off();
 +	if (ret)
@@ -1908,7 +2495,7 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +			PW_WAKE_SRC, wake_mask);
 +	wake_src = spm_sip(MTK_SIP_SPM_GET_PWR_CTRL_ARGS, SPM_PWR_CTRL_SUSPEND,
 +			   PW_WAKE_SRC, 0);
-+	spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 1, PCM_WDT_SEC);
++	spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 1, pcm_wdt_timer ?: PCM_WDT_SEC);
 +	spm_crumb_atomic(CRUMB_ATF_ARGS);
 +	mtk_mcdi_pause(true);
 +	spm_crumb_atomic(CRUMB_SSPM_ASK);
@@ -1924,8 +2511,10 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +		mtk_mcdi_pause(false);
 +		spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 0, 0);
 +		pr_warn("mt6771-spm: suspend aborted: SSPM did not answer (%d)\n", ret);
++		spm_crumb_report();
 +		return -EBUSY;
 +	}
++	vs1 = vs1_sleep_lp ? 0 : spm_vs1_full_power();
 +	spm_crumb_atomic(CRUMB_SSPM_DOWN);
 +	crumb_held = spm_crumb_readback();	/* what a reset in the sleep would show */
 +
@@ -1934,15 +2523,21 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +	regmap_read(spm_regmap, SPM_SRC_REQ, &src_in);	/* ... and who asks for what */
 +	regmap_read(spm_regmap, SRC_REQ_STA, &req_in);
 +	regmap_read(spm_regmap, SUBSYS_IDLE_STA, &idle_in);
++	spm_pll_sleep_apply(true);
++	spm_clk_snapshot();
 +	spm_sip(MTK_SIP_SPM_SUSPEND_ARGS, pcm_flags, pcm_flags1, PCM_TIMER_MAX);
++	spm_mark(MARK_PSCI);
 +	ret = psci_cpu_suspend_enter(MT6771_PSCI_SUSPEND);
++	spm_pll_sleep_apply(false);
 +	spm_crumb_atomic(CRUMB_BACK);
 +	mt6771_spm_hold(spm_regmap);
++	spm_mark(MARK_HELD);
 +
 +	sspm_spm_command(SSPM_SPM_RESUME);
 +	spm_crumb_atomic(CRUMB_SSPM_UP);
 +	mtk_mcdi_pause(false);
 +	spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 0, 0);
++	spm_mark(MARK_WDT_OFF);
 +
 +	regmap_read(spm_regmap, SPM_SW_RSV_0, &r12);
 +	regmap_read(spm_regmap, SPM_WAKEUP_STA, &wake_sta);
@@ -1955,10 +2550,15 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +	regmap_read(spm_regmap, SUBSYS_IDLE_STA, &idle);
 +	regmap_read(spm_regmap, SPM_SRC_MASK, &mask);
 +	regmap_read(spm_regmap, SPM_SRC2_MASK, &mask2);
-+	pr_info("mt6771-spm: suspend %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x, fail 0x%x, pwr 0x%x, src_req 0x%x, req_sta 0x%x/0x%x, idle_sta 0x%x/0x%x, src_mask 0x%x/0x%x, crumbs lost 0x%x, held %d\n",
++	pr_info("mt6771-spm: suspend %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x, fail 0x%x, pwr 0x%x, src_req 0x%x, req_sta 0x%x/0x%x, idle_sta 0x%x/0x%x, src_mask 0x%x/0x%x, crumbs lost 0x%x, held %d, cpu0 %u kHz\n",
 +		ret, wake_src, r12, wake_sta, r13,
 +		(u32)div_u64((u64)timer * 1000, 32768), debug, pc, fail, pwr, src_in,
-+		req_in, req, idle_in, idle, mask, mask2, crumb_failed, crumb_held);
++		req_in, req, idle_in, idle, mask, mask2, crumb_failed, crumb_held,
++		cpufreq_quick_get(0));
++	spm_clk_report();
++	spm_crumb_report();
++	if (vs1)
++		pr_warn("mt6771-spm: VS1 low power not cleared for the sleep (OP_EN 0x%x)\n", vs1);
 +
 +	return ret;
 +}
@@ -2026,6 +2626,7 @@ index 0000000000000000000000000000000000000000..8281425ef9f0aac1c5f559e1789967e3
 +		if (ret)
 +			return dev_err_probe(dev, ret, "PMIC low power setup\n");
 +		spm_crumb_init(dev, pmic);
++		spm_clk_init(dev);
 +	}
 +
 +	ret = mt6771_spm_hold(spm_regmap);

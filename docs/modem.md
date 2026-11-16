@@ -3,16 +3,21 @@
 Status (2026-11-04, Linux 6.12): **the modem registers on LTE and mobile data works.** ModemManager drives it
 over a 27.010 mux on WWAN AT ports (`wwan0at0` = `cmd1`), and it is `registered`, `home` on 310260 within 2-3 s of
 enabling (see "Radio on with a valid SIM"). `tools/modem/ltedata.py` brings up IPv6 data on `ccmni0` over CLDMA (see "Mobile
-data"). Calls, SMS and USSD have not run. It runs as the `titan-modem` service, on a RAM copy of the phone's own NVRAM
+data"). Calls and SMS work over IMS (see "IMS"); USSD works over IMS (one-shot code measured; menus offline only, see "USSD"). It runs as the `titan-modem` service, on a RAM copy of the phone's own NVRAM
 served by `tools/modem/mdd.py` (see "File service" and "AT port and ModemManager"). It reports `MOLY.LR12A.R3.MP.V162`.
 ModemManager sees it `disabled`, with the SIM up and the radio off, until it is enabled.
 
-The driver is a proper platform driver (kernel #94+): it binds to a DT
-node `modem@10209000` (`mediatek,mt6771-modem`) and takes every register
-window, interrupt, clock and syscon from it, with devm/probe-remove
-teardown. The node is in `mt6771.dtsi` (disabled) and enabled in the
-board dts. It is still loaded by hand for bring-up (`insmod`; `rmmod`
-powers the modem off), not started at boot.
+The driver is a platform driver in the kernel tree (2026-11-10:
+`drivers/net/wwan/mt6771/titan_modem.c`, `CONFIG_MTK_MT6771_MODEM`, module
+`titan_modem`; until then an out-of-tree module loaded by hand, kept in
+`out/modem/out-of-tree-driver/`). It binds to the DT node `modem@10209000`
+(`mediatek,mt6771-modem`) and takes every register window, interrupt,
+clock, syscon and its power domain from it. The node is in `mt6771.dtsi`
+(disabled) and enabled in the board dts. udev loads the module at boot; the
+modem itself runs only while `/dev/titan-modem` is open: `titan-mdd`'s open
+powers it on and boots it, its close stops it (see "In tree, MD1 as a power
+domain, crashes"). Runs on the phone since kernel #124 (2026-11-10): the
+modem boots, registers on LTE and IMS registers, as before.
 
 ## What LK does
 
@@ -67,19 +72,15 @@ As the vendor eccci driver (`mt6771/md_sys1_platform.c`, `modem_sys1.c`,
 2. **CCIF.** Enable the CLDMA and CCIF0-2 infra clocks, reset CCIF0
    (INFRA_RST0/1 bit 8), clear both CCIF SRAMs and write the debug area's
    address into the SRAM's last 12 bytes.
-3. **Power** (`md_cd_power_on`): clear TOPCKGEN CLK_MODE bits 8-9 (the
-   modem's clock gating), power the MD1 domain (MD1_PWR_CON 0x320 with the
-   extra SPM registers MD_SRAM_ISO_CON 0x394 and MD_EXTRA_PWR_CON 0x398,
-   then the bus protection: INFRA PROTECTEN bits 3, 4, 7 and PROTECTEN_1
-   bit 6), close MD-to-AP, set the modem's 26 MHz request
-   (INFRA 0xf0c = 0x21), initialise the modem PLLs (MDTOP_PLLMIXED
-   0x20140000, MDTOP_CLKSW 0x20150000; the PLL block reads version
-   0x20160627) and stop the modem watchdog. This stays open-coded rather
-   than a genpd: the MT8183 power-domain table has no MD1, and MD1's
-   sequence touches MD_SRAM_ISO_CON (0x394) and MD_EXTRA_PWR_CON (0x398),
-   separate registers the generic scpsys genpd data model can't express,
-   so the driver drives the scpsys and infracfg syscons itself (the
-   phandles come from DT).
+3. **Power** (`md_cd_power_on`): the MD1 power domain through runtime PM
+   (since 2026-11-10 the scpsys driver's: clear TOPCKGEN CLK_MODE bits 8-9,
+   the modem's clock gating, then MD1_PWR_CON 0x320 with the extra SPM
+   registers MD_SRAM_ISO_CON 0x394 and MD_EXTRA_PWR_CON 0x398, then the bus
+   protection: INFRA PROTECTEN bits 3, 4, 7 and PROTECTEN_1 bit 6; see "In
+   tree, MD1 as a power domain, crashes"), close MD-to-AP, set the modem's
+   26 MHz request (INFRA 0xf0c = 0x21), initialise the modem PLLs
+   (MDTOP_PLLMIXED 0x20140000, MDTOP_CLKSW 0x20150000; the PLL block reads
+   version 0x20160627) and stop the modem watchdog.
 4. **Release** (`md_cd_let_md_go`): MD_BOOT_VECTOR_EN (0x20000024) = 1,
    then AP-to-MD bus protection on and MD-to-AP off.
 5. **Handshake 1.** The modem writes a header and its feature query (64
@@ -97,8 +98,9 @@ As the vendor eccci driver (`mt6771/md_sys1_platform.c`, `modem_sys1.c`,
    channel 0-7. The modem's exceptions use channels 16-19, on CCIF0's
    second interrupt (SPI 152; data is on SPI 151, both active low).
 
-The MD1 domain powers off again on unload (measured: MD1_PWR_CON back to
-off, PWR_STATUS bit 0 clear), also after a modem exception.
+The MD1 domain powered off again on unload (measured with the out-of-tree
+driver: MD1_PWR_CON back to off, PWR_STATUS bit 0 clear), also after a modem
+exception. The in-tree driver powers it off when `/dev/titan-modem` closes.
 
 VMODEM stays at LK's 0.55 V (MT6358 ELR0 0x08): the vendor MT6358 code
 only re-applies the value LK left, and the modem sets its own voltage.
@@ -312,6 +314,145 @@ region) and a log line for CCIF channels 8-14. `mdmock.sh` saves the
 exception record, all of the non-cached region, the CCIF SRAM and every
 ring's pointers (`tools/modem/rings.py`) after each run.
 
+## In tree, MD1 as a power domain, crashes
+
+**2026-11-10: runs on the phone (kernel #124, `boot-6.12-124.img`);
+stop/start cycles, suspend with the modem on and the crash path are not
+yet tested.** It needs a kernel and DT built from the same tree (the power
+domain is built in). Measured on the first boot of #124:
+
+- the probe (6.5 s), with no power-domain or bus-protection error from the
+  platform core's switch of MD1 at probe;
+- the service's open at 11.2 s: MD PLL version 0x20160627, released;
+- handshake 1 at 11.3 s and handshake 2 at 11.55 s, all 24 mux channels;
+- `pm_genpd_summary`: `md1 on` while the service runs;
+- ModemManager registered on LTE, and `titan-ims` registered.
+
+The old out-of-tree module on #124 fails as expected: no `mediatek,scpsys`
+syscon, `-ENODEV`.
+
+**The driver in the tree.** `drivers/net/wwan/mt6771/titan_modem.c`
+(`CONFIG_MTK_MT6771_MODEM=m`, in `titanpocket.config`; Kconfig selects
+`WANT_DEV_COREDUMP`). `modules/modem/build612.sh` builds it and `wwan.ko`
+from the tree for `tools/modem/install.sh`. The out-of-tree copy is kept in
+`out/modem/out-of-tree-driver/`. The module carries the DT node's alias, so
+udev loads it at boot. Probing only maps and allocates: the CCIF and
+watchdog interrupts stay disabled, nothing is powered, and
+`/dev/titan-modem` appears last.
+
+**A session per open.** The first open of `/dev/titan-modem` (one user at
+a time) runs `md_start`. It clears what the last session left (flags, the
+handshake state, the AT mux, the packet queue), lays out the rings, resets
+CCIF and CLDMA, and puts CLDMA's descriptors back in place. Then it powers
+the modem on, releases it and starts CLDMA. The close runs `md_stop`, which
+does the same in reverse: the WWAN AT ports go, MD1 powers off and the 26
+MHz request drops. The `ccmniN` interfaces stay registered across sessions.
+So restarting the service restarts the modem without unloading anything,
+and a crash ends with a fresh boot from the same image in memory. The
+out-of-tree driver already rebooted that image on each `insmod`.
+
+**MD1 as a power domain.** The scpsys power-domain driver
+(`drivers/pmdomain/mediatek`) gained `mediatek,mt6771-power-controller`:
+MT8183's table, with the same indices and registers and the CONN
+`ACTIVE_WAKEUP` our tree had added, plus `MT6771_POWER_DOMAIN_MD1` (15,
+`dt-bindings/power/mt6771-power.h`). The modem's sequence does not fit the
+generic one: its clocks are gated in topckgen, and its SRAM powers up with
+no ack before the isolation is released. It has an extra SRAM isolation
+(0x394) and a buck isolation (0x398), and the vendor releases its bus
+protection without waiting. So it has its own cap, `MTK_SCPD_MD_PWRSEQ`,
+running the sequence the driver used to open-code (`scpsys_md_power_on` and
+`_off`):
+
+- **The registers come from data:** `md_sram_iso_offs`,
+  `md_clk_mode_mask` and the existing `ext_buck_iso_*` fields. The domain
+  node's `mediatek,topckgen` phandle reaches the clock gates.
+- **Bus protection** is three `BUS_PROT_WR_IGN` entries, AP to MD (bit 7),
+  MD to AP (`_1` bit 6) and step 2 (bits 3-4). Power-on releases them in
+  the driver's old order. Power-off sets them in a slightly different order
+  (MD to AP before step 2), each waiting for its ack.
+- **The caps:** the domain is `KEEP_DEFAULT_OFF` and `ACTIVE_WAKEUP`.
+
+The driver switches the domain with `pm_runtime_resume_and_get` and
+`pm_runtime_put_sync`. On suspend it calls `device_set_wakeup_path`, so
+genpd keeps MD1 on while the modem runs. The modem node lost its
+`mediatek,scpsys` and `mediatek,topckgen` phandles and gained
+`power-domains`. The binding documents the new compatible and property.
+
+The gates live in the domain rather than the driver because the platform
+core switches a device's domain on before probe and off after it. With the
+gates in the driver, that cycle would run with the modem's clocks gated.
+Inside the domain, every switch keeps the vendor's order: ungate, power on;
+power off, gate. Whether that probe-time cycle is harmless to an unbooted
+modem is one of the things the phone test must show.
+
+**The exception handshake** (vendor `modem_sys1.c` `md_cd_ee_handshake`,
+`fsm/ccci_fsm.c` `EXCEPTION_EE`, `fsm/ccci_fsm_ee.c`). The steps:
+
+1. The modem raises CCIF channel 16 (`D2H_EXCEPTION_INIT`) on the second
+   CCIF interrupt.
+2. The driver stops CLDMA and acks on channel 16 (`H2D_EXCEPTION_ACK`).
+3. It waits for channel 17 (init done) and 18 (queues cleared), then 2 s
+   for the modem's log to flush, as the vendor does.
+4. It resets CLDMA and moves the CCIF queues onto the exception rings (881
+   KB into the shared memory), which it empties, with sequence numbers back
+   to 0.
+5. It acks on 17 (`H2D_EXCEPTION_CLEARQ_ACK`) and waits for 19 (all queues
+   reset). Each step waits up to 5 s; the modem's own limit is 10 s.
+6. On the control channel, the modem sends `MD_EX` (id `0x45584350`),
+   which the driver answers with the same message. Then `MD_EX_REC_OK` (id
+   `0x45524543`), whose payload is kept, and `MD_EX_PASS`. The driver
+   waits up to 10 s for each.
+
+**The modem's watchdog.** Its interrupt (SPI 283, the vendor's
+`IRQ_MDWDT`, now `md-wdt` in the node) is armed after the release, as the
+vendor does. It is ignored once an exception is being handled. A watchdog
+has no handshake.
+
+**After either:** the driver decodes the exception record into one log
+line, as before, and saves a core dump. The session is then dead: reads
+fail with `-EIO`, and poll reports `POLLERR` and `POLLHUP`. Writes, the
+ioctl and the AT ports fail with `-EIO`.
+
+**Recovery.** `titan-mdd` exits with status 3 on `-EIO`. Its close powers
+the modem off, and `titan-modem.service` (`Restart=on-failure`, at most 3
+starts in 10 minutes) boots it again 10 s later. Whether ModemManager,
+`titan-net` and `titan-ims` pick the modem up again by themselves after
+such a restart has not been tested.
+
+## Crashes
+
+The crash logger is a devcoredump (`dev_coredumpv`): the kernel's standard
+way to hand a device's crash state to userspace. A dump is `TMDCORE1`, a
+version, then sections:
+
+- `reason`: watchdog or exception, and which handshake steps and messages
+  arrived;
+- `rec_ok`: the modem's `MD_EX_REC_OK` payload, up to 16 KB;
+- `ccif_sram`: the CCIF SRAM;
+- `mdccci_dbg`: the shared memory's first 2 KB;
+- `mdss_dbg`: the 10 KB exception record.
+
+`82-titan-modem-core.rules` runs `save-core.sh` for each new devcoredump of
+the `titan-modem` driver. The script copies it to
+`/var/lib/titan-modem/crash/<time>.core` (mode 600, the newest 10 kept),
+frees it and logs the path. `tools/modem/mdcore.py CORE [--dbginfo
+DbgInfo_<build>] [--hex SECTION]` prints the reason and the decoded record
+(file, line and parameters of an assert; codes, pc and lr of a fatal error,
+named from the symbol file when it is given). It was checked on a made-up
+dump. A dump holds whatever the modem had in those areas: it stays on the
+phone (or in `out/`), never committed.
+
+**Testing it.** `echo 1 > /sys/kernel/debug/titan-modem/force_assert`
+makes a ready modem assert the way the vendor's `force_assert` does
+(`CCIF_INTERRUPT`: CCIF channel 21, `AP_MD_SEQ_ERROR`, raised from the AP
+side). It drops calls and data until the service has restarted the modem,
+and has not been tried.
+
+**Not a trace logger.** The modem's running log (DHL, on the CCB) can't be
+decoded: its trace database is encrypted (see "Modem debug data"). So the
+logger keeps what can be read: the exception record and the debug areas
+around each crash.
+
 ## AT port and ModemManager
 
 When the daemon asks (`TITAN_MD_AT_PORT`, `_IO('t', 1)` on
@@ -326,13 +467,14 @@ That channel no longer reaches `/dev/titan-modem`. The WWAN core is
 `wwan.ko` from the same kernel build (`CONFIG_WWAN=m`; `build612.sh`
 copies it).
 
-`tools/modem/install.sh` puts the driver in the module tree (`updates/`,
-blacklisted so the DT node does not load it at boot: the modem must start
-with its file server), `mdd.py` and `nvcopy.sh` in
-`/usr/local/lib/titan-modem`, and `titan-modem.service` (not enabled):
-it takes a wake lock, copies the NVRAM to `/run/titan-modem`, loads the
-driver (which boots the modem) and runs `mdd.py` until stopped; stopping
-unloads the driver, which powers the modem off, and drops the copy. With
+`tools/modem/install.sh` puts the driver in the module tree (`updates/`;
+until 2026-11-10 it was blacklisted, because loading it booted the modem;
+now the open of `/dev/titan-modem` does, and install.sh removes the
+blacklist), `mdd.py` and `nvcopy.sh` in `/usr/local/lib/titan-modem`, and
+`titan-modem.service` (not enabled): it takes a wake lock, copies the NVRAM
+to `/run/titan-modem` and runs the file service, whose open boots the
+modem, until stopped; its close powers the modem off, and the copy is
+dropped. With
 `AT_PORT=1` (the unit's), `mdd.py` waits for the modem's AT layer (`+EIND: 128`, about
 1 s after handshake 2; a command sent at handshake 2 is ignored), then asks for the ports
 (after 10 s at the latest), and `radioinit.py` brings the SIM up with the radio off.
@@ -737,6 +879,15 @@ network devices (`ARPHRD_NONE`). The modem's request to move an interface to ano
 (`IPC_RPC_CCCI_LHIF_MAPPING`, 0x400d) gets success from `mdd.py`, and every interface stays on queue 0. The vendor gives IMS
 queue 3; not done here. debugfs `titan-modem/cldma` shows the registers and counters.
 
+**The uplink ring can jam (2026-11-14 and 15, open).** Twice in 13 hours queue 0 stopped being served: all 128
+descriptors owned by the hardware, none completing (`tx in flight 128` in debugfs), queue 0 active in `UL_STATUS`, the
+current pointer on the oldest descriptor, `CLDMA_IP_BUSY` 1, no error bit. The second time was within 10 minutes of a
+modem start, with no sleep in between. Data and VoLTE are dead from then on (titan-ims: "no connection"), the interfaces'
+queues stop, and the modem holds `MD1_SRCCLKENA` and `MD1_APSRC_REQ` to the SPM without a break, so the phone's deep sleep
+stops at DRAM self-refresh ([power-rails.md](power-rails.md)). `systemctl restart titan-modem` clears it. Nothing detects
+it yet. The modem had asked for interface 0 on queue 3 and interface 1 on queue 2 both times; whether keeping them on
+queue 0 is the cause is not known.
+
 **The commands (`ltedata.py`), from the RIL (`libmtk-ril.so`, read as reference) and Android's log:**
 
 1. `AT+EDALLOW=1`: without it `AT+EAPNACT` gets `CME ERROR 5745`.
@@ -815,7 +966,7 @@ call against a fake speaker draining the pipe in real time, fed 5 s of AMR-WB wi
 each frame on arrival left 64 of 270 periods short, the jitter buffer none (2 at the very end, after the feed stopped). The
 call log now counts filled and dropped frames.
 
-**Call volume.** In a call on the earpiece the volume keys step the handset gain by 2 dB, -10 to +8 dB, starting at -6 dB: `titan-powerkey` sees `call=active` in `/run/titan-lockinfo` and sends `{"cmd": "volume", "up": ...}` to `titan-ims`, which keeps the level in `/var/lib/titan-ims/earpiece-db` for later calls. On the loudspeaker or headphones `titan-ims` declines and the keys change PipeWire's volume as usual, which the call's stream follows.
+**Call volume.** In a call on the earpiece the volume keys step the handset gain by 2 dB, -10 to +8 dB, starting at -6 dB: `titan-powerkey` sees `call=active` in `/run/titan-lockinfo` and sends `{"cmd": "volume", "up": ...}` to `titan-ims`, which keeps the level in `/var/lib/titan-ims/earpiece-db` for later calls. On the loudspeaker or headphones `titan-ims` declines and the keys change PipeWire's volume as usual, which the call's stream follows. Since 2026-11-15 the Sound app sets the same level: its "Earpiece" slider (-10 to +8 dB, 1 dB steps) sends `{"cmd": "volume", "db": n}`, which `titan-ims` (Rust and Python) clamps, keeps in `earpiece-db` and, in a call on the earpiece, writes to `Handset Volume` at once; the answer has `"live": true` then. Outside a call it is only kept, and the next call starts at it. The slider follows the file, so key presses in a call move it.
 
 Outgoing calls took three tries. An offer with `a=des:qos mandatory remote sendrecv` got `580 Precondition Failure`; `optional` for the remote side passed it. Then the carrier's server answered `200 OK` within about 2 s, with no ringing stage and `Reason: SIP;text="Invalid Identity Header";code=438`, and the other phone did not ring, with either form of the number as the identity. Adding `P-Early-Media: supported`, `Session-Expires: 1800`, `Min-SE: 90`, `Privacy: none`, `timer` in `Supported` and `application/3gpp-ims+xml` in `Accept` together made the other phone ring (one call, 2026-11-04); which of them mattered was not tested. A call should present `sip:+1...`: the `reg` event lists it, while P-Associated-URI gave the number without the `+`. Signalling: Outgoing and incoming INVITE with preconditions (183, PRACK, UPDATE), CANCEL, BYE, session timers. The sound is on the CPU, not
 the modem: RTP on the IMS interface, AMR-WB (12.65 kbit/s) or AMR (12.2 kbit/s) through `libvo-amrwbenc` and `libopencore-amr*`, in either RFC 4867 packing,
@@ -827,10 +978,87 @@ the modem: RTP on the IMS interface, AMR-WB (12.65 kbit/s) or AMR (12.2 kbit/s) 
 the network and `titan-ims.service` running, with or without data. `titan_mm` connects to `/run/titan-ims.sock` and offers its calls with the same signals as ModemManager's, so `titan-dialer` and
 `titan-call-watch` take them without knowing the difference; the header shows "VoLTE" when registered.
 
-**Not done:** emergency calls (there is no emergency registration: 911 and 112 are sent as `urn:service:sos`, untested, and the dialer says so), MMS and RCS,
-call waiting and hold, video, handover to Wi-Fi calling, and the modem being told of the registration (`+CIREG` stays 0).
+**The modem told of the registration (2026-11-10: built and tested offline; not yet run on the phone).** `+CIREG` is the modem's
+own view of IMS, and the modem only has one if the AP's IMS stack tells it: the RIL just reads `AT+CIREG?`, and no AT command
+sets it. On Android `volte_imcb` does, over `/dev/ccci_imsc`, CCCI channels 54 (up) and 55 (down), to the modem's IMS controller
+(IMC). Read from the stock `volte_imcb` (Ghidra; the decompile stays in `out/modem/imcb-re/`, not committed): every message is one
+CCCI packet of the full MTU (3584 - 128 = 0xd80 bytes), a 64-byte header and the body padded with zeros. The header: message id
+(32 bits), a sequence number (16), the destination (8; 2 for the controller), a flag (8; 0), the SIM (32), the body's length at
+offset 16 (32); the rest is 0. Message ids start at 100000 (`MSG_ID_IMC_IN_BEGIN`). At start `volte_imcb` sends 100012 with its
+header file version (0x79) for each SIM; the modem answers 100008 with its own (0x79) and a message-id version (1); on a match
+`volte_imcb` reports both of the SIM's accounts (account = SIM × 2, + 1 for the emergency one) unregistered, and on a mismatch
+sends 100013 and stops. Registration state is 100026, a 32-byte body: account, state (0 unregistered, 1 registering, 2
+registered), a 16-bit cause, the SIP status (200 when registered), retry-after, then at offset 12 the radio access type in the
+modem's own numbering, which the modem sends in 100034 (account, type); the remaining fields (an emergency flag, the
+registration event, the SIP URI type) are left 0 here. The same channel carries the rest of that design, by the function names
+in `volte_imcb` (`imcb_send_imc_cc_mo_call_rsp`, `..._send_sms_rsp`, `..._send_ussd_rsp` and many more): calls, SMS and USSD that
+arrive at the modem as AT commands go to the AP's stack as messages, presumably only once the IMC sees a registration. Nothing here
+answers those yet; `titan-ims` logs their ids.
+
+Here: the driver puts the IMS channels on CCIF queue 6 as the vendor's `port_cfg.c` does; `titan-mdd` carries channels 54 and
+55 on `/run/titan-imc.sock` (`IMC_SOCK` in `titan-modem.service`), one client at a time, each packet as a 32-bit length and its
+bytes; `titan-ims` (`userspace/titan-ims-rs/src/imc.rs`) connects, exchanges versions, and reports state 2 for account 0 while
+registered and 0 otherwise (and 0 when it stops), with the radio access type once the modem has sent one; after each report it
+logs the modem's `+CIREG`. The control socket's `status` has `"imc"`: `off`, `connecting` or `linked`. Offline tests: the
+frame layout, a version exchange and the reports through a socket, and a version mismatch (100013, link not used again).
+Only message ids and lengths are logged. **On the phone (2026-11-15, the first run): it crashes the modem.** A build with this code linked
+(`imc: the modem's version matches (0x79, 1): linked`), reported Unregistered then Registered, and about 13 s after the
+Registered report the modem asserted at `imc_reg_msghdlr.c:2427` (params 0) and stopped; `titan-modem` restarted it and the
+next registration did the same (twice in 4 minutes). The binary that had run since 2026-11-09 predates this code and never
+connects. The phone went back to that binary; a phone build of `titan-ims` should use `Imc::new(None)` until the report is
+understood. The phone now runs such a build (the Sound app's volume command, `out/ims-noimc/`): registered, `imc` off, no
+assert.
+
+**Not done:** USSD menus on the network (see "USSD" below), emergency calls (there is no emergency registration: 911 and 112 are sent as `urn:service:sos`, untested, and the dialer says so), MMS and RCS,
+call waiting and hold, video, handover to Wi-Fi calling, and on the modem's side, calls, SMS and USSD sent as AT commands (the IMC's messages for them go unanswered).
 
 **SMS.** First run 2026-11-04, on the first try: one text received and stored, its report accepted (202), and two sent from `titan-messages`, each accepted and acknowledged by the network within a second (RP-ACK), and both received by the other phone. On Android `volte_ua` has SMS handling and the `+g.3gpp.smsip` tag, and the RIL sends `AT+CMGS`; our capture holds only the set-up, with no message sent. `titan-ims` does it in SIP (TS 24.341): the registration's Contact carries `+g.3gpp.smsip`, and a `MESSAGE` of type `application/vnd.3gpp.sms` carries an RP-DATA (TS 24.011) with an SMS-SUBMIT or SMS-DELIVER (TS 23.040), to `tel:` the service centre from `AT+CSCA?`. A message is stored before it is acknowledged, in `/var/lib/titan-ims/messages.sqlite3` (mode 600); text and numbers never reach a log. Long messages go in parts and come back whole, in any order. `{"cmd": "sms", "to": ..., "text": ..., "class": 0-3 (optional)}` on the control socket sends one (the class sets the TP-DCS message class: 0 flash, 1 ME, 2 SIM, 3 TE; omitted means no class); the state follows as `sms-state`, and `sms` announces a new one. An incoming WAP push (8-bit data or a port-addressing header, which is how an MMS notification arrives) is stored as an `[MMS - not downloaded]` placeholder, not as binary — there is no MMS stack yet. (The Rust client earlier mis-stored such a message because `CString` cannot hold the NUL bytes a WAP-push PDU carries; it now binds the body's raw bytes, and the messages app reads bodies lossily, so a bad row cannot blank the list.) Long messages, and non-GSM text, have only been tested offline: the published GSM 7-bit and SMS-DELIVER examples, and our encoders against our decoder (GSM, escapes, UCS2, emoji, up to 7 parts). The app is `userspace/titan-messages` (docs/desktop.md).
+
+**USSD (2026-11-09: a code answered on the network; menus tested offline only).** The path is USSD over IMS ("USSI", TS 24.390), in `titan-ims` (the Rust
+one: `userspace/titan-ims-rs/src/ussd.rs` and the session in `ua.rs`). Why that path, from what was read rather than measured: on
+Android the RIL chooses a domain per code (`RmcSuppServUssdDomainSelector`, `isImsRegOn`, `isVopsOn` in `libmtk-ril.so`) and, with IMS
+registered, sends `AT+EIUSD`, which the modem hands to `volte_ua` on the AP, whose `ussd` module (`volte_ua/src/ussd/ussd.c`, strings
+only) speaks SIP; the circuit-switched path is `AT+ECUSD`/`AT+CUSD`, which needs a 2G or 3G network to fall back to. Here the AP runs
+IMS and the modem is not told of the registration (`+CIREG` stays 0), so `AT+EIUSD` has nothing behind it, and this network has no
+3G. Measured: `AT+CREG?` gives stat 6, registered for SMS only (the combined attach gives SMS over SGs and nothing else in CS),
+with `AT+CEREG?` and `AT+CGREG?` at 1 and `AT+CIREG?` at 0, so there is no CS domain for `AT+CUSD` (it reports `+CUSD: 1`, `(0-2)`,
+and was not sent a code).
+
+How it goes (TS 24.390 4.5.4.1 and Annex A, release 20, read from the 3GPP PDF): an `INVITE` to the code as a dialstring in the
+home domain (`sip:*%23100%23;phone-context=<domain>@<domain>;user=dialstring`), with `Recv-Info: g.3gpp.ussd`, `Accept: application/sdp,
+application/vnd.3gpp.ussd+xml, multipart/mixed` and a `multipart/mixed` body: an SDP offer whose audio line has port 0 (no media) and
+a `<ussd-data>` document (`<language>en`, `<ussd-string>` the code; `Content-Disposition: render;handling=optional`). The network
+answers 200 (ACKed). When it wants input it sends `INFO` (`Info-Package: g.3gpp.ussd`) with the question in `<ussd-string>`; the
+answer goes back in an `INFO` of the same form. It ends the session with a `BYE` carrying the last text, or an `<error-code>`
+(1 unspecified, 2 language, 3 unexpected data, 4 busy). A 404 to the `INVITE` means the network has no USSD over IMS. Our side
+ends a session with `BYE` once answered, `CANCEL` before; a new code ends the one before it. Timeouts: 60 s for the network,
+180 s for the user's answer. Codes and replies are never logged (a reply can hold a number or a balance), only states and lengths.
+
+The control socket takes `{"cmd": "ussd", "code": "*#100#"}`, `{"cmd": "ussd-reply", "text": ...}` and `{"cmd": "ussd-cancel"}`
+and sends `{"ev": "ussd", "state": ..., "text": ...}`: `sent`, `request` (an answer is wanted), `notify`, `done`, `failed` or
+`ended`; `status` gains `"ussd"` (`idle`, `sent`, `request`), which tells a client that this `titan-ims` takes codes (the Python one
+doesn't). From a shell: `titan-ims ussd '*#100#'` prints the replies and asks for an answer when the network wants one (an empty
+line ends the session; `-m` masks digits, for logs that leave the phone). Both dialers send a code to `titan-ims` while it is
+registered and says it takes them, and to ModemManager's `Ussd` otherwise.
+
+Tested offline only (`cargo test`): the spec's examples, the multipart body round trip, XML entities and CDATA, and two sessions
+driven through a real `Ua` with a loopback TCP connection as the P-CSCF and a fake AT channel: a menu (`INVITE`, 200, `ACK` to the
+Contact through the Record-Route, the network's `INFO` answered 200 and shown as a question, our `INFO` answer with CSeq 2, the
+network's `BYE` with the final text), and a 404 (ACKed, "no USSD over IMS"), a cancel before the answer and a code replacing
+another. The CLI against a fake socket: question, answer, final text.
+
+**On the network** (2026-11-09, Tello SIM on T-Mobile 310260, `titan-ims ussd -m '#225#'`, sent twice with the user's go-ahead): the
+`INVITE` as above was answered 200 within about a second, ACKed, and the network's `BYE` followed with a 80-character
+`<ussd-string>` ("Thank you, your request is being processed. A message will be sent to your phone") **and `<error-code>0`**. 0 is
+not a defined code; with that text it means success, so the parser drops it (the first build showed "error, unspecified" instead
+of the text). No text message had arrived 5 minutes later. Then T-Mobile's other free query codes from its "Self-service & short
+codes" page, one session each: `#646#` (minutes), `#674#` (texts) and `#932#` (data) got the same 80-character "being processed"
+answer, `#686#` (the line's number) a 34-character answer with the number; every one 200 then `BYE`, shown as `done`. The promised
+text messages had not arrived 15 minutes after the first (none received in that time), so on this MVNO those codes are answered
+but apparently not served. Registration and calls were unaffected; each install restarted
+`titan-ims`, which registered again within seconds. Not yet run on the network: a menu (the `INFO` exchange), a cancel, and
+network-initiated USSD (an incoming `INVITE` with a USSD body; we don't advertise `+g.3gpp.nw-init-ussi`, so the network should not
+send one). The dialers' USSD page has not been tried by touch. Sending a code reaches the carrier: ask first.
 
 ## Status bar signal
 
@@ -852,6 +1080,84 @@ listed by T-Mobile, then SpeedTalk, Mint and US Mobile). `titan-signal` writes i
 (ModemManager's name when it is a name, else the database's, else the code); Phone Settings shows it for the network
 ("T-Mobile (310260)"), the SIM's operator and the network scan.
 
+## Cell location
+
+**2026-11-10: built and tested offline; not yet run on the phone.** `titan-cellloc` (Rust, in `titan-phone`)
+estimates a coarse position from the cells the modem hears, with no GPS. It has its own AT channel (`cmd11`, which
+nothing else uses) and asks `AT+ECELL`. The answer's layout comes from the vendor RIL's parser
+(`RmcNetworkHandler::getCellInfoListV12` in `libmtk-ril.so`, decompiled locally with Ghidra into
+`out/modem/ril-re/`, not committed). `+ECELL: <n>` is followed by n cells of 13 values, or 15 when the modem adds
+BSIC and ARFCN, in this order:
+
+1. access technology: 0 GSM, 2 UMTS, 7 LTE (11, NR, has another layout)
+2. cell id, hex
+3. LAC or TAC, hex
+4. MCC
+5. MNC, a string
+6. PSC or PCI
+7. two signal values
+8. RSRP in quarter dBm
+9. RSRQ in quarter dB
+10. timing advance (0-1282)
+11. RSSNR
+12. CQI
+
+The first cell is the one the phone is camped on; the RIL marks it registered. `0x7fffffff`, or all ones, means
+unknown. The real answer's neighbour entries have not been seen yet. The parser expects neighbours to carry a PCI
+without a cell id, the usual case for LTE.
+
+How the estimate is made:
+
+- **Tower sites** come from an OpenCelliD export (CC BY-SA 4.0). It is imported on the phone into
+  `/var/lib/titan-cellloc/cells.db`, a sorted binary file read with `pread`, plus an index by PCI.
+  The import command is
+  `zcat cell_towers.csv.gz | titan-cellloc import --mcc 310,311,312,313,316`.
+  Downloading the export needs an OpenCelliD account.
+- **The serving cell** is looked up by its full identity. If that cell is missing, the locator uses another sector
+  of the same LTE site (eNB = cell id >> 8, same TAC) and adds 1 km of uncertainty.
+- **Each neighbour** is placed at the nearest site with its PCI within 15 km of the serving site.
+- **The position** is the sites' centroid. Each site is weighted by 10^((RSRP + 140)/30), roughly 1/distance for a
+  path-loss exponent of 3.
+- **Timing advance.** When the serving cell gives one, the estimate is moved onto the ring at TA × 78.12 m from the
+  serving site, in the direction of that centroid.
+- **The accuracy** is the sites' weighted spread about the estimate, capped at the TA ring and kept within 200 m to
+  20 km.
+- **With only the serving cell,** the estimate is its site, with the TA ring or the database's range for that cell
+  as the accuracy.
+
+These weights and limits are not calibrated against a reference yet.
+
+**BeaconDB.** When the serving cell is in neither the database nor the learned file, the cells can go to BeaconDB
+(`api.beacondb.net`, the MLS-style geolocate API, `considerIp` false). This is only done when
+`titan-cellloc online on` has created `/var/lib/titan-cellloc/online`; it is off by default. It goes out through
+`curl` with a generic user agent. Each answer is kept in `learned.tsv` (mode 0600) under the serving cell, so a
+cell is sent once. A request tells BeaconDB roughly where the phone is.
+
+**Output and privacy.**
+
+- `/run/titan-cellloc.json` holds time, position, accuracy, cells used and seen, and the source (db, learned or
+  beacondb).
+- The command prints how the estimate was made, never where: cells as technology, the last two hex digits of the id,
+  PCI, RSRP and TA.
+- When the GPS daemon's last position (`/var/lib/titan-gnss-open/position`) exists, the command prints the distance
+  to it.
+- The GPS daemon needs a rough position within tens of km before its first fix. When that file is missing, or more
+  than 50 km from an estimate whose accuracy is within 20 km, the locator writes its estimate there.
+- The database, the learned file and the output stay on the phone.
+
+**The service.** `titan-cellloc watch 300` estimates every 5 minutes. Its unit, `titan-cellloc.service`, is
+installed but not enabled, because each query wakes the modem.
+
+Tests (7) cover these cases, all with made-up cells placed over open ocean:
+
+- the `+ECELL` layouts and malformed input;
+- the CSV rows;
+- exact, sibling and PCI lookups;
+- a fix from three cells with TA, landing on the ring towards the neighbours;
+- the serving cell alone;
+- the BeaconDB request and answer shapes;
+- the log masks.
+
 ## Phone apps
 
 Two apps on ModemManager's D-Bus API, sharing `titan_mm.py` (plain Gio
@@ -866,7 +1172,8 @@ valid SIM").
 
 - `titan-dialer` (drawer: Phone): a keypad; a number is a voice call
   (`Voice.CreateCall`, `Call.Start`), a code that starts with `*` or `#`
-  and ends with `#` is USSD (`Ussd.Initiate`, the answer on screen, `Respond`
+  and ends with `#` is USSD (through `titan-ims` over IMS while it is registered,
+  see "USSD"; otherwise `Ussd.Initiate`, the answer on screen, `Respond`
   when the network asks for a reply). `*#06#` shows the IMEI locally. In a
   call: hang up, mute, loudspeaker, DTMF; an incoming call rings (a quiet
   tone, -30 dBFS, and the motor) with answer and decline. When the radio is
@@ -902,9 +1209,10 @@ masking bug that showed identities in full (fixed, 2026-11-03).
 
 ### The phone app in Rust, with the proximity sensor (2026-11-09)
 
-`userspace/titan-dialer` (`build.sh` -> `out/titan-dialer`, installed as
-`/usr/local/bin/titan-dialer-rs` beside the Python app, which
-titan-call-watch still starts): the same three pages (keypad, call, USSD)
+`userspace/titan-dialer` (`build.sh` -> `out/titan-dialer`; since
+2026-11-11 installed as `/usr/local/bin/titan-dialer`, the app Home and
+titan-call-watch start, the Python app kept as `titan-dialer-py` and
+`titan-dialer-rs` a link to the Rust one): the same three pages (keypad, call, USSD)
 and behaviour. Its modem client (`src/modem.rs`) is titan_mm.py's in Rust:
 ModemManager through gio proxies on the system bus (the first modem, its
 Modem, Modem3gpp, Ussd and Voice interfaces and its calls, followed through
@@ -919,9 +1227,11 @@ signals are connected with `connect_local` (gio-rs's typed connectors want
 on the earpiece (dialing, ringing out or active; not on the loudspeaker or
 a headset or headphones, not while one rings in), the app reads the
 sensor: the SCP hub's `scp-proximity` IIO device (0 near, 1 far, reported on
-change; docs/hardware.md), its own buffer claimed with
-`IIO_BUFFER_GET_FD_IOCTL`, the state before the first change from
-`in_proximity_raw`. Near for 250 ms darkens the panel as titan-powerkey's
+change; docs/hardware.md), through titan-sensord (sensord.md; subscribed with
+`keep`, so it goes on while the screen is off) or, without the server, its
+own buffer claimed with `IIO_BUFFER_GET_FD_IOCTL`; the state before the first
+change from `in_proximity_raw` when it can be read (held still, the read
+times out and the state is far until the sensor reports a change). Near for 250 ms darkens the panel as titan-powerkey's
 screen off does on 6.12 (backlight 0, the MT6370 boost 0) without locking or
 suspending, and a black full-window shield swallows touches and keys; far
 lights it again (the boost's level, then `titan-brightness apply`). A guard
@@ -933,8 +1243,9 @@ exists while the call has the screen dark.
 Tried on the phone (kernel #115, a VoLTE call through titan-ims): the
 screen went dark at the ear and lit again away from it, four times in the
 call, each time back to the levels it had (backlight 887, boost 511); the
-app closed cleanly after the call. titan-call-watch still starts the
-Python dialer for incoming calls.
+app closed cleanly after the call. Until 2026-11-11 Home and
+titan-call-watch started the Python dialer, which has no proximity: calls
+made from it kept the screen on at the ear.
 
 ## Modem debug data
 
@@ -989,15 +1300,17 @@ need the firmware disassembled, which this project does not do.
    (171), the status channel, and what they need answered.
 4. SMS and voice (the apps are there, see "Phone apps"), and data through
    ModemManager rather than `ltedata.py`. Each is outward facing: ask first.
-5. Later: a modem logger on the CCB (what `mdlogger` sends to start
-   logging) and decoding the DHL log, the driver in tree with MD1
-   as a power domain, the modem's exception handshake, its cost in
-   suspend.
+5. Later: the DHL log on the CCB (what `mdlogger` sends to start
+   logging; not decodable, see "Modem debug data"). The driver in tree
+   with MD1 as a power domain runs (kernel #124, 2026-11-10); the
+   exception handshake and the crash logger are untested on a real
+   crash.
 
 ## Testing it
 
-The module is loaded by hand (`insmod`, or `systemctl start titan-modem`),
-never at boot, and unloading powers the modem off. The service holds a
+The modem starts with `systemctl start titan-modem` (the file service's
+open of `/dev/titan-modem`; before 2026-11-10, loading the module), never at
+boot, and stopping the service powers it off. The service holds a
 wake lock while it runs unless `/var/lib/titan-modem/allow-sleep` exists;
 with that file the phone deep-sleeps with the modem on, and a call wakes
 it (2026-11-05: see power.md, "Sleep with the modem on"). Risky experiments

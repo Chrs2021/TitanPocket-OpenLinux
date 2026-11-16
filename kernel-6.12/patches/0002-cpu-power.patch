@@ -1,18 +1,35 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 02/16] cpufreq, cpuidle, devfreq: mediatek: support the MT6771
+Subject: [PATCH 02/22] cpufreq, cpuidle, devfreq, soc: mediatek: support the MT6771, SVS
 
 mediatek-cpufreq and mtk-cci-devfreq gain MT6771 data (MediaTek's V5_T
-table: A53 to 1989 MHz, A73 to 1924 MHz, CCI to 1196 MHz), cpufreq-dt
+table: A53 to 1989 MHz, A73 to 2106 MHz, CCI to 1196 MHz), cpufreq-dt
 leaves the SoC to mediatek-cpufreq, and dt_idle_states can start every
-idle state disabled (dt_idle_states.off=1) for bring-up.
+idle state disabled (dt_idle_states.off=1) for bring-up. mtk-svs gains
+the MT6771: the MT8183's banks for the CPUs and the CCI (MediaTek's EEM
+for the MT6771 has the same detectors, efuse fields and limits), without
+the GPU bank, whose thermal zone this SoC's thermal driver doesn't give.
 ---
- drivers/cpufreq/cpufreq-dt-platdev.c |  1 +
- drivers/cpufreq/mediatek-cpufreq.c   | 23 +++++++++++++++++++++++
- drivers/cpuidle/dt_idle_states.c     | 11 +++++++++++
- drivers/devfreq/mtk-cci-devfreq.c    |  9 +++++++++
- 4 files changed, 44 insertions(+)
+ .../bindings/soc/mediatek/mtk-svs.yaml        |  1 +
+ drivers/cpufreq/cpufreq-dt-platdev.c          |  1 +
+ drivers/cpufreq/mediatek-cpufreq.c            | 65 +++++++++++++++++++
+ drivers/cpuidle/dt_idle_states.c              | 11 ++++
+ drivers/devfreq/mtk-cci-devfreq.c             |  9 +++
+ drivers/soc/mediatek/mtk-svs.c                | 21 ++++++
+ 6 files changed, 108 insertions(+)
 
+diff --git a/Documentation/devicetree/bindings/soc/mediatek/mtk-svs.yaml b/Documentation/devicetree/bindings/soc/mediatek/mtk-svs.yaml
+index 742b91d1d28eb41c2e0a2220a1c4cc6e2ae61d6a..a782ba80cb0ed4d9603a577b92f696f0d0b4f648 100644
+--- a/Documentation/devicetree/bindings/soc/mediatek/mtk-svs.yaml
++++ b/Documentation/devicetree/bindings/soc/mediatek/mtk-svs.yaml
+@@ -21,6 +21,7 @@ description: |+
+ properties:
+   compatible:
+     enum:
++      - mediatek,mt6771-svs
+       - mediatek,mt8183-svs
+       - mediatek,mt8186-svs
+       - mediatek,mt8188-svs
 diff --git a/drivers/cpufreq/cpufreq-dt-platdev.c b/drivers/cpufreq/cpufreq-dt-platdev.c
 index 9e86a0e8b9e8615fd63c8c046b267d98cb41dee9..45409550b447b2bad1e14b91af4493958527b624 100644
 --- a/drivers/cpufreq/cpufreq-dt-platdev.c
@@ -26,7 +43,7 @@ index 9e86a0e8b9e8615fd63c8c046b267d98cb41dee9..45409550b447b2bad1e14b91af449395
  	{ .compatible = "mediatek,mt8186", },
  	{ .compatible = "mediatek,mt8365", },
 diff --git a/drivers/cpufreq/mediatek-cpufreq.c b/drivers/cpufreq/mediatek-cpufreq.c
-index 663f61565cf7289fe34d9a735e825206dd13152c..736ddfe80f0f91437dce6856cea18eb96687f8fa 100644
+index 663f61565cf7289fe34d9a735e825206dd13152c..301b59077059114db63b3204ed121f6ee41ed06b 100644
 --- a/drivers/cpufreq/mediatek-cpufreq.c
 +++ b/drivers/cpufreq/mediatek-cpufreq.c
 @@ -23,6 +23,9 @@ struct mtk_cpufreq_platform_data {
@@ -39,16 +56,72 @@ index 663f61565cf7289fe34d9a735e825206dd13152c..736ddfe80f0f91437dce6856cea18eb9
  };
  
  /*
-@@ -596,6 +599,8 @@ static int mtk_cpufreq_init(struct cpufreq_policy *policy)
+@@ -571,6 +574,45 @@ static void mtk_cpu_dvfs_info_release(struct mtk_cpu_dvfs_info *info)
+ 	dev_pm_opp_unregister_notifier(info->cpu_dev, &info->opp_nb);
+ }
+ 
++/*
++ * The frequency to sleep at: the fastest operating point that runs at or
++ * below the rail's power-on voltage. On the MT6771 the SPM firmware takes
++ * the CPU rails down in its suspend and brings them back to their set
++ * voltage at the wake, then restarts CPU 0 after a fixed wait. Asleep at
++ * whatever the governor had (often the top point, 1.0 V), about one long
++ * sleep in twenty ended with CPU 0 never restarting and the SPM's watchdog
++ * resetting the phone 30 s later (Titan Pocket, 2026-11: the PMIC's
++ * latched VPROC read 1.0 V at every such reset). MediaTek's own software
++ * leaves CPU DVFS to the SSPM, which stops it for the suspend.
++ */
++static unsigned int suspend_microvolt = 800000;
++module_param(suspend_microvolt, uint, 0644);
++MODULE_PARM_DESC(suspend_microvolt, "Sleep at the fastest OPP at or below this voltage (0: wherever the governor left it)");
++
++static unsigned int mtk_cpufreq_suspend_freq(struct mtk_cpu_dvfs_info *info,
++					     struct cpufreq_frequency_table *table)
++{
++	struct cpufreq_frequency_table *pos;
++	unsigned int best = 0;
++
++	if (!suspend_microvolt)
++		return 0;
++	cpufreq_for_each_valid_entry(pos, table) {
++		struct dev_pm_opp *opp;
++		unsigned long volt;
++
++		opp = dev_pm_opp_find_freq_exact(info->cpu_dev,
++						 pos->frequency * 1000UL, true);
++		if (IS_ERR(opp))
++			continue;
++		volt = dev_pm_opp_get_voltage(opp);
++		dev_pm_opp_put(opp);
++		if (volt <= suspend_microvolt && pos->frequency > best)
++			best = pos->frequency;
++	}
++	return best;
++}
++
+ static int mtk_cpufreq_init(struct cpufreq_policy *policy)
+ {
+ 	struct mtk_cpu_dvfs_info *info;
+@@ -596,6 +638,10 @@ static int mtk_cpufreq_init(struct cpufreq_policy *policy)
  	policy->freq_table = freq_table;
  	policy->driver_data = info;
  	policy->clk = info->cpu_clk;
++	policy->suspend_freq = mtk_cpufreq_suspend_freq(info, freq_table);
++	dev_info(info->cpu_dev, "suspend frequency %u kHz\n", policy->suspend_freq);
 +	policy->transition_delay_us = cpumask_test_cpu(0, &info->cpus) ?
 +		info->soc_data->little_delay_us : info->soc_data->big_delay_us;
  
  	return 0;
  }
-@@ -728,6 +733,23 @@ static const struct mtk_cpufreq_platform_data mt8186_platform_data = {
+@@ -616,6 +662,7 @@ static struct cpufreq_driver mtk_cpufreq_driver = {
+ 	.get = cpufreq_generic_get,
+ 	.init = mtk_cpufreq_init,
+ 	.exit = mtk_cpufreq_exit,
++	.suspend = cpufreq_generic_suspend,
+ 	.register_em = cpufreq_register_em_with_opp,
+ 	.name = "mtk-cpufreq",
+ 	.attr = cpufreq_generic_attr,
+@@ -728,6 +775,23 @@ static const struct mtk_cpufreq_platform_data mt8186_platform_data = {
  	.ccifreq_supported = true,
  };
  
@@ -72,7 +145,7 @@ index 663f61565cf7289fe34d9a735e825206dd13152c..736ddfe80f0f91437dce6856cea18eb9
  static const struct mtk_cpufreq_platform_data mt8516_platform_data = {
  	.min_volt_shift = 100000,
  	.max_volt_shift = 200000,
-@@ -748,6 +770,7 @@ static const struct of_device_id mtk_cpufreq_machines[] __initconst __maybe_unus
+@@ -748,6 +812,7 @@ static const struct of_device_id mtk_cpufreq_machines[] __initconst __maybe_unus
  	{ .compatible = "mediatek,mt817x", .data = &mt2701_platform_data },
  	{ .compatible = "mediatek,mt8173", .data = &mt2701_platform_data },
  	{ .compatible = "mediatek,mt8176", .data = &mt2701_platform_data },
@@ -136,3 +209,41 @@ index 6e608d92f7e66a42fedaf83d96db35100fa80988..dd909396bcc5e7e5fd886c74b07fef79
  	{ .compatible = "mediatek,mt8183-cci", .data = &mt8183_platform_data },
  	{ .compatible = "mediatek,mt8186-cci", .data = &mt8186_platform_data },
  	{ },
+diff --git a/drivers/soc/mediatek/mtk-svs.c b/drivers/soc/mediatek/mtk-svs.c
+index 07ab261e1269d0f9073e32f2ef49c9dab287207a..ce9cdd416f6e4af642e4110b4f91bc1b39b938a8 100644
+--- a/drivers/soc/mediatek/mtk-svs.c
++++ b/drivers/soc/mediatek/mtk-svs.c
+@@ -2828,12 +2828,33 @@ static const struct svs_platform_data svs_mt8183_platform_data = {
+ 	}
+ };
+ 
++/*
++ * MT6771: the MT8183's SVS (MediaTek's EEM v2 for the MT6771 runs the same
++ * four detectors with the same efuse fields, control words, limits and
++ * frequency bases, and smaller voltage margins than these). The GPU bank
++ * is left out: it needs a "gpu-thermal" zone, and the MT6771's thermal
++ * driver registers one sensor only.
++ */
++static const struct svs_platform_data svs_mt6771_platform_data = {
++	.name = "mt6771-svs",
++	.banks = svs_mt8183_banks,
++	.efuse_parsing = svs_mt8183_efuse_parsing,
++	.probe = svs_mt8183_platform_probe,
++	.regs = svs_regs_v2,
++	.bank_max = 3,			/* CPU little, CPU big, CCI */
++	.glb_fuse_map = (const struct svs_fusemap[GLB_MAX]) {
++		/* VMIN not present */
++		{ 0, 4 }, { -1, 0 }
++	}
++};
++
+ static const struct of_device_id svs_of_match[] = {
+ 	{ .compatible = "mediatek,mt8195-svs", .data = &svs_mt8195_platform_data },
+ 	{ .compatible = "mediatek,mt8192-svs", .data = &svs_mt8192_platform_data },
+ 	{ .compatible = "mediatek,mt8188-svs", .data = &svs_mt8188_platform_data },
+ 	{ .compatible = "mediatek,mt8186-svs", .data = &svs_mt8186_platform_data },
+ 	{ .compatible = "mediatek,mt8183-svs", .data = &svs_mt8183_platform_data },
++	{ .compatible = "mediatek,mt6771-svs", .data = &svs_mt6771_platform_data },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, svs_of_match);

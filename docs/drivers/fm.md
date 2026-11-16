@@ -11,7 +11,8 @@ loudspeaker. The test channel is 99.5 MHz.
 | Firmware: `mt6631_fm_v1_patch.bin`, `mt6631_fm_v1_coeff.bin`, `fm_cust.cfg` | `/lib/firmware` | vendor partition (not redistributable) |
 | `titan-fm`: tuner CLI | `userspace/src/titan-fm.c` | new |
 | `titan-radio`: audio routing + `titan-fm` | `userspace/debian/overlay/usr/local/bin/` | new |
-| `titan-radio-gui`: the **Radio** app (GTK 3) | `userspace/debian/overlay/usr/local/bin/` | new |
+| `titan-radio-gui`: the **Radio** app (GTK 4, Python on `titan_ui4`) | `userspace/debian/overlay/usr/local/bin/` | new |
+| `titan-radio-gui` in Rust (the same app on `titan-ui`) | `userspace/titan-radio/` | new |
 
 The driver needs the WMT core (`titan-wmt.service`) to be running. Its
 module depends on `wmt_drv`, so `modprobe fmradio_drv` works at any time.
@@ -35,6 +36,19 @@ last station and stops when the window closes.
 - Keys: ←/→ step, ↑/↓ seek, Space power, F favorite.
 - State (frequency, volume, favorites, last scan):
   `~/.config/titan-radio/state.json`.
+
+**The Rust port** (`userspace/titan-radio`, 2026-11-12) is the same app on
+the `titan-ui` crate: the same window, ioctls, audio, keys and state file
+(the two read each other's). `build.sh` builds `out/titan-radio-gui`.
+`TITAN_RADIO_FAKE=1` swaps `/dev/fm` for a made-up band (five stations,
+RDS on 99.5) and plays nothing, for testing the window without the chip.
+Checked headless (see docs/desktop.md, "The shared UI files and the Rust
+port"): from the same state file the Rust and Python windows differ only in
+the error line, which reads "FM unavailable: modprobe fmradio_drv failed"
+instead of Python's exception text. On the fake tuner, titan-comp's script
+drove power-up (chip ID, stereo, RDS name, type and text), a scan (progress,
+Stop, five stations), seek, a dial drag, the header star, and power off and
+on with Space. Not yet tried on the phone with the real tuner.
 
 It drives `/dev/fm` itself (the ioctls below, from Python) and sets up the
 audio the same way as `titan-radio`. `spk-hold` is started with
