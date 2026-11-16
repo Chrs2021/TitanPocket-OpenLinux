@@ -21,9 +21,10 @@ Wayland desktop.
 Linux 6.12.115 as a patch series against the kernel.org release: upstream
 drivers wherever the MT6771 matches the MT8183 (it mostly does), our own
 where it doesn't. It boots the same Debian with the desktop, touch, keys,
-sound, Wi-Fi, Bluetooth, FM, sensors, charging and suspend; deep sleep is
-in progress and the cameras are ported but not yet run. Its status table
-and build steps are in that README.
+sound, Wi-Fi, Bluetooth, FM, sensors, charging and deep sleep (37.5 mA in
+everyday standby with the modem registered; the fix for its occasional
+hung wake is being confirmed in daily use); the cameras are ported but not
+yet run. Its status table and build steps are in that README.
 
 ## Contents
 
