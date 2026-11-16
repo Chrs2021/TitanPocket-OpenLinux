@@ -6,7 +6,7 @@ powers down the CPU top, sends DRAM to self-refresh, turns off the 26 MHz
 clock, and reverses all of it on wake; while the system is awake it serves
 the Vcore and DRAM frequency requests. MediaTek ships the program as a
 binary (the `spmfw` partition); ATF loads it, and the kernel only passes
-flags (`mt6771-spm`, see [mainline.md](mainline.md), "Suspend").
+flags (`mt6771-spm`, see mainline.md, "Suspend").
 
 This page is the whole program, read statically with `tools/spm/spmfw.py`:
 every instruction decodes, every routine is named, and every branch's

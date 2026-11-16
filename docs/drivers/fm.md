@@ -11,8 +11,6 @@ loudspeaker. The test channel is 99.5 MHz.
 | Firmware: `mt6631_fm_v1_patch.bin`, `mt6631_fm_v1_coeff.bin`, `fm_cust.cfg` | `/lib/firmware` | vendor partition (not redistributable) |
 | `titan-fm`: tuner CLI | `userspace/src/titan-fm.c` | new |
 | `titan-radio`: audio routing + `titan-fm` | `userspace/debian/overlay/usr/local/bin/` | new |
-| `titan-radio-gui`: the **Radio** app (GTK 4, Python on `titan_ui4`) | `userspace/debian/overlay/usr/local/bin/` | new |
-| `titan-radio-gui` in Rust (the same app on `titan-ui`) | `userspace/titan-radio/` | new |
 
 The driver needs the WMT core (`titan-wmt.service`) to be running. Its
 module depends on `wmt_drv`, so `modprobe fmradio_drv` works at any time.
@@ -22,35 +20,7 @@ listen.
 
 ## Using it
 
-**Radio** in the app drawer opens `titan-radio-gui`. It starts playing the
-last station and stops when the window closes.
-- Big frequency readout; a dial (87.5–108); seek ⏮ ⏭, step ‹ › (100 kHz)
-  and power buttons; a volume slider (the AFE FM gain, −48…0 dB, default
-  −24 dB; the speaker level stays with the volume keys).
-- Signal meter (GETRSSI, about dBm) and a stereo/mono badge.
-- **RDS:** station name, call letters and programme type under the
-  frequency, radio text below them; station names are remembered and
-  shown in the station list (see "RDS" below).
-- **Scan** lists the stations it finds (about 8 s for the band); the star
-  saves a favorite, listed first. Tap a row to tune.
-- Keys: ←/→ step, ↑/↓ seek, Space power, F favorite.
-- State (frequency, volume, favorites, last scan):
-  `~/.config/titan-radio/state.json`.
-
-**The Rust port** (`userspace/titan-radio`, 2026-11-12) is the same app on
-the `titan-ui` crate: the same window, ioctls, audio, keys and state file
-(the two read each other's). `build.sh` builds `out/titan-radio-gui`.
-`TITAN_RADIO_FAKE=1` swaps `/dev/fm` for a made-up band (five stations,
-RDS on 99.5) and plays nothing, for testing the window without the chip.
-Checked headless (see docs/desktop.md, "The shared UI files and the Rust
-port"): from the same state file the Rust and Python windows differ only in
-the error line, which reads "FM unavailable: modprobe fmradio_drv failed"
-instead of Python's exception text. On the fake tuner, titan-comp's script
-drove power-up (chip ID, stereo, RDS name, type and text), a scan (progress,
-Stop, five stations), seek, a dial drag, the header star, and power off and
-on with Space. Not yet tried on the phone with the real tuner.
-
-It drives `/dev/fm` itself (the ioctls below, from Python) and sets up the
+The phone's radio app drives `/dev/fm` itself (the ioctls below) and sets up the
 audio the same way as `titan-radio`. `spk-hold` is started with
 `PR_SET_PDEATHSIG`, so the FM route closes even if the app is killed. Only
 the process that powered FM up may use the ioctls (others get `EPERM`), so

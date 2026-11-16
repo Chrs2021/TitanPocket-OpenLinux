@@ -14,7 +14,7 @@ work.
   AK7371 motor).
 - Kernels #31/#32 add what libcamera needs from Linux 4.20/5.0
   (`/dev/udmabuf`, V4L2 buffer orphaning).
-- **Camera** app (`titan-camera-gui`, app drawer): live preview, photos
+- A camera app: live preview, photos
   at full resolution, front/rear switch, **autofocus** (contrast detection,
   tap to focus) and manual focus (rear).
 - The driver reports each sensor's location and mounting rotation, so
@@ -441,204 +441,6 @@ On 2026-10-18 the flash and the torch stopped. The kernel logged
 - **What still protects the battery.** The low-voltage protection, the
   PMIC's battery voltage comparator, isn't touched: a truly sagging
   battery still blocks the flash.
-
-## The Camera app (titan-camera-gui)
-
-`userspace/debian/overlay/usr/local/bin/titan-camera-gui` (Python, GTK 4 and
-`titan_ui4` since 2026-10-28, GStreamer), **Camera** in the app drawer.
-
-- **Preview:** `libcamerasrc`, converted, rotated (mirrored for the front
-  camera) by `glvideoflip` and scaled to about the screen by `glcolorscale`
-  on the GPU. GTK 3 showed it with `gtkglsink`; GTK 4 has no GStreamer GL
-  sink in Debian 12, so the small frame is downloaded by an appsink and
-  drawn as a texture (~30 fps, see desktop.md).
-- **Photo:** one stream at a time, so the shutter stops the preview, runs
-  the camera at its largest RGB size (rear 4668×3504 from the sensor's
-  full-resolution mode, front 3260×2448: the OV8865's full mode), drops
-  the first 15 frames while auto exposure settles (it converges in about
-  8), rotates, encodes one frame as JPEG (quality 92) into
-  `~/Pictures/Camera/IMG_<date>_<time>.jpg` and restarts the preview.
-  Front about 2 s; rear about 4 s (the software ISP debayers 16 MP at
-  ~9.5 fps). The thumbnail shows the last photo; tap it to
-  view it. All photos are browsable in the **Photos** app
-  (`titan-gallery`, desktop.md).
-- **Rotation:** from the driver's `camera_sensor_rotation` (clockwise in
-  the app: rear 90°, front 270°, both checked upright on the phone; the
-  stock HAL's angles weren't found, MTK compiles them into its custom
-  code). The rotate button overrides it per camera
-  (`~/.config/titan-camera/state.json`), for photos too.
-- **Autofocus** (rear; the front camera is fixed-focus), contrast
-  detection in the app:
-  - a second preview branch hands the frames (the same BGRx buffers) to an
-    appsink; sharpness is the gradient energy of the focus region's green
-    channel (30 % of the frame, binned 2×2, normalised by brightness);
-  - the lens (`FOCUS_ABSOLUTE` on the sensor subdev; libcamera leaves it
-    alone) sweeps 0–1023 in steps of 64, two frames per position, stopping
-    once sharpness is well past the peak, then ±48 in steps of 16, four
-    frames each: 2–3 s;
-  - after a move, only frames whose capture began after the lens settled
-    count (sensor timestamps against the pipeline clock), since the ISP
-    adds latency;
-  - no clear peak (best < 1.25× worst): "Low contrast", the lens stays;
-  - focused, it measures every third frame and refocuses when the median
-    sharpness stays below 60 % of the focused level for ~3 s;
-  - tap the preview to focus there; dragging the Far–Near slider switches
-    to manual focus (MF) until the next tap. A photo keeps the focus;
-  - CPU: the measurement thread takes ~5 %; the app ~55 % with preview.
-- **Flash** (rear camera, button beside rotate; T): Off → Auto → On →
-  Torch, both LEDs together (coupled). On: 400 mA each (the torch
-  maximum) for the whole photo capture, since the still pipeline needs
-  ~4 s at full resolution, longer than a strobe; a 6 s hardware
-  timeout backs it up (measured: lit 3.7 s of a 3.8 s capture). Auto: fires when auto exposure has raised the
-  sensor's analogue gain to 4× or more. Torch: 175 mA each while the
-  app runs; off on another mode, the front camera, or quitting.
-- **Flash exposure (pre-flash metering)**, for flash photos (Auto when
-  it fires, On):
-  - **The problem:** libcamera's software AE starts a still capture from
-    the dark-scene settings (full exposure, ~15× gain) and moves at most
-    10–15 % a frame (a gain step about every 4 frames). With the flash on,
-    every frame up to the saved one was 100 % clipped; reaching a
-    flash-lit exposure would take hundreds of frames.
-  - **Metering:** with the preview still running, the app switches it to
-    manual exposure (400 µs, gain 1×), lights the flash at full power and
-    reads the hardware AF statistics. Their block pixel sums (word 3,
-    before any processing) are linear: raw / 8 per pixel, black about 8,
-    clipping at about 119.
-  - **Timing:** a control change reaches the sensor a few requests later,
-    so the app waits until the sensor's exposure register shows the new
-    value, then 3 frames.
-  - **Stepping:** while the 97th-percentile block clips, the exposure
-    drops 8× (down to 40 µs); while the scene is too dark, it rises 8×
-    (up to 25.6 ms). Usually 1–2 steps, under 0.5 s.
-  - **Dimming the pre-flash:** if it still clips at 40 µs (a very close
-    subject), the pre-flash itself steps down about 4× (level 15 → 3 → 0).
-    The model scales its share back to full power.
-  - **Choosing the exposure:** the ambient levels just before metering
-    (at the preview AE's exposure × gain) separate the flash's share from
-    the ambient light. The app then picks the exposure × gain that puts
-    the centre-weighted mean at 32 with the 97th-percentile block at most
-    66. Measured against the output, a block level s comes out as about
-    303 × (s / 111)^(1/2.2), so that's a photo mean of about 80 with
-    highlights at about 240.
-  - **Dimming:** if that would be under the sensor's shortest exposure (4
-    lines, 35 µs: a close subject), the flash itself is dimmed (level
-    0–15, about 25 mA × (level + 1)).
-  - **Splitting:** exposure up to 1/30 s (3800 lines), the rest as gain
-    up to 8×.
-  - **Capture:** the still pipeline starts with that manual exposure and
-    the flash at that level, so it skips only 6 frames instead of 15.
-  - **Results:** before, flash photos of a close bottle were 100 %
-    clipped. Now two scenes metered to 31 and 108 lines both came out with
-    mean 60 and highlights at 222–244 of 255 (0.4–1.4 % clipped:
-    glints), label text readable, in 4.2 s per photo.
-  - **Close subjects** (bottle label, held by hand):
-    - at ~5 cm: flash level 11 at 4 lines, mean 73, 0.8 % clipped;
-    - at ~2 cm: pre-flash stepped down to level 3, photo at level 2
-      (~75 mA per LED), mean 79, 0.6 % clipped. Before the pre-flash could
-      dim, its reading clipped and the photo had 20 % clipped.
-    - Both show a green cast (the software ISP's white balance under
-      flash) and the 2 cm one is closer than the lens focuses.
-- **AF assist** (flash Auto or On, when it's dark: the same 4× gain):
-  - both LEDs light at torch level (175 mA) for the autofocus run;
-  - the sweep waits 500 ms first, so auto exposure settles on the lit
-    scene (it converges in ~8 frames);
-  - the light goes off as soon as the lens is placed, about 3 s in all;
-  - the focus is then held rather than tracked, since a tracking refocus
-    in the dark would keep switching the light on. Tap to refocus;
-  - auto exposure needs a moment to recover after the light goes off, so
-    Auto treats the scene as dark for 2 s afterwards. A photo taken during
-    or right after an assisted focus still gets the flash;
-  - tested with the threshold forced to 0: FLEDEN read 0x0b from the start
-    of the wait to the focused position, then 0x08.
-- **QR codes**, found passively while the preview runs (either camera):
-  - **Inline:** a third branch of the preview's `tee`, straight after
-    `libcamerasrc` and before the GPU upload: `videorate max-rate=5` → a
-    leaky one-buffer queue → 640×480 `GRAY8` → appsink. The decoding
-    thread is that branch's own, so a slow scan only drops QR frames, never
-    preview frames.
-  - **Decoder:** libzbar through ctypes, configured for QR only and every
-    second line and column (`ZBAR_CFG_X/Y_DENSITY` 2). GStreamer's `zbar`
-    element tries every symbology on every line and can't be configured:
-    136 ms per 640×480 frame of sensor noise, against 14 ms (37 ms QR-only
-    at density 1). Live, with a code in view: 5 scans/s at ~30 ms, ~15 %
-    of a core.
-  - **Alert:** each code becomes a chip over the bottom of the preview
-    ("QR · LINK/WI-FI/TEXT/…" and what it holds), up to 3, newest on top. A
-    chip stays (sticky) until its ✕ is tapped, across camera switches and
-    photos, and is outlined in yellow while its code is in view (1.2 s
-    after the last sighting). Copy puts the text on the clipboard; links
-    also get Open (Chromium, `titan-chromium`). Nothing opens on its own;
-    Wi-Fi codes show the network name, and Copy gives the whole `WIFI:`
-    string.
-  - **Buzz:** a new chip comes with a short double buzz of the vibration
-    motor (40 ms, 90 ms pause, 40 ms; [hardware.md](hardware.md#vibration-motor)).
-    It isn't repeated while the code stays in view, only for a new code or
-    one whose chip was dismissed.
-- Keys: Space/Enter photo, F switch camera, R rotate, A autofocus, T flash.
-
-### The Rust camera app (titan-camera, 2026-11-09, not yet run on the phone)
-
-`userspace/titan-camera` (`build.sh` -> `out/titan-camera`, installed as
-`/usr/local/bin/titan-camera` beside the Python app until it has been tried):
-the same hardware-ISP preview, stills, autofocus and flash, rewritten in Rust
-(gtk4-rs 0.9, gstreamer-rs 0.23, built against the phone's Debian 12
-libraries like titan-messages), plus:
-
-- **Video**: Photo/Video mode. A recording replaces the preview stream with
-  one that also encodes: the GPU-rotated frames are scaled to the video size
-  (4:3: 1440×1080 at 12 Mbit/s, 960×720 at 6, 640×480 at 3) as NV12 and go to
-  the best H.264 encoder installed (`v4l2h264enc` once the hardware encoder
-  has a V4L2 driver, docs/video-encoder.md; else `x264enc`, ultrafast,
-  zero latency; else `openh264enc`), with Opus sound from `pulsesrc`, into
-  MP4 (Matroska when this `mp4mux` takes no Opus) in `~/Videos/Camera`.
-  Stopping sends EOS so the muxer closes the file. The rootfs now installs
-  `gstreamer1.0-plugins-ugly` and `gstreamer1.0-pulseaudio` for this.
-- **Shutter speed and ISO** (settings panel): Auto, or 1/2000 s to 1/30 s on
-  the preview and in video, and down to 1 s for photos. With both on Auto
-  the driver's own exposure runs. Fixing either one takes over: the sensor
-  gets the fixed value (exposure in lines from the line time, (width +
-  hblank) / pixel rate; gain with 128 = 1×, ISO 100 = 1×), and the app moves
-  the other one from the preview's centre-weighted luma toward Y 105 (shutter
-  priority or ISO priority). A photo starts from the preview's exposure ×
-  gain; a shutter longer than the frame raises VBLANK for that stream (the
-  driver limits exposure to frame length − 8 lines), and photos longer than
-  1/15 s take one frame instead of a burst.
-- **Photo size**: the sensor's full mode (rear 16 MP, front 8 MP) or its
-  binned mode (4 MP, 2 MP; faster).
-
-QR codes (2026-11-09): as the Python app's (above), with two changes. The
-decoder (`qr.rs`) loads libzbar with `dlopen`, so the build needs no zbar
-and the app runs without it, and it reads the luma straight from the
-preview's YUYV, every n-th pixel for frames over 1000 wide, so the branch
-has no `videoscale` or `videoconvert`. 3 scans a second: at 5 a second the
-decoding thread took about 26% of a core on the 960x720 preview, at 3
-about 12%. Tested on the phone with a real code: it decodes and the chip
-appears. Flash pre-metering (2026-11-09, `meter.rs`; built and unit-tested,
-not yet run on the phone): as the Python app's ("Flash exposure",
-above). The preview stays up at 400 µs, gain 1×, with the torch at its
-maximum; the app reads `af_stats` every 15 ms, waits for the sensor to
-show the exposure and then 3 frames, steps 8× while the 97th-percentile
-block clips or the scene is too dark, dims the pre-flash for a close
-subject, and solves for the photo's exposure × gain (and flash level)
-from the ambient and lit levels. The still then starts at that exposure
-(set before stream on and again on the first frame) and fires the strobe
-on its first frame (`flash::strobe`, from the streaming thread; the main
-thread's `Flash` only records it, so it can end it), keeping the burst
-after 6 settle frames, inside the strobe's 1184 ms. Levels under the
-strobe's 50 mA floor go on the torch. Without statistics (or after the
-2.5 s timeout with no valid read) the flash is the torch maximum through
-the capture, as before. Torch mode and a fixed shutter or ISO aren't
-metered.
-
-The preview runs at the ISP's scaled-down size (`Camera::preview`: rear
-960x720, front 816x612; see "The resizer" below), or the binned mode when
-a recording is larger. Measured with the app on the phone's screen: the
-whole app took 89% of a core with the 2336x1752 preview, 61% with the
-960x720 one (QR decoding apart).
-
-The settings live in `~/.config/titan-camera/settings` (key=value). Unit
-tests cover the settings file, the sharpness measure and the focus search
-(a simulated lens), the exposure loop, and the V4L2 control layouts.
 
 ## MediaTek ISP (hardware), work in progress
 
@@ -1111,7 +913,7 @@ balance and exposure from the AA statistics are below.
 
 ### Camera app preview on the hardware ISP (2026-10-27)
 
-`titan-camera-gui`'s preview now requests the driver's `YUYV` node, so the
+the camera app's preview now requests the driver's `YUYV` node, so the
 live preview runs through MediaTek's pass-2 hardware ISP and the GPU only
 converts `YUYV`→RGB for display (no software debayer). Per camera it asks
 for the sensor-mode size the DIP delivers — rear 2336×1752, front
@@ -1203,7 +1005,7 @@ missing piece was a **built-in tile list** for each full-res mode.
 Both are registered in `dip_tdrs[]` (`dip_core.h`), so `dip_find_tdr` matches
 the full-res YUYV stream on either camera.
 
-**App still path.** `titan-camera-gui`'s `capture()` requests `YUY2` at the
+**App still path.** the camera app's `capture()` requests `YUY2` at the
 exact sensor-mode size (`hwstill`: 4672×3504 / 3264×2448) when the hardware
 ISP is on, so stills come finished from the DIP; `TITAN_CAMERA_HWISP=0` keeps
 the old `BGRx` GPU software-ISP path at its cropped size (4668 / 3260). The
@@ -1699,7 +1501,7 @@ from the device tree and upstream drivers:
   `out612/media-modules.tar` (paths under `/lib/modules/<version>/`). Unpack
   it there, put `titan_camera.ko` in `extra/` and run `depmod`; the driver
   then loads on its device tree match.
-- **Userspace.** `titan-camera-gui` finds the driver's sysfs directory and
+- **Userspace.** the camera app finds the driver's sysfs directory and
   libcamera's camera IDs from where `1a050000.camsv*` is (on 6.12 under
   `platform/soc/`).
 
@@ -1742,7 +1544,7 @@ between streams. Entity names: `ov16880 3-0036`, `ov8865 2-0010`.
   of 46. A brighter picture there needs digital gain in the DIP or a
   longer exposure (not done).
 - libcamera lists both cameras; on 6.12 it names them by device tree node
-  (`/base/soc/camsv@1a050000/rear`), which `titan-camera-gui` now derives
+  (`/base/soc/camsv@1a050000/rear`), which the camera app now derives
   (`camera_id()`); the app previews and takes photos.
 
 Not ported: the MT6370 flash (its LED driver is not enabled on 6.12; the

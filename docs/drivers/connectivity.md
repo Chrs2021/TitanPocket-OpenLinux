@@ -6,16 +6,18 @@ Bluetooth: `hci0` (BlueZ) starts at boot through `titan-bt.service` and
 uses the factory address from NVRAM. Classic and LE scanning work, and
 LE connections reach BlueZ (fixed 2026-10-15, see "LE commands" below). A
 BlueZ GATT peripheral (a phone app connecting, subscribing to notifications
-and exchanging encrypted data) works end to end; classic (BR/EDR) pairing
-and audio are untested. FM radio works ([fm.md](fm.md)). GPS shares the same chip and
-core driver but isn't brought up yet.
+and exchanging encrypted data) works end to end. Classic pairing and A2DP
+audio through PipeWire work (2026-11-15: a Bluetooth headset, AAC, volume over
+AVRCP; desktop.md, "Bluetooth"). FM radio works
+([fm.md](fm.md)). GPS shares the same chip and core driver and works
+([gnss-open.md](../gnss-open.md)).
 
 Everything is built **from source** (no stock `.ko`), so it can move to a
 newer kernel later. On Linux 6.12, Wi-Fi and Bluetooth run from the same
 sources (`build612.sh`, a new BTIF driver with APDMA, no vendor adapters;
 it sets the BTIF and its DMA up again when the SPM's deep sleep has reset
 them); see
-[../mainline.md](../mainline.md#connectivity). Two MT6771-specific files that MediaTek never published
+../mainline.md. Two MT6771-specific files that MediaTek never published
 were reconstructed from the stock modules.
 
 ## Hardware
@@ -349,8 +351,7 @@ sends vendor command **0xFC7A** with 7 bytes from the NVRAM record (bytes
 
 ### Using it
 
-The phone's Bluetooth settings app, `titan-bluetooth`
-(../desktop.md), switches it
+The phone's Bluetooth settings switches it
 on and off, makes the phone visible, scans, and pairs as BlueZ's agent.
 From a shell:
 
@@ -393,8 +394,8 @@ on the phone.
 
 ## Not done
 
-- Bluetooth audio (A2DP needs PipeWire/PulseAudio; SCO over HCI is untested).
-- GPS. FM is in [fm.md](fm.md).
+- Bluetooth HFP (RFCOMM is in the 6.12 config from #136; SCO over HCI and the
+  `mtk-btcvsd` path untested in a call).
 - Why scans sometimes find nothing after a monitor session with an AWDL
   peer (worked around by power-cycling Wi-Fi).
 - Concurrent monitor and station mode (AWDL while connected to an access

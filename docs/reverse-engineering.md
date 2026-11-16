@@ -16,7 +16,7 @@ the fuel gauge, keymap and amp in hours rather than weeks.
 | `Firmware/super_ext/vendor_ext/` | extracted vendor partition: HAL libraries, firmware, configs |
 | `Firmware/super_ext/system_ext/` | extracted system partition (keylayouts etc.) |
 
-## Tools (`tools/re/`)
+## Tools (`tools/re/`; more below, under "Emulating vendor code" and "Firmware disassemblers")
 
 ```sh
 # disassemble stock kernel functions by name
@@ -79,11 +79,69 @@ the RELA table by scanning and `dq.py` applies it, then resolves targets to
   count at 42, 81 x u32 DSP RAM words at 144, register values at 64–146 and
   76–116 for the two preset sets) + 512 u16 coefficients.
 
+## Emulating vendor code
+
+When a vendor library computes something we need (register values, a
+tuning table, a firmware command), running the stock function is often
+quicker and more reliable than reading it. These load stock Android
+libraries into Unicorn with just enough of their environment stubbed, call
+the function, and log register writes or dump memory:
+
+| Tool | What |
+|---|---|
+| `emu_so.py` | one function of an AArch64 shared library, memory dumped afterwards |
+| `emu_hal.py`, `emu32.py` | several AArch64 (or 32-bit ARM) libraries in one address space, for HAL code that calls across them |
+| `emu_dip_regs.py`, `emu_dip_config.py`, `emu_tile.py` | the camera HAL's pass-2 tuning managers and tile engine: the DIP (hardware ISP) register values for a frame ([camera.md](camera.md)) |
+| `emu_sensor.py` | a stock-kernel imgsensor function: the sensor register writes it makes |
+| `emu_venc.py` | the H.264 encoder's vendor driver: every VENC register access ([video-encoder.md](video-encoder.md)) |
+
+Reading decompiled HAL code: `hal_func.sh`, `hal_view.sh`, `hal_regseq.py`,
+`ghidra_regops.py` (register sequences out of Ghidra's output),
+`ispmgr_engines.sh`; `elf_strrefs.py` finds where a PIE library points at
+a string. Kernel modules: `kodis.py` and `kosimp.py` annotate and simplify
+a module's disassembly, `modcheck.py` says whether a prebuilt `.ko` would
+load into our kernel.
+
+## Firmware disassemblers
+
+The SoC's coprocessors run firmware from their own partitions. Each has a
+tool that parses the container and disassembles the program with
+annotations:
+
+| Firmware | Tool | Doc |
+|---|---|---|
+| SPM (the PCM sleep controller) | `tools/spm/spmfw.py` | [spm-firmware.md](spm-firmware.md) |
+| SSPM (MD32 power coprocessor) | `tools/sspm/sspmdis.py` | sspm-firmware.md |
+| SCP (Cortex-M4 sensor hub) | `tools/scp/scpdis.py` | scp-firmware.md |
+| VPU (Xtensa Vision P6) | `tools/vpu/vpuimg.py`, `xtdis.py`; `xtasm.py` assembles our own | apu.md |
+
+## What has been reverse engineered, and where it is written down
+
+| Subject | How | Doc |
+|---|---|---|
+| Fuel gauge, keymap, speaker amp, touchpad | stock kernel and HAL, this method | [drivers/](drivers/) |
+| Cameras: sensor init, the hardware ISP (DIP) registers and tuning, AF statistics | the camera HAL run in the emulator; register traces | [camera.md](camera.md) |
+| SPM sleep firmware: the instruction set, every routine, the sleep ladder, the `debug` word | `spmfw.py` | [spm-firmware.md](spm-firmware.md) |
+| SSPM firmware: what suspend and resume do to the PMIC, the RTC's clocks and the rails | `sspmdis.py` | sspm-firmware.md |
+| SCP firmware: its IPC and the sensor hub | `scpdis.py` | scp-firmware.md |
+| PLL sleep control: `AP_PLL_CON3/4` hand-over, `SPM_PLL_CON`, the CPU PLLs' hardware mode, the vendor's suspend golden tables; every MT6358 rail's sleep mode | the vendor's clock and hotplug code, `goldcheck.py`, `rails.py`, `pllctl.py` on the phone | power-rails.md |
+| Why deep sleep reset the phone: hung wakes, the RTC breadcrumb and the preloader's watchdog record, the CPU PLLs across the sleep | `sleepcrash.py`, `longsleep.py`, LK's crash dump in `expdb` | power-testing.md, power-rails.md |
+| MT6358 `TOP_RST_MISC`: the MT6331's layout, not the MT6397's | the vendor's PMIC register header against the phone | power-testing.md |
+| Modem: LK's hand-off, CCCI, the boot and exception handshakes, the NVRAM file service, CLDMA, the AT mux, the uplink queue mapping the modem asks for; the IMS side (SIP, IPsec, VoLTE, SMS, USSD) | the vendor's eccci driver, AT and packet traces under Android | [modem.md](modem.md) |
+| GNSS chip: its protocol and measurements (replacing libmnl), the receiver's registers and gain, the camera clocks as a desense source | libmnl traces, register reads through the WMT debug file | [gnss-open.md](gnss-open.md), gnss-chip.md, gnss-research.md |
+| H.264 encoder (VENC) | `emu_venc.py` | [video-encoder.md](video-encoder.md) |
+| VPU / APU: firmware format, the NN runtime, writing our own DSP programs | `vpuimg.py`, `xtdis.py`, `xtasm.py` | apu.md |
+| Connectivity firmware (Wi-Fi/BT/FM/GPS): the MTKE container, NDS32 sections; monitor mode and injection for AWDL | parsing the firmware files | [drivers/connectivity.md](drivers/connectivity.md), airdrop.md |
+| Fingerprint sensor: chip, wiring and ID reads from the stock `sf_ctl` driver | `vmlinux.elf` symbols and disassembly | fingerprint.md |
+| IR blaster: the PWM block's memory mode | the vendor IRTX driver | [ir.md](ir.md) |
+| NFC (ST21NFC): the driver's NCI transport and the chip's init | the stock driver and the NCI specification | [nfc.md](nfc.md) |
+
+Confidential reference material (`reference/mediatek/`) was read for some
+of these; nothing from it is quoted in the docs.
+
 ## Still to recover
 
-(The touchpad was recovered with this method; see [drivers/touchpad.md](drivers/touchpad.md).)
-
-
-- **Cameras** (OV16880, OV8865): `OV16880_MIPI_RAW_SensorInit` etc.; an
-  earlier session extracted init tables (`ov16880_sensor_init.c`,
-  `extracted_blobs/`). Of limited value without MediaTek's camera HAL.
+- **Fingerprint:** the capture protocol (in the stock HAL, not the kernel
+  driver) and a matcher (fingerprint.md).
+- **Modem power:** what keeps the modem's domain at ~12 mA asleep
+  ([power.md](power.md)).

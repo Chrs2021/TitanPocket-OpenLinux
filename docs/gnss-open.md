@@ -219,7 +219,7 @@ Ruled out since, by A/B inside one session (same satellite, 90 s each):
   mode): Linux has 0x0003, Android 0x0002 (the vendor clock-buffer driver
   clears the bit at boot; nothing in our 6.12 tree touches it). G03 read
   14-20 dB-Hz at 0x0003 and 18-20 at 0x0002. Left at 0x0003.
-- The compositor (titan-comp, the display and GPU on MMPLL, whose half
+- The compositor (the display and GPU on MMPLL, whose half
   frequency is 0.42 MHz from L1): G17 read 21-23 dB-Hz running and 21-23
   stopped.
 

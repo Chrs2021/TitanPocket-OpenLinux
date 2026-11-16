@@ -412,7 +412,7 @@ The **volume keys** (same `mtk-kpd` device) step the speaker amp
 (never full blast), only while the screen is on. The level is kept in
 `/var/lib/titan-audio/volume` and applied when the daemon starts (default
 160; the amp otherwise boots at 255). While `/run/titan-volume-keys.grab` exists, an app
-owns the keys (`titan-remote` sends the TV's volume) and the phone's volume
+owns the keys (the remote-control app sends the TV's volume) and the phone's volume
 is left alone.
 
 **Screenshot:** the red key on the left side (`KEY_RED`, 250: `0xfa` in the
@@ -498,6 +498,17 @@ tagged `power-switch`, and logind's default is **poweroff**), so
   reconnecting in a few seconds. With them off CONNSYS stops holding the
   26 MHz clock, DRAM and the bus; deep sleep measured 7.6 mA lower (53.9
   against 61.5 mA, same image). `TITAN_SLEEP_RADIOS=on` keeps them up.
+- **Sound with the screen off** (2026-11-15): until then titan-powerkey
+  stopped Bluetooth and Wi-Fi and suspended at screen off whatever was
+  playing, so music cut in and out (it played only while something else
+  kept the phone awake) and a Bluetooth headset dropped. Now, while any
+  PipeWire sink is `RUNNING` (`pactl list short sinks`: the speaker, wired
+  headphones, a Bluetooth headset), it doesn't suspend, leaves the radios
+  as they are, takes the big cluster off line (the CPUs with the highest
+  `cpu_capacity`, the A73s; the A53s carry the playback), and looks again
+  every 10 s. When playback stops the radios go off and the phone sleeps as
+  before; the big cores come back at screen on. A paused stream counts as
+  stopped. Not yet measured: the current while playing with the screen off.
 - **Wakelocks and the cable** (2026-11-03, kernel #94): the 6.12 config
   lacked `CONFIG_PM_WAKELOCKS`, so `/sys/power/wake_lock` didn't exist and
   neither the GPS's wakelock nor any other kept the phone awake; it is set
@@ -641,7 +652,7 @@ sleep 0.60 V (awake 0.80), both CPU clusters and their SRAM rails 0.60 V,
 Vmodem 0.55 V, VSRAM_OTHERS 0.85 V; VS1, VS2 and VDRAM1 keep their awake
 levels. Read awake these miss the SSPM's part: for each suspend it lowers
 VSRAM_OTHERS's sleep target to 0.60 V and puts VS1 into low power on
-SRCLKEN0, undoing both on resume ([sspm-firmware.md](sspm-firmware.md)). The sensor hub's hold (Vcore and VSRAM_OTHERS while the SCP's
+SRCLKEN0, undoing both on resume (sspm-firmware.md). The sensor hub's hold (Vcore and VSRAM_OTHERS while the SCP's
 request is up) is 0.60 and 0.85 V, as 4.14 programs it, and the bucks
 follow the SPM's `SRCVOLTEN` (TOP_CLK_CON0 0x134 reads 0x3b0, bit 4 set).
 Whether the rails reach those levels in sleep is not measured: the PMIC's
@@ -656,7 +667,7 @@ GPS flag with them. With an SSPM, the vendor's kernel writes no PMIC sleep
 voltages itself. The Vcore command table the vendor gives the SSPM
 (`SPM_VCORE_PWARP_CMD`) goes to ATF here at boot (`VCOREFS_PWRAP_CMD`).
 What the SSPM does with them is decoded in
-[sspm-firmware.md](sspm-firmware.md): `SUSPEND` reprograms VSRAM_OTHERS and
+sspm-firmware.md: `SUSPEND` reprograms VSRAM_OTHERS and
 VS1 as above and stops the MT6358 RTC's clocks until `RESUME`;
 `SUSPEND_PREPARE`, `POST_SUSPEND` and the Vcore table command do nothing.
 
@@ -698,7 +709,7 @@ PMIC-level reading above. `tools/power/sleepcrash.py` tallies the resets
 (27 of 30 at step 10, 1 in 104 suspends with today's parameters).
 
 **The SSPM's side of that window** (static analysis of its firmware,
-[sspm-firmware.md](sspm-firmware.md), 2026-11-09): from the doorbell until
+sspm-firmware.md, 2026-11-09): from the doorbell until
 it answers `RESUME`, the SSPM keeps the RTC's main and 32k clocks gated
 (`SCK_TOP_CKPDN_CON0` bits 4-5), which is why steps 12, 6 and 7 never
 commit. It also sets VSRAM_OTHERS's sleep target to 0.60 V (level with
@@ -724,7 +735,7 @@ Whether the resets stop is not measured yet (power-testing.md,
 
 ## Rails, domains and clocks (2026-11-15)
 
-[power-rails.md](power-rails.md) maps every MT6358 rail, the SoC's power
+power-rails.md maps every MT6358 rail, the SoC's power
 domains, the PLLs and the unused clocks, with who switches each in a deep
 sleep, and compares 6.12 with 4.14 and with the vendor's suspend table.
 Two results so far. The modem's uplink ring can jam, after which the modem

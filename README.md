@@ -34,7 +34,6 @@ yet run. Its status table and build steps are in that README.
 | `kernel-6.12/` | the Linux 6.12 port: patches against v6.12.115, build and boot-image tools, status |
 | `modules/connectivity/` | out-of-tree MediaTek CONNSYS drivers: WMT core, Wi-Fi, Bluetooth, FM radio, GPS (`linux612/` and `build612.sh`: the 6.12 build) |
 | `modules/camera/` | the camera driver (`v4l2/`: V4L2 + media controller; `linux612/`: its 6.12 version), the pass-2 ISP (`dip/`), bring-up tools (`camprobe/`, `camcap/`) and the ISP register map (`isp/`) |
-| `userspace/` | the programs that drive the connectivity chip (WMT launcher, Bluetooth, FM, Wi-Fi bring-up), the FM radio, camera and photo gallery apps, the libcamera patch, the power/volume keys, charging (log, limit, LED), the microSD card as a USB drive, and the microphone path, with their systemd units |
 | `docs/` | hardware reference, per-driver notes, and how the vendor drivers were reverse-engineered |
 
 ## Hardware support
@@ -50,9 +49,9 @@ yet run. Its status table and build steps are in that README.
 | Charging (MT6370) | BSP | ⚠️ works, not characterized |
 | Speaker amplifier (FourSemi FS1860) | `sound/soc/codecs/fs1860.c` (new) | ✅ |
 | Wi-Fi 2.4 + 5 GHz (CONNSYS gen3) | `modules/connectivity/` | ✅ sleeps with the SoC (power save, suspend mode); monitor mode with frame injection |
-| Bluetooth | `modules/connectivity/bt/` | ✅ BlueZ via raw HCI (`/dev/stpbt`); LE scanning and GATT peripheral connections work (with the supported-commands fix in `titan-btbridge`); controller sleep enabled, so it no longer keeps the connectivity chip awake; classic pairing and audio untested |
-| FM radio (MT6631) | `modules/connectivity/fm/` | ✅ `/dev/fm`; Radio app (`titan-radio-gui`) with RDS (station name, call letters, programme type, radio text) |
-| Headphone jack (MT6358 accdet) | BSP | ✅ plug detection (`SW_HEADPHONE_INSERT`); sound and FM switch to the headphones with their own volume (`titan-speakerd`, [docs/audio.md](docs/audio.md#headphones)) |
+| Bluetooth | `modules/connectivity/bt/` | ✅ BlueZ via raw HCI (`/dev/stpbt`); LE scanning and GATT peripheral connections work (with the supported-commands fix in the HCI relay); controller sleep enabled, so it no longer keeps the connectivity chip awake; classic pairing and A2DP audio through PipeWire work |
+| FM radio (MT6631) | `modules/connectivity/fm/` | ✅ `/dev/fm`: tuning, seek, scan, RDS (station name, call letters, programme type, radio text) |
+| Headphone jack (MT6358 accdet) | BSP | ✅ plug detection (`SW_HEADPHONE_INSERT`); sound and FM switch to the headphones with their own volume ([docs/audio.md](docs/audio.md#headphones)) |
 | IR blaster | BSP `mtk_irtx_pwm` + MT6370 LDO fix | ✅ `/dev/irtx` |
 | NFC (STMicro ST21NFC) | BSP `st21nfc` | ✅ `/dev/st21nfc` (NCI) |
 | USB gadget (serial + network) | BSP | ✅ plus a mass-storage LUN that lends the microSD card to a computer on request |
@@ -252,8 +251,13 @@ that contain them.
 The drivers also need userspace:
 - **Wi-Fi/Bluetooth/FM:** the WMT core needs a launcher that powers the
   chip on and serves the patch download. Bluetooth needs a relay from
-  `/dev/stpbt` to `/dev/vhci` so it appears as BlueZ `hci0`. Both are in
-  [`userspace/`](#userspace-programs).
+  `/dev/stpbt` to `/dev/vhci` so it appears as BlueZ `hci0` (set to the
+  factory address from NVRAM with vendor command `0xFC1A`). Wi-Fi needs the
+  factory NVRAM record handed to the driver before power-on
+  ([docs/drivers/connectivity.md](docs/drivers/connectivity.md)).
+- **Speaker:** the loudspeaker path (I2S clock, then the FS1860 amp) has to
+  be powered while a playback device is open
+  ([docs/audio.md](docs/audio.md)).
 - **GPS:** `libmnl.so` needs a host process that loads it and feeds it
   `/dev/stpgps`, and something to turn its output into NMEA for gpsd. The
   interface (17 callbacks, the `/dev/stpgps` framing) is documented in
@@ -264,60 +268,16 @@ The drivers also need userspace:
 - **NFC:** an NCI stack talking to `/dev/st21nfc`
   ([docs/nfc.md](docs/nfc.md)).
 
-## Userspace programs
+## Userspace
 
-`userspace/` holds what Android's vendor daemons used to do for this
-hardware, rewritten for a plain Linux system (systemd, BlueZ, ALSA).
+The userspace this was brought up with (the daemons that replace Android's
+vendor services, the desktop and the apps) is a separate project, not yet
+released. The docs describe what the hardware needs from it in general
+terms; where they name a program, it belongs to that project.
 
-| Program | What it does |
-|---|---|
-| `titan-wmt` (C) | WMT launcher, replacing Android's `wmt_loader` + `wmt_launcher`. Configures the WMT core, then serves the chip's ROM patch download requests. Everything else on CONNSYS depends on it |
-| `titan-wifi-on` (sh) | loads the Wi-Fi drivers, hands the driver the phone's factory NVRAM record (MAC address, TX power, 5 GHz enable), powers Wi-Fi on and waits for `wlan0` |
-| `titan-btbridge` (C) | relays raw H4 HCI between `/dev/stpbt` and `/dev/vhci`, which creates BlueZ `hci0`. Sets the factory Bluetooth address with vendor command `0xFC1A` |
-| `titan-bt-start` (sh) | loads `bt_drv`, reads the phone's Bluetooth address from NVRAM, starts `titan-btbridge` |
-| `titan-nvram-copy` (sh) | one-time, read-only copy of a factory NVRAM record from Android's `nvdata` partition (kept mode 600: it is unique to the phone) |
-| `titan-fm` (C) | FM tuner on `/dev/fm`: tune, seek, scan, signal strength |
-| `titan-speakerd` (C) | powers the loudspeaker path (I2S clock, then the FS1860 amp) while a speaker playback device is open (samples on device 7, FM on device 21) and switches it off 2 s after they close. Any ALSA or PipeWire playback to device 7 is audible without manual mixer steps |
-| `titan-radio` (sh) | FM on the loudspeaker: holds the FM I2S link open (`titan-speakerd` powers the speaker) and runs `titan-fm` |
-| `titan-radio-gui` (Python 3, GTK 3) | the **Radio** app: frequency dial, seek and step, station scan, favorites, signal meter, volume. Drives `/dev/fm` itself and sets up the FM audio like `titan-radio`; plays while its window is open |
-| `titan-camera-gui` (Python 3, GTK 3, GStreamer) | the **Camera** app: live preview, full-resolution photos, front/rear switch, contrast-detect autofocus with tap to focus, manual focus. Needs libcamera built with `libcamera/build.sh` |
-| `libcamera/` | `build.sh` builds libcamera v0.7.2 on the phone with `0001-titan-pocket.patch`: the `titan-camera` device for the simple pipeline handler, the 4.14 version check, an OV16880 sensor helper, and a `libcamerasrc` crash fix |
-| `spk-hold` (C) | holds an ALSA hostless link open (used by `titan-radio` and `titan-radio-gui` for the FM link) |
-| `titan-powerkey` (Python 3) | power key: screen off + suspend to RAM, wake on the power key only. Volume keys: speaker volume with a safe cap, saved across boots |
-| `titan-wlan-cmd` (C) | sends private commands to the gen3 Wi-Fi driver (e.g. `SETSUSPENDMODE 1`, which titan-powerkey sends at screen-off) |
-| `titan-charge` (Rust) | battery log (`/var/log/titan-charge/`), a charge limit (stops charging at N % through MediaTek's charger manager, resumes 5 % below) and the RGB indicator LED (charging, full or held, a hardware low-battery blink). `cargo build --release`, then `make install-charge` |
-| `titan-usb-storage` (Python 3) | the microSD card as Pictures storage, lent to a computer as a USB mass-storage drive on request (`titan-usb-storage on/off`) |
-| `titan-mic` (sh) | the MT6358 microphone path (DCC mode, main/back/dual, PGA gain); capture is ALSA device 1 |
-| `python/titan_ui.py` | the apps' look (the water membranes and the header), used by the GTK apps |
-| `tools/power/` | sleep tests run on the phone: `sleeptest.py` (an unattended suspend loop with a log of every Wi-Fi frame), `sleepstats.sh`, `wlan-rx-count.py`, `sleepfloor.py` (sleep current per radio setup), `drainlog.sh` and `connlog.py` (battery and connectivity-chip state while in use) ([docs/power.md](docs/power.md)) |
-| `tinymix` | ALSA mixer tool from the bundled tinyalsa, used by `titan-radio` and `titan-powerkey` |
-
-systemd units: `titan-wmt.service` (WMT core), `titan-wifi.service`,
-`titan-bt.service` (both need `titan-wmt`), `titan-powerkey.service`,
-`titan-speaker.service`, `titan-usb-storage.service`, `titan-charge.service`.
-
-Build and install on the phone (or cross-compile with
-`CC=aarch64-linux-gnu-gcc`; `LDFLAGS=-static` for static binaries):
-
-```sh
-cd userspace
-make
-sudo make install            # /usr/local/{bin,sbin}, /etc/systemd/system
-sudo systemctl enable --now titan-speaker titan-wmt titan-wifi titan-bt titan-powerkey
-```
-
-The connectivity modules must be installed (`/lib/modules/$(uname -r)/`,
-then `depmod`), and the firmware from the table above must be in
-`/lib/firmware`. `titan-powerkey` needs Python 3 (standard library only);
-`titan-radio-gui` needs Python 3 with GTK 3 (`python3-gi`, `gir1.2-gtk-3.0`)
-and a Wayland or X session.
-
-**tinyalsa:** `third_party/tinyalsa/` is tinyalsa 2.0.0 (BSD-3-Clause, see
-its `LICENSE`) with one fix applied
-(`third_party/tinyalsa-0001-rw-sync-ptr-keep-kernel-appl.patch`). In
-read/write mode, tinyalsa let `SYNC_PTR` overwrite the kernel's
-application pointer, so the stream rewound on this kernel and audio got
-overwritten. Debian 12 doesn't package tinyalsa.
+**tinyalsa:** in read/write mode, tinyalsa 2.0.0 let `SYNC_PTR` overwrite
+the kernel's application pointer, so the stream rewound on this kernel and
+audio got overwritten; the userspace carries a one-line fix.
 
 ## Known limitations
 
@@ -360,8 +320,8 @@ overwritten. Debian 12 doesn't package tinyalsa.
 | [drivers/fs1860.md](docs/drivers/fs1860.md) | speaker amplifier |
 
 The docs are working notes from bringing up a real device. Some of them
-mention apps (desktop, IR, NFC, GPS and camera tools) and build helpers that are not part
-of this repository.
+mention programs and build helpers from the userspace project, which is not
+part of this repository.
 
 ## License
 
@@ -370,5 +330,4 @@ of this repository.
 - The connectivity modules are GPL-2.0 or "Dual BSD/GPL", as marked in
   each source file. The reconstructed platform files keep the GPL-2.0
   header of the MediaTek code they reimplement.
-- `userspace/third_party/tinyalsa/` is BSD-3-Clause (its `LICENSE`).
 - No vendor firmware, calibration data or NVRAM content is included.

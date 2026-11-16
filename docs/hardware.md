@@ -176,7 +176,7 @@ raw readings). Both are saved in `~/.local/share/titan-sensors/`.
 On Linux 6.12 our `mt6771-scp` driver runs the same hub and gives each
 sensor as an IIO device (`scp-accel`, `scp-gyro`, `scp-magn`, `scp-light`,
 `scp-proximity`); `titan_sensors.py` reads those there
-([mainline.md](mainline.md), subsystem table). The SCP's log names the
+(mainline.md, subsystem table). The SCP's log names the
 chips: a Senodia SH3001 accelerometer/gyroscope.
 
 ## Light and proximity sensors

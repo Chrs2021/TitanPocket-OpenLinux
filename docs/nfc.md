@@ -3,7 +3,7 @@
 Status (2026-10-12): the controller initializes and reports its identity;
 NDEF read works for NFC Forum Type 2 / Type 4 / Type 5 tags, NDEF write for
 Type 2 (NTAG / MIFARE Ultralight), and dumps MIFARE Classic cards with a key
-dictionary (`classic-dump`). A GTK app (`titan-nfc-gui`, in the app drawer)
+dictionary (`classic-dump`). A GTK app
 and a terminal UI (`titan-nfc tui`) drive it. **Needs on-device testing with
 real tags.**
 
@@ -97,15 +97,6 @@ and the GTK app sets it explicitly. Card size comes from the SAK
 (`TITAN_NFC_CARD=mini|1k|2k|4k` overrides). MIFARE Classic is kept **out** of
 the general polling discovery map (the ST21NFC rejects proto `0x80` there,
 see below); `classic-dump` reaches the card through its own path.
-
-### The apps
-
-**NFC** in the app drawer launches `titan-nfc-gui` (GTK 4 with `titan_ui4`, same toolkit as
-the other apps). It runs `titan-nfc watch` and shows tapped tags live (type,
-UID, NDEF). The mode buttons: **Read**, **Write URL**, **Write Text**, and
-**MIFARE** — which stops scanning, and on **Dump card** runs `classic-dump`
-(with the key dictionary) and streams the sector dump into a scrollable
-view. Writing and dumping own the controller, so they pause scanning.
 
 ### The terminal UI
 

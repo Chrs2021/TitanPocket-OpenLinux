@@ -6,7 +6,7 @@ replaces the 4.14 BSP kernel in `kernel/`: upstream drivers wherever
 the MT6771's blocks match the MT8183's (they mostly do), and our own
 drivers where the hardware is board-specific or MediaTek never
 upstreamed it. It boots the same Debian 12 system as the 4.14 kernel,
-with the Weston desktop.
+with its Wayland desktop.
 
 The work is in progress; see the table below for what works.
 
@@ -30,22 +30,29 @@ modules (`videodev`, `mc`, `videobuf2-*`): install those with it.
 
 | Patch | What |
 |---|---|
-| 0001 soc-mediatek | MCDI (CPU power-down with the SSPM), SPM (resource requests, suspend through the SPM firmware), SCP sensor hub (IIO), LK framebuffer handover |
-| 0002 cpu-power | MT6771 CPU and CCI frequency tables |
-| 0003 pmdomain | the CONN power domain stays on through suspend |
-| 0004 pmic | MT6358 VA09 regulator; MT6397 RTC reboot modes as LK reads them; MT6358 AUD/MISC interrupts dispatched (XPP bit); accdet cell |
-| 0005 ufs | MT6771 UFS host (UniPro 1.6) |
-| 0006 usb | forced VBUS session that follows the Type-C role; USB set up again after a deep-sleep reset |
-| 0007 watchdog | the watchdog stops in suspend when the bootloader left it running |
-| 0008 i2c | the multi-channel I2C controller's mode restored through ATF |
-| 0009 keyboard | AW9523 and matrix-keypad locking fixes for I2C GPIO expanders |
-| 0010 power-supply | OZ8806 fuel gauge; MT6370 charging policy |
-| 0011 display | firmware-framebuffer handover, DSI interrupt order, Synaptics R63308 panel |
-| 0012 ir | IR transmitter on the PWM block |
-| 0013 audio | machine driver, FS1860 amplifier, AFE hardware gain and FM paths, modem voice links (PCM 2), PCM rate fix, MT6358 jack detection |
-| 0014 dts | `mt6771.dtsi` and `mt6771-unihertz-titan-pocket.dts` |
-| 0015 config | `titanpocket.config`, a fragment over arm64 `defconfig` |
-| 0016 leds-flash | MT6370 flash: strobe timeout written at probe |
+| 0001 soc-mediatek | MCDI (CPU power-down with the SSPM), SPM (resource requests, suspend through the SPM firmware, the PLLs' sleep control, unused PLLs off), SCP sensor hub (IIO), LK framebuffer handover |
+| 0002 cpu-power | MT6771 CPU and CCI frequency tables, SVS |
+| 0003 iommu | MT6771 data with the VPU's fixed IOVA window |
+| 0004 pmdomain | the CONN power domain stays on through suspend |
+| 0005 pmic | MT6358 VA09 regulator; MT6397 RTC reboot modes as LK reads them; MT6358 AUD/MISC interrupts dispatched (XPP bit); accdet cell |
+| 0006 ufs | MT6771 UFS host (UniPro 1.6) |
+| 0007 usb | forced VBUS session that follows the Type-C role; USB set up again after a deep-sleep reset |
+| 0008 watchdog | the watchdog stops in suspend when the bootloader left it running |
+| 0009 i2c | the multi-channel I2C controller's mode restored through ATF |
+| 0010 keyboard | AW9523 and matrix-keypad locking fixes for I2C GPIO expanders |
+| 0011 power-supply | OZ8806 fuel gauge; MT6370 charging policy |
+| 0012 display | firmware-framebuffer handover, DSI interrupt order, Synaptics R63308 panel |
+| 0013 ir | IR transmitter on the PWM block |
+| 0014 audio | machine driver, FS1860 amplifier, AFE hardware gain and FM paths, modem voice links (PCM 2), PCM rate fix, MT6358 jack detection |
+| 0015 dts | `mt6771.dtsi` and `mt6771-unihertz-titan-pocket.dts` |
+| 0016 config | `titanpocket.config`, a fragment over arm64 `defconfig` |
+| 0017 leds-flash | MT6370 flash: strobe timeout written at probe |
+| 0018 pmdomain-md1 | the MT6771 power controller with the modem's domain (MD1) |
+| 0019 modem | the MT6771 modem: CCCI over CCIF, the AT mux as WWAN ports, network data over CLDMA (`ccmniN`), exception handshake and devcoredump |
+| 0020 vdec | the MT6771 H.264 decoder (in progress) |
+| 0021 panfrost | the GPU clock unprepared for system suspend, so its PLL stops |
+| 0022 pmic-keys | the MT6358's reset register with the MT6331's layout |
+| 0023 spidev | spidev for the fingerprint sensor on SPI0 |
 
 ## Building
 
@@ -123,7 +130,7 @@ logs what the kernel found and returns to fastboot.
 | Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; 23 mA with the modem stopped, 39 mA with it registered and VoLTE up (4.14 reached 12 mA), with the SCP asleep and the A73 buck cut (2026-11-05), 37.5 mA in everyday standby on #136 (2026-11-15); the occasional reset was a hung wake (CPU 0 not restarting after a sleep of a minute or more), fixed on test by putting the CPU PLLs under the hardware's sleep control across each sleep (`mt6771_spm.pll_sleep=2`, the default): 0 resets in 100 long sleeps against 1 in 45 without it; unused PLLs (TVDPLL, the audio PLLs, the GPU's in system suspend) are off; what the SPM firmware does: `docs/spm-firmware.md` |
 | Cameras (OV16880, OV8865) | `modules/camera/linux612/` (CAMSV, CAM A statistics, the DIP) | ✅ both at 30 fps through the hardware ISP, auto exposure and white balance, libcamera; the flash is not enabled |
 | NFC (ST21NFC) | `modules/nfc/linux612/` (`/dev/st21nfc`) | ✅ tags read; the controller and its 26 MHz clock buffer are off while the device is closed |
-| Cellular modem | `modules/modem/linux612/` (`titan_modem`) | ✅ registers on LTE under ModemManager, IPv6 data over CLDMA, IPv4 through 464XLAT, IMS registration and first calls with our own client (`userspace/sbin/titan-ims`) (`tools/modem/ltedata.py`); SMS, USSD and emergency calls not done |
+| Cellular modem | `drivers/net/wwan/mt6771` (`titan_modem`, patch 0019) | ✅ registers on LTE under ModemManager, IPv6 data over CLDMA, IPv4 through 464XLAT; VoLTE calls, SMS and USSD with an IMS client in userspace; a call wakes the phone from deep sleep. Emergency calls not supported |
 
 ## Firmware
 

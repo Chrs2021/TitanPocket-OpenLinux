@@ -111,10 +111,9 @@ device appears, after `90-alsa-restore.rules` (whose restore of the saved
 state switched them off again when the rule ran first). ASoC's DAPM powers
 the amp, so `titan-speaker.service` doesn't run there
 (`ConditionPathExists=!/proc/asound/titanpocket`). Verified: a tone through
-`pw-play` ran DL1 at 48 kHz S16_LE and was heard from the speaker. Not yet
-on 6.12: headphones (no jack detection).
+`pw-play` ran DL1 at 48 kHz S16_LE and was heard from the speaker.
+Headphones on 6.12: `titan-headphones`, see "Headphones on Linux 6.12".
 
-**FM on 6.12 goes through PipeWire** (the Radio app, `titan-radio-gui`):
 the udev rule also routes the CONNSYS I2S to UL2 (`UL2_CH1/2
 CONNSYS_I2S_CH1/2`), and while the radio is on the app pipes `arecord` from
 `hw:CARD=titanpocket,DEV=3` (WAV, 48 kHz S16 stereo) into `pw-cat`, a
@@ -150,7 +149,7 @@ level used to be written to it one to one: 100 % was -15.5 dB, 40 % was
 the top third. Now the level spreads 42 dB below 100 %, like the
 headphones: amp = 224 - 84 x (1 - level / 224), 1.5 dB per volume-key step;
 40 % is 25 dB below full. `amp_value()` in `titan-powerkey` and
-`titan-mixer`, the same in `titan-speakerd` (`SPK_RANGE_DB`). The level
+The mixer, the same in `titan-speakerd` (`SPK_RANGE_DB`). The level
 file keeps its meaning; only what reaches the amp changed, so a saved level
 now plays louder below the top.
 
@@ -158,8 +157,9 @@ now plays louder below the top.
 |---|---|---|
 | Side rocker and headset buttons (`titan-powerkey`, from every input device with volume keys: `mtk-kpd`, `ACCDET`) | before each step | file + amp |
 | Top-bar indicator (desktop shell) | inotify on the file | - |
-| **Sound** app, "All apps" (`titan-mixer`) | file monitor | file + amp |
+| The mixer | file monitor | file + amp |
 | `titan-speakerd` | every time it powers the amp on; with headphones, on every change | amp, or the headphone gain; on a jack change it swaps the file with `volume.speaker` / `volume.headphones` |
+| `titan-headphones` (6.12) | with headphones, on every change | the headphone gain (codec step + sink); on a switch the amp from the speaker's level, and the file swap as above |
 | `titan-powerkey` at start and after resume | file | amp |
 | FM (`titan-radio`) | follows the amp (FM bypasses PipeWire) | - |
 
@@ -172,7 +172,7 @@ Two traps this closes:
   file, indicator and mixer all showed the saved level. `titan-speakerd` now
   re-applies the level right after it opens the amp link. (A kernel-side fix
   would be to cache the volume in the driver and restore it after init.)
-- **A stale volume-key grab.** `titan-remote` takes the volume keys (for a
+- **A stale volume-key grab.** the remote-control app takes the volume keys (for a
   TV's volume) while it's focused, through `/run/titan-volume-keys.grab`. If
   it was killed (desktop restart, crash), the file stayed and the keys were
   dead until reboot. The file now holds the Remote's PID, and
@@ -184,13 +184,13 @@ scaling everything down. The mixer re-pins them when it runs and every volume
 key press does too (at most every 10 s). Per-app volume and mute are PipeWire
 stream volumes; WirePlumber remembers them.
 
-`titan-mixer` uses `pactl` (`pulseaudio-utils`): `pactl subscribe` for live
+The mixer uses `pactl` (`pulseaudio-utils`): `pactl subscribe` for live
 updates, JSON listings, `set-sink-input-*`.
 
 The earpiece has its own level, apart from the master: the codec's handset
 gain (`Handset Volume`, -10 to +8 dB in 1 dB steps), used only by calls.
 `titan-ims` keeps it in `/var/lib/titan-ims/earpiece-db` and sets it when a
-call starts on the earpiece; the volume keys in a call and the Sound app's
+call starts on the earpiece; the volume keys in a call and the mixer's
 "Earpiece" slider change it (docs/modem.md, "Call volume"). Measured 2026-11-15 with no call (a -20 dBFS 1 kHz tone through
 PipeWire on the earpiece route, the main mic at 24 dB preamp, 1.5 s
 Goertzel at 1 kHz): -10 dB gave -78.6 dBFS at the mic, -7 dB -75.4, -4 dB
@@ -198,32 +198,13 @@ Goertzel at 1 kHz): -10 dB gave -78.6 dBFS at the mic, -7 dB -75.4, -4 dB
 steps come out as about 3 dB. (Start the tone before the capture: capture
 overruns by about 0.5 s when DL1 starts.)
 
-### UI sounds (2026-10-28)
-
-`userspace/debian/sounds/gen-sounds.py` synthesizes them at build time into
-`/usr/local/share/titan/sounds` (48 kHz mono, peaks about -10 dBFS, so the
-speaker level sets their loudness):
-
-- `vol-up.wav`: a quick, glassy major arpeggio rising to the octave
-  (C5 E5 G5 C6, 55 ms apart). `titan-powerkey` plays it on a volume step up,
-  at the level just set.
-- `vol-down.wav`: a slower, rounder minor arpeggio falling (G5 Eb5 C5, 85 ms
-  apart). The two first differed only in major vs minor and sounded alike;
-  direction, register, timbre and pace now tell them apart.
-- `pop.wav`: the lock screen's bubble popping (a chirp from 380 Hz up toward
-  1.9 kHz, a 3 ms click), played by the shell as the bubble bursts.
-
-No tone at the ends of the range, when muted or with the screen off; a
-held key's step cuts the previous tone short. They play with `pw-play` in
-PipeWire's session (`XDG_RUNTIME_DIR=/run/user/0`).
-
-**A sleeping speaker.** `titan-speakerd` notices the PCM open within its
-200 ms poll and needs ~50 ms more to start the amp, so a short sound played
-to a sleeping speaker was lost. Each sound also comes as `NAME-cold.wav`,
-with 0.3 s of silence first, played when
-`/proc/asound/card0/pcm7p/sub0/status` reads `closed`. The lock screen also
-plays `wake.wav` (0.6 s of silence) when the bubble is pressed, so the
-speaker is usually on by the time it pops.
+While the default output is a Bluetooth device's (a `bluez_output.*` sink),
+the volume keys step that sink instead of the speaker level (2026-11-15,
+`titan-powerkey`): a sixteenth (6.25 %) a press, 0-100 %, unmuting on
+volume up, without the key tones (they would play in the ears). PipeWire
+passes the sink volume to the device as AVRCP absolute volume while audio
+flows (a Bluetooth headset: 30 % gave 38 of 127). The panel's volume indicator still
+shows the speaker level; the mixer's Bluetooth row follows the keys.
 
 ## Headphones
 
@@ -250,7 +231,7 @@ something plays moves the sound over. FM follows too; the headphone cable
 is also the FM antenna.
 
 **Volume per output:** the shared level file keeps working for the volume
-keys, the Sound app and the panel indicator, but it follows the output in
+keys, the mixer and the panel indicator, but it follows the output in
 use. On a jack change `titan-speakerd` saves the level to
 `volume.speaker` or `volume.headphones` and loads the other one;
 `volume.output` says whose level the file holds. For the headphones the
@@ -264,7 +245,7 @@ daemon applies the level itself, whenever the file changes:
   step at or above the target (−10, −9 or −8 dB), and **PipeWire's sink
   volume** takes the rest (`pactl set-sink-volume @DEFAULT_SINK@`, linear;
   the speaker is off meanwhile). Back on the speaker the sink returns to
-  100 %; the Sound app, which otherwise keeps the sink at 100 %, leaves it
+  100 %; the mixer, which otherwise keeps the sink at 100 %, leaves it
   alone while `volume.output` is `headphones`.
 - FM bypasses PipeWire, so on headphones its fine level is the Radio app's
   own (AFE) gain; the volume keys move only the codec step for it.
@@ -272,6 +253,72 @@ daemon applies the level itself, whenever the file changes:
 - The top bar shows a headphone icon while they're in use, and the volume
   indicator shows headphones instead of a speaker
   (desktop.md).
+
+### Headphones on Linux 6.12
+
+The jack is detected by the kernel (our `mt6358-accdet`, below) and the
+headphone route works, but on 6.12 nothing switched to it until
+2026-11-16: `titan-speakerd` is 4.14 only, so sound stayed on the
+loudspeaker with headphones in. `titan-headphones`
+(`userspace/titan-phone/src/bin/titan-headphones.rs`, Rust,
+`titan-headphones.service`, `ConditionPathExists=/proc/asound/titanpocket`)
+handles them, with a sink of their own so each app can play on either:
+
+- **Routes.** The loudspeaker keeps DL1 (`hw:0,0`, PipeWire's
+  `titan-speaker` behind the limiter) through I2S3. While something is in
+  the jack, DL2 (`hw:0,1`, otherwise used only by the modem loop test) goes
+  to the codec (`ADDA_DL_CH1/2 DL2_CH1/2`) and the headphone muxes (`HPL/HPR
+  Mux` Audio Playback); DL1 stays off the codec. Pulled out, DL2's routes and
+  the muxes go off. The jack is the "titanpocket Headset Jack" input device
+  (`SW_HEADPHONE_INSERT`, `SW_MICROPHONE_INSERT`, `SW_LINEOUT_INSERT`), read
+  300 ms after an event, past the plug's ring crossing the mic contact.
+- **Sink.** `titan-headphones` ("Headphones"), an ALSA adapter on DL2 with
+  the speaker's settings (no mmap, 4 x 1024 frames), created by a `pw-cli`
+  the daemon keeps running (`create-node adapter {...}` on its stdin): the
+  sink lives as long as that process, so it goes when the headphones are
+  pulled out, and the daemon makes it again if PipeWire restarts.
+  pipewire-pulse 0.3.65 has no `module-alsa-sink`, and a one-shot `pw-cli
+  create-node` exits before the node exists. The values must be quoted
+  (`api.alsa.path="hw:CARD=titanpocket,DEV=1"`): SPA JSON reads `:` as a
+  separator, and unquoted the path came out as `hw`, i.e. DL1 (logged as
+  `'hw': playback open failed: Device or resource busy` while DL1 played).
+- **Plugging in** makes the sink PipeWire's default and moves the apps on
+  the speaker (`titan-speaker-limited`'s streams, not the limiter's own) to
+  it, after DL2's routes are up and before DL1 leaves the codec. Afterwards
+  the mixer moves the default or single apps between the speaker, the
+  headphones and Bluetooth like any outputs; WirePlumber remembers an app's
+  choice. Pulled out, the sink goes, its apps fall back, and the default
+  returns to the speaker.
+- **Levels.** Each output keeps its own, as on 4.14 (`volume.speaker`,
+  `volume.headphones`, `volume.output`), and the shared level file belongs
+  to the default: the headphones' while their sink is the default (followed
+  through `pactl subscribe`), else the speaker's. The headphone curve is
+  4.14's: full scale −8 dB, 1.5 dB a key step. The 6.12 control is
+  `Headphone Volume` (0..18 = −10..+8 dB), so it takes 0, 1 or 2 and the
+  headphones' sink the rest, as a linear factor: `pactl` reads a signed dB
+  value (`-28dB`) as a step from the current volume, which once sent a sink
+  to −88 dB. While the level is the headphones', `titan-powerkey` and the
+  mixer leave the speaker's amp alone; the speaker's sinks stay at
+  100 %.
+- **Calls** switch these routes themselves (the UCM profile's devices) and
+  put the speaker back when they end (`titan-ims` re-enables `Speaker`). The
+  daemon subscribes to the card's control events; when one of its routes
+  changes and no call is on (no `titan-call-audio run`, no `pw-cat` with the
+  Phone role), it puts them back 1.5 s later. During a call it switches
+  nothing; a plug or unplug waits for the call's end.
+
+Measured on the phone, first version (one sink for both, 2026-11-16): the
+switch, the level swap (speaker 115 saved, headphones 48 loaded: `Headphone
+Volume` 0, sink −31 dB, −41 dB in all), levels 64 and 224 (−28 dB; `Headphone
+Volume` 2 and 0 dB), the volume keys, and routes changed by hand as a call
+would, put back within 2.5 s. The two-sink version (headphones in,
+Chromium playing on the speaker's sink): on start the `titan-headphones` sink
+came up on DL2 (`pcm1p` RUNNING, `pcm0p` closed), became the default, and
+Chromium's stream moved to it; the speaker's sinks idle at 100 %, DL1 off
+the codec; level 40 gave `Headphone Volume` 0 and the sink −32.5 dB
+(−42.5 dB in all). Not yet tried: an app moved to the speaker by touch,
+both playing at once, a call with headphones in, plugging and unplugging
+under the daemon.
 
 ## Microphones
 
