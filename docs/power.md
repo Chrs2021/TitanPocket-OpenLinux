@@ -503,7 +503,10 @@ tagged `power-switch`, and logind's default is **poweroff**), so
   (BTIF) gates its clocks while the connectivity chip sleeps, I2C runs from
   26 MHz, the sensor hub's clock mux is parked on 26 MHz, and the USB
   controller sleeps with the cable out; all of these let the SoC's idle
-  states in.
+  states in. Deep sleep with the modem registered and VoLTE up then
+  measured 28.5 mA over 20 minutes (#151, one run; 37-39 mA before),
+  probably because UNIVPLL, which nothing hands to the SPM for sleep on
+  6.12, is now off when the phone suspends.
 - **Screen off is a minimal system** on 6.12: `titan-powerkey` switches the
   Wi-Fi and Bluetooth functions off on the chip (`titan-bt` stopped, 0 to
   `/dev/wmtWifi`) and back on at screen on, only those that were on, Wi-Fi
