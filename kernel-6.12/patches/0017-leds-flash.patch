@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 17/22] leds: flash: mt6370: write the strobe timeout at probe
+Subject: [PATCH 17/23] leds: flash: mt6370: write the strobe timeout at probe
 
 The strobe timeout register is shared between the channels. Without
 this it holds the reset value, not the value sysfs reports.

@@ -62,6 +62,11 @@ cd "$OUT/repack"
 #   them given in EXTRA_CMDLINE wins (e.g. mt6771_scp.sleep=0);
 #   SLEEP=s2idle gives suspend to idle instead (no SPM firmware), as
 #   before 2026-11-05;
+#   with deep, the SPM's SoC idle states from cpuidle as well
+#   (mt6771_spm.sodi=1 mt6771_spm.sodi3=1, since 2026-11-17: SODI with the
+#   screen on, SODI3 with it off and the phone awake; docs/mainline.md,
+#   "Screen-on idle (SODI, SODI3) and the screen off"); =0 in
+#   EXTRA_CMDLINE switches either off;
 # - EXTRA_CMDLINE is appended as is (bisecting, e.g. initcall_blacklist=).
 # (dt_idle_states.off=1 would start the device tree's idle states disabled,
 # WFI only, for testing new ones from the shell; cpufreq.default_governor=
@@ -89,6 +94,14 @@ if [ "${DEBIAN:-}" = 1 ]; then
 	      case " ${EXTRA_CMDLINE:-} " in
 	      *" mt6771_spm.pcm_flags1="*) ;;
 	      *) flags="$flags mt6771_spm.pcm_flags1=0x300" ;;
+	      esac
+	      case " ${EXTRA_CMDLINE:-} " in
+	      *" mt6771_spm.sodi="*) ;;
+	      *) flags="$flags mt6771_spm.sodi=1" ;;
+	      esac
+	      case " ${EXTRA_CMDLINE:-} " in
+	      *" mt6771_spm.sodi3="*) ;;
+	      *) flags="$flags mt6771_spm.sodi3=1" ;;
 	      esac ;;
 	*) echo "SLEEP: deep or s2idle" >&2; exit 1 ;;
 	esac

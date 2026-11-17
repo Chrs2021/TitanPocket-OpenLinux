@@ -1283,6 +1283,7 @@ WLAN_STATUS wlanProcessCommandQueue(IN P_ADAPTER_T prAdapter, IN P_QUE_T prCmdQu
 	P_CMD_INFO_T prCmdInfo;
 	P_MSDU_INFO_T prMsduInfo;
 	ENUM_FRAME_ACTION_T eFrameAction = FRAME_ACTION_DROP_PKT;
+	UINT_32 u4BlockedTc = 0;	/* Titan: TCs that ran out of resources in this pass */
 
 	KAL_SPIN_LOCK_DECLARATION();
 
@@ -1310,6 +1311,18 @@ WLAN_STATUS wlanProcessCommandQueue(IN P_ADAPTER_T prAdapter, IN P_QUE_T prCmdQu
 			"CMD: CID=0x%x, SEQ=%d, CMD type=%d\n",
 			prCmdInfo->ucCID, prCmdInfo->ucCmdSeqNum,
 			prCmdInfo->eCmdType);
+		/*
+		 * Titan: a TC out of resources holds back only its own commands,
+		 * in order. Data frames injected on the monitor interface go
+		 * through this queue on an LMAC TC (TC1); they used to wait
+		 * behind management frames for the firmware's TC4 and reached
+		 * the air seconds late.
+		 */
+		if (u4BlockedTc & BIT(nicTxGetCmdResourceType(prCmdInfo))) {
+			QUEUE_INSERT_TAIL(prMergeCmdQue, prQueueEntry);
+			QUEUE_REMOVE_HEAD(prTempCmdQue, prQueueEntry, P_QUE_ENTRY_T);
+			continue;
+		}
 		switch (prCmdInfo->eCmdType) {
 		case COMMAND_TYPE_NETWORK_IOCTL:
 			if (prCmdInfo->ucCID == CMD_ID_ADD_REMOVE_KEY) {
@@ -1382,12 +1395,13 @@ WLAN_STATUS wlanProcessCommandQueue(IN P_ADAPTER_T prAdapter, IN P_QUE_T prCmdQu
 			rStatus = wlanSendCommandMthread(prAdapter, prCmdInfo);
 
 			if (rStatus == WLAN_STATUS_RESOURCES) {
-				/* no more TC4 resource for further transmission */
+				/* no more resource of this TC for further transmission */
 				DBGLOG(TX, WARN, "NO Resource for CMD TYPE[%u] ID[0x%02X] SEQ[%u]\n",
 				       prCmdInfo->eCmdType, prCmdInfo->ucCID, prCmdInfo->ucCmdSeqNum);
 
 				QUEUE_INSERT_TAIL(prMergeCmdQue, prQueueEntry);
-				break;
+				/* Titan: go on with the other TCs (see above) */
+				u4BlockedTc |= BIT(nicTxGetCmdResourceType(prCmdInfo));
 			} else if (rStatus != WLAN_STATUS_SUCCESS && rStatus != WLAN_STATUS_PENDING) {
 				P_CMD_INFO_T prCmdInfo = (P_CMD_INFO_T) prQueueEntry;
 

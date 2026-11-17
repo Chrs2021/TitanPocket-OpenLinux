@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 19/22] net: wwan: add the MT6771 modem (MD1)
+Subject: [PATCH 19/23] net: wwan: add the MT6771 modem (MD1)
 
 titan_modem boots the modem image the bootloader loaded, runs the CCCI
 handshakes over CCIF, carries the AT channels as WWAN ports (a 27.010
@@ -14,8 +14,8 @@ stalled, flushed.
  drivers/net/wwan/Kconfig              |   17 +
  drivers/net/wwan/Makefile             |    1 +
  drivers/net/wwan/mt6771/Makefile      |    2 +
- drivers/net/wwan/mt6771/titan_modem.c | 3235 +++++++++++++++++++++++++
- 4 files changed, 3255 insertions(+)
+ drivers/net/wwan/mt6771/titan_modem.c | 3306 +++++++++++++++++++++++++
+ 4 files changed, 3326 insertions(+)
 
 diff --git a/drivers/net/wwan/Kconfig b/drivers/net/wwan/Kconfig
 index 410b0245114e892808f1a445e34f954376e5d2ae..e718ce454cde5d17f54ef242e216dad27b54fcf1 100644
@@ -64,10 +64,10 @@ index 0000000000000000000000000000000000000000..b87597741f71a6f66c8690096673e8a3
 +obj-$(CONFIG_MTK_MT6771_MODEM) += titan_modem.o
 diff --git a/drivers/net/wwan/mt6771/titan_modem.c b/drivers/net/wwan/mt6771/titan_modem.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..ac5c74717765cdd1f4762e16dde8a5b2ac9bcfcf
+index 0000000000000000000000000000000000000000..4933100cb8d1d8ea8d08cae0cab3c8cf2e20b974
 --- /dev/null
 +++ b/drivers/net/wwan/mt6771/titan_modem.c
-@@ -0,0 +1,3235 @@
+@@ -0,0 +1,3306 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 modem (MD1): power it on, start the image LK left in memory, do
@@ -111,6 +111,7 @@ index 0000000000000000000000000000000000000000..ac5c74717765cdd1f4762e16dde8a5b2
 +#include <linux/clk.h>
 +#include <linux/completion.h>
 +#include <linux/debugfs.h>
++#include <linux/ctype.h>
 +#include <linux/delay.h>
 +#include <linux/devcoredump.h>
 +#include <linux/dma-mapping.h>
@@ -622,6 +623,13 @@ index 0000000000000000000000000000000000000000..ac5c74717765cdd1f4762e16dde8a5b2
 +	struct work_struct rx_work;
 +	spinlock_t tx_lock;
 +	u16 tx_seq[CCCI_CH_MAX];
++	/* what arrives, for debugfs "rx": packets per CCCI channel, frames per mux
++	 * DLCI, and the names of the AT lines (the text before ':', nothing after
++	 * it: no identities or cell IDs), counted
++	 */
++	u32 rx_ch[CCCI_CH_MAX];
++	u32 rx_dlci[64];
++	struct { char tag[16]; u8 dlci; u32 n; } rx_tag[64];
 +
 +	struct dentry *debugfs;
 +	struct debugfs_blob_wrapper smem_blob, sram_blob, ccb_blob, dsp_blob;
@@ -1558,6 +1566,44 @@ index 0000000000000000000000000000000000000000..ac5c74717765cdd1f4762e16dde8a5b2
 +	return at_send_raw(md, f, p - f);
 +}
 +
++/* "\r\n+CEREG: 2,1,..." -> "+CEREG": the name of each AT line in a frame, counted */
++static void rx_tag_count(struct titan_md *md, u8 dlci, const u8 *d, u32 n)
++{
++	u32 at = 0, k, j;
++	char t[16];
++
++	while (at < n) {
++		while (at < n && (d[at] == '\r' || d[at] == '\n'))
++			at++;
++		if (at >= n)
++			break;
++		for (j = 0; j < sizeof(t) - 1 && at + j < n; j++) {
++			u8 c = d[at + j];
++
++			if (c == ':' || c == '\r' || c == '\n' || c == ' ' || c == '=')
++				break;
++			t[j] = isalnum(c) || c == '+' || c == '*' || c == '^' ? c : '?';
++		}
++		t[j] = 0;
++		/* reports and final results; not the echo, which comes in pieces */
++		if ((j >= 2 && (t[0] == '+' || t[0] == '*' || t[0] == '^')) ||
++		    !strcmp(t, "OK") || !strcmp(t, "ERROR") || !strcmp(t, "RING")) {
++			for (k = 0; k < ARRAY_SIZE(md->rx_tag); k++) {
++				if (!md->rx_tag[k].n) {
++					strscpy(md->rx_tag[k].tag, t);
++					md->rx_tag[k].dlci = dlci;
++				}
++				if (md->rx_tag[k].dlci == dlci && !strcmp(md->rx_tag[k].tag, t)) {
++					md->rx_tag[k].n++;
++					break;
++				}
++			}
++		}
++		while (at < n && d[at] != '\r' && d[at] != '\n')
++			at++;
++	}
++}
++
 +static void mux_frame(struct titan_md *md, u8 dlci, u8 ctrl, u8 *d, u32 n)
 +{
 +	struct sk_buff *skb;
@@ -1586,6 +1632,9 @@ index 0000000000000000000000000000000000000000..ac5c74717765cdd1f4762e16dde8a5b2
 +		}
 +		return;
 +	}
++	if (dlci < ARRAY_SIZE(md->rx_dlci))
++		md->rx_dlci[dlci]++;
++	rx_tag_count(md, dlci, d, n);
 +	for (i = 0; i < AT_CHANS; i++) {
 +		struct at_chan *c = &md->at[i];
 +
@@ -1833,6 +1882,8 @@ index 0000000000000000000000000000000000000000..ac5c74717765cdd1f4762e16dde8a5b2
 +				       skb_put(skb, n), n);
 +			ring_consume(rb, n);
 +			h = (struct ccci_header *)skb->data;
++			if (h->channel < CCCI_CH_MAX)
++				md->rx_ch[h->channel]++;
 +			if (h->channel == CCCI_CONTROL_RX)
 +				control_rx(md, h, n);
 +			if (h->channel == CCCI_UART2_RX &&
@@ -2465,6 +2516,25 @@ index 0000000000000000000000000000000000000000..ac5c74717765cdd1f4762e16dde8a5b2
 +	return 0;
 +}
 +
++static int rx_show(struct seq_file *m, void *unused)
++{
++	struct titan_md *md = dev_get_drvdata(m->private);
++	u32 i;
++
++	seq_puts(m, "ccci channel packets:");
++	for (i = 0; i < CCCI_CH_MAX; i++)
++		if (md->rx_ch[i])
++			seq_printf(m, " %u:%u", i, md->rx_ch[i]);
++	seq_puts(m, "\nmux dlci frames:");
++	for (i = 0; i < ARRAY_SIZE(md->rx_dlci); i++)
++		if (md->rx_dlci[i])
++			seq_printf(m, " %u:%u", i, md->rx_dlci[i]);
++	seq_puts(m, "\nat lines (dlci name count):\n");
++	for (i = 0; i < ARRAY_SIZE(md->rx_tag) && md->rx_tag[i].n; i++)
++		seq_printf(m, "%u %s %u\n", md->rx_tag[i].dlci, md->rx_tag[i].tag, md->rx_tag[i].n);
++	return 0;
++}
++
 +/* the rings, once, before the modem runs */
 +static int cldma_alloc(struct titan_md *md)
 +{
@@ -2523,6 +2593,7 @@ index 0000000000000000000000000000000000000000..ac5c74717765cdd1f4762e16dde8a5b2
 +	if (ret)
 +		return ret;
 +	debugfs_create_devm_seqfile(md->dev, "cldma", md->debugfs, cldma_show);
++	debugfs_create_devm_seqfile(md->dev, "rx", md->debugfs, rx_show);
 +	return ccmni_add(md);
 +}
 +

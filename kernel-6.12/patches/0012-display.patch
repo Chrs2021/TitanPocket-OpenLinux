@@ -1,20 +1,351 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 12/22] drm/mediatek: hand the firmware framebuffer over; drm/panel: add the Synaptics R63308 panel
+Subject: [PATCH 12/23] drm/mediatek, soc: mediatek, pwm: power the display down; SODI requests; drm/panel: add the Synaptics R63308 panel
 
 mediatek-drm removes a firmware framebuffer (the bootloader's, through
 simplefb) before registering. The MT6771's DSI interrupt is requested
 before the host registers. panel-synaptics-r63308 drives the Titan
 Pocket's 720x720 MIPI-DSI panel with the vendor's power and init
 sequences.
+
+The display's power domain now goes off with the CRTC: AAL, CCORR,
+COLOR, GAMMA, the DSI, the mutex and the display PWM gain runtime PM
+(genpd counted them as in use), each holding the domain while it is
+clocked or powered; the display PWM switches off at duty 0, which
+pwm-backlight asks for with the backlight off. For the SPM's SODI, as
+MediaTek's display does for a video-mode panel: mmsys sets the MT6771's
+SODI request mask while the path runs (RDMA0's AP-source request held,
+DDREN from its FIFO), and RDMA0 gets its SODI FIFO thresholds.
 ---
+ drivers/gpu/drm/mediatek/mtk_crtc.c           |   2 +
+ drivers/gpu/drm/mediatek/mtk_disp_aal.c       |  17 +-
+ drivers/gpu/drm/mediatek/mtk_disp_ccorr.c     |  17 +-
+ drivers/gpu/drm/mediatek/mtk_disp_color.c     |  17 +-
+ drivers/gpu/drm/mediatek/mtk_disp_gamma.c     |  17 +-
+ drivers/gpu/drm/mediatek/mtk_disp_rdma.c      |  45 ++++
  drivers/gpu/drm/mediatek/mtk_drm_drv.c        |  10 +
- drivers/gpu/drm/mediatek/mtk_dsi.c            |  20 +-
+ drivers/gpu/drm/mediatek/mtk_dsi.c            |  33 ++-
  drivers/gpu/drm/panel/Kconfig                 |  10 +
  drivers/gpu/drm/panel/Makefile                |   1 +
  .../gpu/drm/panel/panel-synaptics-r63308.c    | 247 ++++++++++++++++++
- 5 files changed, 280 insertions(+), 8 deletions(-)
+ drivers/pwm/pwm-mtk-disp.c                    | 106 +++++---
+ drivers/soc/mediatek/mtk-mmsys.c              |  38 +++
+ drivers/soc/mediatek/mtk-mmsys.h              |   5 +
+ drivers/soc/mediatek/mtk-mutex.c              |  17 +-
+ include/linux/soc/mediatek/mtk-mmsys.h        |   2 +
+ 16 files changed, 533 insertions(+), 51 deletions(-)
 
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index aa8e6f6ddcd32ee8d15b7b696d12ea9acecbd41c..07772c8ea2057785168de003e4fed012b22d5d6a 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -398,6 +398,7 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 	}
+ 	if (!mtk_ddp_comp_add(mtk_crtc->ddp_comp[i], mtk_crtc->mutex))
+ 		mtk_mutex_add_comp(mtk_crtc->mutex, mtk_crtc->ddp_comp[i]->id);
++	mtk_mmsys_sodi_req(mtk_crtc->mmsys_dev, true);
+ 	mtk_mutex_enable(mtk_crtc->mutex);
+ 
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+@@ -448,6 +449,7 @@ static void mtk_crtc_ddp_hw_fini(struct mtk_crtc *mtk_crtc)
+ 		if (i == 1)
+ 			mtk_ddp_comp_bgclr_in_off(mtk_crtc->ddp_comp[i]);
+ 	}
++	mtk_mmsys_sodi_req(mtk_crtc->mmsys_dev, false);
+ 
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++)
+ 		if (!mtk_ddp_comp_remove(mtk_crtc->ddp_comp[i], mtk_crtc->mutex))
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_aal.c b/drivers/gpu/drm/mediatek/mtk_disp_aal.c
+index 59fb9a08d54bd23da88766309c7f1c16a1768470..e6e89cb2f1839fc1614bb71133e82fec65583b78 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_aal.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_aal.c
+@@ -9,6 +9,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/soc/mediatek/mtk-cmdq.h>
+ 
+ #include "mtk_crtc.h"
+@@ -53,8 +54,16 @@ struct mtk_disp_aal {
+ int mtk_aal_clk_enable(struct device *dev)
+ {
+ 	struct mtk_disp_aal *aal = dev_get_drvdata(dev);
++	int ret;
+ 
+-	return clk_prepare_enable(aal->clk);
++	/* the DISP power domain, held while the pipeline runs */
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(aal->clk);
++	if (ret)
++		pm_runtime_put(dev);
++	return ret;
+ }
+ 
+ void mtk_aal_clk_disable(struct device *dev)
+@@ -62,6 +71,7 @@ void mtk_aal_clk_disable(struct device *dev)
+ 	struct mtk_disp_aal *aal = dev_get_drvdata(dev);
+ 
+ 	clk_disable_unprepare(aal->clk);
++	pm_runtime_put(dev);
+ }
+ 
+ void mtk_aal_config(struct device *dev, unsigned int w,
+@@ -193,6 +203,11 @@ static int mtk_disp_aal_probe(struct platform_device *pdev)
+ 	priv->data = of_device_get_match_data(dev);
+ 	platform_set_drvdata(pdev, priv);
+ 
++	/* without runtime PM genpd counts the block as in use: DISP never powers off */
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
+ 	ret = component_add(dev, &mtk_disp_aal_component_ops);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to add component\n");
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_ccorr.c b/drivers/gpu/drm/mediatek/mtk_disp_ccorr.c
+index cb6d829d93db1ac72813cb011efd5e95e90eb530..5377e88ff3d738ee53f24b9b371657d565e61922 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_ccorr.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_ccorr.c
+@@ -8,6 +8,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/soc/mediatek/mtk-cmdq.h>
+ 
+ #include "mtk_crtc.h"
+@@ -43,8 +44,16 @@ struct mtk_disp_ccorr {
+ int mtk_ccorr_clk_enable(struct device *dev)
+ {
+ 	struct mtk_disp_ccorr *ccorr = dev_get_drvdata(dev);
++	int ret;
+ 
+-	return clk_prepare_enable(ccorr->clk);
++	/* the DISP power domain, held while the pipeline runs */
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(ccorr->clk);
++	if (ret)
++		pm_runtime_put(dev);
++	return ret;
+ }
+ 
+ void mtk_ccorr_clk_disable(struct device *dev)
+@@ -52,6 +61,7 @@ void mtk_ccorr_clk_disable(struct device *dev)
+ 	struct mtk_disp_ccorr *ccorr = dev_get_drvdata(dev);
+ 
+ 	clk_disable_unprepare(ccorr->clk);
++	pm_runtime_put(dev);
+ }
+ 
+ void mtk_ccorr_config(struct device *dev, unsigned int w,
+@@ -157,6 +167,11 @@ static int mtk_disp_ccorr_probe(struct platform_device *pdev)
+ 	priv->data = of_device_get_match_data(dev);
+ 	platform_set_drvdata(pdev, priv);
+ 
++	/* without runtime PM genpd counts the block as in use: DISP never powers off */
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
+ 	ret = component_add(dev, &mtk_disp_ccorr_component_ops);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to add component\n");
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_color.c b/drivers/gpu/drm/mediatek/mtk_disp_color.c
+index 2fd5e7dc9e247c0b3a47c1fac9ba35ad6678dc38..1fc5147018b48b379431ab9e162c4518a17f8c97 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_color.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_color.c
+@@ -8,6 +8,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/soc/mediatek/mtk-cmdq.h>
+ 
+ #include "mtk_crtc.h"
+@@ -46,8 +47,16 @@ struct mtk_disp_color {
+ int mtk_color_clk_enable(struct device *dev)
+ {
+ 	struct mtk_disp_color *color = dev_get_drvdata(dev);
++	int ret;
+ 
+-	return clk_prepare_enable(color->clk);
++	/* the DISP power domain, held while the pipeline runs */
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(color->clk);
++	if (ret)
++		pm_runtime_put(dev);
++	return ret;
+ }
+ 
+ void mtk_color_clk_disable(struct device *dev)
+@@ -55,6 +64,7 @@ void mtk_color_clk_disable(struct device *dev)
+ 	struct mtk_disp_color *color = dev_get_drvdata(dev);
+ 
+ 	clk_disable_unprepare(color->clk);
++	pm_runtime_put(dev);
+ }
+ 
+ void mtk_color_config(struct device *dev, unsigned int w,
+@@ -122,6 +132,11 @@ static int mtk_disp_color_probe(struct platform_device *pdev)
+ 	priv->data = of_device_get_match_data(dev);
+ 	platform_set_drvdata(pdev, priv);
+ 
++	/* without runtime PM genpd counts the block as in use: DISP never powers off */
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
+ 	ret = component_add(dev, &mtk_disp_color_component_ops);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to add component\n");
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_gamma.c b/drivers/gpu/drm/mediatek/mtk_disp_gamma.c
+index f0b38817ba6c74daf62ad736de055daa4c6e367c..351a8fdddc59123e6d62c6151bf566fbdb689e56 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_gamma.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_gamma.c
+@@ -9,6 +9,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/soc/mediatek/mtk-cmdq.h>
+ 
+ #include "mtk_crtc.h"
+@@ -67,8 +68,16 @@ struct mtk_disp_gamma {
+ int mtk_gamma_clk_enable(struct device *dev)
+ {
+ 	struct mtk_disp_gamma *gamma = dev_get_drvdata(dev);
++	int ret;
+ 
+-	return clk_prepare_enable(gamma->clk);
++	/* the DISP power domain, held while the pipeline runs */
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(gamma->clk);
++	if (ret)
++		pm_runtime_put(dev);
++	return ret;
+ }
+ 
+ void mtk_gamma_clk_disable(struct device *dev)
+@@ -76,6 +85,7 @@ void mtk_gamma_clk_disable(struct device *dev)
+ 	struct mtk_disp_gamma *gamma = dev_get_drvdata(dev);
+ 
+ 	clk_disable_unprepare(gamma->clk);
++	pm_runtime_put(dev);
+ }
+ 
+ unsigned int mtk_gamma_get_lut_size(struct device *dev)
+@@ -283,6 +293,11 @@ static int mtk_disp_gamma_probe(struct platform_device *pdev)
+ 	priv->data = of_device_get_match_data(dev);
+ 	platform_set_drvdata(pdev, priv);
+ 
++	/* without runtime PM genpd counts the block as in use: DISP never powers off */
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
+ 	ret = component_add(dev, &mtk_disp_gamma_component_ops);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to add component\n");
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_rdma.c b/drivers/gpu/drm/mediatek/mtk_disp_rdma.c
+index 07243f3722604a2d92516b1b1a3c1343f2e50bba..c609a91253c6207d18703c26701fc1a4f344bbce 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_rdma.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_rdma.c
+@@ -50,6 +50,7 @@
+ #define RDMA_FIFO_PSEUDO_SIZE(bytes)			(((bytes) / 16) << 16)
+ #define RDMA_OUTPUT_VALID_FIFO_THRESHOLD(bytes)		((bytes) / 16)
+ #define RDMA_FIFO_SIZE(rdma)			((rdma)->data->fifo_size)
++#define DISP_REG_RDMA_THRESHOLD_FOR_SODI	0x00a8
+ #define DISP_RDMA_MEM_START_ADDR		0x0f00
+ 
+ #define RDMA_MEM_GMC				0x40402020
+@@ -72,6 +73,7 @@ struct mtk_disp_rdma_data {
+ 	unsigned int fifo_size;
+ 	const u32 *formats;
+ 	size_t num_formats;
++	bool sodi;	/* the SPM's SODI: the FIFO decides the DRAM requests */
+ };
+ 
+ /*
+@@ -181,6 +183,35 @@ void mtk_rdma_stop(struct device *dev)
+ 	rdma_update_bits(dev, DISP_REG_RDMA_GLOBAL_CON, RDMA_ENGINE_EN, 0);
+ }
+ 
++/*
++ * The FIFO levels between which the RDMA lets DRAM go to self-refresh in the
++ * SPM's SODI (MT6771, vendor rdma_set_ultra_l() for RDMA0 without a shared
++ * SRAM): below the low one it asks for DRAM, above the high one it lets it
++ * go. In FIFO entries (16 bytes), from what the panel takes per µs with a
++ * quarter's margin, rounded up: low covers 10 µs (the 5 µs ultra level and
++ * 5 µs for the SPM to bring DRAM back); high is the FIFO less the vendor's
++ * refill margin (1200 x (fill - take) / 10^6, filling at the MM clock's low
++ * rate, 300 MHz), at least the 9 µs pre-ultra level. 720x720 at 60 Hz, 3
++ * bytes a pixel, 320 entries: 80 and 265.
++ */
++static u32 rdma_sodi_threshold(unsigned int width, unsigned int height,
++			       unsigned int vrefresh, unsigned int fifo_entries)
++{
++	u64 bytes_ms = div_u64((u64)width * height * (vrefresh ?: 60) * 3, 1000);
++	u32 per_us = DIV_ROUND_UP((u32)div_u64(bytes_ms * 1250, 16000 * 100), 10);
++	u32 fill = 960 * 300 * 3 / 16;	/* entries per ms, x1000 per us */
++	u32 low = (5 * 10 + 50) * per_us / 10;
++	u32 high = 9 * per_us;
++	u32 room;
++
++	if (fill > per_us * 1000) {
++		room = 1200 * (fill - per_us * 1000) / 1000000;
++		if (fifo_entries > room)
++			high = max(high, fifo_entries - room);
++	}
++	return min(low, fifo_entries) | (min(high, fifo_entries) << 16);
++}
++
+ void mtk_rdma_config(struct device *dev, unsigned int width,
+ 		     unsigned int height, unsigned int vrefresh,
+ 		     unsigned int bpc, struct cmdq_pkt *cmdq_pkt)
+@@ -211,6 +242,11 @@ void mtk_rdma_config(struct device *dev, unsigned int width,
+ 	      RDMA_FIFO_PSEUDO_SIZE(rdma_fifo_size) |
+ 	      RDMA_OUTPUT_VALID_FIFO_THRESHOLD(threshold);
+ 	mtk_ddp_write(cmdq_pkt, reg, &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_FIFO_CON);
++
++	if (rdma->data->sodi)
++		mtk_ddp_write(cmdq_pkt,
++			      rdma_sodi_threshold(width, height, vrefresh, rdma_fifo_size / 16),
++			      &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_THRESHOLD_FOR_SODI);
+ }
+ 
+ static unsigned int rdma_fmt_convert(struct mtk_disp_rdma *rdma,
+@@ -396,6 +432,13 @@ static const struct mtk_disp_rdma_data mt8183_rdma_driver_data = {
+ 	.num_formats = ARRAY_SIZE(mt8173_formats),
+ };
+ 
++static const struct mtk_disp_rdma_data mt6771_rdma_driver_data = {
++	.fifo_size = 5 * SZ_1K,
++	.formats = mt8173_formats,
++	.num_formats = ARRAY_SIZE(mt8173_formats),
++	.sodi = true,
++};
++
+ static const struct mtk_disp_rdma_data mt8195_rdma_driver_data = {
+ 	.fifo_size = 1920,
+ 	.formats = mt8173_formats,
+@@ -405,6 +448,8 @@ static const struct mtk_disp_rdma_data mt8195_rdma_driver_data = {
+ static const struct of_device_id mtk_disp_rdma_driver_dt_match[] = {
+ 	{ .compatible = "mediatek,mt2701-disp-rdma",
+ 	  .data = &mt2701_rdma_driver_data},
++	{ .compatible = "mediatek,mt6771-disp-rdma",
++	  .data = &mt6771_rdma_driver_data},
+ 	{ .compatible = "mediatek,mt8173-disp-rdma",
+ 	  .data = &mt8173_rdma_driver_data},
+ 	{ .compatible = "mediatek,mt8183-disp-rdma",
 diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
 index 0ed249ccd1ea93a9a06b412d18acb0fde332a78d..9e850d20295c3de85c97bdd9cf16b55467337ff3 100644
 --- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
@@ -44,10 +375,18 @@ index 0ed249ccd1ea93a9a06b412d18acb0fde332a78d..9e850d20295c3de85c97bdd9cf16b554
  	if (ret < 0)
  		goto err_deinit;
 diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
-index 57e8abc5c5f6fc09889e3ad6a904f57b89e49f10..cf585bde9b660a2bd15e34c4928bd74a6443ee48 100644
+index 57e8abc5c5f6fc09889e3ad6a904f57b89e49f10..932b07bfaca1d68fd939ae1157c8e4657477c660 100644
 --- a/drivers/gpu/drm/mediatek/mtk_dsi.c
 +++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
-@@ -654,9 +654,10 @@ static irqreturn_t mtk_dsi_irq(int irq, void *dev_id)
+@@ -12,6 +12,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/reset.h>
+ #include <linux/units.h>
+ 
+@@ -654,9 +655,10 @@ static irqreturn_t mtk_dsi_irq(int irq, void *dev_id)
  		mtk_dsi_mask(dsi, DSI_INTSTA, status, 0);
  		mtk_dsi_irq_data_set(dsi, status);
  		wake_up_interruptible(&dsi->irq_wait_queue);
@@ -59,14 +398,55 @@ index 57e8abc5c5f6fc09889e3ad6a904f57b89e49f10..cf585bde9b660a2bd15e34c4928bd74a
  }
  
  static s32 mtk_dsi_switch_to_cmd_mode(struct mtk_dsi *dsi, u8 irq_flag, u32 t)
-@@ -1230,16 +1231,19 @@ static int mtk_dsi_probe(struct platform_device *pdev)
+@@ -684,7 +686,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	ret = mipi_dsi_pixel_format_to_bpp(dsi->format);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Unknown MIPI DSI format %d\n", dsi->format);
+-		return ret;
++		goto err_refcount;
+ 	}
+ 	bit_per_pixel = ret;
+ 
+@@ -697,6 +699,11 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 		goto err_refcount;
+ 	}
+ 
++	/* the DISP power domain, held while the DSI is powered */
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret < 0)
++		goto err_refcount;
++
+ 	phy_power_on(dsi->phy);
+ 
+ 	ret = clk_prepare_enable(dsi->engine_clk);
+@@ -730,6 +737,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	clk_disable_unprepare(dsi->engine_clk);
+ err_phy_power_off:
+ 	phy_power_off(dsi->phy);
++	pm_runtime_put(dev);
+ err_refcount:
+ 	dsi->refcount--;
+ 	return ret;
+@@ -765,6 +773,7 @@ static void mtk_dsi_poweroff(struct mtk_dsi *dsi)
+ 	clk_disable_unprepare(dsi->digital_clk);
+ 
+ 	phy_power_off(dsi->phy);
++	pm_runtime_put(dsi->host.dev);
+ 
+ 	dsi->lanes_ready = false;
+ }
+@@ -1230,16 +1239,24 @@ static int mtk_dsi_probe(struct platform_device *pdev)
  
  	platform_set_drvdata(pdev, dsi);
  
 -	ret = mipi_dsi_host_register(&dsi->host);
 -	if (ret < 0)
 -		return dev_err_probe(dev, ret, "Failed to register DSI host\n");
--
++	/* without runtime PM genpd counts the DSI as in use: DISP never powers off */
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
+ 
 +	/*
 +	 * Request the interrupt before registering the host: registering
 +	 * can attach a panel that is already loaded, bind the DRM device
@@ -372,3 +752,316 @@ index 0000000000000000000000000000000000000000..b6e069d83c220f637330bb2a525a2a84
 +
 +MODULE_DESCRIPTION("Synaptics R63308 MIPI-DSI panel (Unihertz Titan Pocket)");
 +MODULE_LICENSE("GPL");
+diff --git a/drivers/pwm/pwm-mtk-disp.c b/drivers/pwm/pwm-mtk-disp.c
+index bafd6b6195f662cd459fe2fd9234348fb2297366..680baaa15523d0c0096157d3e6d5e6d9d0a21aac 100644
+--- a/drivers/pwm/pwm-mtk-disp.c
++++ b/drivers/pwm/pwm-mtk-disp.c
+@@ -12,6 +12,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/pwm.h>
+ #include <linux/slab.h>
+ 
+@@ -66,6 +67,49 @@ static void mtk_disp_pwm_update_bits(struct mtk_disp_pwm *mdp, u32 offset,
+ 	writel(value, address);
+ }
+ 
++/*
++ * The block's power domain (the display's, on MT6771) and its clocks, held
++ * while the PWM runs or is read: without runtime PM genpd counts the PWM as
++ * in use and never powers the domain off.
++ */
++static int mtk_disp_pwm_power_on(struct pwm_chip *chip)
++{
++	struct mtk_disp_pwm *mdp = to_mtk_disp_pwm(chip);
++	struct device *dev = pwmchip_parent(chip);
++	int err;
++
++	err = pm_runtime_resume_and_get(dev);
++	if (err < 0)
++		return err;
++
++	err = clk_prepare_enable(mdp->clk_main);
++	if (err < 0) {
++		dev_err(dev, "Can't enable mdp->clk_main: %pe\n", ERR_PTR(err));
++		goto err_pm;
++	}
++
++	err = clk_prepare_enable(mdp->clk_mm);
++	if (err < 0) {
++		dev_err(dev, "Can't enable mdp->clk_mm: %pe\n", ERR_PTR(err));
++		clk_disable_unprepare(mdp->clk_main);
++		goto err_pm;
++	}
++	return 0;
++
++err_pm:
++	pm_runtime_put(dev);
++	return err;
++}
++
++static void mtk_disp_pwm_power_off(struct pwm_chip *chip)
++{
++	struct mtk_disp_pwm *mdp = to_mtk_disp_pwm(chip);
++
++	clk_disable_unprepare(mdp->clk_mm);
++	clk_disable_unprepare(mdp->clk_main);
++	pm_runtime_put(pwmchip_parent(chip));
++}
++
+ static int mtk_disp_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
+ 			      const struct pwm_state *state)
+ {
+@@ -77,31 +121,27 @@ static int mtk_disp_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
+ 	if (state->polarity != PWM_POLARITY_NORMAL)
+ 		return -EINVAL;
+ 
+-	if (!state->enabled && mdp->enabled) {
+-		mtk_disp_pwm_update_bits(mdp, DISP_PWM_EN,
+-					 mdp->data->enable_mask, 0x0);
+-		clk_disable_unprepare(mdp->clk_mm);
+-		clk_disable_unprepare(mdp->clk_main);
+-
+-		mdp->enabled = false;
++	/*
++	 * A duty cycle of 0 is the output held low, which the block also
++	 * gives switched off: so it is switched off and its power domain let
++	 * go. pwm-backlight asks for exactly that (enabled, duty 0) with the
++	 * backlight off when it has no enable GPIO or supply, which on the
++	 * MT6771 kept the display's power domain up with the screen off.
++	 */
++	if (!state->enabled || !state->duty_cycle) {
++		if (mdp->enabled) {
++			mtk_disp_pwm_update_bits(mdp, DISP_PWM_EN,
++						 mdp->data->enable_mask, 0x0);
++			mtk_disp_pwm_power_off(chip);
++			mdp->enabled = false;
++		}
+ 		return 0;
+ 	}
+ 
+ 	if (!mdp->enabled) {
+-		err = clk_prepare_enable(mdp->clk_main);
+-		if (err < 0) {
+-			dev_err(pwmchip_parent(chip), "Can't enable mdp->clk_main: %pe\n",
+-				ERR_PTR(err));
+-			return err;
+-		}
+-
+-		err = clk_prepare_enable(mdp->clk_mm);
+-		if (err < 0) {
+-			dev_err(pwmchip_parent(chip), "Can't enable mdp->clk_mm: %pe\n",
+-				ERR_PTR(err));
+-			clk_disable_unprepare(mdp->clk_main);
++		err = mtk_disp_pwm_power_on(chip);
++		if (err < 0)
+ 			return err;
+-		}
+ 	}
+ 
+ 	/*
+@@ -118,10 +158,8 @@ static int mtk_disp_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
+ 	clk_div = mul_u64_u64_div_u64(state->period, rate, NSEC_PER_SEC) >>
+ 			  PWM_PERIOD_BIT_WIDTH;
+ 	if (clk_div > PWM_CLKDIV_MAX) {
+-		if (!mdp->enabled) {
+-			clk_disable_unprepare(mdp->clk_mm);
+-			clk_disable_unprepare(mdp->clk_main);
+-		}
++		if (!mdp->enabled)
++			mtk_disp_pwm_power_off(chip);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -178,18 +216,9 @@ static int mtk_disp_pwm_get_state(struct pwm_chip *chip,
+ 	u32 clk_div, pwm_en, con0, con1;
+ 	int err;
+ 
+-	err = clk_prepare_enable(mdp->clk_main);
+-	if (err < 0) {
+-		dev_err(pwmchip_parent(chip), "Can't enable mdp->clk_main: %pe\n", ERR_PTR(err));
+-		return err;
+-	}
+-
+-	err = clk_prepare_enable(mdp->clk_mm);
+-	if (err < 0) {
+-		dev_err(pwmchip_parent(chip), "Can't enable mdp->clk_mm: %pe\n", ERR_PTR(err));
+-		clk_disable_unprepare(mdp->clk_main);
++	err = mtk_disp_pwm_power_on(chip);
++	if (err < 0)
+ 		return err;
+-	}
+ 
+ 	/*
+ 	 * Apply DISP_PWM_DEBUG settings to choose whether to enable or disable
+@@ -217,8 +246,7 @@ static int mtk_disp_pwm_get_state(struct pwm_chip *chip,
+ 	state->duty_cycle = DIV64_U64_ROUND_UP(high_width * (clk_div + 1) * NSEC_PER_SEC,
+ 					       rate);
+ 	state->polarity = PWM_POLARITY_NORMAL;
+-	clk_disable_unprepare(mdp->clk_mm);
+-	clk_disable_unprepare(mdp->clk_main);
++	mtk_disp_pwm_power_off(chip);
+ 
+ 	return 0;
+ }
+@@ -257,6 +285,10 @@ static int mtk_disp_pwm_probe(struct platform_device *pdev)
+ 
+ 	chip->ops = &mtk_disp_pwm_ops;
+ 
++	ret = devm_pm_runtime_enable(&pdev->dev);
++	if (ret)
++		return ret;
++
+ 	ret = devm_pwmchip_add(&pdev->dev, chip);
+ 	if (ret < 0)
+ 		return dev_err_probe(&pdev->dev, ret, "pwmchip_add() failed\n");
+diff --git a/drivers/soc/mediatek/mtk-mmsys.c b/drivers/soc/mediatek/mtk-mmsys.c
+index bb4639ca0b8cdc0731554cb487e8454cdd31de18..08131048db0b097e25d75edd6cdcc02620acba37 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.c
++++ b/drivers/soc/mediatek/mtk-mmsys.c
+@@ -75,6 +75,30 @@ static const struct mtk_mmsys_driver_data mt8183_mmsys_driver_data = {
+ 	.num_resets = 32,
+ };
+ 
++/*
++ * MMSYS_SODI_REQ_MASK (vendor ddp_reg_mmsys.h, ddp_path.c and ddp_rdma_ex.c
++ * for the MT6771): bits 4:0 a golden value of 3; for RDMA0, mask enables
++ * (9:8) and mask values (13:12) of its two requests, the AP source (bit 0:
++ * DRAM and its PHY powered) and DDREN (bit 1: DRAM out of self-refresh).
++ * The vendor's rdma_start() holds the AP source and leaves DDREN to the
++ * RDMA's FIFO thresholds, so with the display running the SPM may put DRAM
++ * into self-refresh between fetches but no further (SODI's CG mode);
++ * rdma_stop() forces both requests low.
++ */
++#define MT6771_MMSYS_SODI_REQ_MASK	0x0f8
++
++static const struct mtk_mmsys_driver_data mt6771_mmsys_driver_data = {
++	.clk_driver = "clk-mt8183-mm",
++	.routes = mmsys_mt8183_routing_table,
++	.num_routes = ARRAY_SIZE(mmsys_mt8183_routing_table),
++	.sw0_rst_offset = MT8183_MMSYS_SW0_RST_B,
++	.num_resets = 32,
++	.sodi_req_offset = MT6771_MMSYS_SODI_REQ_MASK,
++	.sodi_req_mask = GENMASK(4, 0) | GENMASK(9, 8) | GENMASK(13, 12),
++	.sodi_req_on = 0x3 | (0x1 << 8) | (0x3 << 12),
++	.sodi_req_off = 0x3 | (0x3 << 8) | (0x0 << 12),
++};
++
+ static const struct mtk_mmsys_driver_data mt8186_mmsys_driver_data = {
+ 	.clk_driver = "clk-mt8186-mm",
+ 	.routes = mmsys_mt8186_routing_table,
+@@ -213,6 +237,19 @@ void mtk_mmsys_ddp_disconnect(struct device *dev,
+ }
+ EXPORT_SYMBOL_GPL(mtk_mmsys_ddp_disconnect);
+ 
++/* The display path's DRAM requests to the SPM: on while it runs */
++void mtk_mmsys_sodi_req(struct device *dev, bool on)
++{
++	struct mtk_mmsys *mmsys = dev_get_drvdata(dev);
++	const struct mtk_mmsys_driver_data *data = mmsys->data;
++
++	if (!data->sodi_req_mask)
++		return;
++	mtk_mmsys_update_bits(mmsys, data->sodi_req_offset, data->sodi_req_mask,
++			      on ? data->sodi_req_on : data->sodi_req_off, NULL);
++}
++EXPORT_SYMBOL_GPL(mtk_mmsys_sodi_req);
++
+ void mtk_mmsys_merge_async_config(struct device *dev, int idx, int width, int height,
+ 				  struct cmdq_pkt *cmdq_pkt)
+ {
+@@ -458,6 +495,7 @@ static void mtk_mmsys_remove(struct platform_device *pdev)
+ static const struct of_device_id of_match_mtk_mmsys[] = {
+ 	{ .compatible = "mediatek,mt2701-mmsys", .data = &mt2701_mmsys_driver_data },
+ 	{ .compatible = "mediatek,mt2712-mmsys", .data = &mt2712_mmsys_driver_data },
++	{ .compatible = "mediatek,mt6771-mmsys", .data = &mt6771_mmsys_driver_data },
+ 	{ .compatible = "mediatek,mt6779-mmsys", .data = &mt6779_mmsys_driver_data },
+ 	{ .compatible = "mediatek,mt6795-mmsys", .data = &mt6795_mmsys_driver_data },
+ 	{ .compatible = "mediatek,mt6797-mmsys", .data = &mt6797_mmsys_driver_data },
+diff --git a/drivers/soc/mediatek/mtk-mmsys.h b/drivers/soc/mediatek/mtk-mmsys.h
+index d370192737ca45ed480f2167dfb1ac94dd16baad..c47ca765a45c29cbc7151f636ccfdaab3a8c7d92 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.h
++++ b/drivers/soc/mediatek/mtk-mmsys.h
+@@ -125,6 +125,11 @@ struct mtk_mmsys_driver_data {
+ 	const u32 num_resets;
+ 	const bool is_vppsys;
+ 	const u8 vsync_len;
++	/* the display's DRAM requests to the SPM for SODI (MT6771) */
++	const u16 sodi_req_offset;
++	const u32 sodi_req_mask;
++	const u32 sodi_req_on;
++	const u32 sodi_req_off;
+ };
+ 
+ /*
+diff --git a/drivers/soc/mediatek/mtk-mutex.c b/drivers/soc/mediatek/mtk-mutex.c
+index aaa965d4b050a795b7e5bc93f4ca26bfd352e32e..c63ec85482cc2f23698c7be325eb9cf6e4d2702b 100644
+--- a/drivers/soc/mediatek/mtk-mutex.c
++++ b/drivers/soc/mediatek/mtk-mutex.c
+@@ -8,6 +8,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+ #include <linux/soc/mediatek/mtk-mmsys.h>
+ #include <linux/soc/mediatek/mtk-mutex.h>
+@@ -841,7 +842,16 @@ int mtk_mutex_prepare(struct mtk_mutex *mutex)
+ {
+ 	struct mtk_mutex_ctx *mtx = container_of(mutex, struct mtk_mutex_ctx,
+ 						 mutex[mutex->id]);
+-	return clk_prepare_enable(mtx->clk);
++	int ret;
++
++	/* its power domain (the display's), held while a path uses it */
++	ret = pm_runtime_resume_and_get(mtx->dev);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(mtx->clk);
++	if (ret)
++		pm_runtime_put(mtx->dev);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(mtk_mutex_prepare);
+ 
+@@ -850,6 +860,7 @@ void mtk_mutex_unprepare(struct mtk_mutex *mutex)
+ 	struct mtk_mutex_ctx *mtx = container_of(mutex, struct mtk_mutex_ctx,
+ 						 mutex[mutex->id]);
+ 	clk_disable_unprepare(mtx->clk);
++	pm_runtime_put(mtx->dev);
+ }
+ EXPORT_SYMBOL_GPL(mtk_mutex_unprepare);
+ 
+@@ -1098,6 +1109,7 @@ static int mtk_mutex_probe(struct platform_device *pdev)
+ 	if (!mtx)
+ 		return -ENOMEM;
+ 
++	mtx->dev = dev;
+ 	for (i = 0; i < MTK_MUTEX_MAX_HANDLES; i++)
+ 		mtx->mutex[i].id = i;
+ 
+@@ -1123,7 +1135,8 @@ static int mtk_mutex_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, mtx);
+ 
+-	return 0;
++	/* without runtime PM genpd counts the mutex as in use: its domain never powers off */
++	return devm_pm_runtime_enable(dev);
+ }
+ 
+ static const struct of_device_id mutex_driver_dt_match[] = {
+diff --git a/include/linux/soc/mediatek/mtk-mmsys.h b/include/linux/soc/mediatek/mtk-mmsys.h
+index 4885b065b849fb32897f41ba8983f5cdc07318c9..af2a40456e0ee7b1660a813f5976962a3c3edb0c 100644
+--- a/include/linux/soc/mediatek/mtk-mmsys.h
++++ b/include/linux/soc/mediatek/mtk-mmsys.h
+@@ -92,6 +92,8 @@ void mtk_mmsys_ddp_disconnect(struct device *dev,
+ 			      enum mtk_ddp_comp_id cur,
+ 			      enum mtk_ddp_comp_id next);
+ 
++void mtk_mmsys_sodi_req(struct device *dev, bool on);
++
+ void mtk_mmsys_ddp_dpi_fmt_config(struct device *dev, u32 val);
+ 
+ void mtk_mmsys_merge_async_config(struct device *dev, int idx, int width,

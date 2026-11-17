@@ -5094,6 +5094,27 @@ VOID aisFsmRunEventMgmtFrameTx(IN P_ADAPTER_T prAdapter, IN P_MSG_HDR_T prMsgHdr
 }				/* aisFsmRunEventMgmtFrameTx */
 
 #if CFG_SUPPORT_SNIFFER
+/* commands already queued above which an injected management frame is dropped */
+#define MON_TX_MGMT_QUEUE_MAX	2
+/* how long the hardware may hold an injected management frame (ms) */
+#define MON_TX_MGMT_LIFETIME_MS	20
+
+extern int mon_tx_lmac;	/* os/linux/gl_init.c */
+extern unsigned int mon_tx_stats[8];
+
+static WLAN_STATUS aisFsmRunEventMonTxDone(IN P_ADAPTER_T prAdapter, IN P_MSDU_INFO_T prMsduInfo,
+					   IN ENUM_TX_RESULT_CODE_T rTxDoneStatus)
+{
+	UINT_32 u4Ms = kalGetTimeTick() - prMsduInfo->rPktProfile.rHardXmitArrivalTimestamp;
+
+	mon_tx_stats[rTxDoneStatus == TX_RESULT_SUCCESS ? 0 : 1]++;
+	mon_tx_stats[2] += u4Ms;
+	if (u4Ms > mon_tx_stats[3])
+		mon_tx_stats[3] = u4Ms;
+	mon_tx_stats[u4Ms < 10 ? 4 : u4Ms < 30 ? 5 : u4Ms < 100 ? 6 : 7]++;
+	return WLAN_STATUS_SUCCESS;
+}
+
 /*----------------------------------------------------------------------------*/
 /*!
 * @brief Send a frame injected on the monitor interface (wlanMonHardStartXmit):
@@ -5106,6 +5127,8 @@ VOID aisFsmRunEventMonTx(IN P_ADAPTER_T prAdapter, IN P_MSG_HDR_T prMsgHdr)
 	P_MSG_MON_TX_T prMonTxMsg = (P_MSG_MON_TX_T) prMsgHdr;
 	P_MSDU_INFO_T prMsduInfo = prMonTxMsg->prMsduInfo;
 	UINT_8 ucMacHeaderLength = prMonTxMsg->ucMacHeaderLength;
+	P_WLAN_MAC_HEADER_T prHdr;
+	BOOLEAN fgData;
 
 	cnmMemFree(prAdapter, prMsgHdr);
 
@@ -5114,18 +5137,47 @@ VOID aisFsmRunEventMonTx(IN P_ADAPTER_T prAdapter, IN P_MSG_HDR_T prMsgHdr)
 		return;
 	}
 
+	prHdr = (P_WLAN_MAC_HEADER_T) ((ULONG) prMsduInfo->prPacket + MAC_TX_RESERVED_FIELD);
+	fgData = (prHdr->u2FrameCtrl & MASK_FC_TYPE) == MAC_FRAME_TYPE_DATA;
+
+	/*
+	 * On the firmware path (TC4) management frames go out more slowly
+	 * than AWDL injects its action frames (~14 frames/s measured). Drop one
+	 * rather than queue it behind others: an AWDL frame carries the
+	 * sender's timing and is wrong once it is late.
+	 */
+	if (!fgData && !mon_tx_lmac &&
+	    prAdapter->prGlueInfo->rCmdQueue.u4NumElem > MON_TX_MGMT_QUEUE_MAX) {
+		static UINT_32 u4Dropped;
+
+		if ((++u4Dropped & 0xff) == 1)
+			DBGLOG(TX, WARN, "monitor TX: %u late management frames dropped\n", u4Dropped);
+		cnmMgtPktFree(prAdapter, prMsduInfo);
+		return;
+	}
+
 	TX_SET_MMPDU(prAdapter, prMsduInfo, prAdapter->prAisBssInfo->ucBssIndex, STA_REC_INDEX_NOT_FOUND,
-		     ucMacHeaderLength, prMsduInfo->u2FrameLength, NULL, MSDU_RATE_MODE_MANUAL_DESC);
+		     ucMacHeaderLength, prMsduInfo->u2FrameLength, fgData ? NULL : aisFsmRunEventMonTxDone,
+		     MSDU_RATE_MODE_MANUAL_DESC);
 	nicTxSetPktFixedRateOption(prMsduInfo, RATE_OFDM_6M, 0, FALSE, FALSE);
 	/* keep the sequence number the frame carries */
 	nicTxConfigPktOption(prMsduInfo, MSDU_OPT_MANUAL_SN, FALSE);
 	/*
 	 * The firmware (TC4, MCU port) drops data frames that come as MMPDUs:
 	 * send those through the best effort LMAC queue, i.e. the hardware.
+	 * Management frames go to the voice queue (mon_tx_lmac): the MAC sends
+	 * them as fast as the air allows, and one the hardware still holds after
+	 * MON_TX_MGMT_LIFETIME_MS is dropped there instead of sent late.
 	 */
-	if ((((P_WLAN_MAC_HEADER_T) ((ULONG) prMsduInfo->prPacket + MAC_TX_RESERVED_FIELD))->u2FrameCtrl
-	     & MASK_FC_TYPE) == MAC_FRAME_TYPE_DATA)
+	if (fgData)
 		nicTxSetPktMacTxQue(prMsduInfo, MAC_TXQ_AC1_INDEX);
+	else if (mon_tx_lmac) {
+		nicTxSetPktMacTxQue(prMsduInfo, MAC_TXQ_AC3_INDEX);
+		nicTxSetPktLifeTime(prMsduInfo, MON_TX_MGMT_LIFETIME_MS);
+	}
+	/* group addressed frames are never ACKed: send them once */
+	if (IS_BMCAST_MAC_ADDR(prHdr->aucAddr1))
+		nicTxConfigPktOption(prMsduInfo, MSDU_OPT_NO_ACK, TRUE);
 	nicTxConfigPktControlFlag(prMsduInfo, MSDU_CONTROL_FLAG_FORCE_TX, TRUE);
 
 	nicTxEnqueueMsdu(prAdapter, prMsduInfo);

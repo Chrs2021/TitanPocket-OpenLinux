@@ -247,6 +247,65 @@ address** while sniffing (`tools/wifi/inject-test.py`: 1.1-1.2 copies per
 probe response, i.e. almost no retries), so it works as an "active"
 monitor interface. Only test-inject towards your own equipment.
 
+**Injected frames waiting behind the firmware's queue (fixed 2026-11-16).**
+On 6.12, an AWDL peer ACKed our unicast frames for the first ~10 s of a
+session and none after (counted on `radiotap0` with a capture of frames
+addressed to wlan0: 10 of 10 ACKed, then 0 of ~50 per minute), and
+`wlanProcessCommandQueue: NO Resource for CMD TYPE[3]` was logged ~900
+times in 30 s. With the TX trace on (`echo 0x04:0x13 >
+/proc/net/wlan/dbgLevel`): every injected frame goes through the driver's
+command queue as `COMMAND_TYPE_MANAGEMENT_FRAME`. AWDL's action frames are
+charged to `TC4` (26 pages, 3 per frame), which the firmware gives back
+only as fast as it sends them (~14 frames/s); TC4 ran down to 0-4 free
+pages. The queue stopped at the first entry that didn't fit, so the data
+frames behind it (on `TC1`, 466 pages free) waited too and went out seconds
+late, outside the peer's availability windows. Two changes:
+- `common/wlan_lib.c` (`wlanProcessCommandQueue`): a TC that is out of
+  resources holds back only its own commands, in order; the others go on.
+  Only injected data frames use another TC on this queue, so normal
+  traffic keeps its order.
+- `mgmt/ais_fsm.c` (`aisFsmRunEventMonTx`): an injected management frame is
+  dropped when more than `MON_TX_MGMT_QUEUE_MAX` (2) commands are queued
+  (`monitor TX: N late management frames dropped`). An AWDL frame carries
+  its sender's timing and is wrong once late; about 13 frames/s are dropped
+  during an AWDL session.
+
+After the change, a 60 s session lost 0-10% of pings to an iPhone per round
+(100% before, after the first round), every unicast frame was ACKed, and
+AirDrop transfers of 0.1 and 4.9 MB completed (private notes).
+
+**Management frames through the hardware (2026-11-16, later).** Injected
+management frames now go to an LMAC queue too (`MAC_TXQ_AC3`, voice), like
+data frames, instead of the firmware's `TC4`. The MAC sends them itself:
+the TX descriptor carries the 802.11 type and subtype, and TX status comes
+back for them as for any frame. They get a 20 ms lifetime
+(`MON_TX_MGMT_LIFETIME_MS`), so a frame the hardware can't send in time is
+dropped there rather than sent late, and the queue-length drop above now
+applies only on the firmware route. Group-addressed frames (AWDL's action
+frames, and multicast data such as mDNS) are sent once with no-ACK set;
+before, the hardware retried each up to the data retry limit, since nobody
+ACKs a broadcast.
+
+Module parameters (`/sys/module/wlan_drv_gen3/parameters/`):
+- `mon_tx_lmac` (default 1): 1 = the LMAC route, 0 = the firmware route.
+  It can be changed while running.
+- `mon_tx_stats`: TX status of injected management frames: sent, failed,
+  the sum and the maximum of the delay from `radiotap0`'s transmit to TX
+  done in ms, and how many took <10, <30, <100 and >=100 ms. Write
+  `0,0,0,0,0,0,0,0` to reset. The delay is in jiffies (4 ms steps).
+
+Measured with OWL against the same two AWDL peers, 45 s per route, back to
+back (`/root/ab.sh`):
+
+| Route | Frames | Failed | Mean delay | Max | Over 10 ms |
+|---|---|---|---|---|---|
+| firmware (`TC4`) | 1143 | 0 | 2.7 ms | 24 ms | 9 |
+| LMAC (`AC3`) | 1143 | 0 | 1.9 ms | 8 ms | 0 |
+
+Ping loss and ACK counts were the same on both routes in this test, with
+no transfer running. The difference matters under load: the firmware route
+is the one that ran out of `TC4` pages during transfers.
+
 Known issue: once in a while, after a monitor session in which an AWDL
 peer was active, scans return nothing until the Wi-Fi function is powered
 off and on (`echo 0 > /dev/wmtWifi`, `systemctl restart titan-wifi`).

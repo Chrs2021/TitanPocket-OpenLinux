@@ -19,6 +19,15 @@
  * moves only on a flush. Upstream's mtk-uart-apdma drives the same
  * channels for 8250 UARTs, but fills rx to 3/4 and relies on the UART's
  * rx timeout, which BTIF in DMA mode does not raise.
+ *
+ * Clocks while CONNSYS sleeps: STP's power saving (psm_core.c) calls
+ * mtk_wcn_btif_dpidle_ctrl() once CONNSYS has acknowledged sleep and
+ * again before waking it. Asleep, BTIF's and APDMA's clocks are gated, as
+ * the vendor's _btif_enter_dpidle_from_on() does: the SoC's idle states
+ * (deep idle, SODI) wait for APDMA's gate, so with them running the SoC
+ * never left MCDI while Wi-Fi or Bluetooth was on. CONNSYS wakes the AP
+ * through its own line (the BGF wake interrupt, an SPM wake source) and
+ * sends nothing until STP has woken it, which ungates first.
  */
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -124,6 +133,8 @@ struct btif {
 
 	struct mutex lock;		/* open/close */
 	bool opened;
+	bool gated;			/* clocks off while CONNSYS sleeps; tx_lock */
+	unsigned long sleeps, early_wakes;	/* gated; ungated by a register access */
 	MTK_WCN_BTIF_RX_CB rx_cb;
 
 	DECLARE_KFIFO_PTR(rx_fifo, u8);
@@ -213,6 +224,32 @@ static void btif_rxlog_add(const u8 *p, unsigned int len)
 	while (len--)
 		btif_rxlog[btif_rxlog_pos++ % BTIF_RXLOG_SIZE] = *p++;
 	spin_unlock_irqrestore(&btif_rxlog_lock, flags);
+}
+
+/* The clocks back before a register access; tx_lock held */
+static void btif_ungate(struct btif *b)
+{
+	if (!b->gated)
+		return;
+	WARN_ON(clk_enable(b->clk));
+	if (b->dma)
+		WARN_ON(clk_enable(b->dma_clk));
+	b->gated = false;
+}
+
+/* An interrupt while gated (not expected): the clocks back first */
+static void btif_irq_ungate(struct btif *b)
+{
+	unsigned long flags;
+
+	if (!READ_ONCE(b->gated))
+		return;
+	spin_lock_irqsave(&b->tx_lock, flags);
+	if (b->gated) {
+		b->early_wakes++;
+		btif_ungate(b);
+	}
+	spin_unlock_irqrestore(&b->tx_lock, flags);
 }
 
 static void btif_hw_init(struct btif *b)
@@ -337,6 +374,10 @@ static irqreturn_t btif_tx_dma_irq(int irq, void *data)
 	u32 left, valid;
 
 	spin_lock_irqsave(&b->tx_lock, flags);
+	if (b->gated) {
+		b->early_wakes++;
+		btif_ungate(b);
+	}
 	valid = readl(b->tx_dma + VFF_VALID_SIZE);
 	left = readl(b->tx_dma + VFF_LEFT_SIZE);
 	if (valid && valid < 8) {
@@ -365,6 +406,7 @@ static irqreturn_t btif_rx_dma_irq(int irq, void *data)
 	unsigned long flags;
 	bool rx = false;
 
+	btif_irq_ungate(b);
 	spin_lock_irqsave(&b->rx_lock, flags);
 	writel(VFF_RX_INT_THRE | VFF_RX_INT_DONE, b->rx_dma + VFF_INT_FLAG);
 	while (readl(b->rx_dma + VFF_VALID_SIZE)) {
@@ -404,6 +446,19 @@ static irqreturn_t btif_rx_dma_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/* Nothing in flight either way: rings and FIFOs empty; tx_lock held */
+static bool btif_quiet(struct btif *b)
+{
+	u32 lsr = readl(b->base + BTIF_LSR);
+
+	if (!(lsr & BTIF_LSR_TEMT) || (lsr & BTIF_LSR_DR))
+		return false;
+	if (b->dma)
+		return !readl(b->tx_dma + VFF_VALID_SIZE) && !readl(b->rx_dma + VFF_VALID_SIZE) &&
+		       !(readl(b->tx_dma + VFF_FLUSH) & 1);
+	return kfifo_is_empty(&b->tx_fifo);
+}
+
 /* Moves queued bytes into the hardware FIFO; tx_lock held */
 static void btif_tx_fill(struct btif *b)
 {
@@ -439,6 +494,7 @@ static irqreturn_t btif_irq(int irq, void *data)
 	unsigned long flags;
 	bool rx = false;
 
+	btif_irq_ungate(b);
 	spin_lock_irqsave(&b->rx_lock, flags);
 	while (readl(b->base + BTIF_IIR) & (BTIF_IIR_RX | BTIF_IIR_RX_TIMEOUT)) {
 		u8 c;
@@ -551,6 +607,7 @@ int mtk_wcn_btif_close(unsigned long u_id)
 	mutex_lock(&b->lock);
 	if (b->opened) {
 		spin_lock_irq(&b->tx_lock);
+		btif_ungate(b);
 		b->opened = false;
 		writel(0, b->base + BTIF_IER);
 		spin_unlock_irq(&b->tx_lock);
@@ -590,6 +647,11 @@ int mtk_wcn_btif_write(unsigned long u_id, const unsigned char *p_buf,
 	if (!b->opened) {
 		spin_unlock_irqrestore(&b->tx_lock, flags);
 		return -EIO;
+	}
+	if (b->gated) {
+		/* STP holds data back while CONNSYS sleeps: not expected */
+		b->early_wakes++;
+		btif_ungate(b);
 	}
 	if (b->dma) {
 		n = btif_dma_write(b, p_buf, len);
@@ -631,17 +693,64 @@ int mtk_wcn_btif_wakeup_consys(unsigned long u_id)
 
 	if (!b || !b->opened)
 		return -EINVAL;
+	spin_lock_irq(&b->tx_lock);
+	if (b->gated) {
+		b->early_wakes++;
+		btif_ungate(b);
+	}
 	writel(readl(b->base + BTIF_WAK) & ~1, b->base + BTIF_WAK);
+	spin_unlock_irq(&b->tx_lock);
 	usleep_range(128, 160);
+	spin_lock_irq(&b->tx_lock);
+	btif_ungate(b);
 	writel(readl(b->base + BTIF_WAK) | 1, b->base + BTIF_WAK);
+	spin_unlock_irq(&b->tx_lock);
 	return 0;
 }
 EXPORT_SYMBOL(mtk_wcn_btif_wakeup_consys);
 
-/* Deep idle needs no action with the clock kept on while open */
+/*
+ * ENABLE: CONNSYS sleeps, so the clocks go off once the link is quiet
+ * (waiting up to BTIF_QUIET_MS for the last bytes, as the vendor waits for
+ * tx); DISABLE: on again before STP wakes CONNSYS. STP calls both from its
+ * power-saving work, in process context.
+ */
+#define BTIF_QUIET_MS		100
+
 int mtk_wcn_btif_dpidle_ctrl(unsigned long u_id, enum _ENUM_BTIF_DPIDLE_ en_flag)
 {
-	return 0;
+	struct btif *b = btif_get(u_id);
+	unsigned long flags;
+	int i, ret = 0;
+
+	if (!b)
+		return -EINVAL;
+	mutex_lock(&b->lock);
+	for (i = 0; ; i++) {
+		spin_lock_irqsave(&b->tx_lock, flags);
+		if (!b->opened) {
+			ret = -EIO;
+		} else if (en_flag != BTIF_DPIDLE_ENABLE) {
+			btif_ungate(b);
+		} else if (!b->gated && btif_quiet(b)) {
+			if (b->dma)
+				clk_disable(b->dma_clk);
+			clk_disable(b->clk);
+			b->gated = true;
+			b->sleeps++;
+		} else if (!b->gated) {
+			ret = -EBUSY;
+		}
+		spin_unlock_irqrestore(&b->tx_lock, flags);
+		if (ret != -EBUSY || i >= BTIF_QUIET_MS)
+			break;
+		ret = 0;
+		usleep_range(1000, 1200);
+	}
+	mutex_unlock(&b->lock);
+	if (ret == -EBUSY)
+		dev_warn_ratelimited(b->dev, "link busy %u ms: clocks left on\n", BTIF_QUIET_MS);
+	return ret;
 }
 EXPORT_SYMBOL(mtk_wcn_btif_dpidle_ctrl);
 
@@ -737,6 +846,17 @@ static ssize_t rx_stats_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(rx_stats);
 
+/* how often the clocks went off with CONNSYS asleep, and came back early */
+static ssize_t sleep_stats_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct btif *b = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "sleeps %lu early_wakes %lu gated %d\n", b->sleeps,
+			  b->early_wakes, READ_ONCE(b->gated));
+}
+static DEVICE_ATTR_RO(sleep_stats);
+
 static ssize_t rx_log_read(struct file *f, struct kobject *kobj,
 			   struct bin_attribute *attr, char *buf,
 			   loff_t off, size_t count)
@@ -760,6 +880,7 @@ static BIN_ATTR_RO(rx_log, BTIF_RXLOG_SIZE);
 
 static struct attribute *btif_attrs[] = {
 	&dev_attr_rx_stats.attr,
+	&dev_attr_sleep_stats.attr,
 	NULL
 };
 

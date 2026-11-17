@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 09/22] i2c: mt65xx: restore a multi-channel controller's mode through ATF
+Subject: [PATCH 09/23] i2c: mt65xx: restore a multi-channel controller's mode through ATF
 
 The MT6771's i2c at 0x11008000 is shared between channels; the AP's
 channel needs the controller's multi-channel DMA mode, a secure register
@@ -8,11 +8,11 @@ only ATF writes. The SPM's deep sleep resets it and the channel then runs
 no transfer. With mediatek,secure-channel-id the driver asks ATF for it
 at every init, as MediaTek's driver does at resume.
 ---
- drivers/i2c/busses/i2c-mt65xx.c | 31 +++++++++++++++++++++++++++++++
- 1 file changed, 31 insertions(+)
+ drivers/i2c/busses/i2c-mt65xx.c | 38 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/i2c/busses/i2c-mt65xx.c b/drivers/i2c/busses/i2c-mt65xx.c
-index adcc43a24b5d15f7651be41e5b2a6f914d43df22..f961d7fa2ce6ee6039d4ba86b62cb473cda82159 100644
+index adcc43a24b5d15f7651be41e5b2a6f914d43df22..d25c7da61334f8d628decd313958c31dfc29a1af 100644
 --- a/drivers/i2c/busses/i2c-mt65xx.c
 +++ b/drivers/i2c/busses/i2c-mt65xx.c
 @@ -4,6 +4,7 @@
@@ -77,7 +77,22 @@ index adcc43a24b5d15f7651be41e5b2a6f914d43df22..f961d7fa2ce6ee6039d4ba86b62cb473
  }
  
  static const struct i2c_spec_values *mtk_i2c_get_spec(unsigned int speed)
-@@ -1391,6 +1418,10 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+@@ -963,8 +990,13 @@ static void i2c_dump_register(struct mtk_i2c *i2c)
+ 	dev_dbg(i2c->dev, "HS: 0x%x, IO_CONFIG: 0x%x\n",
+ 		mtk_i2c_readw(i2c, OFFSET_HS),
+ 		mtk_i2c_readw(i2c, OFFSET_IO_CONFIG));
++	/*
++	 * Titan Pocket: DCM_EN only where the chip has DCM. On the MT8183 map it
++	 * is at 0xf88, past the window of an I2C channel at +0x100 that ends
++	 * where the next block (SPI0) starts (mt6771.dtsi, i2c_2).
++	 */
+ 	dev_dbg(i2c->dev, "DCM_EN: 0x%x, TRANSFER_LEN_AUX: 0x%x\n",
+-		mtk_i2c_readw(i2c, OFFSET_DCM_EN),
++		i2c->dev_comp->dcm ? mtk_i2c_readw(i2c, OFFSET_DCM_EN) : 0,
+ 		mtk_i2c_readw(i2c, OFFSET_TRANSFER_LEN_AUX));
+ 	dev_dbg(i2c->dev, "CLOCK_DIV: 0x%x, FIFO_STAT: 0x%x\n",
+ 		mtk_i2c_readw(i2c, OFFSET_CLOCK_DIV),
+@@ -1391,6 +1423,10 @@ static int mtk_i2c_probe(struct platform_device *pdev)
  	if (IS_ERR(i2c->pdmabase))
  		return PTR_ERR(i2c->pdmabase);
  

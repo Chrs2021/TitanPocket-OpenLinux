@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 14/22] ASoC: mediatek: mt8183: Titan Pocket audio; codecs: add FS1860, MT6358 accdet
+Subject: [PATCH 14/23] ASoC: mediatek: mt8183: Titan Pocket audio; codecs: add FS1860, MT6358 accdet
 
 The MT6771's AFE is the MT8183's; this adds the Titan Pocket machine
 driver, the FS1860 speaker amplifier, the AFE's hardware gain and the
@@ -11,6 +11,9 @@ detection: an MT6358 ACCDET driver and the card's headset jack. The
 MT6358 codec keeps the handset gain across its power-down (it came back
 at -40 dB) and starts it at -10 dB; the AFE writes a stream's buffer
 address again on every prepare, as deep sleep loses that register.
+A memif's playback buffer can sit in the AFE's own SRAM (the DT's iram
+pool), so DRAM may self-refresh while audio plays; not enabled in the
+Titan Pocket's DT yet.
 ---
  sound/soc/codecs/Kconfig                      |  15 +
  sound/soc/codecs/Makefile                     |   4 +
@@ -19,18 +22,19 @@ address again on every prepare, as deep sleep loses that register.
  sound/soc/codecs/mt6358-accdet.h              |  11 +
  sound/soc/codecs/mt6358.c                     |   8 +
  sound/soc/mediatek/Kconfig                    |  12 +
- sound/soc/mediatek/common/mtk-afe-fe-dai.c    |  10 +
- .../mediatek/common/mtk-afe-platform-driver.c |  17 +-
+ sound/soc/mediatek/common/mtk-afe-fe-dai.c    |  20 +
+ .../mediatek/common/mtk-afe-platform-driver.c |  43 +-
+ sound/soc/mediatek/common/mtk-base-afe.h      |   7 +
  sound/soc/mediatek/mt8183/Makefile            |   2 +
  .../soc/mediatek/mt8183/mt6771-titanpocket.c  | 320 +++++++++++
  sound/soc/mediatek/mt8183/mt8183-afe-common.h |   4 +
- sound/soc/mediatek/mt8183/mt8183-afe-pcm.c    |  46 ++
+ sound/soc/mediatek/mt8183/mt8183-afe-pcm.c    |  67 +++
  sound/soc/mediatek/mt8183/mt8183-dai-adda.c   |   4 +
  .../soc/mediatek/mt8183/mt8183-dai-hostless.c |  29 +
  .../soc/mediatek/mt8183/mt8183-dai-hw-gain.c  | 163 ++++++
  sound/soc/mediatek/mt8183/mt8183-dai-i2s.c    | 103 ++++
  .../mediatek/mt8183/mt8183-interconnection.h  |   2 +
- 18 files changed, 1588 insertions(+), 4 deletions(-)
+ 19 files changed, 1649 insertions(+), 7 deletions(-)
 
 diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
 index 399dcf3d1c64b6b7a6b57d2bb2ed4834ecfee292..3bd964f6300cf0593f447f49c73e75e6f17ac4ad 100644
@@ -1022,10 +1026,27 @@ index 3033e2d3fe16840631a465dd967da77f7a6ff43c..b51e7cf3f739001c9843f4887f7d9c17
  	tristate "ASoC Audio driver for MT8183 with MT6358 TS3A227E MAX98357A RT1015 codec"
  	depends on I2C && GPIOLIB
 diff --git a/sound/soc/mediatek/common/mtk-afe-fe-dai.c b/sound/soc/mediatek/common/mtk-afe-fe-dai.c
-index 3044d9ab3d4d95e53a414281a072b77c5d24acf3..e3aa726903e6407e381b4073492027f338c3ec6b 100644
+index 3044d9ab3d4d95e53a414281a072b77c5d24acf3..97c0bf25dd4bda9518fbc18e276d5809ec3d5606 100644
 --- a/sound/soc/mediatek/common/mtk-afe-fe-dai.c
 +++ b/sound/soc/mediatek/common/mtk-afe-fe-dai.c
-@@ -266,8 +266,18 @@ int mtk_afe_fe_prepare(struct snd_pcm_substream *substream,
+@@ -55,6 +55,16 @@ int mtk_afe_fe_startup(struct snd_pcm_substream *substream,
+ 
+ 	snd_soc_set_runtime_hwparams(substream, mtk_afe_hardware);
+ 
++	/* a buffer in the AFE's SRAM: no larger than the SRAM */
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
++	    (afe->sram_memifs & BIT(memif_num))) {
++		ret = snd_pcm_hw_constraint_minmax(runtime,
++						   SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
++						   0, afe->sram_size);
++		if (ret < 0)
++			return ret;
++	}
++
+ 	/*
+ 	 * Capture cannot use ping-pong buffer since hw_ptr at IRQ may be
+ 	 * smaller than period_size due to AFE's internal buffer.
+@@ -266,8 +276,18 @@ int mtk_afe_fe_prepare(struct snd_pcm_substream *substream,
  	struct snd_soc_pcm_runtime *rtd  = snd_soc_substream_to_rtd(substream);
  	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
  	int id = snd_soc_rtd_to_cpu(rtd, 0)->id;
@@ -1045,7 +1066,7 @@ index 3044d9ab3d4d95e53a414281a072b77c5d24acf3..e3aa726903e6407e381b4073492027f3
  		if (afe->get_memif_pbuf_size) {
  			pbuf_size = afe->get_memif_pbuf_size(substream);
 diff --git a/sound/soc/mediatek/common/mtk-afe-platform-driver.c b/sound/soc/mediatek/common/mtk-afe-platform-driver.c
-index 70fd05d5ff486c6da7e648eaef90e0a4f1a6567f..2f744f9a4534d761f3acb31b42e06d9156e7bb39 100644
+index 70fd05d5ff486c6da7e648eaef90e0a4f1a6567f..4c923b9dccdd7d10fc6bfa95ba5128b3b572a63b 100644
 --- a/sound/soc/mediatek/common/mtk-afe-platform-driver.c
 +++ b/sound/soc/mediatek/common/mtk-afe-platform-driver.c
 @@ -82,15 +82,24 @@ snd_pcm_uframes_t mtk_afe_pcm_pointer(struct snd_soc_component *component,
@@ -1077,6 +1098,59 @@ index 70fd05d5ff486c6da7e648eaef90e0a4f1a6567f..2f744f9a4534d761f3acb31b42e06d91
  	ret = regmap_read(regmap, reg_ofs_cur, &hw_ptr);
  	if (ret || hw_ptr == 0) {
  		dev_err(dev, "%s hw_ptr err\n", __func__);
+@@ -118,11 +127,31 @@ int mtk_afe_pcm_new(struct snd_soc_component *component,
+ 	size_t size;
+ 	struct snd_pcm *pcm = rtd->pcm;
+ 	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
++	struct snd_pcm_substream *substream;
++	int memif = snd_soc_rtd_to_cpu(rtd, 0)->id;
++	int stream;
+ 
+ 	size = afe->mtk_afe_hardware->buffer_bytes_max;
+-	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, afe->dev,
+-				       afe->preallocate_buffers ? size : 0,
+-				       size);
++	if (!(afe->sram_memifs & BIT(memif))) {
++		snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV, afe->dev,
++					       afe->preallocate_buffers ? size : 0,
++					       size);
++		return 0;
++	}
++
++	/* playback from SRAM, allocated at hw_params (DRAM if the pool is short) */
++	for (stream = 0; stream < 2; stream++)
++		for (substream = pcm->streams[stream].substream; substream;
++		     substream = substream->next) {
++			if (stream == SNDRV_PCM_STREAM_PLAYBACK)
++				snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_DEV_IRAM,
++							   afe->dev, 0, afe->sram_size);
++			else
++				snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_DEV,
++							   afe->dev,
++							   afe->preallocate_buffers ? size : 0,
++							   size);
++		}
+ 
+ 	return 0;
+ }
+diff --git a/sound/soc/mediatek/common/mtk-base-afe.h b/sound/soc/mediatek/common/mtk-base-afe.h
+index a406f2e3e7a8786984ad89f4b1402d402a4e2923..9fdc9fc450b2c67e3a979db7d083c8130b9c4077 100644
+--- a/sound/soc/mediatek/common/mtk-base-afe.h
++++ b/sound/soc/mediatek/common/mtk-base-afe.h
+@@ -118,6 +118,13 @@ struct mtk_base_afe {
+ 	int irqs_size;
+ 	int memif_32bit_supported;
+ 	bool preallocate_buffers;
++	/*
++	 * Memifs whose playback buffer is in the AFE's own SRAM (the DT's
++	 * "iram" pool), and the pool's size: playing from SRAM lets the SoC's
++	 * idle states put DRAM in self-refresh while audio plays.
++	 */
++	unsigned int sram_memifs;
++	size_t sram_size;
+ 
+ 	struct list_head sub_dais;
+ 	struct snd_soc_dai_driver *dai_drivers;
 diff --git a/sound/soc/mediatek/mt8183/Makefile b/sound/soc/mediatek/mt8183/Makefile
 index 0d0dcdde00fcc88ae687795a828da8818dd379f6..ba4b460c42cd56ae1ba7ea1f9b32fd4c8bff7fd2 100644
 --- a/sound/soc/mediatek/mt8183/Makefile
@@ -1439,10 +1513,18 @@ index 40ab48c1566c8cac33af206f9caae784855fab27..fa213ce399eb7123be30ad654c64a459
 +int mt8183_dai_hw_gain_register(struct mtk_base_afe *afe);
  #endif
 diff --git a/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c b/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c
-index 23c8974d9adbd9fd97e8394582cd89822c789c8e..fba8147861352a19d443d2496299cb094484b16c 100644
+index 23c8974d9adbd9fd97e8394582cd89822c789c8e..5cf895fb474a5ae3b92e91db6d8cf88f4f9f409e 100644
 --- a/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c
 +++ b/sound/soc/mediatek/mt8183/mt8183-afe-pcm.c
-@@ -115,12 +115,34 @@ static unsigned int dai_memif_rate_transform(struct device *dev,
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
++#include <linux/genalloc.h>
+ #include <linux/module.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/of.h>
+@@ -115,12 +116,34 @@ static unsigned int dai_memif_rate_transform(struct device *dev,
  	}
  }
  
@@ -1477,7 +1559,7 @@ index 23c8974d9adbd9fd97e8394582cd89822c789c8e..fba8147861352a19d443d2496299cb09
  	default:
  		return mt8183_general_rate_transform(dev, rate);
  	}
-@@ -316,6 +338,10 @@ static const struct snd_kcontrol_new memif_ul2_ch1_mix[] = {
+@@ -316,6 +339,10 @@ static const struct snd_kcontrol_new memif_ul2_ch1_mix[] = {
  				    I_DL3_CH1, 1, 0),
  	SOC_DAPM_SINGLE_AUTODISABLE("I2S2_CH1", AFE_CONN5,
  				    I_I2S2_CH1, 1, 0),
@@ -1488,7 +1570,7 @@ index 23c8974d9adbd9fd97e8394582cd89822c789c8e..fba8147861352a19d443d2496299cb09
  };
  
  static const struct snd_kcontrol_new memif_ul2_ch2_mix[] = {
-@@ -329,6 +355,10 @@ static const struct snd_kcontrol_new memif_ul2_ch2_mix[] = {
+@@ -329,6 +356,10 @@ static const struct snd_kcontrol_new memif_ul2_ch2_mix[] = {
  				    I_DL3_CH2, 1, 0),
  	SOC_DAPM_SINGLE_AUTODISABLE("I2S2_CH2", AFE_CONN6,
  				    I_I2S2_CH2, 1, 0),
@@ -1499,7 +1581,7 @@ index 23c8974d9adbd9fd97e8394582cd89822c789c8e..fba8147861352a19d443d2496299cb09
  };
  
  static const struct snd_kcontrol_new memif_ul3_ch1_mix[] = {
-@@ -404,6 +434,11 @@ static const struct snd_soc_dapm_route mt8183_memif_routes[] = {
+@@ -404,6 +435,11 @@ static const struct snd_soc_dapm_route mt8183_memif_routes[] = {
  	{"UL2_CH2", "ADDA_UL_CH2", "ADDA Capture"},
  	{"UL2_CH1", "I2S2_CH1", "I2S2"},
  	{"UL2_CH2", "I2S2_CH2", "I2S2"},
@@ -1511,7 +1593,23 @@ index 23c8974d9adbd9fd97e8394582cd89822c789c8e..fba8147861352a19d443d2496299cb09
  
  	{"UL3", NULL, "UL3_CH1"},
  	{"UL3", NULL, "UL3_CH2"},
-@@ -945,6 +980,7 @@ static const dai_register_cb dai_register_cbs[] = {
+@@ -907,6 +943,15 @@ static int mt8183_afe_runtime_resume(struct device *dev)
+ 	regmap_update_bits(afe->regmap, AFE_MEMIF_MSB,
+ 			   CPU_HD_ALIGN_MASK_SFT, 0 << CPU_HD_ALIGN_SFT);
+ 
++	/*
++	 * Buffers in the AFE's SRAM: the memifs keep their compact layout
++	 * (the reset default) and the CPU's accesses to the SRAM must use it
++	 * too, as the MT6771's audio driver set (set_sram_mode()).
++	 */
++	if (afe->sram_memifs)
++		regmap_update_bits(afe->regmap, AFE_MEMIF_MSB,
++				   CPU_COMPACT_MODE_MASK_SFT, CPU_COMPACT_MODE_MASK_SFT);
++
+ 	/* set all output port to 24bit */
+ 	regmap_write(afe->regmap, AFE_CONN_24BIT, 0xffffffff);
+ 	regmap_write(afe->regmap, AFE_CONN_24BIT_1, 0xffffffff);
+@@ -945,6 +990,7 @@ static const dai_register_cb dai_register_cbs[] = {
  	mt8183_dai_pcm_register,
  	mt8183_dai_tdm_register,
  	mt8183_dai_hostless_register,
@@ -1519,7 +1617,25 @@ index 23c8974d9adbd9fd97e8394582cd89822c789c8e..fba8147861352a19d443d2496299cb09
  	mt8183_dai_memif_register,
  };
  
-@@ -1154,9 +1190,19 @@ static const struct of_device_id mt8183_afe_pcm_dt_match[] = {
+@@ -989,6 +1035,17 @@ static int mt8183_afe_pcm_dev_probe(struct platform_device *pdev)
+ 			return ret;
+ 	}
+ 
++	/* DL1 plays from the AFE's SRAM when the DT gives it as "iram" */
++	{
++		struct gen_pool *sram = of_gen_pool_get(dev->of_node, "iram", 0);
++
++		if (sram) {
++			afe->sram_memifs = BIT(MT8183_MEMIF_DL1);
++			afe->sram_size = gen_pool_size(sram);
++			dev_info(dev, "DL1 plays from SRAM (%zu bytes)\n", afe->sram_size);
++		}
++	}
++
+ 	/* initial audio related clock */
+ 	ret = mt8183_init_clock(afe);
+ 	if (ret) {
+@@ -1154,9 +1211,19 @@ static const struct of_device_id mt8183_afe_pcm_dt_match[] = {
  };
  MODULE_DEVICE_TABLE(of, mt8183_afe_pcm_dt_match);
  

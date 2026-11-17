@@ -1,11 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 02/22] cpufreq, cpuidle, devfreq, soc: mediatek: support the MT6771, SVS
+Subject: [PATCH 02/23] cpufreq, cpuidle, devfreq, soc: mediatek: support the MT6771, SVS
 
 mediatek-cpufreq and mtk-cci-devfreq gain MT6771 data (MediaTek's V5_T
 table: A53 to 1989 MHz, A73 to 2106 MHz, CCI to 1196 MHz), cpufreq-dt
 leaves the SoC to mediatek-cpufreq, and dt_idle_states can start every
-idle state disabled (dt_idle_states.off=1) for bring-up. mtk-svs gains
+idle state disabled (dt_idle_states.off=1) for bring-up, and
+cpuidle-psci lets a platform driver take over entering PSCI states
+(psci_cpuidle_set_platform_enter(): the MT6771's SoC idle states go
+through the SPM firmware). mtk-svs gains
 the MT6771: the MT8183's banks for the CPUs and the CCI (MediaTek's EEM
 for the MT6771 has the same detectors, efuse fields and limits), without
 the GPU bank, whose thermal zone this SoC's thermal driver doesn't give.
@@ -13,10 +16,12 @@ the GPU bank, whose thermal zone this SoC's thermal driver doesn't give.
  .../bindings/soc/mediatek/mtk-svs.yaml        |  1 +
  drivers/cpufreq/cpufreq-dt-platdev.c          |  1 +
  drivers/cpufreq/mediatek-cpufreq.c            | 65 +++++++++++++++++++
+ drivers/cpuidle/cpuidle-psci.c                | 19 ++++++
  drivers/cpuidle/dt_idle_states.c              | 11 ++++
  drivers/devfreq/mtk-cci-devfreq.c             |  9 +++
  drivers/soc/mediatek/mtk-svs.c                | 21 ++++++
- 6 files changed, 108 insertions(+)
+ include/linux/psci.h                          |  5 ++
+ 8 files changed, 132 insertions(+)
 
 diff --git a/Documentation/devicetree/bindings/soc/mediatek/mtk-svs.yaml b/Documentation/devicetree/bindings/soc/mediatek/mtk-svs.yaml
 index 742b91d1d28eb41c2e0a2220a1c4cc6e2ae61d6a..a782ba80cb0ed4d9603a577b92f696f0d0b4f648 100644
@@ -153,6 +158,41 @@ index 663f61565cf7289fe34d9a735e825206dd13152c..301b59077059114db63b3204ed121f6e
  	{ .compatible = "mediatek,mt8183", .data = &mt8183_platform_data },
  	{ .compatible = "mediatek,mt8186", .data = &mt8186_platform_data },
  	{ .compatible = "mediatek,mt8365", .data = &mt2701_platform_data },
+diff --git a/drivers/cpuidle/cpuidle-psci.c b/drivers/cpuidle/cpuidle-psci.c
+index 4ad8d614acf6900a438b1f72606913621f1940e8..0db79a6440ba128c5879f6af7d1de70fa28c2f92 100644
+--- a/drivers/cpuidle/cpuidle-psci.c
++++ b/drivers/cpuidle/cpuidle-psci.c
+@@ -196,11 +196,30 @@ static void psci_idle_init_cpuhp(void)
+ 		pr_warn("Failed %d while setup cpuhp state\n", err);
+ }
+ 
++/*
++ * A platform driver can take over entering PSCI states: MediaTek's MT6771
++ * enters its SoC idle states (deep idle) through the SPM firmware, whose
++ * scenario is set up through SiP calls, with the SSPM told, before
++ * CPU_SUSPEND (drivers/soc/mediatek/mt6771-spm.c). The hook gets each
++ * state's PSCI parameter in place of psci_cpu_suspend_enter(), which it
++ * calls itself for the states it leaves alone or cannot enter.
++ */
++static int (*psci_platform_enter)(u32 state);
++
++void psci_cpuidle_set_platform_enter(int (*enter)(u32 state))
++{
++	WRITE_ONCE(psci_platform_enter, enter);
++}
++EXPORT_SYMBOL_GPL(psci_cpuidle_set_platform_enter);
++
+ static __cpuidle int psci_enter_idle_state(struct cpuidle_device *dev,
+ 					   struct cpuidle_driver *drv, int idx)
+ {
+ 	u32 *state = __this_cpu_read(psci_cpuidle_data.psci_states);
++	int (*enter)(u32 state) = READ_ONCE(psci_platform_enter);
+ 
++	if (enter)
++		return CPU_PM_CPU_IDLE_ENTER_PARAM_RCU(enter, idx, state[idx]);
+ 	return CPU_PM_CPU_IDLE_ENTER_PARAM_RCU(psci_cpu_suspend_enter, idx, state[idx]);
+ }
+ 
 diff --git a/drivers/cpuidle/dt_idle_states.c b/drivers/cpuidle/dt_idle_states.c
 index 97feb7d8fb2329fa4e0f20a858e0a9c1680ff49a..78e95eb170022932592b7ff1785349d354643948 100644
 --- a/drivers/cpuidle/dt_idle_states.c
@@ -247,3 +287,19 @@ index 07ab261e1269d0f9073e32f2ef49c9dab287207a..ce9cdd416f6e4af642e4110b4f91bc1b
  	{ /* sentinel */ }
  };
  MODULE_DEVICE_TABLE(of, svs_of_match);
+diff --git a/include/linux/psci.h b/include/linux/psci.h
+index 4ca0060a3fc42ba1ca751c7862fb4ad8dda35a4c..08f7df4c5049ea9487e4a8e3800ff018fa491a67 100644
+--- a/include/linux/psci.h
++++ b/include/linux/psci.h
+@@ -17,6 +17,11 @@
+ bool psci_tos_resident_on(int cpu);
+ 
+ int psci_cpu_suspend_enter(u32 state);
++#ifdef CONFIG_ARM_PSCI_CPUIDLE
++void psci_cpuidle_set_platform_enter(int (*enter)(u32 state));
++#else
++static inline void psci_cpuidle_set_platform_enter(int (*enter)(u32 state)) { }
++#endif
+ bool psci_power_state_is_valid(u32 state);
+ int psci_set_osi_mode(bool enable);
+ bool psci_has_osi_support(void);

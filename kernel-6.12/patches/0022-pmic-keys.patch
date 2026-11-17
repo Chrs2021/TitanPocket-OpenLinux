@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 21/22] Input: mtk-pmic-keys: the MT6358's reset register has the MT6331's layout
+Subject: [PATCH 22/23] Input: mtk-pmic-keys: the MT6358's reset register has the MT6331's layout
 
 The MT6358's TOP_RST_MISC has the MT6331's bits (MediaTek's upmu_hw.h).
 With the MT6397 masks the long-press setup cleared bit 5, the deglitch

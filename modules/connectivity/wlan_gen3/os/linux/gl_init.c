@@ -1602,6 +1602,25 @@ static UINT_8 wlanMonHeaderLength(const UINT_8 *pucFrame, UINT_32 u4Len)
 }
 
 /*
+ * Where injected management frames go (aisFsmRunEventMonTx): 1 = an LMAC
+ * queue, i.e. straight to the MAC hardware like data frames; 0 = the
+ * firmware's management path (TC4), which sends ~14 frames/s.
+ */
+int mon_tx_lmac = 1;
+module_param(mon_tx_lmac, int, 0644);
+MODULE_PARM_DESC(mon_tx_lmac, "monitor TX: management frames via the LMAC (1) or the firmware (0)");
+
+/*
+ * TX status of injected management frames (aisFsmRunEventMonTxDone): sent,
+ * failed, sum and max of the delay from wlanMonHardStartXmit to TX done
+ * in ms, and how many took <10, <30, <100 and >=100 ms. Write zeros to
+ * reset.
+ */
+unsigned int mon_tx_stats[8];
+module_param_array(mon_tx_stats, uint, NULL, 0644);
+MODULE_PARM_DESC(mon_tx_stats, "monitor TX management frames: ok,fail,sum_ms,max_ms,<10,<30,<100,>=100");
+
+/*
  * Frame injection (e.g. libpcap): a radiotap header followed by an 802.11
  * frame without FCS. The radiotap fields are ignored; aisFsmRunEventMonTx
  * sends the frame from the main thread on the sniffer's channel.
@@ -1636,6 +1655,8 @@ static netdev_tx_t wlanMonHardStartXmit(struct sk_buff *prSkb, struct net_device
 	}
 	kalMemCopy((PUINT_8) ((ULONG) prMsduInfo->prPacket + MAC_TX_RESERVED_FIELD), prSkb->data + u4RtLen, u4Len);
 	prMsduInfo->u2FrameLength = (UINT_16) u4Len;
+	/* for the delay in mon_tx_stats (not used otherwise for management frames) */
+	prMsduInfo->rPktProfile.rHardXmitArrivalTimestamp = kalGetTimeTick();
 
 	prMsg->rMsgHdr.eMsgId = MID_MNY_AIS_MON_TX;
 	prMsg->prMsduInfo = prMsduInfo;

@@ -220,7 +220,8 @@ and DDR50, not enabled here. Writes have not been measured. The 100 ms power-on 
 
 `/dev/mmcblk0` (28.8 GB, one FAT32 partition, label `TITAN`; formatted by
 Android as portable storage, its empty Android folders kept). It holds
-**Pictures**: `titan-usb-storage.service` mounts it at `/media/sdcard` and
-binds its `Pictures` folder on `~/Pictures`, and lends it to a computer as a
+**Pictures** and **Documents**: `titan-usb-storage.service` mounts it at
+`/media/sdcard`, binds its `Pictures` and `Documents` folders on `~/Pictures`
+and `~/Documents` (Documents since 2026-11-16), and lends it to a computer as a
 USB drive on request (desktop.md).
 

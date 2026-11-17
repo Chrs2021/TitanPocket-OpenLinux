@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 03/22] iommu: mediatek: MT6771 data with the VPU's fixed IOVA window
+Subject: [PATCH 03/23] iommu: mediatek: MT6771 data with the VPU's fixed IOVA window
 
 The MT6771's VPU (two Vision P6 DSPs) runs firmware linked to fixed
 IOVAs (0x7da00000-0x82600000). The MT6771 gets the MT8183's data plus a

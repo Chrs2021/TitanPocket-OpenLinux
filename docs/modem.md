@@ -978,6 +978,20 @@ the modem: RTP on the IMS interface, AMR-WB (12.65 kbit/s) or AMR (12.2 kbit/s) 
 the network and `titan-ims.service` running, with or without data. `titan_mm` connects to `/run/titan-ims.sock` and offers its calls with the same signals as ModemManager's, so the dialer and
 `titan-call-watch` take them without knowing the difference; the header shows "VoLTE" when registered.
 
+**The IMC link is off by default (2026-11-16).** Since the modem asserts after our
+"Registered" report, `titan-ims` opens the IMC link only with `TITAN_IMS_IMC=1`; the phone had
+been running a hand-edited build for that. `cell_info()` (the cell for
+`P-Access-Network-Info`) needs `+CEREG` mode 2 and now restores the mode it found, since
+titan-powerkey lowers it to 1 with the screen off ([power.md](power.md)).
+
+**What arrives, counted (2026-11-16).** `titan_modem`'s debugfs file `rx` counts every packet
+the modem sends by CCCI channel (2 system, 10 the AT mux, 14 the file service, 32 RPC, 34 IPC,
+57/59 IMS, ...), every mux frame by DLCI, and every AT line by its name: the text before `:`
+(`+CEREG`, `+ECSQ`, `OK`), never what follows, so cell IDs and identities aren't kept. The
+echo, which arrives in pieces, isn't counted. `titan-wakelog` diffs it at each wake
+(power-testing.md). The first screen-off half hour after a module reload
+(2026-11-16 19:34-20:04) had no modem wake at all: one 1784 s sleep, ended by the cable.
+
 **The modem told of the registration (2026-11-10: built and tested offline; not yet run on the phone).** `+CIREG` is the modem's
 own view of IMS, and the modem only has one if the AP's IMS stack tells it: the RIL just reads `AT+CIREG?`, and no AT command
 sets it. On Android `volte_imcb` does, over `/dev/ccci_imsc`, CCCI channels 54 (up) and 55 (down), to the modem's IMS controller
@@ -1082,7 +1096,7 @@ listed by T-Mobile, then SpeedTalk, Mint and US Mobile). `titan-signal` writes i
 
 ## Cell location
 
-**2026-11-10: built and tested offline; not yet run on the phone.** `titan-cellloc` (Rust, in `titan-phone`)
+**2026-11-10: built and tested offline. 2026-11-16: installed on the phone (`/usr/local/sbin`); its `AT+ECELL` query works there, no estimate yet: there is no tower database on the phone.** `titan-cellloc` (Rust, in `titan-phone`)
 estimates a coarse position from the cells the modem hears, with no GPS. It has its own AT channel (`cmd11`, which
 nothing else uses) and asks `AT+ECELL`. The answer's layout comes from the vendor RIL's parser
 (`RmcNetworkHandler::getCellInfoListV12` in `libmtk-ril.so`, decompiled locally with Ghidra into
@@ -1103,8 +1117,9 @@ BSIC and ARFCN, in this order:
 12. CQI
 
 The first cell is the one the phone is camped on; the RIL marks it registered. `0x7fffffff`, or all ones, means
-unknown. The real answer's neighbour entries have not been seen yet. The parser expects neighbours to carry a PCI
-without a cell id, the usual case for LTE.
+unknown, and so is an empty field. With `AT+ECELL=4` first the modem adds BSIC and the EARFCN (15 values); on
+LTE the two signal values are RSRP and RSRQ as 27.007 indices (dBm + 140, 2 × (dB + 20)). The modem has not listed
+neighbours yet. The parser expects neighbours to carry a PCI without a cell id, the usual case for LTE.
 
 How the estimate is made:
 

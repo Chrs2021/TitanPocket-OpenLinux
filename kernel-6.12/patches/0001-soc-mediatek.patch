@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 01/22] soc: mediatek: add MT6771 MCDI, SPM, SCP and LK framebuffer drivers
+Subject: [PATCH 01/23] soc: mediatek: add MT6771 MCDI, SPM, SCP and LK framebuffer drivers
 
 mtk-mcdi: keeps the SSPM's available-CPU mask in step with the online
 CPUs and pauses MCDI (and cpuidle) across hotplug as MediaTek's kernel
@@ -11,26 +11,36 @@ mt6771-spm: holds the AP's 26 MHz, bus and DRAM requests that the SPM
 firmware holds on MediaTek's kernel (SPM_SRC_REQ 0x83), and optionally
 (mt6771_spm.deep=1) starts the SPM firmware and suspends through it as
 spm_go_to_sleep() does, refusing while a display, GPU or camera power
-domain is still on; mt6771_spm.wake_mask sets the wake sources.
+domain is still on; mt6771_spm.wake_mask sets the wake sources. From
+cpuidle it enters the firmware's SoC idle states as MediaTek's
+mtk_idle.c does: deep idle (CPU 0 alone, mt6771_spm.dpidle), SODI with
+the display running (its CG mode, DRAM self-refresh alone, for a
+video-mode panel; mt6771_spm.sodi) and SODI3 with 26 MHz down too
+(mt6771_spm.sodi3), from the last core: mtk-mcdi checks that every other
+core and cluster is off and pauses the SSPM's MCDI task meanwhile. At
+probe it gates the infra clocks of those states' conditions that the
+bootloader leaves running with no user.
 
 mt6771-scp: starts the SCP and talks to its sensor hub; the
 accelerometer, gyroscope, magnetometer, light and proximity sensors
 become IIO devices with several buffers each. The SCP's own sleep is off
 by default; mt6771_scp.sleep=1 leaves it on, with the MT6358's sensor hub
 supply mode and the SCP's clock mux on its request, as MediaTek's
-scp_dvfs.c does.
+scp_dvfs.c does. The SCP runs on its own oscillators; its clock mux,
+which also feeds the AP's bus gate to it, is parked on 26 MHz unless the
+SCP asks for the PLL, so UNIVPLL can stop.
 
 mtk-lk-fb: hands the bootloader's live framebuffer to simplefb, for a
 console before the display driver binds.
 ---
  drivers/soc/mediatek/Kconfig          |   44 +
  drivers/soc/mediatek/Makefile         |    4 +
- drivers/soc/mediatek/mt6771-scp.c     | 1323 +++++++++++++++++++++++++
- drivers/soc/mediatek/mt6771-spm.c     | 1235 +++++++++++++++++++++++
- drivers/soc/mediatek/mtk-lk-fb.c      |  249 +++++
- drivers/soc/mediatek/mtk-mcdi.c       |  196 ++++
- include/linux/soc/mediatek/mtk-mcdi.h |   13 +
- 7 files changed, 3064 insertions(+)
+ drivers/soc/mediatek/mt6771-scp.c     | 1380 ++++++++++++++++++
+ drivers/soc/mediatek/mt6771-spm.c     | 1924 +++++++++++++++++++++++++
+ drivers/soc/mediatek/mtk-lk-fb.c      |  249 ++++
+ drivers/soc/mediatek/mtk-mcdi.c       |  264 ++++
+ include/linux/soc/mediatek/mtk-mcdi.h |   17 +
+ 7 files changed, 3882 insertions(+)
 
 diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
 index 1b7afb19ccd637471ad82ad833f589cb0f9405b1..cc73ddf801462547795930636f466c91eb5a83e9 100644
@@ -114,10 +124,10 @@ index 6830512848fd0feb2d559894ac1b88397b487e91..e02ca4c3f3ef7dd57b0ee87c32237f18
  obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
 diff --git a/drivers/soc/mediatek/mt6771-scp.c b/drivers/soc/mediatek/mt6771-scp.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..88b26d57b977cad41e0c6a47c945dd334d55f953
+index 0000000000000000000000000000000000000000..b5c7ca4d1bbcc185f4d6f3a5f97f6df511c2b422
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-scp.c
-@@ -0,0 +1,1323 @@
+@@ -0,0 +1,1380 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SCP (Cortex-M4, MediaTek's tinysys firmware) and its sensor hub
@@ -166,6 +176,7 @@ index 0000000000000000000000000000000000000000..88b26d57b977cad41e0c6a47c945dd33
 + */
 +
 +#include <linux/clk.h>
++#include <linux/clk-provider.h>
 +#include <linux/debugfs.h>
 +#include <linux/delay.h>
 +#include <linux/interrupt.h>
@@ -197,6 +208,10 @@ index 0000000000000000000000000000000000000000..88b26d57b977cad41e0c6a47c945dd33
 +#define SCP_CPU_SLEEP_STATUS	0x114	/* bit 0 asleep, bit 1 deep */
 +/* clock control */
 +#define SCP_SLEEP_DEBUG		0x028
++/* the SCP's source (0 clk_sys = scp_sel, 2 ULPOSC2, 3 ULPOSC1) and divider */
++#define SCP_CLK_SW_SEL		0x000
++#define  SCP_CLK_SW_SEL_MASK	GENMASK(1, 0)
++#define SCP_CLK_DIV_SEL		0x024
 +#define SCP_SRAM_PDN		0x02c
 +/*
 + * MT6358 sensor hub mode (vendor scp_dvfs.c mt_pmic_sshub_init(), run at
@@ -397,8 +412,9 @@ index 0000000000000000000000000000000000000000..88b26d57b977cad41e0c6a47c945dd33
 +	int irq;
 +
 +	struct mutex send_lock;
-+	struct clk *scp_sel;	/* the SCP's clock mux, with mt6771_scp.sleep */
-+	bool scp_sel_on;
++	struct clk *scp_sel;	/* the SCP's clk_sys mux (scp_pll_ctrl()) */
++	bool scp_sel_on;	/* held for the SCP's PLL request */
++	unsigned int pll_requests;
 +	u8 rcv[SHARE_OBJ_SIZE];
 +	unsigned int rcv_len;
 +	unsigned int rcv_id;
@@ -742,6 +758,9 @@ index 0000000000000000000000000000000000000000..88b26d57b977cad41e0c6a47c945dd33
 +	seq_printf(m, "sleep status 0x%x, sleep debug 0x%x, sleep %d, suspend mode %d\n",
 +		   readl(scp->cfg + SCP_CPU_SLEEP_STATUS), readl(scp->clkctrl + SCP_SLEEP_DEBUG),
 +		   scp_sleep, scp_suspend_mode);
++	seq_printf(m, "clock SW_SEL 0x%x DIV_SEL 0x%x, PLL requests %u, scp_sel %s\n",
++		   readl(scp->clkctrl + SCP_CLK_SW_SEL), readl(scp->clkctrl + SCP_CLK_DIV_SEL),
++		   scp->pll_requests, scp->scp_sel_on ? "held" : "parked");
 +	for (i = 0; i < IPI_NR; i++)
 +		if (scp->rcv_count[i])
 +			seq_printf(m, "ipi %2d: %u\n", i, scp->rcv_count[i]);
@@ -904,21 +923,61 @@ index 0000000000000000000000000000000000000000..88b26d57b977cad41e0c6a47c945dd33
 +/* ---- the SCP's sleep (mt6771_scp.sleep) ---- */
 +
 +/*
-+ * The SCP asks for its clock mux (topckgen scp_sel) around its own sleep.
-+ * MediaTek's handler reads the frequency a byte off (data + 1 on a void
-+ * pointer), matches no case and so only gates the mux; this does what ran
-+ * on 4.14: hold it on PLL_ENABLE, let it go on PLL_DISABLE.
++ * The SCP's clock (its firmware's dvfs.c, request_dfs_opp(); docs/
++ * scp-firmware.md): OPP0 (125 MHz) is ULPOSC1 at 250 MHz divided by two,
++ * OPP1 ULPOSC2 at 330 MHz; only OPP2 (416 MHz) runs on clk_sys, topckgen's
++ * scp_sel, which the SCP asks for with IPI_SCP_PLL_CTRL around the switch
++ * (turn_on/off_clk_sys). It sets OPP0 itself at start (SW_SEL 3, DIV_SEL 1
++ * read on 6.12) and nothing here asks for more. scp_sel also feeds the
++ * AP's bus gate to the SCP (infra_scp, held while the driver is bound), so
++ * between requests it is parked on 26 MHz: on its UNIVPLL parent it kept
++ * UNIVPLL running, which keeps the SoC out of SODI3 (MediaTek's
++ * soidle3_pll_condition_mask). MediaTek's handler reads the frequency a
++ * byte off (data + 1 on a void pointer) and only gates the mux; this holds
++ * it on the PLL for PLL_ENABLE (univpll_d3 for 416 MHz, else univpll_d2_d8,
++ * as scp_dvfs.c's table) and parks it again on PLL_DISABLE.
 + */
++#define SCP_SEL_26M		0	/* topckgen scp_parents[] */
++#define SCP_SEL_UNIVPLL_D2_D8	1
++#define SCP_SEL_UNIVPLL_D3	6
++
++static void scp_sel_parent(struct mt6771_scp *scp, unsigned int index)
++{
++	struct clk_hw *p = clk_hw_get_parent_by_index(__clk_get_hw(scp->scp_sel), index);
++
++	if (!p || clk_set_parent(scp->scp_sel, p->clk))
++		dev_warn(scp->dev, "scp_sel: parent %u not set\n", index);
++}
++
 +static void scp_pll_ctrl(struct mt6771_scp *scp, u32 enable, u32 mhz)
 +{
 +	dev_dbg(scp->dev, "PLL %s (%u MHz)\n", enable ? "on" : "off", mhz);
++	scp->pll_requests++;
 +	if (!scp->scp_sel || enable == scp->scp_sel_on)
 +		return;
-+	if (enable && clk_prepare_enable(scp->scp_sel))
-+		return;
-+	if (!enable)
++	if (enable) {
++		scp_sel_parent(scp, mhz >= 416 ? SCP_SEL_UNIVPLL_D3 : SCP_SEL_UNIVPLL_D2_D8);
++		if (clk_prepare_enable(scp->scp_sel))
++			return;
++	} else {
 +		clk_disable_unprepare(scp->scp_sel);
++		scp_sel_parent(scp, SCP_SEL_26M);
++	}
 +	scp->scp_sel_on = enable;
++}
++
++/* Once the SCP runs: off scp_sel (its OPP0, ULPOSC1), the hold goes and scp_sel is parked */
++static void scp_sel_settle(struct mt6771_scp *scp)
++{
++	u32 sel = readl(scp->clkctrl + SCP_CLK_SW_SEL);
++
++	if (scp->scp_sel_on && (sel & SCP_CLK_SW_SEL_MASK)) {
++		clk_disable_unprepare(scp->scp_sel);
++		scp->scp_sel_on = false;
++		scp_sel_parent(scp, SCP_SEL_26M);
++	}
++	dev_info(scp->dev, "clock: SW_SEL 0x%x DIV_SEL 0x%x, scp_sel %s\n", sel,
++		 readl(scp->clkctrl + SCP_CLK_DIV_SEL), scp->scp_sel_on ? "held" : "on 26 MHz");
 +}
 +
 +static void scp_sel_release(void *data)
@@ -973,6 +1032,7 @@ index 0000000000000000000000000000000000000000..88b26d57b977cad41e0c6a47c945dd33
 +			memcpy(&sram, data, 4);
 +		dev_info(scp->dev, "SCP ready (SRAM %u KB)\n", sram / 1024);
 +		scp->ready = true;
++		scp_sel_settle(scp);
 +		schedule_work(&scp->no_sleep_work);
 +		complete(&scp->ready_done);
 +		break;
@@ -1293,19 +1353,26 @@ index 0000000000000000000000000000000000000000..88b26d57b977cad41e0c6a47c945dd33
 +	clk = devm_clk_get_enabled(dev, "main");
 +	if (IS_ERR(clk))
 +		return dev_err_probe(dev, PTR_ERR(clk), "no clock\n");
-+	if (scp_sleep) {
-+		/* the SCP runs on scp_sel as LK left it; held until it asks */
-+		scp->scp_sel = devm_clk_get(dev, "scp-sel");
-+		if (IS_ERR(scp->scp_sel))
-+			return dev_err_probe(dev, PTR_ERR(scp->scp_sel), "no scp-sel\n");
++	/*
++	 * The SCP runs on its ULPOSCs, not on scp_sel (scp_pll_ctrl()), unless
++	 * its clock control says it is on clk_sys (SW_SEL 0, also the value
++	 * before LK's image starts): then it is held until the SCP lets it go
++	 * or is ready on a ULPOSC (scp_sel_settle()).
++	 */
++	scp->scp_sel = devm_clk_get(dev, "scp-sel");
++	if (IS_ERR(scp->scp_sel))
++		return dev_err_probe(dev, PTR_ERR(scp->scp_sel), "no scp-sel\n");
++	if (!(readl(scp->clkctrl + SCP_CLK_SW_SEL) & SCP_CLK_SW_SEL_MASK)) {
 +		ret = clk_prepare_enable(scp->scp_sel);
 +		if (ret)
 +			return ret;
 +		scp->scp_sel_on = true;
-+		ret = devm_add_action_or_reset(dev, scp_sel_release, scp);
-+		if (ret)
-+			return ret;
++	} else {
++		scp_sel_parent(scp, SCP_SEL_26M);
 +	}
++	ret = devm_add_action_or_reset(dev, scp_sel_release, scp);
++	if (ret)
++		return ret;
 +	/* as MediaTek's scp_dvfs.c at every boot, the SCP's sleep on or off */
 +	ret = scp_pmic_sshub(scp);
 +	if (ret)
@@ -1443,10 +1510,10 @@ index 0000000000000000000000000000000000000000..88b26d57b977cad41e0c6a47c945dd33
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/soc/mediatek/mt6771-spm.c b/drivers/soc/mediatek/mt6771-spm.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6fb000c830
+index 0000000000000000000000000000000000000000..4cc2f8dc6c054ae9d772b3916790220aafd575ea
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-spm.c
-@@ -0,0 +1,1235 @@
+@@ -0,0 +1,1924 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SPM: resource requests and system suspend.
@@ -1474,6 +1541,42 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 + * frequency scaling off). Left out: the GIC masking and the CIRQ (edge
 + * interrupts that arrive while the GIC is off are lost; the PMIC's is a
 + * level).
++ *
++ * Deep idle. MediaTek's kernel enters the SPM firmware's deep idle
++ * scenario from cpuidle when the last CPU idles with the display and the
++ * other multimedia subsystems off and the clocks its condition masks name
++ * gated (spm_v4/mtk_idle.c, dpidle_can_enter()): the CPU top, MCUSYS and
++ * DRAM go down while the 26 MHz clock and infra stay up, so audio keeps
++ * playing from the AFE and wakes the CPU through the SPM to refill. This
++ * enters it the same way, spm_go_to_dpidle(): the SSPM told, the scenario
++ * set up through a SiP call, PSCI CPU_SUSPEND with the vendor's deep idle
++ * state, through a hook in cpuidle-psci: CPU 0's cluster power-down becomes
++ * deep idle when the conditions hold and the next timer is at least
++ * dpidle_min_us away (no idle-state node of its own: LK edits those by
++ * name). Only with CPU 0 the only one online (the vendor's MCDI governor
++ * picks the last core instead) and off by default (module parameter
++ * dpidle).
++ *
++ * SODI (screen-on deep idle). With the display running but the GPU and the
++ * other multimedia blocks off, MediaTek's kernel enters the firmware's SODI
++ * scenario from the last core (spm_v4/mtk_spm_sodi.c, spm_go_to_sodi();
++ * conditions in mtk_idle_mt6771.c): the CPU top and MCUSYS go down, infra
++ * and 26 MHz stay up and DRAM goes to self-refresh between the display's
++ * fetches. The last core is MCDI's: every other core and the other cluster
++ * powered off by the SSPM's MCDI task, which is then paused until the core
++ * is back (mtk-mcdi.c). Entered here through the same cpuidle-psci hook as
++ * deep idle, from any CPU's cluster power-down. The panel runs in video
++ * mode, for which the vendor uses SODI's "CG mode" (SODI_CG_MODE: only
++ * DRAM self-refresh; the DRAM PHY, its PLLs and the main PLLs stay on, so
++ * the display's DRAM requests are served at once). Off by default (module
++ * parameter sodi; on in the Debian boot images since 2026-11-17).
++ *
++ * SODI3 is the same scenario with 26 MHz going down too, as in suspend
++ * (the vendor's spm_go_to_sodi3()). The vendor kernel used it only with
++ * command-mode panels, whose display path stops between updates; with this
++ * video-mode panel it is for the screen off with the phone awake, the
++ * display powered down (a wakelock, a refused suspend). Tried before SODI
++ * when both are on (module parameter sodi3).
 + */
 +#include <linux/arm-smccc.h>
 +#include <linux/bits.h>
@@ -1495,6 +1598,7 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +#include <linux/soc/mediatek/mtk_sip_svc.h>
 +#include <linux/string.h>
 +#include <linux/suspend.h>
++#include <linux/tick.h>
 +
 +#define SPM_SRC_REQ		0x0b8
 +#define PWR_STATUS		0x180
@@ -1537,7 +1641,14 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +#define VCOREFS_PWRAP_CMD	3
 +/* GET_PWR_CTRL_ARGS: the suspend scenario's wake sources */
 +#define SPM_PWR_CTRL_SUSPEND	17
++#define SPM_PWR_CTRL_DPIDLE	18
++#define SPM_PWR_CTRL_SODI	19
 +#define PW_WAKE_SRC		12
++/* SiP calls for deep idle */
++#define MTK_SIP_SPM_DPIDLE_ARGS		MTK_SIP_SMC_CMD(0x227)
++#define MTK_SIP_SPM_SODI_ARGS		MTK_SIP_SMC_CMD(0x228)
++#define MTK_SIP_SPM_SLEEP_DPIDLE_ARGS	MTK_SIP_SMC_CMD(0x229)
++#define MTK_SIP_CHECK_SECURE_CG		MTK_SIP_SMC_CMD(0x22d)
 +
 +/*
 + * Firmware index 0 (LPDDR4X, 2 channels), no external buck; the Vcore
@@ -1572,11 +1683,41 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +/* SSPM commands (vendor mtk_spm_internal.h) */
 +#define SSPM_SPM_SUSPEND		0
 +#define SSPM_SPM_RESUME			1
++#define SSPM_SPM_DPIDLE_ENTER		2
++#define SSPM_SPM_DPIDLE_LEAVE		3
++#define SSPM_SPM_ENTER_SODI		4
++#define SSPM_SPM_LEAVE_SODI		5
++/* the option word of a command (struct spm_data's spm_opt) */
++#define SSPM_SPM_OPT_SLOT		(SSPM_SPM_SLOT + 5)
++#define SSPM_OPT_SLEEP_DPIDLE		BIT(0)
 +#define SSPM_SPM_SUSPEND_PREPARE	8
 +#define SSPM_SPM_POST_SUSPEND		9
 +
 +/* The vendor tree's "suspend" idle state: cluster power-down, state 5 */
 +#define MT6771_PSCI_SUSPEND	0x01010005
++/* its deep idle (state 4) and mcdi-cluster, what deep idle falls back to */
++#define MT6771_PSCI_DPIDLE	0x01010004
++#define MT6771_PSCI_CLUSTER	0x01010001
++/* the vendor tree's SODI state (2) */
++#define MT6771_PSCI_SODI	0x01010002
++
++/*
++ * The vendor's slp_spm_deepidle_flags for the MT6771 with an SSPM: infra
++ * kept on, Vcore DVS and DFS off, no ATF abort, CSYSPWRUPACK kept high, the
++ * deep idle option (the firmware keeps 26 MHz). Flags 1: 0, leaving the
++ * A73 buck alone.
++ */
++#define SPM_DPIDLE_FLAGS	0x10019a
++
++/*
++ * The vendor's slp_spm_SODI_flags for the MT6771 with an SSPM: the deep
++ * idle set with the SODI option (bit 21) instead of deep idle's; and
++ * SODI_CG_MODE (bit 12), the scenario the vendor's display picks for a
++ * video-mode panel (through the GCE there): the firmware arms DRAM
++ * self-refresh alone (docs/spm-firmware.md, the main program, step 10).
++ */
++#define SPM_FLAG_SODI_CG_MODE	BIT(12)
++#define SPM_SODI_FLAGS		(0x20019a | SPM_FLAG_SODI_CG_MODE)
 +
 +static uint pcm_flags = SPM_SUSPEND_FLAGS;
 +module_param(pcm_flags, uint, 0644);
@@ -1697,6 +1838,10 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +static bool apll_off = true;
 +module_param(apll_off, bool, 0444);
 +MODULE_PARM_DESC(apll_off, "Switch the audio PLLs off at boot when nothing uses them");
++
++/* the infra clocks LK leaves on and nothing uses gated at probe (spm_clk_init()) */
++static bool infra_gate_unused = true;
++module_param(infra_gate_unused, bool, 0444);
 +
 +static struct regmap *apmixed_regmap, *topck_regmap, *infracfg_regmap;
 +static u32 pll_con3_boot, pll_con4_boot;
@@ -1819,6 +1964,41 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +	return true;
 +}
 +
++/*
++ * Infra clock gates in MediaTek's SODI and deep idle conditions
++ * (mtk_idle_mt6771.c) that LK leaves running: with clk_ignore_unused
++ * (docs/build-and-flash.md) nothing gates them, and each one blocks both
++ * idle states. Each one running with no user is switched on and off once
++ * through the clock framework, which leaves its gate closed (and, as
++ * disabling unused clocks would, parents nothing else uses); a driver that
++ * wants it later enables it as usual. The APDMA and display-PWM clocks of
++ * the same masks are left out: they have users.
++ */
++static const char *const spm_infra_unused[] = {
++	"infra_icusb", "infra_i2c0", "infra_i2c1", "infra_i2c2", "infra_pwm_hclk",
++	"infra_pwm1", "infra_pwm2", "infra_pwm3", "infra_pwm4", "infra_pwm",
++	"infra_uart1", "infra_uart2", "infra_uart3", "infra_spi0", "infra_cpum",
++	"infra_irtx", "infra_spi1", "infra_i2c4",
++};
++
++static void spm_infra_gate_unused(struct device *dev)
++{
++	char names[160] = "";
++	int i, n = 0;
++
++	for (i = 0; i < ARRAY_SIZE(spm_infra_unused); i++) {
++		struct clk *clk = __clk_lookup(spm_infra_unused[i]);
++
++		if (!clk || __clk_get_enable_count(clk) || !__clk_is_enabled(clk) ||
++		    clk_prepare_enable(clk))
++			continue;
++		clk_disable_unprepare(clk);
++		n += scnprintf(names + n, sizeof(names) - n, " %s",
++			       spm_infra_unused[i] + strlen("infra_"));
++	}
++	dev_info(dev, "unused infra clocks gated:%s\n", n ? names : " none");
++}
++
 +static void spm_clk_init(struct device *dev)
 +{
 +	bool aplls = false;
@@ -1844,6 +2024,8 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +	dev_info(dev, "AP_PLL_CON3 0x%x (boot 0x%x), CON4 boot 0x%x, pll_sleep %u, TVDPLL %s, APLLs %s\n",
 +		 v, pll_con3_boot, pll_con4_boot, pll_sleep,
 +		 tvdpll_off ? "off" : "left", aplls ? "off" : "left");
++	if (infra_gate_unused)
++		spm_infra_gate_unused(dev);
 +}
 +
 +/*
@@ -2395,7 +2577,14 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +/* a command timed out: its answer may still come, and must not block the next */
 +static bool sspm_late;
 +
++static int sspm_spm_command_opt(u32 cmd, u32 opt);
++
 +static int sspm_spm_command(u32 cmd)
++{
++	return sspm_spm_command_opt(cmd, 0);
++}
++
++static int sspm_spm_command_opt(u32 cmd, u32 opt)
 +{
 +	u32 val;
 +	int i, ret;
@@ -2411,6 +2600,7 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +	writel(cmd, sspm_slots + 4 * SSPM_SPM_SLOT);
 +	for (i = 1; i < SSPM_SPM_LEN; i++)
 +		writel(0, sspm_slots + 4 * (SSPM_SPM_SLOT + i));
++	writel(opt, sspm_slots + 4 * SSPM_SPM_OPT_SLOT);
 +	/*
 +	 * Before the doorbell: SUSPEND gates the RTC's clocks until RESUME
 +	 * (docs/sspm-firmware.md), so a breadcrumb after it never commits and
@@ -2474,6 +2664,557 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +	return regmap_set_bits(regmap, SPM_SRC_REQ, SPM_HELD_REQ);
 +}
 +
++/* ---- deep idle ---- */
++
++static int so_enter(void);	/* SODI and SODI3 (below) */
++static bool so_any(void);
++
++static bool dpidle;
++static int dpidle_set(const char *val, const struct kernel_param *kp);
++static const struct kernel_param_ops dpidle_ops = {
++	.set = dpidle_set,
++	.get = param_get_bool,
++};
++module_param_cb(dpidle, &dpidle_ops, &dpidle, 0644);
++MODULE_PARM_DESC(dpidle, "Enter the SPM's deep idle from cpuidle (CPU 0 alone online); set up at the first 1");
++
++static uint dpidle_min_us = 2000;	/* the vendor's min-residency */
++module_param(dpidle_min_us, uint, 0644);
++MODULE_PARM_DESC(dpidle_min_us, "Deep idle only when the next timer is this far");
++
++static uint dpidle_wake_mask;
++module_param(dpidle_wake_mask, uint, 0644);
++MODULE_PARM_DESC(dpidle_wake_mask, "Deep idle wake sources (R12 bits) set at probe, 0 for the suspend set plus the AFE");
++
++static bool sleep_dpidle;
++module_param(sleep_dpidle, bool, 0644);
++MODULE_PARM_DESC(sleep_dpidle, "System suspend through the deep idle scenario (26 MHz on: FM radio through the AFE keeps playing)");
++
++#define R12_AFE_IRQ_MCU		BIT(20)
++
++/*
++ * The vendor's deep idle conditions (mtk_idle_mt6771.c): power domains
++ * (PWR_STATUS, mask 0xbef000b8: display, GPU, ISP, encoder, decoder,
++ * camera, VPU) and infra clock gates (on when the status bit is clear),
++ * three groups at INFRA_SW_CG_0/1/2_STA = 0x94, 0x90, 0xac.
++ */
++#define DPIDLE_PWR_MASK		0xbef000b8
++static const struct { u16 sta; u32 mask; } dpidle_cg[] = {
++	{ 0x094, 0x00040802 }, { 0x090, 0x03afb900 }, { 0x0ac, 0x000000c5 },
++};
++
++/* aud_intbus_sel (CLK_CFG_5 bits 9:8, set/clr 0x94/0x98, update bit 21) */
++#define CLK_CFG_5		0x090
++#define CLK_CFG_5_CLR		0x098
++#define CLK_CFG_5_SET		0x094
++#define CLK_CFG_UPDATE		0x004
++#define AUD_INTBUS_SHIFT	8
++#define AUD_INTBUS_GATE		BIT(15)
++#define AUD_INTBUS_UPD		BIT(21)
++
++enum { DP_OK, DP_OFF, DP_CPUS, DP_SHORT, DP_PWR, DP_CG, DP_SECURE_CG, DP_SSPM, DP_NR };
++static const char *const dp_why[] = { "entered", "disabled", "cpus", "short", "power domain",
++				      "clock gate", "secure clock", "sspm" };
++static struct {
++	unsigned long count[DP_NR];
++	u32 last_pwr, last_cg[3], last_r12, last_debug;
++	u64 slept_ticks;
++} dp_stats;
++
++static void __iomem *spm_base;
++
++static int dpidle_check(void)
++{
++	u32 pwr, v;
++	int i, blocked = 0;
++
++	if (!READ_ONCE(dpidle))
++		return DP_OFF;
++	if (num_online_cpus() != 1 || smp_processor_id())
++		return DP_CPUS;
++	/* the next timer, as cpuidle programmed it (the broadcast's) */
++	if (ktime_us_delta(tick_nohz_get_next_hrtimer(), ktime_get()) < dpidle_min_us)
++		return DP_SHORT;
++	pwr = readl(spm_base + PWR_STATUS) & readl(spm_base + PWR_STATUS_2ND);
++	if (pwr & DPIDLE_PWR_MASK) {
++		dp_stats.last_pwr = pwr & DPIDLE_PWR_MASK;
++		return DP_PWR;
++	}
++	for (i = 0; i < ARRAY_SIZE(dpidle_cg); i++) {
++		regmap_read(infracfg_regmap, dpidle_cg[i].sta, &v);
++		dp_stats.last_cg[i] = ~v & dpidle_cg[i].mask;
++		blocked |= !!dp_stats.last_cg[i];
++	}
++	if (blocked)
++		return DP_CG;
++	if (spm_sip(MTK_SIP_CHECK_SECURE_CG, 0, 0, 0))
++		return DP_SECURE_CG;
++	return DP_OK;
++}
++
++/* the audio bus clock to 26 MHz across deep idle, as the vendor's audio
++ * driver did on its idle notifier; returns the selection to restore */
++static int dpidle_aud_intbus(int sel)
++{
++	u32 cfg;
++
++	regmap_read(topck_regmap, CLK_CFG_5, &cfg);
++	if (cfg & AUD_INTBUS_GATE)	/* gated: nobody uses it */
++		return -1;
++	regmap_write(topck_regmap, CLK_CFG_5_CLR, 3 << AUD_INTBUS_SHIFT);
++	if (sel > 0)
++		regmap_write(topck_regmap, CLK_CFG_5_SET, sel << AUD_INTBUS_SHIFT);
++	regmap_write(topck_regmap, CLK_CFG_UPDATE, AUD_INTBUS_UPD);
++	return (cfg >> AUD_INTBUS_SHIFT) & 3;
++}
++
++static int mt6771_spm_cpuidle_enter(u32 state)
++{
++	u32 r12, debug, timer;
++	int why, aud, ret;
++
++	/* only a cluster power-down may become an SoC idle state */
++	if (state != MT6771_PSCI_CLUSTER)
++		return psci_cpu_suspend_enter(state);
++	/* deep idle: CPU 0 alone */
++	why = DP_OFF;
++	if (READ_ONCE(dpidle) && !smp_processor_id()) {
++		why = dpidle_check();
++		if (why != DP_OK)
++			dp_stats.count[why]++;
++	}
++	if (why != DP_OK)
++		return so_any() ? so_enter() : psci_cpu_suspend_enter(state);
++
++	if (sspm_spm_command_opt(SSPM_SPM_DPIDLE_ENTER, 0) < 0) {
++		dp_stats.count[DP_SSPM]++;
++		return psci_cpu_suspend_enter(MT6771_PSCI_CLUSTER);
++	}
++	aud = dpidle_aud_intbus(0);
++	regmap_clear_bits(spm_regmap, SPM_SRC_REQ, SPM_HELD_REQ);
++	spm_sip(MTK_SIP_SPM_DPIDLE_ARGS, SPM_DPIDLE_FLAGS, 0, 0);
++	ret = psci_cpu_suspend_enter(MT6771_PSCI_DPIDLE);
++	mt6771_spm_hold(spm_regmap);
++	if (aud >= 0)
++		dpidle_aud_intbus(aud);
++	sspm_spm_command_opt(SSPM_SPM_DPIDLE_LEAVE, 0);
++
++	regmap_read(spm_regmap, SPM_SW_RSV_0, &r12);
++	regmap_read(spm_regmap, SPM_SW_DEBUG, &debug);
++	regmap_read(spm_regmap, SPM_BSI_D1_SR, &timer);
++	dp_stats.count[DP_OK]++;
++	dp_stats.last_r12 = r12;
++	dp_stats.last_debug = debug;
++	dp_stats.slept_ticks += timer;
++	return ret;
++}
++
++static int dpidle_stats_get(char *buf, const struct kernel_param *kp)
++{
++	int i, n = 0;
++
++	for (i = 0; i < DP_NR; i++)
++		n += sysfs_emit_at(buf, n, "%s %lu\n", dp_why[i], dp_stats.count[i]);
++	n += sysfs_emit_at(buf, n, "slept_ms %llu\nlast_r12 0x%x\nlast_debug 0x%x\n",
++			   div_u64(dp_stats.slept_ticks * 1000, 32768), dp_stats.last_r12,
++			   dp_stats.last_debug);
++	n += sysfs_emit_at(buf, n, "last_pwr 0x%x\nlast_cg 0x%x 0x%x 0x%x\n", dp_stats.last_pwr,
++			   dp_stats.last_cg[0], dp_stats.last_cg[1], dp_stats.last_cg[2]);
++	return n;
++}
++
++static const struct kernel_param_ops dpidle_stats_ops = {
++	.get = dpidle_stats_get,
++};
++module_param_cb(dpidle_stats, &dpidle_stats_ops, NULL, 0444);
++MODULE_PARM_DESC(dpidle_stats, "Deep idle entries, why not, and the last wake");
++
++static struct device *dpidle_dev;
++static bool dpidle_ready;
++
++/* At the first dpidle=1, not at boot: the wake sources and the cpuidle hook */
++static int dpidle_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned long src;
++	bool on;
++	int ret = kstrtobool(val, &on);
++
++	if (ret)
++		return ret;
++	if (on && !dpidle_ready) {
++		if (!dpidle_dev)
++			return -ENODEV;
++		src = dpidle_wake_mask ?: (wake_mask ?: spm_sip(MTK_SIP_SPM_GET_PWR_CTRL_ARGS,
++				SPM_PWR_CTRL_SUSPEND, PW_WAKE_SRC, 0)) | R12_AFE_IRQ_MCU;
++		spm_sip(MTK_SIP_SPM_PWR_CTRL_ARGS, SPM_PWR_CTRL_DPIDLE, PW_WAKE_SRC, src);
++		dev_info(dpidle_dev, "deep idle: wake sources 0x%lx, ATF reads back 0x%lx\n", src,
++			 spm_sip(MTK_SIP_SPM_GET_PWR_CTRL_ARGS, SPM_PWR_CTRL_DPIDLE,
++				 PW_WAKE_SRC, 0));
++		psci_cpuidle_set_platform_enter(mt6771_spm_cpuidle_enter);
++		dpidle_ready = true;
++	}
++	WRITE_ONCE(dpidle, on);
++	return 0;
++}
++
++/* ---- SODI and SODI3 ---- */
++
++static int so_set(const char *val, const struct kernel_param *kp);
++static int so_stats_get(char *buf, const struct kernel_param *kp);
++static const struct kernel_param_ops so_ops = {
++	.set = so_set,
++	.get = param_get_bool,
++};
++static const struct kernel_param_ops so_stats_ops = {
++	.get = so_stats_get,
++};
++
++static uint sodi_min_us = 2000;	/* the vendor's SODI and SODI3 min-residency */
++module_param(sodi_min_us, uint, 0644);
++MODULE_PARM_DESC(sodi_min_us, "SODI and SODI3 only when this CPU's next timer is this far");
++
++/*
++ * The SCP raises R12_SCP_SPM_IRQ_B with every message it sends (docs/
++ * power-testing.md, "The SCP trap"): in ATF's SODI set (0xed7ddff) it
++ * ended every SODI at once (debug 0x11000, r12 0x800, measured). Left out
++ * of both sets, as in suspend's wake_mask; the messages still interrupt
++ * the AP.
++ */
++#define R12_SCP_SPM_IRQ		BIT(11)
++
++/*
++ * The vendor's conditions (mtk_idle_mt6771.c, IDLE_TYPE_SO and _SO3):
++ * power domains (SO_PWR_STA_MASK: GPU, ISP, encoder, decoder, camera, VPU;
++ * the display may be on) and infra clock gates for both, with two more
++ * gates for SODI3 (0x094 bit 25, 0x0ac bit 4); for SODI, while DIS and the
++ * MM clock are on, MMSYS clock gates (CG_CON0/1) of the blocks a
++ * video-mode path does not use (MDP and the like). SODI3 asks for nearly
++ * every MMSYS clock gated (0xfffffc1b, 0x3fff) and the display PWM on its
++ * oscillator, which a video-mode panel never gives with the display
++ * running: here SODI3 needs DIS powered off. And UNIVPLL and MSDCPLL off
++ * (soidle3_pll_condition_mask). And 20 s of uptime for SODI, 30 for SODI3,
++ * as the vendor's.
++ */
++#define SODI_PWR_MASK		0xbef000b0
++#define PWR_DIS			BIT(3)
++#define MMSYS_CG_CON0		0x100
++#define MMSYS_CG_CON1		0x110
++#define SODI_MMSYS_CG0		0x000dfc00
++#define SODI_MMSYS_CG1		0x00000d70
++#define CLK_CFG_0		0x040
++#define MM_SEL_GATE		BIT(15)
++#define UNIVPLL_CON0		0x230
++#define MSDCPLL_CON0		0x250
++#define PLL_EN			BIT(0)
++#define SODI3_UPTIME_S		30
++#define SODI_UPTIME_S		20	/* the vendor's: 20 s for SODI, 30 for SODI3 */
++
++/* infra clock gate status registers, in the order of a scenario's masks */
++static const u16 so_cg_sta[] = { 0x094, 0x090, 0x0ac };
++
++enum { SO_OK, SO_SHORT, SO_PWR, SO_CG, SO_MMSYS, SO_PLL, SO_BOOT, SO_CPUS, SO_SECURE_CG,
++       SO_SSPM, SO_NR };
++static const char *const so_why[] = { "entered", "short", "power domain", "clock gate",
++				      "mmsys clock", "pll", "boot", "cpus", "secure clock",
++				      "sspm" };
++
++/*
++ * One scenario: what the vendor's spm_go_to_sodi() and spm_go_to_sodi3()
++ * set up, the knobs (module parameters) and the counters.
++ *
++ * SODI: the flags are the vendor's MT6771 SODI set (0x20019a) and
++ * SODI_CG_MODE, the scenario the vendor's display picks for a video-mode
++ * panel: the firmware arms DRAM self-refresh alone (docs/spm-firmware.md,
++ * the main program, step 10). The AP's APSRC and 26 MHz requests stay up.
++ *
++ * SODI3: the vendor's SODI3 set (SODI's with ENABLE_SODI3, bit 14, and
++ * without CG mode): the whole ladder down to 26 MHz, as in suspend, with
++ * infra kept powered; every AP request released; the SPM watchdog off for
++ * it (PW_WDT_DISABLE), as the vendor's with no watchdog API.
++ */
++struct so_scen {
++	const char *name;
++	bool three;
++	u32 psci, sspm_enter, sspm_leave, pwr_ctrl;
++	u32 cg_mask[3];
++	bool on;
++	bool at_probe;		/* asked for on the command line, before probe */
++	uint flags, flags1, hold, wake_mask;
++	unsigned long atf_wake;
++	bool ready;
++	struct {
++		unsigned long count[SO_NR];
++		u32 last_pwr, last_cg[3], last_mm[2], last_pll, last_r12, last_debug, last_cpu;
++		u64 slept_ticks;
++	} st;
++};
++
++#define SPM_FLAG_ENABLE_SODI3	BIT(14)
++#define SPM_PWR_CTRL_SODI3	20
++#define PW_WDT_DISABLE		15
++#define SSPM_SPM_ENTER_SODI3	6
++#define SSPM_SPM_LEAVE_SODI3	7
++#define MT6771_PSCI_SODI3	0x01010003
++
++static struct so_scen so_sodi = {
++	.name = "SODI", .psci = MT6771_PSCI_SODI,
++	.sspm_enter = SSPM_SPM_ENTER_SODI, .sspm_leave = SSPM_SPM_LEAVE_SODI,
++	.pwr_ctrl = SPM_PWR_CTRL_SODI,
++	.cg_mask = { 0x00040802, 0x03afb900, 0x000000c1 },
++	.flags = SPM_SODI_FLAGS, .hold = SPM_APSRC_REQ | SPM_F26M_REQ,
++};
++
++static struct so_scen so_sodi3 = {
++	.name = "SODI3", .three = true, .psci = MT6771_PSCI_SODI3,
++	.sspm_enter = SSPM_SPM_ENTER_SODI3, .sspm_leave = SSPM_SPM_LEAVE_SODI3,
++	.pwr_ctrl = SPM_PWR_CTRL_SODI3,
++	.cg_mask = { 0x02040802, 0x03afb900, 0x000000d1 },
++	.flags = (SPM_SODI_FLAGS & ~SPM_FLAG_SODI_CG_MODE) | SPM_FLAG_ENABLE_SODI3,
++};
++
++module_param_cb(sodi, &so_ops, &so_sodi.on, 0644);
++MODULE_PARM_DESC(sodi, "Enter the SPM's SODI from cpuidle (the last core, screen on)");
++module_param_named(sodi_flags, so_sodi.flags, uint, 0644);
++MODULE_PARM_DESC(sodi_flags, "SPM firmware flags for SODI (SPM_SW_FLAG)");
++module_param_named(sodi_flags1, so_sodi.flags1, uint, 0644);
++MODULE_PARM_DESC(sodi_flags1, "SPM firmware flags 1 for SODI (0: the A73 buck left alone)");
++module_param_named(sodi_hold, so_sodi.hold, uint, 0644);
++MODULE_PARM_DESC(sodi_hold, "SPM_SRC_REQ bits kept across SODI (0 APSRC, 1 26 MHz, 7 DDREN; default APSRC and 26 MHz)");
++module_param_named(sodi_wake_mask, so_sodi.wake_mask, uint, 0644);
++MODULE_PARM_DESC(sodi_wake_mask, "SODI wake sources (R12 bits) set at each sodi=1, 0 for ATF's less the SCP's");
++module_param_cb(sodi_stats, &so_stats_ops, &so_sodi, 0444);
++MODULE_PARM_DESC(sodi_stats, "SODI entries, why not, and the last wake");
++
++module_param_cb(sodi3, &so_ops, &so_sodi3.on, 0644);
++MODULE_PARM_DESC(sodi3, "Enter the SPM's SODI3 (26 MHz off) from cpuidle (the last core, display off)");
++module_param_named(sodi3_flags, so_sodi3.flags, uint, 0644);
++MODULE_PARM_DESC(sodi3_flags, "SPM firmware flags for SODI3 (SPM_SW_FLAG)");
++module_param_named(sodi3_flags1, so_sodi3.flags1, uint, 0644);
++MODULE_PARM_DESC(sodi3_flags1, "SPM firmware flags 1 for SODI3");
++module_param_named(sodi3_hold, so_sodi3.hold, uint, 0644);
++MODULE_PARM_DESC(sodi3_hold, "SPM_SRC_REQ bits kept across SODI3 (default none)");
++module_param_named(sodi3_wake_mask, so_sodi3.wake_mask, uint, 0644);
++MODULE_PARM_DESC(sodi3_wake_mask, "SODI3 wake sources (R12 bits) set at each sodi3=1, 0 for ATF's less the SCP's");
++module_param_cb(sodi3_stats, &so_stats_ops, &so_sodi3, 0444);
++MODULE_PARM_DESC(sodi3_stats, "SODI3 entries, why not, and the last wake");
++
++static void __iomem *mmsys_base;
++
++static int so_check(struct so_scen *sc)
++{
++	u32 pwr, v;
++	int i, blocked = 0;
++
++	if (ktime_us_delta(tick_nohz_get_next_hrtimer(), ktime_get()) < sodi_min_us)
++		return SO_SHORT;
++	if (ktime_get_boottime_seconds() < (sc->three ? SODI3_UPTIME_S : SODI_UPTIME_S))
++		return SO_BOOT;
++	pwr = readl(spm_base + PWR_STATUS) & readl(spm_base + PWR_STATUS_2ND);
++	sc->st.last_pwr = pwr & (SODI_PWR_MASK | (sc->three ? PWR_DIS : 0));
++	if (sc->st.last_pwr)
++		return SO_PWR;
++	for (i = 0; i < ARRAY_SIZE(so_cg_sta); i++) {
++		regmap_read(infracfg_regmap, so_cg_sta[i], &v);
++		sc->st.last_cg[i] = ~v & sc->cg_mask[i];
++		blocked |= !!sc->st.last_cg[i];
++	}
++	if (blocked)
++		return SO_CG;
++	if (sc->three) {
++		regmap_read(apmixed_regmap, UNIVPLL_CON0, &v);
++		sc->st.last_pll = v & PLL_EN;
++		regmap_read(apmixed_regmap, MSDCPLL_CON0, &v);
++		sc->st.last_pll |= (v & PLL_EN) << 1;
++		return sc->st.last_pll ? SO_PLL : SO_OK;
++	}
++	/* MMSYS registers only with DIS powered and the MM clock running */
++	regmap_read(topck_regmap, CLK_CFG_0, &v);
++	if ((pwr & PWR_DIS) && !(v & MM_SEL_GATE) && mmsys_base) {
++		sc->st.last_mm[0] = ~readl(mmsys_base + MMSYS_CG_CON0) & SODI_MMSYS_CG0;
++		sc->st.last_mm[1] = ~readl(mmsys_base + MMSYS_CG_CON1) & SODI_MMSYS_CG1;
++		if (sc->st.last_mm[0] | sc->st.last_mm[1])
++			return SO_MMSYS;
++	}
++	return SO_OK;
++}
++
++/*
++ * spm_go_to_sodi()/spm_go_to_sodi3(), once the conditions hold: the last
++ * core, the SSPM told, the scenario through a SiP call, PSCI CPU_SUSPEND
++ * with the state; anything that fails falls back to the cluster power-down
++ * cpuidle asked for.
++ */
++static int so_go(struct so_scen *sc)
++{
++	unsigned int cpu = smp_processor_id();
++	u32 r12, debug, timer;
++	int why = SO_OK, ret;
++
++	if (!mtk_mcdi_last_core(cpu)) {
++		sc->st.count[SO_CPUS]++;
++		return psci_cpu_suspend_enter(MT6771_PSCI_CLUSTER);
++	}
++	/* from here MCDI is paused: no other core comes up */
++	if (spm_sip(MTK_SIP_CHECK_SECURE_CG, 0, 0, 0))
++		why = SO_SECURE_CG;
++	else if (sspm_spm_command(sc->sspm_enter) < 0)
++		why = SO_SSPM;
++	if (why != SO_OK) {
++		mtk_mcdi_last_core_release();
++		sc->st.count[why]++;
++		return psci_cpu_suspend_enter(MT6771_PSCI_CLUSTER);
++	}
++
++	regmap_clear_bits(spm_regmap, SPM_SRC_REQ, SPM_HELD_REQ & ~READ_ONCE(sc->hold));
++	spm_sip(MTK_SIP_SPM_SODI_ARGS, READ_ONCE(sc->flags), READ_ONCE(sc->flags1), 0);
++	ret = psci_cpu_suspend_enter(sc->psci);
++	mt6771_spm_hold(spm_regmap);
++	sspm_spm_command(sc->sspm_leave);
++	mtk_mcdi_last_core_release();
++
++	regmap_read(spm_regmap, SPM_SW_RSV_0, &r12);
++	regmap_read(spm_regmap, SPM_SW_DEBUG, &debug);
++	regmap_read(spm_regmap, SPM_BSI_D1_SR, &timer);
++	sc->st.count[SO_OK]++;
++	sc->st.last_r12 = r12;
++	sc->st.last_debug = debug;
++	sc->st.last_cpu = cpu;
++	sc->st.slept_ticks += timer;
++	return ret;
++}
++
++/* SODI3 first (the deeper), else SODI, else the cluster power-down */
++static int so_enter(void)
++{
++	int why;
++
++	if (READ_ONCE(so_sodi3.on)) {
++		why = so_check(&so_sodi3);
++		if (why == SO_OK)
++			return so_go(&so_sodi3);
++		so_sodi3.st.count[why]++;
++	}
++	if (READ_ONCE(so_sodi.on)) {
++		why = so_check(&so_sodi);
++		if (why == SO_OK)
++			return so_go(&so_sodi);
++		so_sodi.st.count[why]++;
++	}
++	return psci_cpu_suspend_enter(MT6771_PSCI_CLUSTER);
++}
++
++static int so_stats_get(char *buf, const struct kernel_param *kp)
++{
++	struct so_scen *sc = kp->arg;
++	int i, n = 0;
++
++	for (i = 0; i < SO_NR; i++)
++		n += sysfs_emit_at(buf, n, "%s %lu\n", so_why[i], sc->st.count[i]);
++	n += sysfs_emit_at(buf, n, "slept_ms %llu\nlast_r12 0x%x\nlast_debug 0x%x\nlast_cpu %u\n",
++			   div_u64(sc->st.slept_ticks * 1000, 32768), sc->st.last_r12,
++			   sc->st.last_debug, sc->st.last_cpu);
++	n += sysfs_emit_at(buf, n, "last_pwr 0x%x\nlast_cg 0x%x 0x%x 0x%x\n", sc->st.last_pwr,
++			   sc->st.last_cg[0], sc->st.last_cg[1], sc->st.last_cg[2]);
++	if (sc->three)
++		n += sysfs_emit_at(buf, n, "last_pll 0x%x (bit 0 UNIVPLL, 1 MSDCPLL)\n",
++				   sc->st.last_pll);
++	else
++		n += sysfs_emit_at(buf, n, "last_mmsys 0x%x 0x%x\n", sc->st.last_mm[0],
++				   sc->st.last_mm[1]);
++	return n;
++}
++
++static bool so_hooked;
++
++static bool so_any(void)
++{
++	return READ_ONCE(so_sodi.on) || READ_ONCE(so_sodi3.on);
++}
++
++/* The wake sources at each 0 -> 1; the cpuidle hook the first time */
++static int so_setup(struct so_scen *sc)
++{
++	unsigned long src;
++
++	if (!dpidle_dev || !apmixed_regmap)
++		return -ENODEV;
++	if (!sc->ready) {
++		sc->atf_wake = spm_sip(MTK_SIP_SPM_GET_PWR_CTRL_ARGS, sc->pwr_ctrl,
++				       PW_WAKE_SRC, 0);
++		if (sc->three)
++			spm_sip(MTK_SIP_SPM_PWR_CTRL_ARGS, sc->pwr_ctrl, PW_WDT_DISABLE, 1);
++		sc->ready = true;
++	}
++	src = sc->wake_mask ?: sc->atf_wake & ~R12_SCP_SPM_IRQ;
++	spm_sip(MTK_SIP_SPM_PWR_CTRL_ARGS, sc->pwr_ctrl, PW_WAKE_SRC, src);
++	dev_info(dpidle_dev, "%s: ATF's wake sources 0x%lx, set 0x%lx, reads back 0x%lx\n",
++		 sc->name, sc->atf_wake, src,
++		 spm_sip(MTK_SIP_SPM_GET_PWR_CTRL_ARGS, sc->pwr_ctrl, PW_WAKE_SRC, 0));
++	if (!so_hooked)
++		psci_cpuidle_set_platform_enter(mt6771_spm_cpuidle_enter);
++	so_hooked = true;
++	return 0;
++}
++
++/*
++ * sodi=1 / sodi3=1. On the command line it comes before the driver
++ * probes: remembered then and set up at probe (so_probe()).
++ */
++static int so_set(const char *val, const struct kernel_param *kp)
++{
++	struct so_scen *sc = container_of((bool *)kp->arg, struct so_scen, on);
++	bool on;
++	int ret = kstrtobool(val, &on);
++
++	if (ret)
++		return ret;
++	if (!dpidle_dev) {
++		sc->at_probe = on;
++		return 0;
++	}
++	if (on && !READ_ONCE(sc->on)) {
++		ret = so_setup(sc);
++		if (ret)
++			return ret;
++	}
++	WRITE_ONCE(sc->on, on);
++	return 0;
++}
++
++static void so_probe(struct device *dev)
++{
++	struct so_scen *const scens[] = { &so_sodi, &so_sodi3 };
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(scens); i++) {
++		if (!scens[i]->at_probe)
++			continue;
++		if (so_setup(scens[i]))
++			dev_warn(dev, "%s unavailable\n", scens[i]->name);
++		else
++			WRITE_ONCE(scens[i]->on, true);
++	}
++}
++
++static void mt6771_spm_dpidle_init(struct device *dev)
++{
++	struct device_node *np;
++
++	spm_base = of_iomap(dev->parent->of_node, 0);
++	if (!spm_base || !infracfg_regmap || !topck_regmap) {
++		dev_warn(dev, "deep idle unavailable\n");
++		return;
++	}
++	/* SODI reads the MMSYS clock gates */
++	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6771-mmsys");
++	if (np) {
++		mmsys_base = of_iomap(np, 0);
++		of_node_put(np);
++	}
++	dpidle_dev = dev;
++	so_probe(dev);
++}
++
 +static int crumb_held;
 +
 +static int mt6771_spm_suspend_enter(suspend_state_t state)
@@ -2481,7 +3222,8 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +	u32 r12, wake_sta, r13, timer, debug, pc, pwr, fail;
 +	u32 req_in, idle_in, src_in, req, idle, mask, mask2;
 +	unsigned long wake_src;
-+	int ret, vs1;
++	int ret, vs1, aud = -1;
++	bool sdp;
 +
 +	crumb_failed = 0;
 +	crumb_done = 0;
@@ -2495,11 +3237,14 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +			PW_WAKE_SRC, wake_mask);
 +	wake_src = spm_sip(MTK_SIP_SPM_GET_PWR_CTRL_ARGS, SPM_PWR_CTRL_SUSPEND,
 +			   PW_WAKE_SRC, 0);
++	sdp = READ_ONCE(sleep_dpidle);
 +	spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 1, pcm_wdt_timer ?: PCM_WDT_SEC);
 +	spm_crumb_atomic(CRUMB_ATF_ARGS);
 +	mtk_mcdi_pause(true);
 +	spm_crumb_atomic(CRUMB_SSPM_ASK);
-+	ret = sspm_spm_command(SSPM_SPM_SUSPEND);
++	/* the vendor's spm_go_to_sleep_dpidle(): the SSPM's deep idle, "sleep" option */
++	ret = sdp ? sspm_spm_command_opt(SSPM_SPM_DPIDLE_ENTER, SSPM_OPT_SLEEP_DPIDLE) :
++		    sspm_spm_command(SSPM_SPM_SUSPEND);
 +	if (ret < 0) {
 +		/*
 +		 * Going on into the SPM's sleep without the SSPM's part: every
@@ -2523,17 +3268,27 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +	regmap_read(spm_regmap, SPM_SRC_REQ, &src_in);	/* ... and who asks for what */
 +	regmap_read(spm_regmap, SRC_REQ_STA, &req_in);
 +	regmap_read(spm_regmap, SUBSYS_IDLE_STA, &idle_in);
-+	spm_pll_sleep_apply(true);
 +	spm_clk_snapshot();
-+	spm_sip(MTK_SIP_SPM_SUSPEND_ARGS, pcm_flags, pcm_flags1, PCM_TIMER_MAX);
-+	spm_mark(MARK_PSCI);
-+	ret = psci_cpu_suspend_enter(MT6771_PSCI_SUSPEND);
-+	spm_pll_sleep_apply(false);
++	if (sdp) {
++		aud = dpidle_aud_intbus(0);
++		spm_sip(MTK_SIP_SPM_DPIDLE_ARGS, SPM_DPIDLE_FLAGS, 0, 0);
++		spm_sip(MTK_SIP_SPM_SLEEP_DPIDLE_ARGS, 0, wake_src, 0);
++		spm_mark(MARK_PSCI);
++		ret = psci_cpu_suspend_enter(MT6771_PSCI_DPIDLE);
++		if (aud >= 0)
++			dpidle_aud_intbus(aud);
++	} else {
++		spm_pll_sleep_apply(true);
++		spm_sip(MTK_SIP_SPM_SUSPEND_ARGS, pcm_flags, pcm_flags1, PCM_TIMER_MAX);
++		spm_mark(MARK_PSCI);
++		ret = psci_cpu_suspend_enter(MT6771_PSCI_SUSPEND);
++		spm_pll_sleep_apply(false);
++	}
 +	spm_crumb_atomic(CRUMB_BACK);
 +	mt6771_spm_hold(spm_regmap);
 +	spm_mark(MARK_HELD);
 +
-+	sspm_spm_command(SSPM_SPM_RESUME);
++	sspm_spm_command(sdp ? SSPM_SPM_DPIDLE_LEAVE : SSPM_SPM_RESUME);
 +	spm_crumb_atomic(CRUMB_SSPM_UP);
 +	mtk_mcdi_pause(false);
 +	spm_sip(MTK_SIP_SPM_ARGS, SPM_ARGS_PCM_WDT, 0, 0);
@@ -2550,8 +3305,8 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +	regmap_read(spm_regmap, SUBSYS_IDLE_STA, &idle);
 +	regmap_read(spm_regmap, SPM_SRC_MASK, &mask);
 +	regmap_read(spm_regmap, SPM_SRC2_MASK, &mask2);
-+	pr_info("mt6771-spm: suspend %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x, fail 0x%x, pwr 0x%x, src_req 0x%x, req_sta 0x%x/0x%x, idle_sta 0x%x/0x%x, src_mask 0x%x/0x%x, crumbs lost 0x%x, held %d, cpu0 %u kHz\n",
-+		ret, wake_src, r12, wake_sta, r13,
++	pr_info("mt6771-spm: %s %d: wake src 0x%lx, r12 0x%x, wake sta 0x%x, r13 0x%x, slept %u ms, debug 0x%x, pc 0x%x, fail 0x%x, pwr 0x%x, src_req 0x%x, req_sta 0x%x/0x%x, idle_sta 0x%x/0x%x, src_mask 0x%x/0x%x, crumbs lost 0x%x, held %d, cpu0 %u kHz\n",
++		sdp ? "sleep-dpidle" : "suspend", ret, wake_src, r12, wake_sta, r13,
 +		(u32)div_u64((u64)timer * 1000, 32768), debug, pc, fail, pwr, src_in,
 +		req_in, req, idle_in, idle, mask, mask2, crumb_failed, crumb_held,
 +		cpufreq_quick_get(0));
@@ -2627,6 +3382,7 @@ index 0000000000000000000000000000000000000000..32d9678f09ce225f7340e3dfb6888f6f
 +			return dev_err_probe(dev, ret, "PMIC low power setup\n");
 +		spm_crumb_init(dev, pmic);
 +		spm_clk_init(dev);
++		mt6771_spm_dpidle_init(dev);
 +	}
 +
 +	ret = mt6771_spm_hold(spm_regmap);
@@ -2939,10 +3695,10 @@ index 0000000000000000000000000000000000000000..28528069e27e714e036b99aaa546bcf9
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/soc/mediatek/mtk-mcdi.c b/drivers/soc/mediatek/mtk-mcdi.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..0a56e138bf75d705acc775510d077596ebb2b3e7
+index 0000000000000000000000000000000000000000..640e8f597505e39f5cb8985a980d415c835d1c78
 --- /dev/null
 +++ b/drivers/soc/mediatek/mtk-mcdi.c
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,264 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MediaTek MCDI (multi-core deep idle) for the MT6771.
@@ -2993,8 +3749,10 @@ index 0000000000000000000000000000000000000000..0a56e138bf75d705acc775510d077596
 +/* SSPM mailbox 3 slots (32 bits each) */
 +#define MCDI_MBOX_PAUSE_ACTION		6
 +#define MCDI_MBOX_AVAIL_CPU_MASK	7
++#define MCDI_MBOX_CPU_CLUSTER_PWR_STAT	8	/* bit set: off; CPUs 0-7, clusters 16-17 */
 +#define MCDI_MBOX_CPU_ISOLATION_MASK	12
 +#define MCDI_MBOX_PAUSE_ACK		13
++#define MCDI_MBOX_PENDING_ON_EVENT	14	/* a core the SSPM is about to power on */
 +
 +/* MediaTek SiP calls: power a parked core or an empty cluster off */
 +#define MTK_SIP_POWER_DOWN_CLUSTER	MTK_SIP_SMC_CMD(0x210)
@@ -3002,6 +3760,7 @@ index 0000000000000000000000000000000000000000..0a56e138bf75d705acc775510d077596
 +
 +static void __iomem *mcdi_mbox;
 +static DEFINE_SPINLOCK(mcdi_lock);
++static unsigned int mcdi_paused;	/* pause requests held: hotplug, suspend, SoC idle */
 +
 +static void mcdi_write(int slot, u32 val)
 +{
@@ -3019,9 +3778,23 @@ index 0000000000000000000000000000000000000000..0a56e138bf75d705acc775510d077596
 +		pr_warn("mcdi: no %s acknowledge\n", pause ? "pause" : "resume");
 +}
 +
++/* the task stops at the first request and resumes when the last goes */
++static void mcdi_pause_get(void)
++{
++	if (!mcdi_paused++)
++		mcdi_pause(true);
++}
++
++static void mcdi_pause_put(void)
++{
++	if (!WARN_ON(!mcdi_paused) && !--mcdi_paused)
++		mcdi_pause(false);
++}
++
 +/*
-+ * Also for system suspend through the SPM (mt6771-spm), which MediaTek's
-+ * kernel runs with MCDI paused (mcdi_task_pause()).
++ * Also for system suspend and the SoC idle states through the SPM
++ * (mt6771-spm), which MediaTek's kernel runs with MCDI paused
++ * (mcdi_task_pause()). Counted: hotplug, suspend and idle may overlap.
 + */
 +void mtk_mcdi_pause(bool pause)
 +{
@@ -3030,8 +3803,59 @@ index 0000000000000000000000000000000000000000..0a56e138bf75d705acc775510d077596
 +	if (!mcdi_mbox)
 +		return;
 +	spin_lock_irqsave(&mcdi_lock, flags);
-+	mcdi_pause(pause);
++	if (pause)
++		mcdi_pause_get();
++	else
++		mcdi_pause_put();
 +	spin_unlock_irqrestore(&mcdi_lock, flags);
++}
++
++/* The CPU and cluster bits the SSPM shows when only @cpu is powered */
++static bool mcdi_only_cpu_on(unsigned int cpu)
++{
++	u32 cpus = 0, clusters = 0, want, sta;
++	int i;
++
++	for_each_online_cpu(i) {
++		cpus |= BIT(i);
++		clusters |= BIT(MPIDR_AFFINITY_LEVEL(cpu_logical_map(i), 1));
++	}
++	want = ((clusters << 16) | cpus) &
++	       ~(BIT(cpu) | BIT(16 + MPIDR_AFFINITY_LEVEL(cpu_logical_map(cpu), 1)));
++	sta = readl(mcdi_mbox + 4 * MCDI_MBOX_CPU_CLUSTER_PWR_STAT);
++	return sta == want && !readl(mcdi_mbox + 4 * MCDI_MBOX_PENDING_ON_EVENT);
++}
++
++/*
++ * MediaTek's "last core" for the SoC idle states (mtk_mcdi_governor_lib.c,
++ * acquire_last_core_prot(), the MT6771's non-CPC variant): every other
++ * core and the other cluster are powered off by MCDI and no power-on is
++ * pending; then the MCDI task pauses, so the SSPM powers no core on behind
++ * the SPM's back, and the check is repeated. True: @cpu is the last core and
++ * MCDI stays paused until mtk_mcdi_last_core_release(). Called from idle,
++ * with interrupts off.
++ */
++bool mtk_mcdi_last_core(unsigned int cpu)
++{
++	bool last;
++
++	if (!mcdi_mbox || !mcdi_only_cpu_on(cpu))
++		return false;
++
++	spin_lock(&mcdi_lock);
++	mcdi_pause_get();
++	last = mcdi_only_cpu_on(cpu);
++	if (!last)
++		mcdi_pause_put();
++	spin_unlock(&mcdi_lock);
++	return last;
++}
++
++void mtk_mcdi_last_core_release(void)
++{
++	spin_lock(&mcdi_lock);
++	mcdi_pause_put();
++	spin_unlock(&mcdi_lock);
 +}
 +
 +static void mcdi_hotplug_enter(void)
@@ -3053,7 +3877,7 @@ index 0000000000000000000000000000000000000000..0a56e138bf75d705acc775510d077596
 +
 +	spin_lock_irqsave(&mcdi_lock, flags);
 +	mcdi_write(MCDI_MBOX_AVAIL_CPU_MASK, mask);
-+	mcdi_pause(false);
++	mcdi_pause_put();
 +	spin_unlock_irqrestore(&mcdi_lock, flags);
 +
 +	if (!cpuhp_tasks_frozen)
@@ -3141,10 +3965,10 @@ index 0000000000000000000000000000000000000000..0a56e138bf75d705acc775510d077596
 +arch_initcall(mcdi_init);
 diff --git a/include/linux/soc/mediatek/mtk-mcdi.h b/include/linux/soc/mediatek/mtk-mcdi.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..98389925bb23df3b3e68441c65d23054f850964e
+index 0000000000000000000000000000000000000000..621fa684d05833a14060d7edc9bb490f6678e58e
 --- /dev/null
 +++ b/include/linux/soc/mediatek/mtk-mcdi.h
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,17 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef __SOC_MEDIATEK_MTK_MCDI_H
 +#define __SOC_MEDIATEK_MTK_MCDI_H
@@ -3153,8 +3977,12 @@ index 0000000000000000000000000000000000000000..98389925bb23df3b3e68441c65d23054
 +
 +#if IS_ENABLED(CONFIG_MTK_MCDI)
 +void mtk_mcdi_pause(bool pause);
++bool mtk_mcdi_last_core(unsigned int cpu);
++void mtk_mcdi_last_core_release(void);
 +#else
 +static inline void mtk_mcdi_pause(bool pause) { }
++static inline bool mtk_mcdi_last_core(unsigned int cpu) { return false; }
++static inline void mtk_mcdi_last_core_release(void) { }
 +#endif
 +
 +#endif

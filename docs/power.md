@@ -492,6 +492,18 @@ tagged `power-switch`, and logind's default is **poweroff**), so
   26 MHz clock (held by the connectivity chip, whose radio functions were
   still on) and DRAM staying up; 4.14 reached 12 mA (the sleep floor
   above). The sensor hub's SCP is kept awake on 6.12 for now.
+- **Idle with the phone awake** (2026-11-17, #142-#148; mainline.md,
+  "Screen-on idle (SODI, SODI3) and the screen off"): the screen off now
+  powers the display path and the GPU down (the DISP and MFG domains off),
+  and the SPM's SoC idle states run from the last core: SODI with the
+  screen on, SODI3 (26 MHz off) with it off. Held awake, unplugged: screen
+  on and still 171 mA, 164-166 mA with SODI; screen off 98-110 mA, 90-91
+  with SODI, 85-89 with SODI3. Both on in the boot images since #149
+  (`mt6771_spm.sodi=1 mt6771_spm.sodi3=1`). On the way: the Wi-Fi/Bluetooth link
+  (BTIF) gates its clocks while the connectivity chip sleeps, I2C runs from
+  26 MHz, the sensor hub's clock mux is parked on 26 MHz, and the USB
+  controller sleeps with the cable out; all of these let the SoC's idle
+  states in.
 - **Screen off is a minimal system** on 6.12: `titan-powerkey` switches the
   Wi-Fi and Bluetooth functions off on the chip (`titan-bt` stopped, 0 to
   `/dev/wmtWifi`) and back on at screen on, only those that were on, Wi-Fi
@@ -509,6 +521,23 @@ tagged `power-switch`, and logind's default is **poweroff**), so
   every 10 s. When playback stops the radios go off and the phone sleeps as
   before; the big cores come back at screen on. A paused stream counts as
   stopped. Not yet measured: the current while playing with the screen off.
+- **The modem's reports with the screen off** (2026-11-16): on a train in a
+  pocket the phone woke 193 times in an hour (186 by the modem, about
+  60 mA), against no modem wake in a half hour at rest. Moving, the modem
+  reports every cell change (`+CREG`/`+CGREG`/`+CEREG` at mode 2, which
+  ModemManager and titan-ims set) and every signal and service change
+  (`+CIEV`, `AT+CMER` with `<ind>` 1). titan-powerkey now does at screen off
+  what MediaTek's radio layer does on Android (libmtk-ril's
+  `setUnsolResponseFilterNetworkState` and `...SignalStrength`): mode 1
+  (registration changes only, no cell) and no indicator events, and puts
+  back what it found at screen on. The settings are the modem's, shared by
+  every AT channel (an untouched channel reads what the others set), so
+  they go out on `cmd2`; `CGREG` and `CEREG` are one setting on this modem.
+  titan-ims, which needs mode 2 to read the cell for its SIP headers, now
+  puts the mode back after reading it. Checked on the phone: modes 2, 2, 2
+  and `CMER 3,0,0,1` before, 1, 1, 1 and `3,0,0,0` with the screen off,
+  the first values again with it on. Not yet measured: the wakes on a train
+  with this in place.
 - **Wakelocks and the cable** (2026-11-03, kernel #94): the 6.12 config
   lacked `CONFIG_PM_WAKELOCKS`, so `/sys/power/wake_lock` didn't exist and
   neither the GPS's wakelock nor any other kept the phone awake; it is set

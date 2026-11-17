@@ -1,0 +1,1715 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Topher Campbell <chrs2021@gmail.com>
+Subject: [PATCH 20/23] media: mediatek: add the MT6771 H.264 decoder
+
+titan_vdec drives the MT6771's video decoder, MT8183's decoder block,
+as a V4L2 stateless (request API) H.264 decoder: frame-based, Annex B
+start codes, MM21 output in two planes. MT8183's driver hands the
+register programming to decoder firmware on the SCP; the MT6771's SCP
+runs the sensor hub instead, so this driver programs the block itself:
+it parses the first slice header through the decoder's own bitstream
+reader, sets up the sequence, picture, reference lists and buffers from
+the stateless controls, and the hardware decodes every slice of the
+picture on its own.
+---
+ drivers/media/platform/mediatek/Kconfig       |    1 +
+ drivers/media/platform/mediatek/Makefile      |    1 +
+ .../platform/mediatek/mt6771-vdec/Kconfig     |   19 +
+ .../platform/mediatek/mt6771-vdec/Makefile    |    2 +
+ .../mediatek/mt6771-vdec/titan_vdec.c         | 1637 +++++++++++++++++
+ 5 files changed, 1660 insertions(+)
+
+diff --git a/drivers/media/platform/mediatek/Kconfig b/drivers/media/platform/mediatek/Kconfig
+index 84104e2cd02447790ae5c29953a2e82ca4fdd0a7..4e73b7952a746cd2956f1c69b2bea209a8fdc6f7 100644
+--- a/drivers/media/platform/mediatek/Kconfig
++++ b/drivers/media/platform/mediatek/Kconfig
+@@ -7,3 +7,4 @@ source "drivers/media/platform/mediatek/mdp/Kconfig"
+ source "drivers/media/platform/mediatek/vcodec/Kconfig"
+ source "drivers/media/platform/mediatek/vpu/Kconfig"
+ source "drivers/media/platform/mediatek/mdp3/Kconfig"
++source "drivers/media/platform/mediatek/mt6771-vdec/Kconfig"
+diff --git a/drivers/media/platform/mediatek/Makefile b/drivers/media/platform/mediatek/Makefile
+index 38e6ba917fe5cdd932aa6c88221c9a7aa5a7705a..55cf0fe413e416ef30658a3f31ebf53a5d282d61 100644
+--- a/drivers/media/platform/mediatek/Makefile
++++ b/drivers/media/platform/mediatek/Makefile
+@@ -4,3 +4,4 @@ obj-y += mdp/
+ obj-y += vcodec/
+ obj-y += vpu/
+ obj-y += mdp3/
++obj-y += mt6771-vdec/
+diff --git a/drivers/media/platform/mediatek/mt6771-vdec/Kconfig b/drivers/media/platform/mediatek/mt6771-vdec/Kconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..591afe312877ffdfb4795f1618b7140d690da56c
+--- /dev/null
++++ b/drivers/media/platform/mediatek/mt6771-vdec/Kconfig
+@@ -0,0 +1,19 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config VIDEO_MT6771_VDEC
++	tristate "MediaTek MT6771 H.264 video decoder"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on VIDEO_DEV && OF && MFD_SYSCON
++	depends on MTK_IOMMU || COMPILE_TEST
++	depends on MTK_SMI || COMPILE_TEST
++	select MEDIA_CONTROLLER
++	select V4L2_H264
++	select V4L2_MEM2MEM_DEV
++	select VIDEOBUF2_DMA_CONTIG
++	help
++	  The MT6771's (Helio P60's) H.264 hardware decoder as a V4L2
++	  stateless memory-to-memory device. It is MT8183's decoder block;
++	  this driver programs it directly instead of through decoder
++	  firmware on the SCP.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called titan_vdec.
+diff --git a/drivers/media/platform/mediatek/mt6771-vdec/Makefile b/drivers/media/platform/mediatek/mt6771-vdec/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a4cd508e0eb42dc63106d04b1477d6ea820c56c
+--- /dev/null
++++ b/drivers/media/platform/mediatek/mt6771-vdec/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_VIDEO_MT6771_VDEC) += titan_vdec.o
+diff --git a/drivers/media/platform/mediatek/mt6771-vdec/titan_vdec.c b/drivers/media/platform/mediatek/mt6771-vdec/titan_vdec.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..01b5ef63e793515e86cd4ea039fdb3a8634b4f02
+--- /dev/null
++++ b/drivers/media/platform/mediatek/mt6771-vdec/titan_vdec.c
+@@ -0,0 +1,1637 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * titan_vdec: the MT6771's H.264 video decoder as a V4L2 stateless
++ * (request API) memory-to-memory device, docs/video-decoder.md.
++ *
++ * The MT6771's VDEC is MT8183's: the same register blocks at 0x16020000,
++ * interrupt, power domain, clocks and larb 1 ports. MT8183's mainline driver
++ * hands the register programming to decoder firmware on the SCP; the
++ * MT6771's SCP runs the sensor hub instead, and the vendor programmed the
++ * decoder from userspace through a pass-through driver. This driver programs
++ * it directly, from the stateless controls (SPS, PPS, scaling matrix, decode
++ * parameters) and the bitstream.
++ *
++ * How the hardware decodes a picture (register meanings from the vendor
++ * library's behaviour, described in our own words):
++ * - the bitstream goes through a barrel shifter (VLD, AVC_VLD) that also
++ *   reads exp-Golomb codes, finds start codes and parses a slice's
++ *   reference list modifications and prediction weight table by itself;
++ * - software parses the first slice header with it, up to the start of the
++ *   slice data, and programs the sequence, picture, reference lists and
++ *   output buffers;
++ * - started, the decoder runs through every slice of the picture on its
++ *   own (it parses the later slice headers itself) until the end-of-stream
++ *   marker this driver appends, and raises its interrupt.
++ *
++ * Frame-based decoding with Annex B start codes, progressive frames, 8-bit
++ * 4:2:0, up to 1920x1088. Output: MM21 (16x32 luma tiles, 16x16 chroma),
++ * two planes.
++ */
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/workqueue.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-h264.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-dma-contig.h>
++
++#define DRV_NAME	"titan-vdec"
++
++/* register blocks, offsets from 0x16020000 */
++#define MISC		0x0000
++#define VLD		0x1000
++#define VLDTOP		0x1800
++#define MC		0x2000
++#define AVLD		0x3000		/* AVC_VLD */
++#define AVMV		0x4000		/* AVC_MV */
++#define PP		0x5000
++#define REG_SPAN	0x9000
++
++/* vdecsys (0x16000000) */
++#define SYS_CKEN	0x00
++#define SYS_18		0x18
++
++/* MISC */
++#define MISC_IRQ	0xa4		/* bit 16 decode done; ack 0x11 then clear 0x10 */
++#define MISC_BREAK	0x100
++#define MISC_BREAK_ST	0x104
++
++/* AVC_VLD */
++#define AVLD_PEEK	0x000		/* next 32 bits; reading AVLD + 4n shifts n */
++#define AVLD_CTRL	0x084
++#define AVLD_SPS	0x088
++#define AVLD_FIRST_MB	0x08c
++#define AVLD_PPS1	0x090
++#define AVLD_PPS2	0x094
++#define AVLD_SHDR1	0x098
++#define AVLD_SHDR2	0x09c
++#define AVLD_MAX_PICNUM	0x0a0
++#define AVLD_CUR_PICNUM	0x0a4
++#define AVLD_P_PICNUM	0x0a8		/* 32: P list pic nums */
++#define AVLD_RPL_INIT	0x228
++#define AVLD_REORDER	0x22c
++#define AVLD_PWT	0x230
++#define AVLD_CABAC_INIT	0x234
++#define AVLD_START	0x238
++#define AVLD_UE		0x23c
++#define AVLD_SE		0x240
++#define AVLD_STATUS	0x25c
++#define AVLD_ERR_ST	0x270
++#define AVLD_DONE	0x278
++#define AVLD_ERR_MASK	0x280
++#define AVLD_ERR	0x284
++#define AVLD_BS_RESET	0x28c
++#define AVLD_EPB	0x2c8
++#define AVLD_2D0	0x2d0
++#define AVLD_2D4	0x2d4
++#define AVLD_FIND_SC	0x2d8
++#define AVLD_ERR_POS	0x2e4
++
++#define CTRL_DEFAULT	0xae00e007
++#define CTRL_EC		0xae80e007	/* error concealment on */
++
++/* reference lists: luma addresses in MC, chroma (explicit-chroma mode) in MC */
++#define MC_P_Y		0x3dc
++#define MC_B0_Y		0x45c
++#define MC_B1_Y		0x4dc
++#define MC_C_OFFSET	0x784		/* from a list's Y table to its C table */
++#define MC_EXPLICIT_C	0xb5c
++
++/* frame size limits */
++#define MIN_W		64
++#define MIN_H		64
++#define MAX_W		1920
++#define MAX_H		1088
++
++/* work buffers the hardware needs (vendor sizes) */
++#define VLD_WORK_SIZE	0x8000
++#define MC_A20_SIZE	0xf000
++#define MC_A24_SIZE	0x1e000
++
++struct tvdec_buf {
++	void *va;
++	dma_addr_t da;
++	size_t size;
++};
++
++struct tvdec_dev {
++	struct device *dev;
++	void __iomem *regs;
++	struct regmap *sys;
++	struct clk *clk;
++	struct v4l2_device v4l2_dev;
++	struct media_device mdev;
++	struct video_device vfd;
++	struct v4l2_m2m_dev *m2m;
++	struct mutex vfd_lock;
++	struct workqueue_struct *wq;
++	struct work_struct run_work;
++	struct completion irq_done;
++	u32 irq_status;
++	struct tvdec_buf vld_work, mc_a20, mc_a24;
++	struct dentry *dbg;
++	/* register trace for debugging (debugfs "trace") */
++	bool trace;
++	char *tbuf;
++	size_t tlen;
++	u32 last_err, last_done, last_us;
++	unsigned long frames, errors;
++};
++
++struct tvdec_slice {
++	u32 first_mb, slice_type, pps_id, frame_num, idr_pic_id, poc_lsb;
++	s32 delta_poc_bottom, delta_poc[2];
++	u32 num_ref_idx_active[2];
++	bool field_pic, bottom_field, direct_spatial;
++	u32 cabac_init_idc, disable_dbk;
++	s32 qp_delta, alpha, beta;
++	u8 nal_ref_idc, nal_type;
++};
++
++struct tvdec_ctx {
++	struct v4l2_fh fh;
++	struct tvdec_dev *vdec;
++	struct v4l2_ctrl_handler hdl;
++	struct v4l2_pix_format_mplane src_fmt, dst_fmt;
++	struct tvdec_buf mv[VB2_MAX_FRAME];
++	size_t mv_size;
++	unsigned int mbw, mbh;		/* coded size in macroblocks */
++};
++
++static inline struct tvdec_ctx *fh_to_ctx(struct v4l2_fh *fh)
++{
++	return container_of(fh, struct tvdec_ctx, fh);
++}
++
++/* ---- register access ---- */
++
++static void tr(struct tvdec_dev *v, char op, u32 off, u32 val)
++{
++	if (!v->trace || !v->tbuf || v->tlen > PAGE_SIZE * 16 - 32)
++		return;
++	v->tlen += scnprintf(v->tbuf + v->tlen, PAGE_SIZE * 16 - v->tlen,
++			     "%c %04x %08x\n", op, off, val);
++}
++
++static u32 rr(struct tvdec_dev *v, u32 off)
++{
++	u32 val = readl(v->regs + off);
++
++	tr(v, 'r', off, val);
++	return val;
++}
++
++static void ww(struct tvdec_dev *v, u32 off, u32 val)
++{
++	tr(v, 'w', off, val);
++	writel(val, v->regs + off);
++}
++
++static void wset(struct tvdec_dev *v, u32 off, u32 bits)
++{
++	ww(v, off, rr(v, off) | bits);
++}
++
++/* ---- the barrel shifter ---- */
++
++static u32 bs_peek(struct tvdec_dev *v)
++{
++	return rr(v, AVLD + AVLD_PEEK);
++}
++
++static void bs_skip(struct tvdec_dev *v, unsigned int n)
++{
++	while (n) {
++		unsigned int k = min(n, 32u);
++
++		rr(v, AVLD + 4 * k);
++		n -= k;
++	}
++}
++
++static u32 bs_u(struct tvdec_dev *v, unsigned int n)
++{
++	u32 val;
++
++	if (!n)
++		return 0;
++	val = bs_peek(v) >> (32 - n);
++	bs_skip(v, n);
++	return val;
++}
++
++static u32 bs_ue(struct tvdec_dev *v)
++{
++	return rr(v, AVLD + AVLD_UE);
++}
++
++static s32 bs_se(struct tvdec_dev *v)
++{
++	return (s32)rr(v, AVLD + AVLD_SE);
++}
++
++/* the VLD's fetch unit idles (or there was nothing to wait for) */
++static int vld_idle(struct tvdec_dev *v)
++{
++	int i;
++
++	if (!(rr(v, VLD + 0xf4) & 0x8000))
++		return 0;
++	for (i = 0; i < 50000; i++)
++		if (rr(v, VLD + 0xf4) & 1)
++			return 0;
++	return -ETIMEDOUT;
++}
++
++static int hw_reset(struct tvdec_dev *v)
++{
++	int ret = vld_idle(v);
++
++	if (ret)
++		return ret;
++	ww(v, VLD + 0x108, 0x101);
++	ww(v, MISC + 0x84, 2);
++	ww(v, MISC + 0x00, (rr(v, MISC + 0x00) & 0xff400000) | 0x801ff0);
++	ww(v, MISC + 0xc8, 0x1f7);
++	ww(v, MISC + 0xcc, 0x53e30180);
++	ww(v, MISC + 0x178, 0xffffffe1);
++	ww(v, MISC + 0xf4, 0);
++	ww(v, MISC + 0x84, 2);
++	ww(v, VLD + 0x108, 0);
++	regmap_write(v->sys, SYS_18, 1);
++	ww(v, MISC + 0xec, 1);
++	ww(v, MISC + 0x04, 0x10);
++	ww(v, MISC + 0x160, 0x65ff10);
++	return 0;
++}
++
++/* point the barrel shifter at a bitstream ring [start, end) */
++static int bs_init(struct tvdec_dev *v, dma_addr_t start, dma_addr_t end)
++{
++	int ret, i;
++
++	ww(v, VLD + 0xc0, 0x40000);
++	ww(v, AVLD + AVLD_CTRL, CTRL_DEFAULT);
++	wset(v, VLDTOP + 0x54, 1);
++	ww(v, MC + 0x24, 6);
++	ww(v, VLD + 0xb4, start >> 6);
++	ww(v, VLD + 0xb8, end >> 6);
++	ww(v, VLDTOP + 0x28, v->vld_work.da);
++	ww(v, AVLD + AVLD_BS_RESET, 1);
++	ww(v, AVLD + AVLD_BS_RESET, 0);
++
++	ret = vld_idle(v);
++	if (ret)
++		return ret;
++	wset(v, VLD + 0x110, 1);
++	ww(v, VLD + 0xb0, start);		/* read pointer */
++	ww(v, VLD + 0xb0, start);
++	ww(v, VLD + 0x110, end);		/* write pointer */
++	ww(v, AVLD + AVLD_BS_RESET, 1);
++	ww(v, VLD + 0x108, 0x100);
++	ww(v, VLD + 0x108, 0);
++	ww(v, VLD + 0xcc, 0);
++	ww(v, VLD + 0x8c, 0x100000);		/* fetch */
++	for (i = 0; i < 0x1000; i++)
++		if (rr(v, VLD + 0xe8) & 1)
++			break;
++	if (i == 0x1000)
++		return -ETIMEDOUT;
++	ww(v, VLD + 0x8c, 0x800000);		/* load the shifter */
++	ww(v, AVLD + AVLD_BS_RESET, 0);
++	bs_peek(v);
++	return 0;
++}
++
++/* the next start code; returns the NAL header byte, the shifter after it */
++static int bs_next_nal(struct tvdec_dev *v)
++{
++	u32 w = bs_peek(v);
++	int i;
++
++	if ((w & 0xffffff00) != 0x100 || (rr(v, AVLD + AVLD_CTRL) & BIT(31))) {
++		ww(v, AVLD + AVLD_FIND_SC, 1);
++		for (i = 0; i < 0x100000; i++)
++			if (!(rr(v, AVLD + AVLD_FIND_SC) & 1))
++				break;
++		if (i == 0x100000 && !(rr(v, AVLD + AVLD_EPB) & 0x800))
++			return -ENODATA;
++		w = bs_peek(v);
++	}
++	if ((w & 0xffffff00) != 0x100)
++		return -ENODATA;
++	bs_skip(v, 32);
++	return w & 0xff;
++}
++
++static int poll_nonzero(struct tvdec_dev *v, u32 off)
++{
++	ktime_t end = ktime_add_us(ktime_get(), 1500);
++
++	do {
++		if (rr(v, off))
++			return 0;
++	} while (ktime_before(ktime_get(), end));
++	return -ETIMEDOUT;
++}
++
++/* ---- the decode ---- */
++
++struct tvdec_run {
++	struct vb2_v4l2_buffer *src, *dst;
++	const struct v4l2_ctrl_h264_sps *sps;
++	const struct v4l2_ctrl_h264_pps *pps;
++	const struct v4l2_ctrl_h264_scaling_matrix *sm;
++	const struct v4l2_ctrl_h264_decode_params *dp;
++	struct tvdec_slice sh;
++	dma_addr_t y, c;
++	int dst_idx;
++	/* each DPB entry's capture buffer, or -1 */
++	int dpb_buf[V4L2_H264_NUM_DPB_ENTRIES];
++};
++
++static bool slice_is(u32 type, int t)
++{
++	return type % 5 == t;
++}
++
++#define ST_P	0
++#define ST_B	1
++#define ST_I	2
++#define ST_SP	3
++#define ST_SI	4
++
++/* slice_header() up to ref_pic_list_modification() */
++static int parse_sh_head(struct tvdec_dev *v, struct tvdec_run *r)
++{
++	const struct v4l2_ctrl_h264_sps *sps = r->sps;
++	const struct v4l2_ctrl_h264_pps *pps = r->pps;
++	struct tvdec_slice *s = &r->sh;
++
++	s->first_mb = bs_ue(v);
++	s->slice_type = bs_ue(v);
++	if (s->slice_type > 9)
++		return -EINVAL;
++	s->pps_id = bs_ue(v);
++	if (sps->flags & V4L2_H264_SPS_FLAG_SEPARATE_COLOUR_PLANE)
++		bs_u(v, 2);
++	s->frame_num = bs_u(v, sps->log2_max_frame_num_minus4 + 4);
++	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY)) {
++		s->field_pic = bs_u(v, 1);
++		if (s->field_pic)
++			s->bottom_field = bs_u(v, 1);
++	}
++	if (s->nal_type == 5)
++		s->idr_pic_id = bs_ue(v);
++	if (sps->pic_order_cnt_type == 0) {
++		s->poc_lsb = bs_u(v, sps->log2_max_pic_order_cnt_lsb_minus4 + 4);
++		if ((pps->flags & V4L2_H264_PPS_FLAG_BOTTOM_FIELD_PIC_ORDER_IN_FRAME_PRESENT) &&
++		    !s->field_pic)
++			s->delta_poc_bottom = bs_se(v);
++	}
++	if (sps->pic_order_cnt_type == 1 &&
++	    !(sps->flags & V4L2_H264_SPS_FLAG_DELTA_PIC_ORDER_ALWAYS_ZERO)) {
++		s->delta_poc[0] = bs_se(v);
++		if ((pps->flags & V4L2_H264_PPS_FLAG_BOTTOM_FIELD_PIC_ORDER_IN_FRAME_PRESENT) &&
++		    !s->field_pic)
++			s->delta_poc[1] = bs_se(v);
++	}
++	if (pps->flags & V4L2_H264_PPS_FLAG_REDUNDANT_PIC_CNT_PRESENT)
++		bs_ue(v);
++	if (slice_is(s->slice_type, ST_B))
++		s->direct_spatial = bs_u(v, 1);
++	s->num_ref_idx_active[0] = pps->num_ref_idx_l0_default_active_minus1;
++	s->num_ref_idx_active[1] = pps->num_ref_idx_l1_default_active_minus1;
++	if (slice_is(s->slice_type, ST_P) || slice_is(s->slice_type, ST_SP) ||
++	    slice_is(s->slice_type, ST_B)) {
++		if (bs_u(v, 1)) {
++			s->num_ref_idx_active[0] = bs_ue(v);
++			if (slice_is(s->slice_type, ST_B))
++				s->num_ref_idx_active[1] = bs_ue(v);
++		}
++	}
++	s->num_ref_idx_active[0] = min(s->num_ref_idx_active[0], 31u);
++	s->num_ref_idx_active[1] = min(s->num_ref_idx_active[1], 31u);
++	if (!slice_is(s->slice_type, ST_B))
++		s->num_ref_idx_active[1] = 0;
++	return 0;
++}
++
++/* the rest of the slice header, after the hardware parsed the modifications
++ * and the weight table */
++static void parse_sh_tail(struct tvdec_dev *v, struct tvdec_run *r)
++{
++	const struct v4l2_ctrl_h264_pps *pps = r->pps;
++	struct tvdec_slice *s = &r->sh;
++
++	if (s->nal_ref_idc) {			/* dec_ref_pic_marking() */
++		if (s->nal_type == 5) {
++			bs_u(v, 2);
++		} else if (bs_u(v, 1)) {
++			u32 mmco;
++			int n = 0;
++
++			do {
++				mmco = bs_ue(v);
++				if (mmco == 1 || mmco == 3)
++					bs_ue(v);
++				if (mmco == 2)
++					bs_ue(v);
++				if (mmco == 3 || mmco == 6)
++					bs_ue(v);
++				if (mmco == 4)
++					bs_ue(v);
++			} while (mmco && ++n < 66);
++		}
++	}
++	if ((pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE) &&
++	    !slice_is(s->slice_type, ST_I) && !slice_is(s->slice_type, ST_SI))
++		s->cabac_init_idc = bs_ue(v);
++	s->qp_delta = bs_se(v);
++	if (slice_is(s->slice_type, ST_SP) || slice_is(s->slice_type, ST_SI)) {
++		if (slice_is(s->slice_type, ST_SP))
++			bs_u(v, 1);
++		bs_se(v);
++	}
++	if (pps->flags & V4L2_H264_PPS_FLAG_DEBLOCKING_FILTER_CONTROL_PRESENT) {
++		s->disable_dbk = bs_ue(v);
++		if (s->disable_dbk != 1) {
++			s->alpha = bs_se(v);
++			s->beta = bs_se(v);
++		}
++	}
++}
++
++static int dpb_buf_of(struct tvdec_run *r, unsigned int dpb_idx)
++{
++	return dpb_idx < V4L2_H264_NUM_DPB_ENTRIES ? r->dpb_buf[dpb_idx] : -1;
++}
++
++static void buf_addrs(struct tvdec_ctx *ctx, int idx, dma_addr_t *y, dma_addr_t *c)
++{
++	struct vb2_queue *q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
++	struct vb2_buffer *vb = vb2_get_buffer(q, idx);
++
++	*y = vb2_dma_contig_plane_dma_addr(vb, 0);
++	*c = vb2_dma_contig_plane_dma_addr(vb, 1);
++}
++
++/*
++ * Reference list entries. AVC_MV words carry a field's order count (17:0,
++ * B lists only), the picture's structure (19 field-decoded, 18 MBAFF
++ * frame; 0 for our progressive frames), long-term (20), whether its top
++ * field comes first (21), the bottom field (22) and the buffer (27:23).
++ */
++static u32 mv_word(const struct v4l2_h264_dpb_entry *e, bool lt, int buf, bool bottom,
++		   bool with_poc)
++{
++	u32 w = (u32)buf << 23 | (lt ? BIT(20) : 0) | (bottom ? BIT(22) : 0);
++
++	if (e->top_field_order_cnt <= e->bottom_field_order_cnt)
++		w |= BIT(21);
++	if (with_poc)
++		w += (bottom ? e->bottom_field_order_cnt : e->top_field_order_cnt) & 0x3ffff;
++	return w;
++}
++
++enum { LIST_P, LIST_B0, LIST_B1 };
++
++static void write_ref(struct tvdec_ctx *ctx, struct tvdec_run *r, int list,
++		      unsigned int pos, unsigned int dpb_idx)
++{
++	static const struct { u16 y, pic, mv; } regs[] = {
++		[LIST_P] = { MC_P_Y, 0x0a8, 0x000 },
++		[LIST_B0] = { MC_B0_Y, 0x128, 0x080 },
++		[LIST_B1] = { MC_B1_Y, 0x1a8, 0x100 },
++	};
++	struct tvdec_dev *v = ctx->vdec;
++	const struct v4l2_h264_dpb_entry *e = &r->dp->dpb[dpb_idx];
++	int buf = dpb_buf_of(r, dpb_idx);
++	bool lt = e->flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM;
++	bool poc = list != LIST_P;
++	dma_addr_t y, c;
++
++	if (buf < 0 || pos >= 32)
++		return;		/* missing reference: the default stays */
++	buf_addrs(ctx, buf, &y, &c);
++	ww(v, MC + regs[list].y + 4 * pos, y);
++	ww(v, MC + regs[list].y + MC_C_OFFSET + 4 * pos, c);
++	ww(v, AVLD + regs[list].pic + 4 * pos, (e->pic_num & 0x7ffff) | (lt ? BIT(19) : 0));
++	ww(v, AVMV + regs[list].mv + 8 * pos, mv_word(e, lt, buf, false, poc));
++	ww(v, AVMV + regs[list].mv + 8 * pos + 4, mv_word(e, lt, buf, true, poc));
++	if (list == LIST_B1 && ctx->mv[buf].va) {
++		/* the co-located picture's motion vectors, for direct prediction */
++		u32 bot = r->sps->flags & V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE ? 2 : 4;
++
++		ww(v, AVMV + 0x180 + 8 * pos, ctx->mv[buf].da >> 4);
++		ww(v, AVMV + 0x184 + 8 * pos, (ctx->mv[buf].da >> 4) + bot);
++	}
++}
++
++static void program_refs(struct tvdec_ctx *ctx, struct tvdec_run *r)
++{
++	struct tvdec_dev *v = ctx->vdec;
++	struct v4l2_h264_reflist_builder b;
++	struct v4l2_h264_reference p[V4L2_H264_REF_LIST_LEN];
++	struct v4l2_h264_reference b0[V4L2_H264_REF_LIST_LEN], b1[V4L2_H264_REF_LIST_LEN];
++	dma_addr_t cur_mv = ctx->mv[r->dst_idx].da;
++	unsigned int i;
++
++	v4l2_h264_init_reflist_builder(&b, r->dp, r->sps, r->dp->dpb);
++
++	/* P list; the hardware applies each slice's modifications itself */
++	ww(v, MC + 0x564, 0);
++	ww(v, AVLD + AVLD_RPL_INIT, 1);
++	for (i = 0; i < 100000 && (rr(v, AVLD + AVLD_RPL_INIT) & 1); i++)
++		;
++	ww(v, AVLD + AVLD_MAX_PICNUM, 1u << (r->sps->log2_max_frame_num_minus4 + 4));
++	ww(v, AVLD + AVLD_CUR_PICNUM, r->dp->frame_num);
++	for (i = 0; i < 32; i++) {
++		ww(v, MC + MC_P_Y + 4 * i, r->y);
++		ww(v, MC + MC_P_Y + MC_C_OFFSET + 4 * i, r->c);
++		ww(v, AVMV + 0x180 + 4 * i, cur_mv >> 4);
++	}
++	ww(v, MC + MC_EXPLICIT_C, 1);
++	if (b.num_valid) {
++		v4l2_h264_build_p_ref_list(&b, p);
++		for (i = 0; i < b.num_valid; i++)
++			write_ref(ctx, r, LIST_P, i, p[i].index);
++	}
++
++	/* B lists (the builder already swaps B1's first two entries if equal) */
++	ww(v, MC + 0x568, 0);
++	ww(v, MC + 0x56c, 0);
++	for (i = 0; i < 32; i++) {
++		ww(v, MC + MC_B0_Y + 4 * i, r->y);
++		ww(v, MC + MC_B0_Y + MC_C_OFFSET + 4 * i, r->c);
++		ww(v, MC + MC_B1_Y + 4 * i, r->y);
++		ww(v, MC + MC_B1_Y + MC_C_OFFSET + 4 * i, r->c);
++	}
++	if (b.num_valid) {
++		v4l2_h264_build_b_ref_lists(&b, b0, b1);
++		for (i = 0; i < b.num_valid; i++) {
++			write_ref(ctx, r, LIST_B0, i, b0[i].index);
++			write_ref(ctx, r, LIST_B1, i, b1[i].index);
++		}
++	}
++}
++
++static void program_scaling(struct tvdec_dev *v, struct tvdec_run *r, bool *present)
++{
++	static const u8 flat[64] = { [0 ... 63] = 16 };
++	const u8 *lists[8];
++	unsigned int i, j;
++
++	*present = (r->pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT) && r->sm;
++	if (!*present)
++		return;
++	for (i = 0; i < 6; i++)
++		lists[i] = r->sm->scaling_list_4x4[i];
++	lists[6] = r->sm->scaling_list_8x8[0];	/* intra Y */
++	lists[7] = r->sm->scaling_list_8x8[1];	/* inter Y */
++	for (i = 0; i < 8; i++) {
++		unsigned int n = i < 6 ? 16 : 64;
++		u32 base = i < 6 ? 16 * i : (i == 6 ? 0x60 : 0xa0);
++		const u8 *l = lists[i] ? lists[i] : flat;
++
++		for (j = 0; j < n; j += 4) {
++			ww(v, VLD + 0x260, base + j + 0x200);
++			ww(v, VLD + 0x264, l[j] << 24 | l[j + 1] << 16 | l[j + 2] << 8 | l[j + 3]);
++			ww(v, VLD + 0x260, base + j + 0x100);
++		}
++	}
++}
++
++static void program_picture(struct tvdec_ctx *ctx, struct tvdec_run *r)
++{
++	struct tvdec_dev *v = ctx->vdec;
++	const struct v4l2_ctrl_h264_sps *sps = r->sps;
++	const struct v4l2_ctrl_h264_pps *pps = r->pps;
++	struct tvdec_slice *s = &r->sh;
++	bool sm;
++	u32 val;
++
++	program_refs(ctx, r);
++	program_scaling(v, r, &sm);
++
++	ww(v, AVLD + AVLD_SPS,
++	   (sps->chroma_format_idc & 3) |
++	   (sps->log2_max_frame_num_minus4 & 0xf) << 2 |
++	   (sps->pic_order_cnt_type & 3) << 6 |
++	   (sps->log2_max_pic_order_cnt_lsb_minus4 & 0xf) << 8 |
++	   !!(sps->flags & V4L2_H264_SPS_FLAG_DELTA_PIC_ORDER_ALWAYS_ZERO) << 12 |
++	   (sps->max_num_ref_frames & 0x1f) << 13 |
++	   !!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY) << 18 |
++	   !!(sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD) << 19 |
++	   !!(sps->flags & V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE) << 20 |
++	   BIT(21));
++	ww(v, VLDTOP + 0x68, sps->pic_width_in_mbs_minus1 |
++	   sps->pic_height_in_map_units_minus1 << 16);
++	ww(v, VLDTOP + 0x100, (sps->bit_depth_luma_minus8 & 0xf) |
++	   (sps->bit_depth_chroma_minus8 & 0xf) << 4);
++
++	ww(v, AVLD + AVLD_PPS1,
++	   (!!(pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE)) |
++	   !!(pps->flags & V4L2_H264_PPS_FLAG_BOTTOM_FIELD_PIC_ORDER_IN_FRAME_PRESENT) << 1 |
++	   !!(pps->flags & V4L2_H264_PPS_FLAG_WEIGHTED_PRED) << 2 |
++	   (pps->weighted_bipred_idc & 3) << 3 |
++	   (pps->pic_init_qp_minus26 & 0x3f) << 5 |
++	   (pps->chroma_qp_index_offset & 0x1f) << 11 |
++	   !!(pps->flags & V4L2_H264_PPS_FLAG_DEBLOCKING_FILTER_CONTROL_PRESENT) << 16 |
++	   !!(pps->flags & V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED) << 17 |
++	   !!(pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE) << 18 |
++	   (pps->second_chroma_qp_index_offset & 0x1f) << 19);
++	ww(v, AVLD + AVLD_PPS2,
++	   (pps->num_ref_idx_l0_default_active_minus1 & 0x1f) |
++	   (pps->num_ref_idx_l1_default_active_minus1 & 0x1f) << 5 |
++	   (sm ? 0xff << 10 : 0) | sm << 18);
++
++	val = rr(v, AVLD + AVLD_FIRST_MB);
++	ww(v, AVLD + AVLD_FIRST_MB, (val & 0xfffe0000) | (s->first_mb & 0x1fff));
++	val = rr(v, AVLD + AVLD_SHDR1);
++	ww(v, AVLD + AVLD_SHDR1, (val & 0x1fff) |
++	   (s->slice_type & 0xf) << 13 | s->field_pic << 17 | s->bottom_field << 18 |
++	   s->direct_spatial << 19 | (s->num_ref_idx_active[0] & 0x1f) << 20 |
++	   (s->num_ref_idx_active[1] & 0x1f) << 25);
++
++	/* the current picture's order counts */
++	ww(v, AVMV + 0x204, r->dp->top_field_order_cnt & 0x3ffff);
++	ww(v, AVMV + 0x208, r->dp->bottom_field_order_cnt & 0x3ffff);
++	ww(v, AVMV + 0x200, min(r->dp->top_field_order_cnt,
++				r->dp->bottom_field_order_cnt) & 0x3ffff);
++}
++
++static void hw_start(struct tvdec_ctx *ctx, struct tvdec_run *r)
++{
++	struct tvdec_dev *v = ctx->vdec;
++	const struct v4l2_ctrl_h264_sps *sps = r->sps;
++	struct tvdec_slice *s = &r->sh;
++	unsigned int w = ctx->mbw * 16, h = ctx->mbh * 16;
++	u32 luma = ctx->dst_fmt.plane_fmt[0].sizeimage;
++	dma_addr_t cur_mv = ctx->mv[r->dst_idx].da;
++	dma_addr_t lo = min(r->y, r->c), hi = max(r->y + luma, r->c + luma / 2);
++	dma_addr_t mvlo = ~0, mvhi = 0;
++	unsigned int i;
++	int n;
++
++	for (i = 0; i < VB2_MAX_FRAME; i++) {
++		if (!ctx->mv[i].va)
++			continue;
++		mvlo = min(mvlo, ctx->mv[i].da);
++		mvhi = max(mvhi, ctx->mv[i].da);
++	}
++
++	if (sps->flags & V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE)
++		wset(v, AVMV + 0x220, 0x20);
++	else
++		ww(v, AVMV + 0x220, rr(v, AVMV + 0x220) & ~0x20u);
++	ww(v, MISC + 0x04, 3);
++	ww(v, MC + 0x90, 4);
++	ww(v, VLDTOP + 0x58, 0xffffffff);
++	ww(v, MC + 0x208, w);
++	ww(v, MC + 0x20c, h);
++	ww(v, MISC + 0x04, 0x10);
++	ww(v, VLDTOP + 0x70, w | h << 16);
++	ww(v, AVLD + AVLD_ERR_MASK, 0xbfdfb0f7);
++	ww(v, MC + 0x220, 1);
++	ww(v, MC + 0x224, r->y >> 9);
++	ww(v, MC + 0x228, r->c >> 8);
++	ww(v, MC + 0x250, 1);
++	ww(v, MC + 0x238, 3);
++	ww(v, MC + 0x260, ctx->mbw - 1);
++	ww(v, MC + 0x264, ctx->mbh - 1);
++	ww(v, MC + 0x22c, ctx->dst_fmt.plane_fmt[0].bytesperline / 16);
++	ww(v, MC + 0x850, hi >> 4);
++	ww(v, MC + 0x854, lo >> 4);
++	ww(v, MC + 0x858, 1);
++	ww(v, MC + 0x5e4, 0x20000);
++	ww(v, MC + 0x560, r->y);
++	ww(v, MC + 0x55c, (u32)(r->c - r->y));
++	ww(v, MC + 0x980, ctx->dst_fmt.plane_fmt[0].bytesperline / 16);
++	ww(v, AVLD + AVLD_EPB, 0xf9040039);
++	ww(v, AVMV + 0x20c, cur_mv >> 4);
++	ww(v, AVLD + AVLD_SHDR2, (s->qp_delta & 0x7f) | (s->disable_dbk & 3) << 7 |
++	   (s->alpha & 0xf) << 9 | (s->beta & 0xf) << 13 | (s->nal_ref_idc & 3) << 17 |
++	   (s->nal_type == 5) << 19 | (s->cabac_init_idc & 3) << 20);
++	if (r->pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE)
++		ww(v, AVLD + AVLD_CABAC_INIT, 1);
++	for (n = 0; n < 100000 && (rr(v, AVLD + AVLD_STATUS) & BIT(25)); n++)
++		;
++	wset(v, MC + 0x5e4, 0x1000);
++	wset(v, MC + 0x920, BIT(24));
++	ww(v, MC + 0x768, (rr(v, MC + 0x768) & ~7u) | 4);
++	wset(v, MISC + 0xf0, 1);
++	ww(v, VLDTOP + 0x6c, ctx->mbw * ctx->mbh);
++	ww(v, VLDTOP + 0x50, 0xffffffff);
++	ww(v, MC + 0xa20, v->mc_a20.da);
++	ww(v, MC + 0xa24, v->mc_a24.da);
++	ww(v, AVLD + AVLD_2D0, 0x201);
++	ww(v, AVLD + AVLD_2D4, 0xc210);
++	bs_peek(v);
++	wset(v, MISC + 0x28, 1);
++	ww(v, MISC + 0x3c, lo);
++	ww(v, MISC + 0x40, hi);
++	ww(v, MISC + 0x54, mvlo);
++	ww(v, MISC + 0x58, mvhi + ctx->mv_size);
++	ww(v, AVLD + AVLD_CTRL, CTRL_EC);
++	ww(v, AVLD + AVLD_START, 1);
++}
++
++static void hw_break(struct tvdec_dev *v)
++{
++	int i;
++
++	ww(v, MISC + MISC_BREAK, 1);
++	for (i = 0; i < 5000; i++)
++		if ((rr(v, MISC + MISC_BREAK_ST) & 0x11) == 0x11)
++			break;
++	ww(v, VLD + 0x108, 1);
++	ww(v, VLD + 0x108, 0);
++	ww(v, MISC + MISC_BREAK, 0);
++}
++
++static int decode(struct tvdec_ctx *ctx, struct tvdec_run *r)
++{
++	struct tvdec_dev *v = ctx->vdec;
++	struct vb2_buffer *src = &r->src->vb2_buf;
++	dma_addr_t bs = vb2_dma_contig_plane_dma_addr(src, 0);
++	size_t len = vb2_get_plane_payload(src, 0);
++	size_t cap = vb2_plane_size(src, 0);
++	u8 *va = vb2_plane_vaddr(src, 0);
++	struct tvdec_slice *s = &r->sh;
++	ktime_t t0;
++	int nal, ret, tries;
++	bool wt;
++
++	/* an access unit delimiter ends the picture for the hardware */
++	if (!va || len + 8 > cap)
++		return -ENOSPC;
++	memcpy(va + len, "\0\0\0\1\x09\0\0\0", 8);
++	wmb();
++
++	ret = hw_reset(v);
++	if (ret)
++		return ret;
++	ret = bs_init(v, bs, bs + (cap & ~63));
++	if (ret)
++		return ret;
++	for (tries = 0; tries < 16; tries++) {
++		nal = bs_next_nal(v);
++		if (nal < 0)
++			return nal;
++		if ((nal & 0x1f) == 1 || (nal & 0x1f) == 5)
++			break;
++	}
++	if (tries == 16)
++		return -ENODATA;
++	memset(s, 0, sizeof(*s));
++	s->nal_type = nal & 0x1f;
++	s->nal_ref_idc = (nal >> 5) & 3;
++	ret = parse_sh_head(v, r);
++	if (ret)
++		return ret;
++	if (s->field_pic)
++		return -EOPNOTSUPP;	/* field pictures: not yet */
++	ctx->mbw = r->sps->pic_width_in_mbs_minus1 + 1;
++	ctx->mbh = (r->sps->pic_height_in_map_units_minus1 + 1) *
++		   (r->sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY ? 1 : 2);
++	if (ctx->mbw * 16 > ctx->dst_fmt.plane_fmt[0].bytesperline ||
++	    ctx->mbh * 16 > ctx->dst_fmt.height)
++		return -EINVAL;
++	if (!ctx->mv[r->dst_idx].va) {
++		ctx->mv[r->dst_idx].size = ctx->mv_size;
++		ctx->mv[r->dst_idx].va = dma_alloc_coherent(v->dev, ctx->mv_size,
++							    &ctx->mv[r->dst_idx].da, GFP_KERNEL);
++		if (!ctx->mv[r->dst_idx].va)
++			return -ENOMEM;
++	}
++
++	program_picture(ctx, r);
++	if (!slice_is(s->slice_type, ST_I) && !slice_is(s->slice_type, ST_SI)) {
++		ww(v, AVLD + AVLD_REORDER, 1);
++		if (poll_nonzero(v, AVLD + AVLD_REORDER))
++			dev_dbg(v->dev, "reordering parse timed out\n");
++	}
++	wt = ((r->pps->flags & V4L2_H264_PPS_FLAG_WEIGHTED_PRED) &&
++	      (slice_is(s->slice_type, ST_P) || slice_is(s->slice_type, ST_SP))) ||
++	     (r->pps->weighted_bipred_idc == 1 && slice_is(s->slice_type, ST_B));
++	if (wt) {
++		u32 t = rr(v, MISC + 0xf0);
++
++		ww(v, MISC + 0xf0, t | 1);
++		ww(v, AVLD + AVLD_PWT, 1);
++		if (poll_nonzero(v, AVLD + AVLD_PWT))
++			dev_dbg(v->dev, "weight table parse timed out\n");
++		ww(v, AVLD + 0xf0, t & ~1u);
++	}
++	parse_sh_tail(v, r);
++
++	reinit_completion(&v->irq_done);
++	v->irq_status = 0;
++	t0 = ktime_get();
++	hw_start(ctx, r);
++	if (!wait_for_completion_timeout(&v->irq_done, msecs_to_jiffies(500))) {
++		dev_warn(v->dev, "decode timed out (mb %u,%u)\n",
++			 rr(v, MC + 0x28), rr(v, MC + 0x2c));
++		hw_break(v);
++		return -ETIMEDOUT;
++	}
++	v->last_us = ktime_us_delta(ktime_get(), t0);
++	v->last_done = rr(v, AVLD + AVLD_DONE);
++	rr(v, AVLD + AVLD_ERR_ST);
++	v->last_err = rr(v, AVLD + AVLD_ERR) & rr(v, AVLD + AVLD_ERR_MASK);
++	if (v->last_err && !(v->last_err == 8 && (v->last_done & BIT(31))))
++		return -EIO;
++	return 0;
++}
++
++static irqreturn_t tvdec_irq(int irq, void *priv)
++{
++	struct tvdec_dev *v = priv;
++	u32 st = readl(v->regs + MISC + MISC_IRQ);
++
++	if (!(st & BIT(16)))
++		return IRQ_NONE;
++	writel(st | 0x11, v->regs + MISC + MISC_IRQ);
++	writel(readl(v->regs + MISC + MISC_IRQ) & ~0x10u, v->regs + MISC + MISC_IRQ);
++	v->irq_status = st;
++	complete(&v->irq_done);
++	return IRQ_HANDLED;
++}
++
++static void *ctrl_ptr(struct tvdec_ctx *ctx, u32 id)
++{
++	struct v4l2_ctrl *c = v4l2_ctrl_find(&ctx->hdl, id);
++
++	return c ? c->p_cur.p : NULL;
++}
++
++static void run_work(struct work_struct *work)
++{
++	struct tvdec_dev *v = container_of(work, struct tvdec_dev, run_work);
++	struct tvdec_ctx *ctx = v4l2_m2m_get_curr_priv(v->m2m);
++	struct vb2_queue *dq;
++	struct tvdec_run r = {};
++	struct media_request *req;
++	enum vb2_buffer_state state = VB2_BUF_STATE_DONE;
++	unsigned int i;
++	int ret;
++
++	if (!ctx)
++		return;
++	r.src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
++	r.dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	req = r.src->vb2_buf.req_obj.req;
++	if (req)
++		v4l2_ctrl_request_setup(req, &ctx->hdl);
++	v4l2_m2m_buf_copy_metadata(r.src, r.dst, true);
++
++	r.sps = ctrl_ptr(ctx, V4L2_CID_STATELESS_H264_SPS);
++	r.pps = ctrl_ptr(ctx, V4L2_CID_STATELESS_H264_PPS);
++	r.sm = ctrl_ptr(ctx, V4L2_CID_STATELESS_H264_SCALING_MATRIX);
++	r.dp = ctrl_ptr(ctx, V4L2_CID_STATELESS_H264_DECODE_PARAMS);
++	r.dst_idx = r.dst->vb2_buf.index;
++	r.y = vb2_dma_contig_plane_dma_addr(&r.dst->vb2_buf, 0);
++	r.c = vb2_dma_contig_plane_dma_addr(&r.dst->vb2_buf, 1);
++	dq = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
++	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
++		const struct v4l2_h264_dpb_entry *e = &r.dp->dpb[i];
++		struct vb2_buffer *b = NULL;
++
++		r.dpb_buf[i] = -1;
++		if (e->flags & V4L2_H264_DPB_ENTRY_FLAG_VALID)
++			b = vb2_find_buffer(dq, e->reference_ts);
++		if (b)
++			r.dpb_buf[i] = b->index;
++	}
++
++	ret = pm_runtime_resume_and_get(v->dev);
++	if (!ret) {
++		if (v->trace) {
++			v->tlen = 0;
++			if (v->tbuf)
++				v->tbuf[0] = 0;
++		}
++		ret = decode(ctx, &r);
++		pm_runtime_mark_last_busy(v->dev);
++		pm_runtime_put_autosuspend(v->dev);
++	}
++	if (ret) {
++		v->errors++;
++		dev_dbg(v->dev, "decode %u: %d (err %08x)\n", r.dst_idx, ret, v->last_err);
++		state = VB2_BUF_STATE_ERROR;
++	} else {
++		v->frames++;
++		vb2_set_plane_payload(&r.dst->vb2_buf, 0, ctx->dst_fmt.plane_fmt[0].sizeimage);
++		vb2_set_plane_payload(&r.dst->vb2_buf, 1, ctx->dst_fmt.plane_fmt[1].sizeimage);
++	}
++	if (req)
++		v4l2_ctrl_request_complete(req, &ctx->hdl);
++	v4l2_m2m_buf_done_and_job_finish(v->m2m, ctx->fh.m2m_ctx, state);
++}
++
++static void tvdec_device_run(void *priv)
++{
++	struct tvdec_ctx *ctx = priv;
++
++	queue_work(ctx->vdec->wq, &ctx->vdec->run_work);
++}
++
++static const struct v4l2_m2m_ops tvdec_m2m_ops = {
++	.device_run = tvdec_device_run,
++};
++
++/* ---- formats ---- */
++
++static void fill_dst_fmt(struct tvdec_ctx *ctx, struct v4l2_pix_format_mplane *f)
++{
++	u32 w = clamp_t(u32, ALIGN(f->width, 16), MIN_W, MAX_W);
++	u32 h = clamp_t(u32, ALIGN(f->height, 32), MIN_H, MAX_H);
++
++	f->pixelformat = V4L2_PIX_FMT_MM21;
++	f->field = V4L2_FIELD_NONE;
++	f->num_planes = 2;
++	f->width = w;
++	f->height = h;
++	f->plane_fmt[0].bytesperline = w;
++	f->plane_fmt[0].sizeimage = w * h;
++	f->plane_fmt[1].bytesperline = w;
++	f->plane_fmt[1].sizeimage = w * h / 2;
++}
++
++static void fill_src_fmt(struct v4l2_pix_format_mplane *f)
++{
++	f->pixelformat = V4L2_PIX_FMT_H264_SLICE;
++	f->field = V4L2_FIELD_NONE;
++	f->num_planes = 1;
++	f->width = clamp_t(u32, f->width, MIN_W, MAX_W);
++	f->height = clamp_t(u32, f->height, MIN_H, MAX_H);
++	f->plane_fmt[0].bytesperline = 0;
++	if (f->plane_fmt[0].sizeimage < SZ_64K)
++		f->plane_fmt[0].sizeimage = max_t(u32, SZ_1M, f->width * f->height * 3 / 4);
++	f->plane_fmt[0].sizeimage = ALIGN(f->plane_fmt[0].sizeimage + 1024, PAGE_SIZE);
++}
++
++static int vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, DRV_NAME, sizeof(cap->driver));
++	strscpy(cap->card, "MT6771 H.264 decoder", sizeof(cap->card));
++	strscpy(cap->bus_info, "platform:" DRV_NAME, sizeof(cap->bus_info));
++	return 0;
++}
++
++static int vidioc_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
++{
++	if (f->index)
++		return -EINVAL;
++	f->pixelformat = V4L2_PIX_FMT_H264_SLICE;
++	return 0;
++}
++
++static int vidioc_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
++{
++	if (f->index)
++		return -EINVAL;
++	f->pixelformat = V4L2_PIX_FMT_MM21;
++	return 0;
++}
++
++static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fs)
++{
++	if (fs->index || fs->pixel_format != V4L2_PIX_FMT_H264_SLICE)
++		return -EINVAL;
++	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	fs->stepwise.min_width = MIN_W;
++	fs->stepwise.max_width = MAX_W;
++	fs->stepwise.step_width = 16;
++	fs->stepwise.min_height = MIN_H;
++	fs->stepwise.max_height = MAX_H;
++	fs->stepwise.step_height = 16;
++	return 0;
++}
++
++static int vidioc_g_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
++{
++	f->fmt.pix_mp = fh_to_ctx(priv)->src_fmt;
++	return 0;
++}
++
++static int vidioc_g_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
++{
++	f->fmt.pix_mp = fh_to_ctx(priv)->dst_fmt;
++	return 0;
++}
++
++static int vidioc_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
++{
++	fill_src_fmt(&f->fmt.pix_mp);
++	return 0;
++}
++
++static int vidioc_try_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct tvdec_ctx *ctx = fh_to_ctx(priv);
++
++	/* the capture size follows the coded size */
++	f->fmt.pix_mp.width = ctx->src_fmt.width;
++	f->fmt.pix_mp.height = ctx->src_fmt.height;
++	fill_dst_fmt(ctx, &f->fmt.pix_mp);
++	f->fmt.pix_mp.colorspace = ctx->src_fmt.colorspace;
++	f->fmt.pix_mp.xfer_func = ctx->src_fmt.xfer_func;
++	f->fmt.pix_mp.ycbcr_enc = ctx->src_fmt.ycbcr_enc;
++	f->fmt.pix_mp.quantization = ctx->src_fmt.quantization;
++	return 0;
++}
++
++static int vidioc_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct tvdec_ctx *ctx = fh_to_ctx(priv);
++	struct vb2_queue *vq = v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
++	struct vb2_queue *cq = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
++
++	if (vb2_is_busy(vq) || vb2_is_busy(cq))
++		return -EBUSY;
++	vidioc_try_fmt_out(file, priv, f);
++	ctx->src_fmt = f->fmt.pix_mp;
++	ctx->dst_fmt.width = ctx->src_fmt.width;
++	ctx->dst_fmt.height = ctx->src_fmt.height;
++	fill_dst_fmt(ctx, &ctx->dst_fmt);
++	ctx->dst_fmt.colorspace = ctx->src_fmt.colorspace;
++	ctx->dst_fmt.xfer_func = ctx->src_fmt.xfer_func;
++	ctx->dst_fmt.ycbcr_enc = ctx->src_fmt.ycbcr_enc;
++	ctx->dst_fmt.quantization = ctx->src_fmt.quantization;
++	return 0;
++}
++
++static int vidioc_s_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct tvdec_ctx *ctx = fh_to_ctx(priv);
++
++	if (vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
++		return -EBUSY;
++	vidioc_try_fmt_cap(file, priv, f);
++	ctx->dst_fmt = f->fmt.pix_mp;
++	return 0;
++}
++
++static const struct v4l2_ioctl_ops tvdec_ioctl_ops = {
++	.vidioc_querycap = vidioc_querycap,
++	.vidioc_enum_framesizes = vidioc_enum_framesizes,
++	.vidioc_enum_fmt_vid_out = vidioc_enum_fmt_out,
++	.vidioc_enum_fmt_vid_cap = vidioc_enum_fmt_cap,
++	.vidioc_g_fmt_vid_out_mplane = vidioc_g_fmt_out,
++	.vidioc_g_fmt_vid_cap_mplane = vidioc_g_fmt_cap,
++	.vidioc_try_fmt_vid_out_mplane = vidioc_try_fmt_out,
++	.vidioc_try_fmt_vid_cap_mplane = vidioc_try_fmt_cap,
++	.vidioc_s_fmt_vid_out_mplane = vidioc_s_fmt_out,
++	.vidioc_s_fmt_vid_cap_mplane = vidioc_s_fmt_cap,
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
++	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++	.vidioc_decoder_cmd = v4l2_m2m_ioctl_stateless_decoder_cmd,
++	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_stateless_try_decoder_cmd,
++	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++/* ---- queues ---- */
++
++static int tvdec_queue_setup(struct vb2_queue *vq, unsigned int *nbufs, unsigned int *nplanes,
++			     unsigned int sizes[], struct device *alloc_devs[])
++{
++	struct tvdec_ctx *ctx = vb2_get_drv_priv(vq);
++	struct v4l2_pix_format_mplane *f =
++		V4L2_TYPE_IS_OUTPUT(vq->type) ? &ctx->src_fmt : &ctx->dst_fmt;
++	unsigned int i;
++
++	if (*nplanes) {
++		if (*nplanes != f->num_planes)
++			return -EINVAL;
++		for (i = 0; i < f->num_planes; i++)
++			if (sizes[i] < f->plane_fmt[i].sizeimage)
++				return -EINVAL;
++		return 0;
++	}
++	*nplanes = f->num_planes;
++	for (i = 0; i < f->num_planes; i++)
++		sizes[i] = f->plane_fmt[i].sizeimage;
++	return 0;
++}
++
++static int tvdec_buf_prepare(struct vb2_buffer *vb)
++{
++	struct tvdec_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct v4l2_pix_format_mplane *f =
++		V4L2_TYPE_IS_OUTPUT(vb->type) ? &ctx->src_fmt : &ctx->dst_fmt;
++	unsigned int i;
++
++	for (i = 0; i < f->num_planes; i++)
++		if (vb2_plane_size(vb, i) < f->plane_fmt[i].sizeimage)
++			return -EINVAL;
++	if (V4L2_TYPE_IS_OUTPUT(vb->type))
++		to_vb2_v4l2_buffer(vb)->field = V4L2_FIELD_NONE;
++	return 0;
++}
++
++static void tvdec_buf_queue(struct vb2_buffer *vb)
++{
++	struct tvdec_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
++}
++
++static int tvdec_buf_out_validate(struct vb2_buffer *vb)
++{
++	to_vb2_v4l2_buffer(vb)->field = V4L2_FIELD_NONE;
++	return 0;
++}
++
++static void tvdec_buf_request_complete(struct vb2_buffer *vb)
++{
++	struct tvdec_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++
++	v4l2_ctrl_request_complete(vb->req_obj.req, &ctx->hdl);
++}
++
++static void free_mv(struct tvdec_ctx *ctx)
++{
++	unsigned int i;
++
++	for (i = 0; i < VB2_MAX_FRAME; i++) {
++		if (ctx->mv[i].va)
++			dma_free_coherent(ctx->vdec->dev, ctx->mv[i].size,
++					  ctx->mv[i].va, ctx->mv[i].da);
++		ctx->mv[i].va = NULL;
++	}
++}
++
++static int tvdec_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct tvdec_ctx *ctx = vb2_get_drv_priv(q);
++	unsigned int i, n;
++
++	if (V4L2_TYPE_IS_OUTPUT(q->type))
++		return 0;
++	/* a motion vector buffer for each capture buffer: 64 bytes a MB (vendor size) */
++	ctx->mv_size = ALIGN(ctx->dst_fmt.width / 16 * (ALIGN(ctx->dst_fmt.height, 32) / 16) *
++			     64 + 0x200, PAGE_SIZE);
++	n = vb2_get_num_buffers(q);
++	for (i = 0; i < n && i < VB2_MAX_FRAME; i++) {
++		ctx->mv[i].size = ctx->mv_size;
++		ctx->mv[i].va = dma_alloc_coherent(ctx->vdec->dev, ctx->mv_size,
++						   &ctx->mv[i].da, GFP_KERNEL);
++		if (!ctx->mv[i].va) {
++			free_mv(ctx);
++			return -ENOMEM;
++		}
++	}
++	return 0;
++}
++
++static void tvdec_stop_streaming(struct vb2_queue *q)
++{
++	struct tvdec_ctx *ctx = vb2_get_drv_priv(q);
++	struct vb2_v4l2_buffer *vbuf;
++
++	flush_workqueue(ctx->vdec->wq);
++	for (;;) {
++		vbuf = V4L2_TYPE_IS_OUTPUT(q->type) ? v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx) :
++						      v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++		if (!vbuf)
++			break;
++		v4l2_ctrl_request_complete(vbuf->vb2_buf.req_obj.req, &ctx->hdl);
++		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
++	}
++	if (!V4L2_TYPE_IS_OUTPUT(q->type))
++		free_mv(ctx);
++}
++
++static const struct vb2_ops tvdec_qops = {
++	.queue_setup = tvdec_queue_setup,
++	.buf_prepare = tvdec_buf_prepare,
++	.buf_queue = tvdec_buf_queue,
++	.buf_out_validate = tvdec_buf_out_validate,
++	.buf_request_complete = tvdec_buf_request_complete,
++	.start_streaming = tvdec_start_streaming,
++	.stop_streaming = tvdec_stop_streaming,
++	.wait_prepare = vb2_ops_wait_prepare,
++	.wait_finish = vb2_ops_wait_finish,
++};
++
++static int queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
++{
++	struct tvdec_ctx *ctx = priv;
++	int ret;
++
++	src->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	src->io_modes = VB2_MMAP | VB2_DMABUF;
++	src->drv_priv = ctx;
++	src->ops = &tvdec_qops;
++	src->mem_ops = &vb2_dma_contig_memops;
++	src->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	src->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	src->lock = &ctx->vdec->vfd_lock;
++	src->dev = ctx->vdec->dev;
++	src->supports_requests = true;
++	src->requires_requests = true;
++	ret = vb2_queue_init(src);
++	if (ret)
++		return ret;
++
++	dst->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	dst->io_modes = VB2_MMAP | VB2_DMABUF;
++	dst->drv_priv = ctx;
++	dst->ops = &tvdec_qops;
++	dst->mem_ops = &vb2_dma_contig_memops;
++	dst->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	dst->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	dst->lock = &ctx->vdec->vfd_lock;
++	dst->dev = ctx->vdec->dev;
++	return vb2_queue_init(dst);
++}
++
++/* ---- controls ---- */
++
++static int tvdec_try_ctrl(struct v4l2_ctrl *ctrl)
++{
++	if (ctrl->id == V4L2_CID_STATELESS_H264_SPS) {
++		const struct v4l2_ctrl_h264_sps *sps = ctrl->p_new.p_h264_sps;
++
++		if (sps->chroma_format_idc > 1 || sps->bit_depth_luma_minus8 ||
++		    sps->bit_depth_chroma_minus8)
++			return -EINVAL;
++		if ((sps->pic_width_in_mbs_minus1 + 1) * 16 > MAX_W ||
++		    (sps->pic_height_in_map_units_minus1 + 1) * 16 > MAX_H)
++			return -EINVAL;
++	}
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops tvdec_ctrl_ops = {
++	.try_ctrl = tvdec_try_ctrl,
++};
++
++static int init_ctrls(struct tvdec_ctx *ctx)
++{
++	struct v4l2_ctrl_handler *h = &ctx->hdl;
++	struct v4l2_ctrl_config sps = {
++		.ops = &tvdec_ctrl_ops, .id = V4L2_CID_STATELESS_H264_SPS,
++	};
++
++	v4l2_ctrl_handler_init(h, 6);
++	v4l2_ctrl_new_custom(h, &sps, NULL);
++	v4l2_ctrl_new_custom(h, &(struct v4l2_ctrl_config){
++		.id = V4L2_CID_STATELESS_H264_PPS }, NULL);
++	v4l2_ctrl_new_custom(h, &(struct v4l2_ctrl_config){
++		.id = V4L2_CID_STATELESS_H264_SCALING_MATRIX }, NULL);
++	v4l2_ctrl_new_custom(h, &(struct v4l2_ctrl_config){
++		.id = V4L2_CID_STATELESS_H264_DECODE_PARAMS }, NULL);
++	v4l2_ctrl_new_custom(h, &(struct v4l2_ctrl_config){
++		.id = V4L2_CID_STATELESS_H264_DECODE_MODE,
++		.min = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++		.max = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++		.def = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED }, NULL);
++	v4l2_ctrl_new_custom(h, &(struct v4l2_ctrl_config){
++		.id = V4L2_CID_STATELESS_H264_START_CODE,
++		.min = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
++		.max = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
++		.def = V4L2_STATELESS_H264_START_CODE_ANNEX_B }, NULL);
++	v4l2_ctrl_new_std_menu(h, NULL, V4L2_CID_MPEG_VIDEO_H264_PROFILE,
++			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
++			       ~(BIT(V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE) |
++				 BIT(V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE) |
++				 BIT(V4L2_MPEG_VIDEO_H264_PROFILE_MAIN) |
++				 BIT(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH)),
++			       V4L2_MPEG_VIDEO_H264_PROFILE_MAIN);
++	v4l2_ctrl_new_std_menu(h, NULL, V4L2_CID_MPEG_VIDEO_H264_LEVEL,
++			       V4L2_MPEG_VIDEO_H264_LEVEL_4_1, 0,
++			       V4L2_MPEG_VIDEO_H264_LEVEL_4_1);
++	if (h->error) {
++		int ret = h->error;
++
++		v4l2_ctrl_handler_free(h);
++		return ret;
++	}
++	ctx->fh.ctrl_handler = h;
++	return v4l2_ctrl_handler_setup(h);
++}
++
++/* ---- file ops ---- */
++
++static int tvdec_open(struct file *file)
++{
++	struct tvdec_dev *v = video_drvdata(file);
++	struct tvdec_ctx *ctx;
++	int ret;
++
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	ctx->vdec = v;
++	v4l2_fh_init(&ctx->fh, video_devdata(file));
++	file->private_data = &ctx->fh;
++	ret = init_ctrls(ctx);
++	if (ret)
++		goto err_fh;
++	ctx->src_fmt.width = 1280;
++	ctx->src_fmt.height = 720;
++	fill_src_fmt(&ctx->src_fmt);
++	ctx->dst_fmt.width = 1280;
++	ctx->dst_fmt.height = 720;
++	fill_dst_fmt(ctx, &ctx->dst_fmt);
++	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(v->m2m, ctx, queue_init);
++	if (IS_ERR(ctx->fh.m2m_ctx)) {
++		ret = PTR_ERR(ctx->fh.m2m_ctx);
++		goto err_ctrl;
++	}
++	v4l2_fh_add(&ctx->fh);
++	return 0;
++
++err_ctrl:
++	v4l2_ctrl_handler_free(&ctx->hdl);
++err_fh:
++	v4l2_fh_exit(&ctx->fh);
++	kfree(ctx);
++	return ret;
++}
++
++static int tvdec_release(struct file *file)
++{
++	struct tvdec_ctx *ctx = fh_to_ctx(file->private_data);
++	struct tvdec_dev *v = ctx->vdec;
++
++	mutex_lock(&v->vfd_lock);
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	mutex_unlock(&v->vfd_lock);
++	v4l2_fh_del(&ctx->fh);
++	v4l2_fh_exit(&ctx->fh);
++	v4l2_ctrl_handler_free(&ctx->hdl);
++	free_mv(ctx);
++	kfree(ctx);
++	return 0;
++}
++
++static const struct v4l2_file_operations tvdec_fops = {
++	.owner = THIS_MODULE,
++	.open = tvdec_open,
++	.release = tvdec_release,
++	.poll = v4l2_m2m_fop_poll,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = v4l2_m2m_fop_mmap,
++};
++
++static const struct media_device_ops tvdec_media_ops = {
++	.req_validate = vb2_request_validate,
++	.req_queue = v4l2_m2m_request_queue,
++};
++
++/* ---- debugfs: register trace of the last decode, counters ---- */
++
++static int trace_show(struct seq_file *m, void *p)
++{
++	struct tvdec_dev *v = m->private;
++
++	if (v->tbuf)
++		seq_puts(m, v->tbuf);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(trace);
++
++static int stats_show(struct seq_file *m, void *p)
++{
++	struct tvdec_dev *v = m->private;
++
++	seq_printf(m, "frames %lu errors %lu last_err %08x last_done %08x last_us %u\n",
++		   v->frames, v->errors, v->last_err, v->last_done, v->last_us);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(stats);
++
++static int trace_on_set(void *data, u64 val)
++{
++	struct tvdec_dev *v = data;
++
++	if (val && !v->tbuf) {
++		v->tbuf = vzalloc(PAGE_SIZE * 16);
++		if (!v->tbuf)
++			return -ENOMEM;
++	}
++	v->trace = !!val;
++	return 0;
++}
++
++static int trace_on_get(void *data, u64 *val)
++{
++	*val = ((struct tvdec_dev *)data)->trace;
++	return 0;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(trace_on_fops, trace_on_get, trace_on_set, "%llu\n");
++
++/* ---- platform ---- */
++
++static int tvdec_runtime_resume(struct device *dev)
++{
++	struct tvdec_dev *v = dev_get_drvdata(dev);
++
++	return clk_prepare_enable(v->clk);
++}
++
++static int tvdec_runtime_suspend(struct device *dev)
++{
++	struct tvdec_dev *v = dev_get_drvdata(dev);
++
++	clk_disable_unprepare(v->clk);
++	return 0;
++}
++
++static const struct dev_pm_ops tvdec_pm_ops = {
++	SET_RUNTIME_PM_OPS(tvdec_runtime_suspend, tvdec_runtime_resume, NULL)
++	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
++};
++
++static int work_alloc(struct tvdec_dev *v, struct tvdec_buf *b, size_t size)
++{
++	b->size = size;
++	b->va = dmam_alloc_coherent(v->dev, size, &b->da, GFP_KERNEL);
++	return b->va ? 0 : -ENOMEM;
++}
++
++static int tvdec_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np;
++	struct tvdec_dev *v;
++	int irq, ret;
++
++	v = devm_kzalloc(dev, sizeof(*v), GFP_KERNEL);
++	if (!v)
++		return -ENOMEM;
++	v->dev = dev;
++	mutex_init(&v->vfd_lock);
++	init_completion(&v->irq_done);
++	INIT_WORK(&v->run_work, run_work);
++	platform_set_drvdata(pdev, v);
++
++	v->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(v->regs))
++		return PTR_ERR(v->regs);
++	v->sys = syscon_regmap_lookup_by_compatible("mediatek,mt8183-vdecsys");
++	if (IS_ERR(v->sys))
++		return PTR_ERR(v->sys);
++	v->clk = devm_clk_get(dev, "vdec");
++	if (IS_ERR(v->clk))
++		return PTR_ERR(v->clk);
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++	ret = devm_request_irq(dev, irq, tvdec_irq, 0, DRV_NAME, v);
++	if (ret)
++		return ret;
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++	ret = work_alloc(v, &v->vld_work, VLD_WORK_SIZE) ?:
++	      work_alloc(v, &v->mc_a20, MC_A20_SIZE) ?:
++	      work_alloc(v, &v->mc_a24, MC_A24_SIZE);
++	if (ret)
++		return ret;
++
++	/* larb 1 powers and clocks with us */
++	np = of_parse_phandle(dev->of_node, "mediatek,larb", 0);
++	if (np) {
++		struct platform_device *larb = of_find_device_by_node(np);
++
++		of_node_put(np);
++		if (!larb || !platform_get_drvdata(larb))
++			return -EPROBE_DEFER;
++		if (!device_link_add(dev, &larb->dev, DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS))
++			return -EINVAL;
++	}
++
++	v->wq = alloc_ordered_workqueue("titan-vdec", WQ_MEM_RECLAIM);
++	if (!v->wq)
++		return -ENOMEM;
++
++	pm_runtime_set_autosuspend_delay(dev, 200);
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_enable(dev);
++
++	ret = v4l2_device_register(dev, &v->v4l2_dev);
++	if (ret)
++		goto err_pm;
++	v->m2m = v4l2_m2m_init(&tvdec_m2m_ops);
++	if (IS_ERR(v->m2m)) {
++		ret = PTR_ERR(v->m2m);
++		goto err_v4l2;
++	}
++
++	v->mdev.dev = dev;
++	strscpy(v->mdev.model, DRV_NAME, sizeof(v->mdev.model));
++	strscpy(v->mdev.bus_info, "platform:" DRV_NAME, sizeof(v->mdev.bus_info));
++	media_device_init(&v->mdev);
++	v->mdev.ops = &tvdec_media_ops;
++	v->v4l2_dev.mdev = &v->mdev;
++
++	v->vfd = (struct video_device) {
++		.fops = &tvdec_fops,
++		.ioctl_ops = &tvdec_ioctl_ops,
++		.minor = -1,
++		.release = video_device_release_empty,
++		.vfl_dir = VFL_DIR_M2M,
++		.device_caps = V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_M2M_MPLANE,
++		.lock = &v->vfd_lock,
++		.v4l2_dev = &v->v4l2_dev,
++	};
++	strscpy(v->vfd.name, DRV_NAME, sizeof(v->vfd.name));
++	video_set_drvdata(&v->vfd, v);
++	ret = video_register_device(&v->vfd, VFL_TYPE_VIDEO, -1);
++	if (ret)
++		goto err_m2m;
++	ret = v4l2_m2m_register_media_controller(v->m2m, &v->vfd,
++						 MEDIA_ENT_F_PROC_VIDEO_DECODER);
++	if (ret)
++		goto err_vfd;
++	ret = media_device_register(&v->mdev);
++	if (ret)
++		goto err_mc;
++
++	v->dbg = debugfs_create_dir("titan_vdec", NULL);
++	debugfs_create_file("trace", 0400, v->dbg, v, &trace_fops);
++	debugfs_create_file("stats", 0400, v->dbg, v, &stats_fops);
++	debugfs_create_file_unsafe("trace_on", 0600, v->dbg, v, &trace_on_fops);
++	dev_info(dev, "H.264 decoder: %s\n", video_device_node_name(&v->vfd));
++	return 0;
++
++err_mc:
++	v4l2_m2m_unregister_media_controller(v->m2m);
++err_vfd:
++	video_unregister_device(&v->vfd);
++err_m2m:
++	v4l2_m2m_release(v->m2m);
++err_v4l2:
++	v4l2_device_unregister(&v->v4l2_dev);
++err_pm:
++	pm_runtime_disable(dev);
++	destroy_workqueue(v->wq);
++	return ret;
++}
++
++static void tvdec_remove(struct platform_device *pdev)
++{
++	struct tvdec_dev *v = platform_get_drvdata(pdev);
++
++	debugfs_remove_recursive(v->dbg);
++	media_device_unregister(&v->mdev);
++	v4l2_m2m_unregister_media_controller(v->m2m);
++	video_unregister_device(&v->vfd);
++	media_device_cleanup(&v->mdev);
++	v4l2_m2m_release(v->m2m);
++	v4l2_device_unregister(&v->v4l2_dev);
++	destroy_workqueue(v->wq);
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++	vfree(v->tbuf);
++}
++
++static const struct of_device_id tvdec_of_match[] = {
++	{ .compatible = "mediatek,mt6771-vdec" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, tvdec_of_match);
++
++static struct platform_driver tvdec_driver = {
++	.probe = tvdec_probe,
++	.remove_new = tvdec_remove,
++	.driver = {
++		.name = DRV_NAME,
++		.of_match_table = tvdec_of_match,
++		.pm = &tvdec_pm_ops,
++	},
++};
++module_platform_driver(tvdec_driver);
++
++MODULE_DESCRIPTION("MT6771 H.264 stateless video decoder");
++MODULE_LICENSE("GPL");

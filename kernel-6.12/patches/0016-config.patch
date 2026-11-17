@@ -1,20 +1,20 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 16/22] arm64: configs: add titanpocket.config
+Subject: [PATCH 16/23] arm64: configs: add titanpocket.config
 
 A fragment on top of defconfig: make defconfig titanpocket.config.
 The media core stays modular for the out-of-tree camera driver; udmabuf
 is built in for libcamera.
 ---
- arch/arm64/configs/titanpocket.config | 176 ++++++++++++++++++++++++++
- 1 file changed, 176 insertions(+)
+ arch/arm64/configs/titanpocket.config | 179 ++++++++++++++++++++++++++
+ 1 file changed, 179 insertions(+)
 
 diff --git a/arch/arm64/configs/titanpocket.config b/arch/arm64/configs/titanpocket.config
 new file mode 100644
-index 0000000000000000000000000000000000000000..86280b9809e86ee3e7b4d69529bff4a5a7a3a1fb
+index 0000000000000000000000000000000000000000..018df1e7b65ec6515d49616236bc5cb5d8df2e35
 --- /dev/null
 +++ b/arch/arm64/configs/titanpocket.config
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,179 @@
 +# Titan Pocket on top of arm64 defconfig:
 +#   make defconfig titanpocket.config
 +CONFIG_LOCALVERSION="-titanpocket"
@@ -191,3 +191,6 @@ index 0000000000000000000000000000000000000000..86280b9809e86ee3e7b4d69529bff4a5
 +# the LTE modem (drivers/net/wwan/mt6771; docs/modem.md)
 +CONFIG_WWAN=m
 +CONFIG_MTK_MT6771_MODEM=m
++# the H.264 hardware decoder (drivers/media/platform/mediatek/mt6771-vdec;
++# docs/video-decoder.md)
++CONFIG_VIDEO_MT6771_VDEC=m

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 22/22] spi: spidev: add the Titan Pocket's fingerprint sensor
+Subject: [PATCH 23/23] spi: spidev: add the Titan Pocket's fingerprint sensor
 
 The Sunwave fingerprint sensor on SPI0 is driven from userspace
 through spidev, so spidev accepts its compatible.

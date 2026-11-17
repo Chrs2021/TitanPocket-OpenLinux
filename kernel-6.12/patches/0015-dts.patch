@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 15/22] arm64: dts: mediatek: add the MT6771 and the Unihertz Titan Pocket
+Subject: [PATCH 15/23] arm64: dts: mediatek: add the MT6771 and the Unihertz Titan Pocket
 
 The MT6771 described on MT8183 bindings (same clocks, pinctrl, power
 domains, display and camera subsystems, IOMMU larbs), and the Titan
@@ -12,8 +12,8 @@ let the bootloader's overlay apply.
  arch/arm64/boot/dts/mediatek/Makefile         |    3 +
  .../dts/mediatek/mt6771-lk-dtbo-labels.dtsi   |  210 ++
  .../mediatek/mt6771-unihertz-titan-pocket.dts | 1192 +++++++++
- arch/arm64/boot/dts/mediatek/mt6771.dtsi      | 2202 +++++++++++++++++
- 4 files changed, 3607 insertions(+)
+ arch/arm64/boot/dts/mediatek/mt6771.dtsi      | 2291 +++++++++++++++++
+ 4 files changed, 3696 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
 index 8fd7b2bb7a1590341e7bb4ea1ecf039ae3e8eb0d..d80f5fd16f5664930365fc17045cbe226c32fd4a 100644
@@ -1451,10 +1451,10 @@ index 0000000000000000000000000000000000000000..4eccb5e8d3cafde3f47b78d4c67c49d5
 +};
 diff --git a/arch/arm64/boot/dts/mediatek/mt6771.dtsi b/arch/arm64/boot/dts/mediatek/mt6771.dtsi
 new file mode 100644
-index 0000000000000000000000000000000000000000..335b186aafed831c353a242414d29fbf6d7546b1
+index 0000000000000000000000000000000000000000..807124ea1c80012454a57038729bcfb7fc6ee925
 --- /dev/null
 +++ b/arch/arm64/boot/dts/mediatek/mt6771.dtsi
-@@ -0,0 +1,2202 @@
+@@ -0,0 +1,2291 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * MediaTek MT6771 (Helio P60/P70).
@@ -1904,8 +1904,12 @@ index 0000000000000000000000000000000000000000..335b186aafed831c353a242414d29fbf
 +	 * mtk-mcdi keeps (the mcdi node). The standby node (0x1) stays for
 +	 * LK but is not used: entering it hung every CPU (measured on 6.12),
 +	 * and its latencies are those of core off. The vendor's deeper
-+	 * system states (SODI, SODI3, deep idle, suspend: 0x1010002-5) need
-+	 * MediaTek's SPM firmware, which 6.12 does not load.
++	 * system states (SODI, SODI3, deep idle, suspend: 0x1010002-5) run
++	 * through MediaTek's SPM firmware: mt6771-spm turns CPU 0's
++	 * mcdi-cluster into deep idle when the vendor's conditions hold (no
++	 * other CPU online, the display and other subsystems off, the clocks
++	 * gated, the next timer far enough). No idle-state node of its own:
++	 * LK edits these nodes by name.
 +	 */
 +	/* the CCI's clock follows the CPUs (mtk-cci-devfreq, passive) */
 +	cci: cci {
@@ -2215,6 +2219,14 @@ index 0000000000000000000000000000000000000000..335b186aafed831c353a242414d29fbf
 +				     "mediatek,mt8183-topckgen", "syscon";
 +			reg = <0 0x10000000 0 0x1000>;
 +			#clock-cells = <1>;
++			/*
++			 * I2C from 26 MHz, its first parent: LK leaves it on
++			 * univpll_d5_d2, and i2c-mt65xx keeps its clocks prepared
++			 * (MediaTek's driver prepared them per transfer), which
++			 * kept UNIVPLL running; SODI3 needs it off.
++			 */
++			assigned-clocks = <&topckgen CLK_TOP_MUX_I2C>;
++			assigned-clock-parents = <&clk26m>;
 +		};
 +
 +		infracfg: syscon@10001000 {
@@ -2360,6 +2372,17 @@ index 0000000000000000000000000000000000000000..335b186aafed831c353a242414d29fbf
 +					 * (VEN_PWR_CON 0x304, SRAM 11:8/15:12, status
 +					 * bit 21, SMI clamp in the vendor sequence)
 +					 */
++					/*
++					 * Video decoder: as MT8183's (VDE_PWR_CON
++					 * 0x300, SRAM bit 8/ack 12, status bit 31,
++					 * SMI clamp bit 7 in the vendor sequence)
++					 */
++					power-domain@MT8183_POWER_DOMAIN_VDEC {
++						reg = <MT8183_POWER_DOMAIN_VDEC>;
++						mediatek,smi = <&smi_common>;
++						#power-domain-cells = <0>;
++					};
++
 +					power-domain@MT8183_POWER_DOMAIN_VENC {
 +						reg = <MT8183_POWER_DOMAIN_VENC>;
 +						mediatek,smi = <&smi_common>;
@@ -2557,8 +2580,8 @@ index 0000000000000000000000000000000000000000..335b186aafed831c353a242414d29fbf
 +			compatible = "mediatek,mt6771-m4u", "mediatek,mt8183-m4u";
 +			reg = <0 0x10205000 0 0x1000>;
 +			interrupts = <GIC_SPI 166 IRQ_TYPE_LEVEL_LOW>;
-+			mediatek,larbs = <&larb0>, <&larb2>, <&larb3>, <&larb4>,
-+					 <&larb5>, <&larb6>;
++			mediatek,larbs = <&larb0>, <&larb1>, <&larb2>, <&larb3>,
++					 <&larb4>, <&larb5>, <&larb6>;
 +			#iommu-cells = <1>;
 +		};
 +
@@ -2658,10 +2681,16 @@ index 0000000000000000000000000000000000000000..335b186aafed831c353a242414d29fbf
 +			status = "disabled";
 +		};
 +
-+		/* the rear camera's bus, shared like i2c_4 (the vendor's id 2) */
++		/*
++		 * The rear camera's bus, shared like i2c_4 (the vendor's id 2).
++		 * Its window ends at 0x1100a000, where SPI0 starts (0x1000 from
++		 * +0x100 took SPI0's first 0x100 bytes: with SPI0 on, the bus
++		 * failed with -EBUSY and no camera probed); i2c-mt65xx reads
++		 * DCM_EN (0xf88) only on chips with DCM, which this isn't.
++		 */
 +		i2c_2: i2c@11009000 {
 +			compatible = "mediatek,mt6771-i2c", "mediatek,mt8183-i2c";
-+			reg = <0 0x11009100 0 0x1000>,
++			reg = <0 0x11009100 0 0xf00>,
 +			      <0 0x11000280 0 0x80>;
 +			interrupts = <GIC_SPI 83 IRQ_TYPE_LEVEL_LOW>;
 +			clocks = <&infracfg CLK_INFRA_I2C2>,
@@ -2739,6 +2768,23 @@ index 0000000000000000000000000000000000000000..335b186aafed831c353a242414d29fbf
 +				clock-names = "sys_ck", "ref_ck";
 +				status = "disabled";
 +			};
++		};
++
++		/*
++		 * The AFE's SRAM, 48 KiB in its compact layout (vendor
++		 * AFE_INTERNAL_SRAM_PHY_BASE and _COMPACT_SIZE). With the AFE
++		 * node's "iram" pointing here DL1 plays from it, so DRAM can
++		 * sleep in deep idle while audio plays. Disabled: kernel #139,
++		 * which played from it, boot-looped, and how the CPU may write
++		 * this SRAM (access widths) is not known yet.
++		 */
++		afe_sram: sram@11221000 {
++			compatible = "mmio-sram";
++			reg = <0 0x11221000 0 0xc000>;
++			#address-cells = <1>;
++			#size-cells = <1>;
++			ranges = <0 0 0x11221000 0xc000>;
++			status = "disabled";
 +		};
 +
 +		/*
@@ -3370,6 +3416,49 @@ index 0000000000000000000000000000000000000000..335b186aafed831c353a242414d29fbf
 +				 <&iommu M4U_PORT_CAM_IMG2O>,
 +				 <&iommu M4U_PORT_CAM_IMG3O>;
 +			status = "disabled";
++		};
++
++		/*
++		 * Video decoder block: clock gates, larb 1 and the decoder,
++		 * laid out as MT8183's (vendor vdec_gcon with the same gate
++		 * registers, smi-id 1, VDEC at 0x16020000 IRQ 250; larb 1
++		 * ports in the same order). The vendor programmed the decoder
++		 * from userspace through a pass-through driver; here the
++		 * titan_vdec driver does (docs/video-decoder.md).
++		 */
++		vdecsys: syscon@16000000 {
++			compatible = "mediatek,mt6771-vdecsys",
++				     "mediatek,mt8183-vdecsys", "syscon";
++			reg = <0 0x16000000 0 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		larb1: larb@16010000 {
++			compatible = "mediatek,mt6771-smi-larb",
++				     "mediatek,mt8183-smi-larb";
++			reg = <0 0x16010000 0 0x1000>;
++			mediatek,smi = <&smi_common>;
++			mediatek,larb-id = <1>;
++			clocks = <&vdecsys CLK_VDEC_VDEC>, <&vdecsys CLK_VDEC_LARB1>;
++			clock-names = "apb", "smi";
++			power-domains = <&spm MT8183_POWER_DOMAIN_VDEC>;
++		};
++
++		vdec: video-decoder@16020000 {
++			compatible = "mediatek,mt6771-vdec";
++			reg = <0 0x16020000 0 0x9000>;	/* MISC to VP9 */
++			interrupts = <GIC_SPI 250 IRQ_TYPE_LEVEL_LOW>;
++			clocks = <&vdecsys CLK_VDEC_VDEC>;
++			clock-names = "vdec";
++			power-domains = <&spm MT8183_POWER_DOMAIN_VDEC>;
++			mediatek,larb = <&larb1>;
++			iommus = <&iommu M4U_PORT_HW_VDEC_MC_EXT>,
++				 <&iommu M4U_PORT_HW_VDEC_PP_EXT>,
++				 <&iommu M4U_PORT_HW_VDEC_VLD_EXT>,
++				 <&iommu M4U_PORT_HW_VDEC_AVC_MV_EXT>,
++				 <&iommu M4U_PORT_HW_VDEC_PRED_RD_EXT>,
++				 <&iommu M4U_PORT_HW_VDEC_PRED_WR_EXT>,
++				 <&iommu M4U_PORT_HW_VDEC_PPWRAP_EXT>;
 +		};
 +
 +		/*

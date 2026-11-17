@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 07/22] usb: mtu3, phy: mediatek: VBUS session follows the role switch; set the IP up after a reset in suspend
+Subject: [PATCH 07/23] usb: mtu3, phy: mediatek: VBUS session follows the role switch; set the IP up after a reset in suspend
 
 phy-mtk-tphy: a port with mediatek,force-vbus forces the VBUS-valid and
 session signals the PHY's comparator cannot see on this board, and ends
@@ -10,14 +10,22 @@ and the IP can sleep when nothing is plugged in.
 
 The SPM's deep sleep leaves the SSUSB IP in software reset; mtu3's resume
 now releases it and sets the device side up again
-(ssusb_gadget_restore()).
+(ssusb_gadget_restore()), soft connect included when the resume is a
+runtime one.
+
+Runtime PM (which userspace has to allow) is held while the role switch
+reports a partner, so the controller no longer suspends under a live
+gadget link; without a cable it suspends and drops its clocks. System
+suspend and resume leave a runtime-suspended controller as it is
+(suspending it again failed and refused the system suspend).
 ---
- drivers/phy/mediatek/phy-mtk-tphy.c | 41 +++++++++++++++++++++++++++--
- drivers/usb/mtu3/mtu3_core.c        | 21 +++++++++++++++
- drivers/usb/mtu3/mtu3_dr.c          | 34 +++++++++++++++++++++++-
- drivers/usb/mtu3/mtu3_dr.h          |  6 +++++
- drivers/usb/mtu3/mtu3_plat.c        | 13 ++++++++-
- 5 files changed, 111 insertions(+), 4 deletions(-)
+ drivers/phy/mediatek/phy-mtk-tphy.c | 41 +++++++++++++++++++--
+ drivers/usb/mtu3/mtu3.h             |  2 ++
+ drivers/usb/mtu3/mtu3_core.c        | 31 ++++++++++++++--
+ drivers/usb/mtu3/mtu3_dr.c          | 55 +++++++++++++++++++++++++++--
+ drivers/usb/mtu3/mtu3_dr.h          |  6 ++++
+ drivers/usb/mtu3/mtu3_plat.c        | 25 ++++++++++++-
+ 6 files changed, 153 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/phy/mediatek/phy-mtk-tphy.c b/drivers/phy/mediatek/phy-mtk-tphy.c
 index 3f7095ec5978e3c80836db98a65cabd55061a36e..aa9403de0f8d79a72b666a5d2a141e18fceed212 100644
@@ -107,8 +115,28 @@ index 3f7095ec5978e3c80836db98a65cabd55061a36e..aa9403de0f8d79a72b666a5d2a141e18
  	device_property_read_u32(dev, "mediatek,eye-src",
  				 &instance->eye_src);
  	device_property_read_u32(dev, "mediatek,eye-vrt",
+diff --git a/drivers/usb/mtu3/mtu3.h b/drivers/usb/mtu3/mtu3.h
+index c11840b9a6f16582a3fbb14d7f6fc1a4104ef63b..265045e51b92049e4c020896b87f7dc218a6abe5 100644
+--- a/drivers/usb/mtu3/mtu3.h
++++ b/drivers/usb/mtu3/mtu3.h
+@@ -217,6 +217,7 @@ struct otg_switch_mtk {
+ 	enum usb_role default_role;
+ 	struct usb_role_switch *role_sw;
+ 	bool role_sw_used;
++	bool partner_held;	/* a runtime PM reference while a partner is there */
+ 	bool is_u3_drd;
+ 	bool manual_drd_enabled;
+ };
+@@ -242,6 +243,7 @@ struct otg_switch_mtk {
+  */
+ struct ssusb_mtk {
+ 	struct device *dev;
++	bool ip_reset;	/* the IP lost its state in a sleep: restore all on resume */
+ 	struct mtu3 *u3d;
+ 	void __iomem *mac_base;
+ 	void __iomem *ippc_base;
 diff --git a/drivers/usb/mtu3/mtu3_core.c b/drivers/usb/mtu3/mtu3_core.c
-index ca8cb6c3a01bf93bc5fa1a885d8ec90b653dc1b0..910a11cb5a4df503316bdf3c5ba68028d219c0a1 100644
+index ca8cb6c3a01bf93bc5fa1a885d8ec90b653dc1b0..50340a24f16b8dd5759cf4f9a23130534c4fc6d1 100644
 --- a/drivers/usb/mtu3/mtu3_core.c
 +++ b/drivers/usb/mtu3/mtu3_core.c
 @@ -1051,6 +1051,27 @@ int ssusb_gadget_suspend(struct ssusb_mtk *ssusb, pm_message_t msg)
@@ -139,8 +167,26 @@ index ca8cb6c3a01bf93bc5fa1a885d8ec90b653dc1b0..910a11cb5a4df503316bdf3c5ba68028
  int ssusb_gadget_resume(struct ssusb_mtk *ssusb, pm_message_t msg)
  {
  	struct mtu3 *mtu = ssusb->u3d;
+@@ -1060,9 +1081,15 @@ int ssusb_gadget_resume(struct ssusb_mtk *ssusb, pm_message_t msg)
+ 
+ 	mtu3_dev_resume(mtu);
+ 
+-	/* Restore soft connect for system resume */
+-	if (mtu->softconnect && !PMSG_IS_AUTO(msg))
++	/*
++	 * Restore soft connect for system resume, and for a runtime resume
++	 * after the IP was reset (MT6771's deep sleep with the controller
++	 * runtime-suspended): the pull-up was lost with the registers and the
++	 * gadget stayed "not attached" at the next cable (2026-11-17).
++	 */
++	if (mtu->softconnect && (!PMSG_IS_AUTO(msg) || ssusb->ip_reset))
+ 		mtu3_dev_on_off(mtu, 1);
++	ssusb->ip_reset = false;
+ 
+ 	return 0;
+ }
 diff --git a/drivers/usb/mtu3/mtu3_dr.c b/drivers/usb/mtu3/mtu3_dr.c
-index 8191b7ed3852107a4ddd55b39fc53987eb56fef6..3337954a20113579bcff3ccf6c6cd26d6c292d64 100644
+index 8191b7ed3852107a4ddd55b39fc53987eb56fef6..878af50c1bad0eb3ccf444c0ed3c120791534793 100644
 --- a/drivers/usb/mtu3/mtu3_dr.c
 +++ b/drivers/usb/mtu3/mtu3_dr.c
 @@ -124,6 +124,30 @@ int ssusb_set_vbus(struct otg_switch_mtk *otg_sx, int is_on)
@@ -174,7 +220,7 @@ index 8191b7ed3852107a4ddd55b39fc53987eb56fef6..3337954a20113579bcff3ccf6c6cd26d
  static void ssusb_mode_sw_work(struct work_struct *work)
  {
  	struct otg_switch_mtk *otg_sx =
-@@ -131,6 +155,7 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+@@ -131,10 +155,25 @@ static void ssusb_mode_sw_work(struct work_struct *work)
  	struct ssusb_mtk *ssusb = otg_sx_to_ssusb(otg_sx);
  	struct mtu3 *mtu = ssusb->u3d;
  	enum usb_role desired_role = otg_sx->desired_role;
@@ -182,23 +228,42 @@ index 8191b7ed3852107a4ddd55b39fc53987eb56fef6..3337954a20113579bcff3ccf6c6cd26d
  	enum usb_role current_role;
  
  	current_role = ssusb->is_host ? USB_ROLE_HOST : USB_ROLE_DEVICE;
-@@ -142,8 +167,14 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 
++	/*
++	 * Runtime suspend (which userspace has to allow: power/control and
++	 * power/wakeup) must not happen with a partner there: nothing else
++	 * holds the device for a connected gadget, and it suspended under a
++	 * live link ("ip sleep failed", the gadget gone; MT6771, 2026-11-17).
++	 * A partner holds a reference; role "none" lets it go, and with no
++	 * cable the controller can drop its clocks (on the MT6771 their
++	 * UNIVPLL parent keeps the SoC out of SODI3).
++	 */
++	if (partner && !otg_sx->partner_held) {
++		pm_runtime_get_sync(ssusb->dev);
++		otg_sx->partner_held = true;
++	}
++
+ 	if (desired_role == USB_ROLE_NONE) {
+ 		/* the default mode is host as probe does */
+ 		desired_role = USB_ROLE_HOST;
+@@ -142,8 +181,14 @@ static void ssusb_mode_sw_work(struct work_struct *work)
  			desired_role = USB_ROLE_DEVICE;
  	}
  
 -	if (current_role == desired_role)
+-		return;
 +	if (current_role == desired_role) {
 +		if (desired_role == USB_ROLE_DEVICE) {
 +			pm_runtime_get_sync(ssusb->dev);
 +			ssusb_phy_vbus(ssusb, partner);
 +			pm_runtime_put(ssusb->dev);
 +		}
- 		return;
++		goto out;
 +	}
  
  	dev_dbg(ssusb->dev, "set role : %s\n", usb_role_string(desired_role));
  	mtu3_dbg_trace(ssusb->dev, "set role : %s", usb_role_string(desired_role));
-@@ -162,6 +193,7 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+@@ -162,6 +207,7 @@ static void ssusb_mode_sw_work(struct work_struct *work)
  		ssusb->is_host = false;
  		ssusb_set_vbus(otg_sx, 0);
  		switch_port_to_device(ssusb);
@@ -206,6 +271,18 @@ index 8191b7ed3852107a4ddd55b39fc53987eb56fef6..3337954a20113579bcff3ccf6c6cd26d
  		mtu3_start(mtu);
  		break;
  	case USB_ROLE_NONE:
+@@ -169,6 +215,11 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 		dev_err(ssusb->dev, "invalid role\n");
+ 	}
+ 	pm_runtime_put(ssusb->dev);
++out:
++	if (!partner && otg_sx->partner_held) {
++		otg_sx->partner_held = false;
++		pm_runtime_put(ssusb->dev);
++	}
+ }
+ 
+ static void ssusb_set_mode(struct otg_switch_mtk *otg_sx, enum usb_role role)
 diff --git a/drivers/usb/mtu3/mtu3_dr.h b/drivers/usb/mtu3/mtu3_dr.h
 index e325508bddf4614dc1890a5b99a9c07c4b93e416..92d486a80b1e1e62884c542ba8175e928fa0bd4c 100644
 --- a/drivers/usb/mtu3/mtu3_dr.h
@@ -231,7 +308,7 @@ index e325508bddf4614dc1890a5b99a9c07c4b93e416..92d486a80b1e1e62884c542ba8175e92
  {
  	return true;
 diff --git a/drivers/usb/mtu3/mtu3_plat.c b/drivers/usb/mtu3/mtu3_plat.c
-index 6858ed9fc3b2f1276161a60554dee3491063bb3d..0220bf0d8328403ab0aec40d5066bcde2379f013 100644
+index 6858ed9fc3b2f1276161a60554dee3491063bb3d..0ec1acf153625ec7240ba87fa67d894d715709f1 100644
 --- a/drivers/usb/mtu3/mtu3_plat.c
 +++ b/drivers/usb/mtu3/mtu3_plat.c
 @@ -32,7 +32,8 @@ int ssusb_check_clocks(struct ssusb_mtk *ssusb, u32 ex_clks)
@@ -244,7 +321,7 @@ index 6858ed9fc3b2f1276161a60554dee3491063bb3d..0220bf0d8328403ab0aec40d5066bcde
  		return ret;
  	}
  
-@@ -570,6 +571,16 @@ static int mtu3_resume_common(struct device *dev, pm_message_t msg)
+@@ -570,6 +571,17 @@ static int mtu3_resume_common(struct device *dev, pm_message_t msg)
  	if (ret)
  		goto phy_err;
  
@@ -252,6 +329,7 @@ index 6858ed9fc3b2f1276161a60554dee3491063bb3d..0220bf0d8328403ab0aec40d5066bcde
 +	if (mtu3_readl(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL0) & SSUSB_IP_SW_RST) {
 +		dev_info(dev, "IP was reset in suspend, setting it up again\n");
 +		ssusb_ip_sw_reset(ssusb);
++		ssusb->ip_reset = true;
 +		if (!ssusb->is_host)
 +			ssusb_gadget_restore(ssusb);
 +		else
@@ -261,3 +339,28 @@ index 6858ed9fc3b2f1276161a60554dee3491063bb3d..0220bf0d8328403ab0aec40d5066bcde
  	return resume_ip_and_ports(ssusb, msg);
  
  phy_err:
+@@ -578,13 +590,24 @@ static int mtu3_resume_common(struct device *dev, pm_message_t msg)
+ 	return ret;
+ }
+ 
++/*
++ * Runtime-suspended already (no partner, runtime PM allowed): the IP is
++ * asleep with its clocks off and wakeup set, as system suspend leaves it.
++ * Suspending it again failed ("ip sleep failed", -EBUSY) and refused every
++ * system suspend on battery (MT6771, 2026-11-17). It stays so through the
++ * resume; the role switch resumes it at the next cable.
++ */
+ static int __maybe_unused mtu3_suspend(struct device *dev)
+ {
++	if (pm_runtime_status_suspended(dev))
++		return 0;
+ 	return mtu3_suspend_common(dev, PMSG_SUSPEND);
+ }
+ 
+ static int __maybe_unused mtu3_resume(struct device *dev)
+ {
++	if (pm_runtime_status_suspended(dev))
++		return 0;
+ 	return mtu3_resume_common(dev, PMSG_SUSPEND);
+ }
+ 

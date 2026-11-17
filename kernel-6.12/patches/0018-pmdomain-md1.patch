@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 18/22] pmdomain: mediatek: add the MT6771 with its modem domain
+Subject: [PATCH 18/23] pmdomain: mediatek: add the MT6771 with its modem domain
 
 The MT6771's power controller has the MT8183's domains and the modem's
 (MD1). The modem's sequence differs from the others (MediaTek's
