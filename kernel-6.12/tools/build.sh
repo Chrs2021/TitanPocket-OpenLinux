@@ -2,7 +2,7 @@
 # Build the Linux 6.12 kernel for the Titan Pocket inside the
 # titan_build_ubuntu container (docs/mainline.md):
 #   container exec titan_build_ubuntu bash /workspace/tools/mainline/build.sh [config|build|modules|all]
-# Source: kernel_vol_mnt/mainline/linux-6.12.115 (branch titanpocket-6.12).
+# Source: kernel_vol_mnt/mainline/linux-6.12.118 (branch titanpocket-6.12.118).
 # Objects go to the container's own disk: on the shared /workspace mount
 # `sed -i` fails (merge_config.sh needs it) and builds are slower. Image.gz
 # and the dtb are copied to out/mainline/. "modules" builds the kernel's
@@ -11,8 +11,8 @@
 # set to the phone.
 set -euo pipefail
 
-KSRC=${KSRC:-/workspace/kernel_vol_mnt/mainline/linux-6.12.115}
-O=${O:-/root/titan-6.12-build}
+KSRC=${KSRC:-/workspace/kernel_vol_mnt/mainline/linux-6.12.118}
+O=${O:-/root/titan-6.12.118-build}
 # REPRO=1: a reproducible build. The kernel's build stamp (uname -v: build
 # counter, time, user@host) comes from the source's last commit instead of
 # this machine, so the same commit, compiler and config give the same

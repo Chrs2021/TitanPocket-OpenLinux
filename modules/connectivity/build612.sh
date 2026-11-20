@@ -14,8 +14,8 @@ set -euo pipefail
 # KDIR/KSRC, O and OUT612 may be set to build against another 6.12 tree (another stable release)
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=/root/titan-conn-612
-KDIR=${KDIR:-/workspace/kernel_vol_mnt/mainline/linux-6.12.115}
-O=${O:-/root/titan-6.12-build}
+KDIR=${KDIR:-/workspace/kernel_vol_mnt/mainline/linux-6.12.118}
+O=${O:-/root/titan-6.12.118-build}
 JOBS=${JOBS:-$(nproc)}
 OUT=${OUT612:-$HERE/out612}
 export ARCH=arm64

@@ -8,7 +8,7 @@
 set -euo pipefail
 # KDIR/KSRC, O and OUT612 may be set to build against another 6.12 tree (another stable release)
 HERE=$(cd "$(dirname "$0")" && pwd)
-KSRC=${KSRC:-/workspace/kernel_vol_mnt/mainline/linux-6.12.115}
+KSRC=${KSRC:-/workspace/kernel_vol_mnt/mainline/linux-6.12.118}
 SRC=/root/titan-venc-612
 rm -rf "$SRC"; mkdir -p "$SRC"
 cp "$KSRC/drivers/media/platform/mediatek/mt6771-venc/titan_venc.c" "$SRC/"
@@ -16,7 +16,7 @@ echo 'obj-m := titan_venc.o' > "$SRC/Kbuild"
 # KBUILD_MODPOST_WARN: the build's Module.symvers may lack the media modules'
 # symbols (a vmlinux-only build rewrites it); the kernel has no MODVERSIONS, so
 # symbols resolve by name at load and depmod on the phone finds the dependencies
-make -C "$KSRC" O="${O:-/root/titan-6.12-build}" ARCH=arm64 M="$SRC" KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules
+make -C "$KSRC" O="${O:-/root/titan-6.12.118-build}" ARCH=arm64 M="$SRC" KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules
 mkdir -p "${OUT612:-$HERE/out612}"
 cp "$SRC/titan_venc.ko" "${OUT612:-$HERE/out612}/"
 ls -l "${OUT612:-$HERE/out612}/titan_venc.ko"

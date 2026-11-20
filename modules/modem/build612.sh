@@ -9,8 +9,8 @@
 set -euo pipefail
 # KDIR/KSRC, O and OUT612 may be set to build against another 6.12 tree (another stable release)
 HERE=$(cd "$(dirname "$0")" && pwd)
-KDIR=${KDIR:-/workspace/kernel_vol_mnt/mainline/linux-6.12.115}
-O=${O:-/root/titan-6.12-build}
+KDIR=${KDIR:-/workspace/kernel_vol_mnt/mainline/linux-6.12.118}
+O=${O:-/root/titan-6.12.118-build}
 export ARCH=arm64
 
 grep -q '^CONFIG_MTK_MT6771_MODEM=m' "$O/.config" || {

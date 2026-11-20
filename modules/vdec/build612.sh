@@ -8,14 +8,14 @@
 set -euo pipefail
 # KDIR/KSRC, O and OUT612 may be set to build against another 6.12 tree (another stable release)
 HERE=$(cd "$(dirname "$0")" && pwd)
-KSRC=${KSRC:-/workspace/kernel_vol_mnt/mainline/linux-6.12.115}
+KSRC=${KSRC:-/workspace/kernel_vol_mnt/mainline/linux-6.12.118}
 SRC=/root/titan-vdec-612
 rm -rf "$SRC"; mkdir -p "$SRC"
 cp "$KSRC/drivers/media/platform/mediatek/mt6771-vdec/titan_vdec.c" "$SRC/"
 echo 'obj-m := titan_vdec.o' > "$SRC/Kbuild"
 # KBUILD_MODPOST_WARN: the build's Module.symvers may lack the media modules'
 # symbols (as modules/venc/build612.sh); no MODVERSIONS, they resolve at load
-make -C "$KSRC" O="${O:-/root/titan-6.12-build}" ARCH=arm64 M="$SRC" KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules
+make -C "$KSRC" O="${O:-/root/titan-6.12.118-build}" ARCH=arm64 M="$SRC" KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules
 mkdir -p "${OUT612:-$HERE/out612}"
 cp "$SRC/titan_vdec.ko" "${OUT612:-$HERE/out612}/"
 ls -l "${OUT612:-$HERE/out612}/titan_vdec.ko"
