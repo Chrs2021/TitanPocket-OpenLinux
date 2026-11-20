@@ -12,7 +12,9 @@ SRC=/root/titan-vdec-612
 rm -rf "$SRC"; mkdir -p "$SRC"
 cp "$KSRC/drivers/media/platform/mediatek/mt6771-vdec/titan_vdec.c" "$SRC/"
 echo 'obj-m := titan_vdec.o' > "$SRC/Kbuild"
-make -C "$KSRC" O=/root/titan-6.12-build ARCH=arm64 M="$SRC" -j"$(nproc)" modules
+# KBUILD_MODPOST_WARN: the build's Module.symvers may lack the media modules'
+# symbols (as modules/venc/build612.sh); no MODVERSIONS, they resolve at load
+make -C "$KSRC" O=/root/titan-6.12-build ARCH=arm64 M="$SRC" KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules
 mkdir -p "$HERE/out612"
 cp "$SRC/titan_vdec.ko" "$HERE/out612/"
 ls -l "$HERE/out612/titan_vdec.ko"

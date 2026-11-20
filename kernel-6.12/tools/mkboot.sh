@@ -5,9 +5,9 @@
 #
 # Repacked with magiskboot from the boot image that was on the phone, like
 # ./mkboot.sh, so the v2 header and cmdline stay as LK expects; the kernel
-# is our 6.12 Image.gz, the header's dtb is ours, the ramdisk is the
-# first-light one (busybox, reboot-bootloader, udhcpd.conf and
-# tools/mainline/firstlight-init), and the cmdline gets the bring-up
+# is our 6.12 Image.gz, the header's dtb is ours, the ramdisk is our small
+# one (busybox, reboot-bootloader, udhcpd.conf and
+# tools/mainline/ramdisk-init), and the cmdline gets the bring-up
 # options below.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -19,7 +19,7 @@ rm -rf "$OUT/rd" "$OUT/repack"
 mkdir -p "$OUT/rd/bin" "$OUT/rd/etc" "$OUT/rd/proc" "$OUT/rd/sys" "$OUT/rd/dev" "$OUT/rd/tmp" "$OUT/repack"
 cp userspace/build/bin/busybox userspace/build/bin/reboot-bootloader "$OUT/rd/bin/"
 cp userspace/rootfs/etc/udhcpd.conf "$OUT/rd/etc/"
-cp tools/mainline/firstlight-init "$OUT/rd/init"
+cp tools/mainline/ramdisk-init "$OUT/rd/init"
 # the 6.12 connectivity modules, when built (modules/connectivity/build612.sh)
 if ls modules/connectivity/out612/*.ko >/dev/null 2>&1; then
 	mkdir -p "$OUT/rd/lib/modules-conn"
@@ -50,7 +50,7 @@ cd "$OUT/repack"
 #   IGNORE_UNUSED lists which of the three to pass (default all:
 #   IGNORE_UNUSED="clk pd regulator"; "" passes none);
 # - ignore_loglevel: everything reaches the console, so pstore keeps it all;
-# - DEBIAN=1 adds titan.root (firstlight-init boots Debian from titanroot)
+# - DEBIAN=1 adds titan.root (ramdisk-init boots Debian from titanroot)
 #   and the sleep Debian's power key gets when it writes "mem": deep sleep
 #   through the SPM firmware (mt6771_spm.deep=1 mem_sleep_default=deep),
 #   with the SPM's default wake sources less the SCP's (bit 11,

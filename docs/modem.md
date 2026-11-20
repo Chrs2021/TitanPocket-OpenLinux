@@ -951,7 +951,10 @@ already up `5847`. `+EIF` then gives it an interface of its own (`ccmni1` when d
 (`AT+CCHO`, `AT+CGLA`, `AUTHENTICATE` in 3G context) answers it and gives the keys. The client sets up four ESP SAs in transport mode with `ip xfrm`
 (the network chose `hmac-sha-1-96` and `aes-cbc`) and sends the second `REGISTER` through them. **Over UDP that got no answer, and over TCP a 200**, so
 all protected signalling is TCP. Measured 2026-11-04: registered on the first try each run, about 3590 s granted, and `SUBSCRIBE` to `reg` accepted, with IPv6 and
-IPv4 data still working. The refresh, at 60 % of that, has not been observed. The kernel needs `CONFIG_XFRM_USER`, `CONFIG_INET_ESP`, `CONFIG_INET6_ESP` and friends
+IPv4 data still working. The refresh, at 60 % of that, has not been observed. A `reg` NOTIFY ends the registration
+(and `titan-ims` starts over) only when its `<registration>` is terminated, or the contact at our own address and port:
+after a restart the network's first NOTIFY still lists the previous run's contact as terminated, which once made it
+start over in a loop (fixed 2026-11-19, two restarts in a row then stayed registered). The kernel needs `CONFIG_XFRM_USER`, `CONFIG_INET_ESP`, `CONFIG_INET6_ESP` and friends
 (`titanpocket.config`). The registration's P-Associated-URI gave one identity here and no `tel:` URI, so calls present the SIM's public identity.
 
 **Calls.** First incoming call 2026-11-04: it rang, answered and the other side heard the phone's mic (2048 RTP packets sent), so the network carries RTP from the AP. The phone's own sound failed: PipeWire still held the output after the ringtone, so `aplay` failed with "Device or resource busy" and the receive loop stopped after 1 packet. `titan-ims` now suspends PipeWire's sinks for the call and retries the player. On the second call the other side was heard, through the loudspeaker: DL1 feeds it as well as the earpiece, so `titan-ims` now turns that route off for the call and back on after (the earpiece not yet confirmed by ear). The speaker mode bypasses PipeWire's limiter, so it plays 6 dB down; calls set `Handset` to -6 dB, as the card's default is about -22 dB. Since 2026-11-06 the call's sound goes through PipeWire (`pw-cat` with the Phone role) instead of `aplay`, so a ringtone or other stream can't hold the device; after changing routes `titan-ims` suspends and resumes the `titan-speaker` sink so PipeWire opens DL1 again with the new route. The earpiece was then confirmed by ear, but quiet, for two reasons. `amixer sset Handset -6dB` never worked, because amixer reads `-6dB` as an option (`titan-ims` now sets the raw `Handset Volume` value, dB + 10). And the MT6358 driver drops the handset gain to -40 dB when the earpiece powers down and never restores it on power-up, so the sink reopen left it at -40 dB (the control then reads -13, the inverted 0x1f). Kernel #111 restores the gain at power-up (`mt_rcv_event`, with -10 dB until the control is set); `titan-ims` also sets it after every reopen.
@@ -970,7 +973,7 @@ call log now counts filled and dropped frames.
 
 Outgoing calls took three tries. An offer with `a=des:qos mandatory remote sendrecv` got `580 Precondition Failure`; `optional` for the remote side passed it. Then the carrier's server answered `200 OK` within about 2 s, with no ringing stage and `Reason: SIP;text="Invalid Identity Header";code=438`, and the other phone did not ring, with either form of the number as the identity. Adding `P-Early-Media: supported`, `Session-Expires: 1800`, `Min-SE: 90`, `Privacy: none`, `timer` in `Supported` and `application/3gpp-ims+xml` in `Accept` together made the other phone ring (one call, 2026-11-04); which of them mattered was not tested. A call should present `sip:+1...`: the `reg` event lists it, while P-Associated-URI gave the number without the `+`. Signalling: Outgoing and incoming INVITE with preconditions (183, PRACK, UPDATE), CANCEL, BYE, session timers. The sound is on the CPU, not
 the modem: RTP on the IMS interface, AMR-WB (12.65 kbit/s) or AMR (12.2 kbit/s) through `libvo-amrwbenc` and `libopencore-amr*`, in either RFC 4867 packing,
-`telephone-event` for DTMF, and `pw-cat` (the Phone media role) for playback with `arecord` for the mic (`plughw:...,DEV=2`), on the HiFi routes from the UCM profile (earpiece, speaker, headphones; main mic with the preamplifier at 24 dB). Offline, encoding and decoding a tone in both codecs and packings kept its level (AMR-WB RMS 4151 of 4242, AMR 4053), and the devices open. There is no echo cancellation; the jitter buffer came later (below, "Jitter buffer").
+`telephone-event` for DTMF, and `pw-cat` (the Phone media role) for playback with `arecord` for the mic (`plughw:...,DEV=2`), on the HiFi routes from the UCM profile (earpiece, speaker, headphones; main mic with the preamplifier at 24 dB). Offline, encoding and decoding a tone in both codecs and packings kept its level (AMR-WB RMS 4151 of 4242, AMR 4053), and the devices open. Echo cancellation and the jitter buffer came later (below, "Voicemail, hold, call waiting, echo cancellation and MMS" and "Jitter buffer").
 
 **Rust port (2026-11-06).** `titan-ims` is also written in Rust, in its own crate `userspace/titan-ims-rs` (build `userspace/titan-ims-rs/build.sh` -> `out/titan-ims/titan-ims`). Unlike the `titan-phone` services (static musl) it is a glibc dynamic binary, 0.7 MB: it `dlopen`s the AMR codec libraries (`libvo-amrwbenc`, `libopencore-amr{wb,nb}`) and `libsqlite3` at runtime, as the Python did with `ctypes`, so it links nothing but glibc and `libdl` and the build needs no codec libraries. Everything else is the standard library plus small C calls (`poll`, `ioctl FIONREAD`, sockets with `SO_BINDTODEVICE`/`IPV6_TCLASS` set before `bind`, `dlopen`), shelling out to `mmcli`/`gdbus`/`amixer`/`ip`/`pactl` as before. SIP parsing, SDP, the IPsec SAs (`ip xfrm`), the MD5 digest, base64, JSON, AMR RFC 4867 packing and GSM 7-bit/TPDU/RP are all by hand, with 18 unit tests. Modules: `util` (log, programs, MD5, base64, JSON, SIP text), `net` (IPv6 sockets and `poll`), `modem` (AT channels, the SIM's ISIM, the PDN, identities), `codec` (AMR via `dlopen`), `sms` (GSM-7/TPDU/RP and the SQLite store), `sip` (message parser, SDP, `Xfrm`, the `Call` record), `media` (RTP, the jitter buffer, routing, earpiece), `ua` (the user agent and event loop). It keeps `/run/titan-ims.sock` and the same JSON, so the dialer and `titan-call-watch` do not change. The SIM runs its own authentication, as in the Python: the code only relays the `AUTHENTICATE` APDU and hands the CK/IK the SIM returns to the kernel's IPsec. The port was built one module at a time and compared against the Python's bit-exact outputs where possible (AMR pack/unpack, GSM-7, the digest). Registration was verified on the phone 2026-11-06 (a 60 s run with the Python stopped): it brought up the bearer, ran the AKA challenge, negotiated IPsec (hmac-sha-1-96/aes-cbc), registered for 3600 s and answered the control socket, with identities masked in the log exactly as the Python masks them. It was then swapped in as the service and carried a real incoming call (answered, earpiece audio, the jitter buffer reporting 0 dropped and 0 player restarts) and SMS both ways on 2026-11-06. `cp /usr/local/lib/titan-py/titan-ims /usr/local/sbin/titan-ims && systemctl restart titan-ims` rolls back to the Python one. `build-rootfs.sh` keeps installing the Python version until the Rust one has carried calls for a while.
 
@@ -1023,10 +1026,52 @@ connects. The phone went back to that binary; a phone build of `titan-ims` shoul
 understood. The phone now runs such a build (the mixer's volume command, `out/ims-noimc/`): registered, `imc` off, no
 assert.
 
-**Not done:** USSD menus on the network (see "USSD" below), emergency calls (there is no emergency registration: 911 and 112 are sent as `urn:service:sos`, untested, and the dialer says so), MMS and RCS,
-call waiting and hold, video, handover to Wi-Fi calling, and on the modem's side, calls, SMS and USSD sent as AT commands (the IMC's messages for them go unanswered).
+**Not done:** USSD menus on the network (see "USSD" below), emergency calls tested on a network (built since 2026-11-19, see "Emergency calls"), RCS,
+3-way calls, video, handover to Wi-Fi calling, and on the modem's side, calls, SMS and USSD sent as AT commands (the IMC's messages for them go unanswered).
 
-**SMS.** First run 2026-11-04, on the first try: one text received and stored, its report accepted (202), and two sent from the messages app, each accepted and acknowledged by the network within a second (RP-ACK), and both received by the other phone. On Android `volte_ua` has SMS handling and the `+g.3gpp.smsip` tag, and the RIL sends `AT+CMGS`; our capture holds only the set-up, with no message sent. `titan-ims` does it in SIP (TS 24.341): the registration's Contact carries `+g.3gpp.smsip`, and a `MESSAGE` of type `application/vnd.3gpp.sms` carries an RP-DATA (TS 24.011) with an SMS-SUBMIT or SMS-DELIVER (TS 23.040), to `tel:` the service centre from `AT+CSCA?`. A message is stored before it is acknowledged, in `/var/lib/titan-ims/messages.sqlite3` (mode 600); text and numbers never reach a log. Long messages go in parts and come back whole, in any order. `{"cmd": "sms", "to": ..., "text": ..., "class": 0-3 (optional)}` on the control socket sends one (the class sets the TP-DCS message class: 0 flash, 1 ME, 2 SIM, 3 TE; omitted means no class); the state follows as `sms-state`, and `sms` announces a new one. An incoming WAP push (8-bit data or a port-addressing header, which is how an MMS notification arrives) is stored as an `[MMS - not downloaded]` placeholder, not as binary — there is no MMS stack yet. (The Rust client earlier mis-stored such a message because `CString` cannot hold the NUL bytes a WAP-push PDU carries; it now binds the body's raw bytes, and the messages app reads bodies lossily, so a bad row cannot blank the list.) Long messages, and non-GSM text, have only been tested offline: the published GSM 7-bit and SMS-DELIVER examples, and our encoders against our decoder (GSM, escapes, UCS2, emoji, up to 7 parts). The app is `userspace/titan-messages` (docs/desktop.md).
+**Voicemail, hold, call waiting, echo cancellation and MMS (2026-11-19, tested offline; installed on the
+phone the same day, where registration works as before; no call, voicemail or MMS has run against the
+network yet).**
+
+- *Voicemail waiting* (RFC 3842): after registering, `titan-ims` subscribes to `message-summary` at its
+  own address and refreshes it before it expires (a refused subscription is asked again after 6 h). A
+  NOTIFY's counts go to `/run/titan-voicemail.json` (`waiting`, `new`, `old`) and as a `voicemail` event;
+  the account address (`Message-Account`) stays in memory and is never logged. `{"cmd": "voicemail"}`
+  calls it (else our own number, which most networks' voicemail answers). On the test phone's network
+  the SUBSCRIBE is refused (503), so a count can come only from a NOTIFY the network sends unasked;
+  the dialer shows the count and
+  holding 1 calls it.
+- *Hold* (RFC 3264 section 8.4): a re-INVITE whose SDP says `sendonly`; the sound stops at once (the
+  media keeps its RTP socket, sequence and SSRC) and comes back when the resume's `sendrecv` is
+  accepted. A refused re-INVITE leaves the call as it was. Their hold (`sendonly` or `inactive` in their
+  offer) is answered `recvonly` and shows as `remote-held`. An established call's SDP says both
+  preconditions are met. Control: `{"cmd": "hold", "id": N, "on": true|false}`, `{"cmd": "swap"}`.
+- *Call waiting*: an INVITE while one call is up rings as `waiting` instead of getting 486 (a third
+  call, or one while a call is being set up, still does); a tone (440 Hz, two 200 ms beeps every 4 s,
+  about -20 dBFS) is mixed into the call's sound until it is answered or ends. Answering it holds the
+  call that was up; dialling during a call does the same. The dialer shows the second call under the
+  first, with Answer, Decline or Swap, and a Hold button in calls over IMS.
+- *Echo cancellation*: the WebRTC audio processing through PipeWire's own plugin,
+  `libspa-aec-webrtc.so` (PipeWire 0.3.65, `libwebrtc-audio-processing1` 0.3), loaded with `dlopen` as
+  the codecs are (`src/aec.rs`): echo canceller with the extended filter and delay-agnostic mode, noise
+  suppression, high-pass filter, no gain control. The far end's sound is handed in as it goes to the
+  player (after the loudspeaker's gain) and every mic frame is cleaned before it is encoded; the queue
+  between them holds at most 500 ms. Tested in the phone's Debian tree with synthetic signals: an echo
+  of noise 40 ms late at half level came out silent once converged, and a tone with the far end silent
+  came through at -0.7 dB. `TITAN_IMS_AEC=0` turns it off. Not yet heard in a call.
+- *MMS* (`src/mms.rs`, OMA MMS encapsulation, WSP): a WAP push (assembled from parts if needed) with
+  an `m-notification-ind` starts a download in a thread: HTTP GET of its Content-Location with curl,
+  bound to the cellular interface that has the default route, then the `m-retrieve-conf`'s parts are
+  saved in `/var/lib/titan-ims/mms/<time>-<id>/` and an `m-notifyresp-ind` (retrieved) is posted back.
+  The message is stored as its text with one `[image: path]` or `[file: path]` line a part; a group (more
+  than one other person on it) is the thread `+1…,+1…`. Sending: `{"cmd": "mms", "to": [...], "text":
+  ..., "files": [...]}` posts an `m-send-req` (multipart/mixed, UTF-8 text, the MMSC fills in From) and
+  reads the `m-send-conf`'s status. The MMSC comes from `/etc/titan-ims/mms.conf` (`mmsc=`, `proxy=`) or
+  from mobile-broadband-provider-info for the SIM's MCC/MNC. The messages app shows the pictures, picks
+  one of the newest in `/root/Pictures` to attach, and takes several numbers for a group. Failed
+  downloads still store the `[MMS - not downloaded]` placeholder; there is no retry yet.
+
+**SMS.** First run 2026-11-04, on the first try: one text received and stored, its report accepted (202), and two sent from the messages app, each accepted and acknowledged by the network within a second (RP-ACK), and both received by the other phone. On Android `volte_ua` has SMS handling and the `+g.3gpp.smsip` tag, and the RIL sends `AT+CMGS`; our capture holds only the set-up, with no message sent. `titan-ims` does it in SIP (TS 24.341): the registration's Contact carries `+g.3gpp.smsip`, and a `MESSAGE` of type `application/vnd.3gpp.sms` carries an RP-DATA (TS 24.011) with an SMS-SUBMIT or SMS-DELIVER (TS 23.040), to `tel:` the service centre from `AT+CSCA?`. A message is stored before it is acknowledged, in `/var/lib/titan-ims/messages.sqlite3` (mode 600); text and numbers never reach a log. Long messages go in parts and come back whole, in any order. `{"cmd": "sms", "to": ..., "text": ..., "class": 0-3 (optional)}` on the control socket sends one (the class sets the TP-DCS message class: 0 flash, 1 ME, 2 SIM, 3 TE; omitted means no class); the state follows as `sms-state`, and `sms` announces a new one. An incoming WAP push (8-bit data or a port-addressing header, which is how an MMS notification arrives) started an MMS download since 2026-11-19 (below); before, it was stored as an `[MMS - not downloaded]` placeholder, as a failed download still is. (The Rust client earlier mis-stored such a message because `CString` cannot hold the NUL bytes a WAP-push PDU carries; it now binds the body's raw bytes, and the messages app reads bodies lossily, so a bad row cannot blank the list.) Long messages, and non-GSM text, have only been tested offline: the published GSM 7-bit and SMS-DELIVER examples, and our encoders against our decoder (GSM, escapes, UCS2, emoji, up to 7 parts). The app is `userspace/titan-messages` (docs/desktop.md).
 
 **USSD (2026-11-09: a code answered on the network; menus tested offline only).** The path is USSD over IMS ("USSI", TS 24.390), in `titan-ims` (the Rust
 one: `userspace/titan-ims-rs/src/ussd.rs` and the session in `ua.rs`). Why that path, from what was read rather than measured: on
@@ -1248,29 +1293,72 @@ and later); a USB cable also keeps it awake.
 
 ## Emergency calls
 
-**Not supported (2026-11-05).** Don't rely on this phone to reach emergency
-services.
+**Built, never tested on a network (2026-11-19).** Don't rely on this phone to reach emergency
+services. Nothing below has placed a real emergency call; it is checked offline only, and it
+cannot be tested by calling (see "Testing").
 
-- Calls go over VoLTE through `titan-ims`, our IMS client on the AP. Emergency
-  calling over IMS is its own procedure (an emergency registration, an
-  emergency bearer, the location sent with the call), and `titan-ims` does
-  none of it: a dialled 911 or 112 is placed as an ordinary call, which the
-  network is likely to refuse.
-- Most phones running Linux (postmarketOS on Qualcomm devices, for one) have
-  VoLTE in the modem's own firmware, which also handles the emergency
-  procedure. Here the AP runs IMS, so the modem firmware can't fill that gap.
-- The older fallback, a circuit-switched call over 2G/3G, needs a network that
-  still has one; most US networks have switched it off.
+Calls go over VoLTE through `titan-ims`, our IMS client on the AP, so the emergency procedure is
+ours to do (TS 23.167, TS 24.229 5.1.6); the modem's firmware can't fill the gap, as on phones
+whose modem runs IMS. MediaTek's own stack (read as reference) brings up an APN of type
+`emergency` with `AT+EAPNACT` and registers over it; ours does the same in this order:
 
-**How it's handled, as postmarketOS does:** said plainly, before anyone
-installs (README, build-and-flash.md, the status table); the dialer doesn't
-block an emergency number or pretend a call went through.
+1. **The emergency instance.** A dialled emergency number (911, 112, or one from the network's
+   list below) makes `titan-ims` start `titan-ims --emergency NUMBER`, a second process with its
+   own AT channel (`cmd11`) and SIM channel, so the normal registration is not touched. It
+   activates the `sos` APN (in the APN table since this change: `type=emergency`, authtype 2, as
+   MediaTek's RIL writes it) with `AT+EAPNACT=1,"sos","emergency",0`, waits for its interface
+   (`+EIF` on `nwurc`) and reads its P-CSCF (`+CGCONTRDP`). Its IPsec cleanup touches only
+   policies to or from its own address (before this change `titan-ims` flushed every policy).
+2. **Emergency registration** over that PDN: the usual AKA and IPsec, the Contact with the `sos`
+   URI parameter, no SMS feature tag. If it fails, or there is no usable SIM (an anonymous
+   identity, the IMEI as the instance), the call goes **unregistered**: an unprotected INVITE to
+   the P-CSCF, From `anonymous@anonymous.invalid`, no `P-Preferred-Identity`, no sec-agree.
+3. **The INVITE**: Request-URI and To `urn:service:sos` (with `.police`, `.ambulance`, ... when the
+   network's category names one service), no `P-Preferred-Service`, the cell in
+   `P-Access-Network-Info`, and the position by value when there is one: `Geolocation:
+   <cid:...>`, `Geolocation-Routing: no`, and a PIDF-LO (a circle of gpsd's 95 % error) next to
+   the SDP in a multipart body. Location is turned on for the call if it was off (every phone
+   does this for an emergency call) and off again after; the call waits at most 3 s for a fix and
+   otherwise goes without one (the network still has the cell). Positions are never logged.
+4. **Callback**: after the call the emergency registration stays up 5 minutes (`CALLBACK_S`) so
+   the dispatcher can call back, the phone kept awake; then the PDN goes down
+   (`AT+CGACT=0,<cid>`). The emergency instance's events reach the dialer through the service
+   (its call ids + 1000), and the dialer's answer, hang-up, mute and route reach it the same way.
+5. **Fallbacks**: no emergency PDN, or no call getting through, and the service tries an
+   emergency INVITE over its normal registration; that failing, it tells the dialer
+   (`"fallback": "modem"`), which places the call through ModemManager (the modem's own `ATD`,
+   circuit-switched where a network still has 2G/3G). Without the service (no SIM, not
+   registered) the dialer starts the emergency instance itself and falls back to the modem the
+   same way. An emergency number is never blocked by the dialer's SIM-locked or flight-mode
+   checks.
 
-**Testing:** never by calling an emergency number. That is illegal in many
-places and takes a dispatcher away from a real call. What can be checked
-without dialling: that the dialer recognises the emergency numbers, which
-path a call would take (IMS or the modem's own `ATD`), and that the modem is
-up and able to try with no SIM inserted.
+**Not done:** the radio isn't switched on from flight mode for the call (the PDN then fails and
+so does the modem's call); the position isn't updated during the call (only the INVITE carries
+it); MediaTek's emergency-mode commands (`AT+EMCS`, `AT+EMCI`, `AT+ECCTRL`) aren't sent, as
+their arguments are unknown; the modem isn't kept running without a SIM; and the lock screen
+has no emergency button. It has no PIN either (popping the bubble unlocks it), so nothing
+stands between anyone and the dialer today; a PIN must come with an emergency button.
+
+**Testing:** never by calling an emergency number. That is illegal in many places and takes a
+dispatcher away from a real call. Activating the `sos` PDN or an emergency registration is
+emergency signalling to the network too, so it isn't done casually either. Checked offline:
+the dialer recognises the numbers; `titan-ims`'s tests build the unregistered emergency INVITE
+(URN, no sec-agree, no service or identity asked for, the `sos` Contact, Geolocation and the
+multipart body with the PIDF-LO) and read gpsd reports.
+
+**The network's numbers (2026-11-19).** The modem reports the emergency
+numbers the network gives it (`+CEN1: <reporting>,<mcc>,<mnc>`, then one
+`+CEN2: <category>,<number>` a number; TS 27.007 `AT+CEN`). Those reports
+go to ModemManager's port, so `titan-ims` asks for the list itself
+(`AT+CEN?`) at each registration and keeps it in
+`/var/lib/titan-modem/emergency-numbers` ("number category" a line; it stays
+on the phone). 911 and 112 count whatever the list says. The dialer marks a
+listed number as an emergency number, and `titan-ims` sends it as
+`urn:service:sos`, with the sub-service when the category names one service
+(1 police, 2 ambulance, 4 fire, 8 marine, 16 mountain; RFC 5031). With the
+screen off `titan-powerkey` turns the reports off (`AT+CEN=0`) and back on at
+screen on: they come with each new cell and woke the phone. Calling any of
+these numbers is still untested, as above.
 
 **To do before a release** (roadmap.md, "Community release"): the modem kept
 running without a SIM (a postmarketOS device lost emergency calls by

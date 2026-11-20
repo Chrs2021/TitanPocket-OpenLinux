@@ -17,7 +17,7 @@ The work is in progress; see the table below for what works.
 | `patches/` | the port, one patch per subsystem, for `git am` on v6.12.115 |
 | `tools/build.sh` | configures and builds `Image.gz` and the board's device tree |
 | `tools/mkboot.sh` | packs an Android v2 boot image that the phone's LK bootloader accepts |
-| `tools/firstlight-init` | `/init` of the boot image's small ramdisk: USB gadget, then Debian |
+| `tools/ramdisk-init` | `/init` of the boot image's small ramdisk: USB gadget, then Debian |
 
 The CONNSYS drivers (Wi-Fi, Bluetooth, FM, GPS) for 6.12 are out of
 tree in `modules/connectivity/linux612/`, built with
@@ -86,7 +86,7 @@ The command line gains:
 | Option | Why |
 |---|---|
 | `clk_ignore_unused pd_ignore_unused` | some clocks and power domains LK leaves on have no consumer in the device tree yet |
-| `titan.root` (`DEBIAN=1`) | `firstlight-init` mounts the Debian root filesystem and switches to it |
+| `titan.root` (`DEBIAN=1`) | `ramdisk-init` mounts the Debian root filesystem and switches to it |
 | `mem_sleep_default=deep` (`DEBIAN=1`) | the power key's suspend is deep sleep through the SPM firmware; `SLEEP=s2idle` gives `mem_sleep_default=s2idle` instead |
 | `mt6771_spm.deep=1` (`DEBIAN=1` with deep) | offers `deep` in `/sys/power/mem_sleep`: starts the SPM firmware and suspends through it |
 | `mt6771_spm.wake_mask=0xe87d5ef` (`DEBIAN=1` with deep) | the SPM's default wake sources less the sensor hub's (bit 11): the SCP's request would end every suspend at once; the modem's interrupts stay wake sources |
@@ -101,9 +101,11 @@ fastboot flash boot boot-6.12.img
 fastboot reboot
 ```
 
-`firstlight-init` starts a USB gadget (serial and network, telnet on
-172.16.42.1) and boots Debian from it with `titan.root`; without it, it
-logs what the kernel found and returns to fastboot.
+`ramdisk-init` starts a USB gadget (serial and network) and boots Debian
+with `titan.root`. Without it, or when the root cannot be mounted, it
+stays in a rescue mode: a short report of what the kernel found, telnet
+on 172.16.42.1 and a shell on the serial port, and back to fastboot after
+90 s when no host configures the gadget.
 
 ## Hardware support
 

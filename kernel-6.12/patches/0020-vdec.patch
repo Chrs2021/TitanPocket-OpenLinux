@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Topher Campbell <chrs2021@gmail.com>
-Subject: [PATCH 20/23] media: mediatek: add the MT6771 H.264 decoder
+Subject: [PATCH 20/23] media: mediatek: add the MT6771 H.264 decoder and encoder
 
 titan_vdec drives the MT6771's video decoder, MT8183's decoder block,
 as a V4L2 stateless (request API) H.264 decoder: frame-based, Annex B
@@ -11,32 +11,45 @@ it parses the first slice header through the decoder's own bitstream
 reader, sets up the sequence, picture, reference lists and buffers from
 the stateless controls, and the hardware decodes every slice of the
 picture on its own.
+
+titan_venc drives its video encoder as a V4L2 stateful H.264 encoder:
+NV12 or NV12M in, Baseline out with the SPS and PPS before each IDR
+frame, the encoder's own rate control holding the bit rate, and the
+STOP command's drain. It programs the block with the register sequence
+of MediaTek's library; the rate control runs on the encoder's own
+processor from code that firmware file titan/venc_rc.bin carries, taken
+from the phone's vendor files and not distributed.
 ---
- drivers/media/platform/mediatek/Kconfig       |    1 +
- drivers/media/platform/mediatek/Makefile      |    1 +
+ drivers/media/platform/mediatek/Kconfig       |    2 +
+ drivers/media/platform/mediatek/Makefile      |    2 +
  .../platform/mediatek/mt6771-vdec/Kconfig     |   19 +
  .../platform/mediatek/mt6771-vdec/Makefile    |    2 +
- .../mediatek/mt6771-vdec/titan_vdec.c         | 1637 +++++++++++++++++
- 5 files changed, 1660 insertions(+)
+ .../mediatek/mt6771-vdec/titan_vdec.c         | 1642 +++++++++++++++++
+ .../platform/mediatek/mt6771-venc/Kconfig     |   18 +
+ .../platform/mediatek/mt6771-venc/Makefile    |    1 +
+ .../mediatek/mt6771-venc/titan_venc.c         | 1309 +++++++++++++
+ 8 files changed, 2995 insertions(+)
 
 diff --git a/drivers/media/platform/mediatek/Kconfig b/drivers/media/platform/mediatek/Kconfig
-index 84104e2cd02447790ae5c29953a2e82ca4fdd0a7..4e73b7952a746cd2956f1c69b2bea209a8fdc6f7 100644
+index 84104e2cd02447790ae5c29953a2e82ca4fdd0a7..413ed163c02346a607f0bda7ecf0405dca6b582c 100644
 --- a/drivers/media/platform/mediatek/Kconfig
 +++ b/drivers/media/platform/mediatek/Kconfig
-@@ -7,3 +7,4 @@ source "drivers/media/platform/mediatek/mdp/Kconfig"
+@@ -7,3 +7,5 @@ source "drivers/media/platform/mediatek/mdp/Kconfig"
  source "drivers/media/platform/mediatek/vcodec/Kconfig"
  source "drivers/media/platform/mediatek/vpu/Kconfig"
  source "drivers/media/platform/mediatek/mdp3/Kconfig"
 +source "drivers/media/platform/mediatek/mt6771-vdec/Kconfig"
++source "drivers/media/platform/mediatek/mt6771-venc/Kconfig"
 diff --git a/drivers/media/platform/mediatek/Makefile b/drivers/media/platform/mediatek/Makefile
-index 38e6ba917fe5cdd932aa6c88221c9a7aa5a7705a..55cf0fe413e416ef30658a3f31ebf53a5d282d61 100644
+index 38e6ba917fe5cdd932aa6c88221c9a7aa5a7705a..08aa9f1a5e2a6187b5706885503d31429f4b0d2e 100644
 --- a/drivers/media/platform/mediatek/Makefile
 +++ b/drivers/media/platform/mediatek/Makefile
-@@ -4,3 +4,4 @@ obj-y += mdp/
+@@ -4,3 +4,5 @@ obj-y += mdp/
  obj-y += vcodec/
  obj-y += vpu/
  obj-y += mdp3/
 +obj-y += mt6771-vdec/
++obj-y += mt6771-venc/
 diff --git a/drivers/media/platform/mediatek/mt6771-vdec/Kconfig b/drivers/media/platform/mediatek/mt6771-vdec/Kconfig
 new file mode 100644
 index 0000000000000000000000000000000000000000..591afe312877ffdfb4795f1618b7140d690da56c
@@ -72,10 +85,10 @@ index 0000000000000000000000000000000000000000..2a4cd508e0eb42dc63106d04b1477d6e
 +obj-$(CONFIG_VIDEO_MT6771_VDEC) += titan_vdec.o
 diff --git a/drivers/media/platform/mediatek/mt6771-vdec/titan_vdec.c b/drivers/media/platform/mediatek/mt6771-vdec/titan_vdec.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..01b5ef63e793515e86cd4ea039fdb3a8634b4f02
+index 0000000000000000000000000000000000000000..e809f5dbac163633b052d6eb3b7976e28fde1b23
 --- /dev/null
 +++ b/drivers/media/platform/mediatek/mt6771-vdec/titan_vdec.c
-@@ -0,0 +1,1637 @@
+@@ -0,0 +1,1642 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * titan_vdec: the MT6771's H.264 video decoder as a V4L2 stateless
@@ -1689,8 +1702,13 @@ index 0000000000000000000000000000000000000000..01b5ef63e793515e86cd4ea039fdb3a8
 +	v4l2_m2m_release(v->m2m);
 +	v4l2_device_unregister(&v->v4l2_dev);
 +	destroy_workqueue(v->wq);
++	/* the driver core resumed the device for remove(); suspend it again, or
++	 * its clocks stay counted as enabled (see titan_venc's remove) */
 +	pm_runtime_dont_use_autosuspend(&pdev->dev);
 +	pm_runtime_disable(&pdev->dev);
++	if (!pm_runtime_status_suspended(&pdev->dev))
++		tvdec_runtime_suspend(&pdev->dev);
++	pm_runtime_set_suspended(&pdev->dev);
 +	vfree(v->tbuf);
 +}
 +
@@ -1713,3 +1731,1349 @@ index 0000000000000000000000000000000000000000..01b5ef63e793515e86cd4ea039fdb3a8
 +
 +MODULE_DESCRIPTION("MT6771 H.264 stateless video decoder");
 +MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/mediatek/mt6771-venc/Kconfig b/drivers/media/platform/mediatek/mt6771-venc/Kconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..38f221d8a84dd835528f5aa193319c8ee61b6f9b
+--- /dev/null
++++ b/drivers/media/platform/mediatek/mt6771-venc/Kconfig
+@@ -0,0 +1,18 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config VIDEO_MT6771_VENC
++	tristate "MediaTek MT6771 H.264 video encoder"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on VIDEO_DEV && OF
++	depends on MTK_IOMMU || COMPILE_TEST
++	depends on MTK_SMI || COMPILE_TEST
++	select MEDIA_CONTROLLER
++	select V4L2_MEM2MEM_DEV
++	select VIDEOBUF2_DMA_CONTIG
++	help
++	  The MT6771's (Helio P60's) H.264 hardware encoder as a V4L2
++	  stateful memory-to-memory device: NV12 in, H.264 Baseline out,
++	  with the encoder's own rate control. It needs the rate-control
++	  code from the phone's vendor files as titan/venc_rc.bin.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called titan_venc.
+diff --git a/drivers/media/platform/mediatek/mt6771-venc/Makefile b/drivers/media/platform/mediatek/mt6771-venc/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9423ef5b1cf5901905ea28f7c88bb60840aa209
+--- /dev/null
++++ b/drivers/media/platform/mediatek/mt6771-venc/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_VIDEO_MT6771_VENC) += titan_venc.o
+diff --git a/drivers/media/platform/mediatek/mt6771-venc/titan_venc.c b/drivers/media/platform/mediatek/mt6771-venc/titan_venc.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..234b9ec5b2935b21f8250fb9f79902892e586298
+--- /dev/null
++++ b/drivers/media/platform/mediatek/mt6771-venc/titan_venc.c
+@@ -0,0 +1,1309 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * titan_venc: the MT6771's H.264 hardware encoder (VENC, 0x17020000) as a
++ * V4L2 stateful memory-to-memory encoder, docs/video-encoder.md.
++ *
++ * OUTPUT takes NV12 or NV12M (luma pitch = width rounded up to 16, chroma
++ * after a 16-line-aligned luma), CAPTURE gives H.264 Baseline (Annex B, the
++ * SPS and PPS before every IDR frame, in the same buffer). Controls: bit rate
++ * (the hardware's rate control holds it), GOP size, force key frame, profile
++ * and level; the frame rate through S_PARM on OUTPUT. A STOP encoder command
++ * drains: after the last frame comes an empty buffer flagged
++ * V4L2_BUF_FLAG_LAST, and an EOS event. One frame at a time, up to 1920x1088's macroblocks either way up
++ * (portrait sizes such as 1080x1440 are not yet tried on the hardware).
++ *
++ * The register sequence is the one MediaTek's driver library writes, found by
++ * running it in emulation (tools/re/emu_venc.py): reset, sequence and frame
++ * settings, buffers, the start, then the frame-done interrupt and the byte
++ * count. SPS and PPS are written here with the library's field choices,
++ * since the hardware writes slice headers that depend on them. The rate
++ * control runs on the encoder's own processor, from code the library
++ * carries: request_firmware("titan/venc_rc.bin"), extracted from a phone's
++ * own vendor files (emu_venc.py --rc-out); it is not distributed.
++ *
++ * The first version of this file was a debugfs test driver (2026-11-08); its
++ * register sequence is kept as it was checked on the phone.
++ */
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/ktime.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/workqueue.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-dma-contig.h>
++
++#define DRV_NAME	"titan-venc"
++
++#define VENC_MODE	0x000	/* mode word; written last before the start */
++#define VENC_SEQ0	0x004	/* GOP, initial QP */
++#define VENC_SEQ1	0x008	/* search and mode enables */
++#define VENC_SEQ2	0x00c
++#define VENC_FRM	0x010	/* frame type */
++#define VENC_FRMNUM	0x014
++#define VENC_FRMNUM2	0x018
++#define VENC_LASTI	0x01c
++#define VENC_SIZE	0x024	/* picture in macroblocks */
++#define VENC_PITCH	0x028	/* pitch, crop */
++#define VENC_PROFILE	0x030	/* entropy, profile, level */
++#define VENC_RC0	0x048	/* rate control on, kbit/s */
++#define VENC_RC1	0x04c	/* fps, QP steps */
++#define VENC_RC2	0x050	/* QP limits */
++#define VENC_START	0x058
++#define VENC_IRQ_STATUS	0x05c
++#define VENC_IRQ_ACK	0x060
++#define VENC_BS_ADDR	0x064
++#define VENC_BS_SIZE	0x068	/* in 128-byte units */
++#define VENC_Y		0x06c
++#define VENC_UV		0x070
++#define VENC_REC_Y	0x074	/* recon luma, chroma; reference luma, chroma; MV out, in */
++#define VENC_PLANE3	0x094
++#define VENC_BS_BYTES	0x098
++#define VENC_RC_CODE	0x08c
++#define VENC_RC_STATE	0x090
++#define VENC_IRQ_EN	0x0a4
++#define VENC_RESET	0x0a8	/* 0: in reset */
++#define VENC_PAUSE	0x0ac
++#define VENC_CLKON	0x0ec
++#define VENC_FRM2	0x124
++#define VENC_FRM3	0x128
++#define VENC_RCFG	0x12c
++#define VENC_CMP	0x164	/* reference compression */
++#define VENC_CMP_SIZE	0x168
++
++#define IRQ_FRM		0x04
++#define IRQ_DRAM	0x08	/* bitstream buffer full */
++#define IRQ_PAUSE	0x10
++
++#define RC_CODE_SIZE	0x4040
++#define RC_STATE_SIZE	0x400
++
++#define MIN_W		64
++#define MIN_H		64
++#define MAX_W		1920
++#define MAX_H		1920
++/* at most 1920x1088's macroblocks, either way up (portrait recordings are tall) */
++#define MAX_MBS		(120 * 68)
++#define HDR_ROOM	256	/* SPS + PPS ahead of the slice data */
++
++struct vbuf {
++	void *va;
++	dma_addr_t da;
++	size_t size;
++};
++
++struct tvenc_dev {
++	struct device *dev;
++	void __iomem *regs;
++	struct clk *clk;
++	struct completion done;
++	u32 irq_status;
++
++	struct v4l2_device v4l2_dev;
++	struct media_device mdev;
++	struct video_device vfd;
++	struct v4l2_m2m_dev *m2m;
++	struct mutex vfd_lock;
++	struct workqueue_struct *wq;
++	struct work_struct run_work;
++
++	struct dentry *dbg;
++	unsigned long frames, errors;
++	char last[96];
++};
++
++struct tvenc_ctx {
++	struct v4l2_fh fh;
++	struct tvenc_dev *venc;
++	struct v4l2_ctrl_handler hdl;
++	struct v4l2_pix_format_mplane src_fmt, dst_fmt;
++	u32 fps_num, fps_den;		/* the frame interval, as S_PARM set it */
++
++	/* the controls' values */
++	u32 kbps, gop, req_level;
++	bool force_idr;
++
++	/* the session: set up at the first frame after both queues stream */
++	bool session;
++	u32 w, h, pw, ph, mbw, mbh, level, hw_level;
++	u32 frame, gop_pos, last_i, itoggle;
++	struct vbuf bs, rc, rcst, rec_y[2], rec_c[2], mv[2];
++};
++
++static inline struct tvenc_ctx *fh_to_ctx(struct v4l2_fh *fh)
++{
++	return container_of(fh, struct tvenc_ctx, fh);
++}
++
++static inline void vw(struct tvenc_dev *v, u32 off, u32 val)
++{
++	writel(val, v->regs + off);
++}
++
++static inline u32 vr(struct tvenc_dev *v, u32 off)
++{
++	return readl(v->regs + off);
++}
++
++static irqreturn_t tvenc_irq(int irq, void *data)
++{
++	struct tvenc_dev *v = data;
++	u32 st = vr(v, VENC_IRQ_STATUS);
++	int b;
++
++	for (b = 0; b < 8; b++)		/* acknowledged a bit at a time, as the vendor driver does */
++		if (st & BIT(b))
++			vw(v, VENC_IRQ_ACK, BIT(b));
++	v->irq_status = st;
++	complete(&v->done);
++	return IRQ_HANDLED;
++}
++
++/* ---- the session's buffers ---- */
++
++static int vb_alloc(struct tvenc_dev *v, struct vbuf *b, size_t size)
++{
++	b->size = ALIGN(size, 4096);
++	b->va = dma_alloc_coherent(v->dev, b->size, &b->da, GFP_KERNEL);
++	return b->va ? 0 : -ENOMEM;
++}
++
++static void vb_free(struct tvenc_dev *v, struct vbuf *b)
++{
++	if (b->va)
++		dma_free_coherent(v->dev, b->size, b->va, b->da);
++	b->va = NULL;
++}
++
++static void session_free(struct tvenc_ctx *ctx)
++{
++	struct tvenc_dev *v = ctx->venc;
++	int i;
++
++	vb_free(v, &ctx->bs);
++	vb_free(v, &ctx->rc);
++	vb_free(v, &ctx->rcst);
++	for (i = 0; i < 2; i++) {
++		vb_free(v, &ctx->rec_y[i]);
++		vb_free(v, &ctx->rec_c[i]);
++		vb_free(v, &ctx->mv[i]);
++	}
++}
++
++/* compressed-reference row sizes (the library's fields +0x110/+0x114) */
++static u32 cmp_a(struct tvenc_ctx *ctx)
++{
++	return (0x815 * ctx->mbw + 0x3ff) >> 10;
++}
++
++static u32 cmp_b(struct tvenc_ctx *ctx)
++{
++	return (0x40f * ctx->mbw + 0x3ff) >> 10;
++}
++
++/* ---- SPS / PPS, with the library's field choices (Baseline, progressive) ---- */
++
++struct bw {
++	u8 *p;
++	u32 bits;
++};
++
++static void put(struct bw *b, u32 val, int n)
++{
++	while (n--) {
++		u32 byte = b->bits >> 3, bit = 7 - (b->bits & 7);
++
++		if (bit == 7)
++			b->p[byte] = 0;
++		if ((val >> n) & 1)
++			b->p[byte] |= BIT(bit);
++		b->bits++;
++	}
++}
++
++static void ue(struct bw *b, u32 val)
++{
++	u32 x = val + 1;
++	int n = fls(x);
++
++	put(b, 0, n - 1);
++	put(b, x, n);
++}
++
++static void trailing(struct bw *b)
++{
++	put(b, 1, 1);
++	while (b->bits & 7)
++		put(b, 0, 1);
++}
++
++static size_t write_sps_pps(struct tvenc_ctx *ctx, u8 *p)
++{
++	struct bw b = { p, 0 };
++	u32 area = ctx->w * ctx->h, prim, xfer, mat;
++	u32 crop_r = ctx->pw - ctx->w, crop_b = ctx->ph - ctx->h;
++
++	put(&b, 1, 32);			/* start code */
++	put(&b, 0x67, 8);		/* SPS, nal_ref_idc 3 */
++	put(&b, 66, 8);			/* Baseline */
++	/*
++	 * constraint_set0 and 1: the stream is Constrained Baseline (no FMO,
++	 * ASO or redundant slices), which players and WebRTC peers expect
++	 */
++	put(&b, 0xc0, 8);
++	put(&b, ctx->level, 8);		/* level_idc */
++	ue(&b, 0);			/* seq_parameter_set_id */
++	ue(&b, 12);			/* log2_max_frame_num - 4 */
++	ue(&b, 0);			/* pic_order_cnt_type */
++	ue(&b, 12);			/* log2_max_pic_order_cnt_lsb - 4 */
++	ue(&b, 1);			/* max_num_ref_frames */
++	put(&b, 0, 1);			/* gaps */
++	ue(&b, ctx->mbw - 1);
++	ue(&b, ctx->mbh - 1);
++	put(&b, 1, 1);			/* frame_mbs_only */
++	put(&b, 1, 1);			/* direct_8x8_inference */
++	if (crop_r || crop_b) {
++		put(&b, 1, 1);
++		ue(&b, 0);
++		ue(&b, crop_r >> 1);
++		ue(&b, 0);
++		ue(&b, crop_b >> 1);
++	} else {
++		put(&b, 0, 1);
++	}
++	put(&b, 1, 1);			/* VUI */
++	put(&b, 0, 1);			/* aspect ratio */
++	put(&b, 0, 1);			/* overscan */
++	put(&b, 1, 1);			/* video signal type */
++	put(&b, 5, 3);			/* format unspecified */
++	put(&b, 0, 1);			/* limited range */
++	put(&b, 1, 1);			/* colour description */
++	prim = area < 1280 * 720 ? 5 : area < 3840 * 2160 ? 1 : 9;
++	xfer = area < 1280 * 720 ? 6 : 1;
++	mat = area < 1280 * 720 ? 5 : 1;
++	put(&b, prim, 8);
++	put(&b, xfer, 8);
++	put(&b, mat, 8);
++	put(&b, 0, 1);			/* chroma location */
++	put(&b, 0, 1);			/* timing */
++	put(&b, 0, 1);			/* NAL HRD */
++	put(&b, 0, 1);			/* VCL HRD */
++	put(&b, 0, 1);			/* pic_struct */
++	put(&b, 1, 1);			/* bitstream restriction */
++	put(&b, 1, 1);			/* motion vectors over picture boundaries */
++	ue(&b, 0);
++	ue(&b, 0);
++	ue(&b, 16);
++	ue(&b, 16);
++	ue(&b, 0);			/* max_num_reorder_frames */
++	ue(&b, 2);			/* max_dec_frame_buffering */
++	trailing(&b);
++
++	put(&b, 1, 32);
++	put(&b, 0x68, 8);		/* PPS */
++	ue(&b, 0);
++	ue(&b, 0);
++	put(&b, 0, 1);			/* CAVLC */
++	put(&b, 0, 1);			/* bottom_field_pic_order */
++	ue(&b, 0);			/* slice groups */
++	ue(&b, 1);			/* num_ref_idx_l0_default - 1 */
++	ue(&b, 1);			/* num_ref_idx_l1_default - 1 */
++	put(&b, 0, 1);			/* weighted_pred */
++	put(&b, 0, 2);			/* weighted_bipred_idc */
++	ue(&b, 0);			/* pic_init_qp - 26 (se 0) */
++	ue(&b, 0);			/* pic_init_qs - 26 */
++	ue(&b, 0);			/* chroma_qp_index_offset */
++	put(&b, 1, 1);			/* deblocking filter control */
++	put(&b, 0, 1);			/* constrained intra */
++	put(&b, 0, 1);			/* redundant_pic_cnt */
++	trailing(&b);
++	return b.bits >> 3;
++}
++
++/* ---- the session ---- */
++
++static u32 ctx_fps(struct tvenc_ctx *ctx)
++{
++	u32 fps = ctx->fps_num ? DIV_ROUND_CLOSEST(ctx->fps_den, ctx->fps_num) : 30;
++
++	return clamp(fps, 1u, 60u);
++}
++
++static int session_start(struct tvenc_ctx *ctx)
++{
++	struct tvenc_dev *v = ctx->venc;
++	const struct firmware *fw;
++	u32 luma, chroma, mv, rows, need;
++	int i, ret;
++
++	ctx->w = ctx->src_fmt.width;
++	ctx->h = ctx->src_fmt.height;
++	ctx->pw = ALIGN(ctx->w, 16);
++	ctx->ph = ALIGN(ctx->h, 16);
++	ctx->mbw = ctx->pw / 16;
++	ctx->mbh = ctx->ph / 16;
++	need = ctx->mbw * ctx->mbh > 3600 ? 40 : 31;	/* above 720p: 4.0 */
++	ctx->hw_level = need;			/* the register keeps the library's values */
++	ctx->level = max(need, ctx->req_level);	/* the SPS may declare a higher one */
++	ctx->frame = 0;
++	ctx->gop_pos = 0;
++	ctx->last_i = 0;
++	ctx->itoggle = 0;
++
++	ret = request_firmware(&fw, "titan/venc_rc.bin", v->dev);
++	if (ret)
++		return ret;
++	if (fw->size != RC_CODE_SIZE) {
++		release_firmware(fw);
++		return -EINVAL;
++	}
++
++	/* the library's sizes (H264_AllocWorkBuf), with reference compression */
++	rows = ((ctx->ph + 0x1f) >> 4) & ~1u;
++	luma = ctx->mbh * (cmp_a(ctx) + cmp_b(ctx)) * 0x80 + 0x200;
++	chroma = rows * ctx->mbw * 0x80;
++	mv = ALIGN(((ctx->w + 0x7f) >> 7) * ctx->mbh * 0x20 * 2, 128);
++	ret = vb_alloc(v, &ctx->bs, ctx->pw * ctx->ph) ?:
++	      vb_alloc(v, &ctx->rc, RC_CODE_SIZE) ?:
++	      vb_alloc(v, &ctx->rcst, RC_STATE_SIZE);
++	for (i = 0; i < 2 && !ret; i++)
++		ret = vb_alloc(v, &ctx->rec_y[i], luma + 4096) ?:
++		      vb_alloc(v, &ctx->rec_c[i], chroma + 4096) ?:
++		      vb_alloc(v, &ctx->mv[i], mv + 4096);
++	if (ret) {
++		release_firmware(fw);
++		session_free(ctx);
++		return ret;
++	}
++	memcpy(ctx->rc.va, fw->data, RC_CODE_SIZE);
++	release_firmware(fw);
++
++	ret = pm_runtime_resume_and_get(v->dev);
++	if (ret) {
++		session_free(ctx);
++		return ret;
++	}
++	ctx->session = true;
++	return 0;
++}
++
++static void session_stop(struct tvenc_ctx *ctx)
++{
++	struct tvenc_dev *v = ctx->venc;
++	int i;
++
++	if (!ctx->session)
++		return;
++	/* the vendor's stop: pause, wait for the pause interrupt, reset */
++	vw(v, VENC_PAUSE, 1);
++	for (i = 0; i < 100 && !(vr(v, VENC_IRQ_STATUS) & IRQ_PAUSE); i++)
++		udelay(10);
++	vw(v, VENC_PAUSE, 0);
++	vw(v, VENC_RESET, 0);
++	vr(v, VENC_RESET);
++	vw(v, VENC_RESET, 1);
++	vw(v, VENC_IRQ_ACK, IRQ_PAUSE);
++	pm_runtime_mark_last_busy(v->dev);
++	pm_runtime_put_autosuspend(v->dev);
++	session_free(ctx);
++	ctx->session = false;
++}
++
++/*
++ * One frame from luma and chroma at y and uv; the slice data lands in ctx->bs.
++ * Returns its byte count, or < 0. *idr says whether it was an IDR frame.
++ */
++static int encode_frame(struct tvenc_ctx *ctx, dma_addr_t y, dma_addr_t uv, bool *idr_out)
++{
++	struct tvenc_dev *v = ctx->venc;
++	bool idr = ctx->gop_pos == 0 || ctx->force_idr;
++	u32 cur = ctx->frame & 1, ref = cur ^ 1, frm, st, n, fps = ctx_fps(ctx);
++	ktime_t t0 = ktime_get();
++	long left;
++
++	if (idr) {
++		ctx->gop_pos = 0;
++		ctx->last_i = ctx->frame;
++		ctx->force_idr = false;
++	}
++
++	/* reset */
++	vw(v, VENC_RESET, 0);
++	vw(v, VENC_RESET, 0);
++	vr(v, VENC_RESET);
++	vw(v, VENC_RESET, 1);
++	vr(v, VENC_RESET);
++
++	/* sequence (H264_SeqLvlMMRSetting) */
++	vw(v, VENC_SEQ0, ctx->gop + (ctx->gop <= 30 ? ctx->gop << 14 : 0) + (22 << 26));
++	vw(v, VENC_SEQ1, 0x626e5fae);
++	vw(v, VENC_SEQ2, 0x104e0000);
++	vw(v, VENC_SIZE, ((ctx->mbw << 16) + 0x100) * ctx->mbh + ctx->mbw);
++	vw(v, VENC_PITCH, ctx->mbw << 21 | ctx->mbw << 11 | (ctx->pw - ctx->w) << 5 | (ctx->ph - ctx->h));
++	vw(v, VENC_PROFILE, ctx->hw_level << 22);	/* CAVLC, Baseline */
++	vw(v, VENC_RC0, 0x40000 | ctx->kbps);
++	vw(v, VENC_RC1, fps << 16 | 5 << 8 | 3);
++	vw(v, VENC_RC2, 0x3308);
++	vw(v, VENC_RCFG, 0x1f4);
++	vw(v, VENC_CMP, 0x11);
++	vw(v, VENC_CMP_SIZE, (cmp_a(ctx) + cmp_b(ctx)) << 16 | cmp_a(ctx));
++
++	/* frame (H264_FrmLvlMMRSetting) */
++	if (idr) {
++		frm = 0x108400 | 0x3000 | 4 | 2 | ctx->itoggle << 3;
++		ctx->itoggle ^= 1;
++	} else {
++		frm = 0x108400 | (ctx->gop_pos != 1 ? 0x100 : 0);
++	}
++	vw(v, VENC_FRM, frm);
++	vw(v, VENC_FRMNUM, ctx->frame);
++	vw(v, VENC_FRMNUM2, ctx->frame);
++	vw(v, VENC_LASTI, ctx->last_i);
++	vw(v, VENC_RC0, 0x40000 | ctx->kbps);
++	vw(v, VENC_RC1, fps << 16 | 5 << 8 | 3);
++	vw(v, VENC_RC2, 0x3308);
++	vw(v, VENC_FRM2, 0);
++	vw(v, VENC_FRM3, 0);
++
++	/* buffers */
++	vw(v, VENC_RC_CODE, ctx->rc.da >> 4);
++	vw(v, VENC_RC_STATE, ctx->rcst.da >> 4);
++	vw(v, VENC_BS_SIZE, ctx->bs.size >> 7);
++	vw(v, VENC_BS_ADDR, ctx->bs.da >> 4);
++	vw(v, VENC_Y, y >> 4);
++	vw(v, VENC_UV, uv >> 4);
++	vw(v, VENC_PLANE3, 0);
++	vw(v, VENC_REC_Y + 0x00, ctx->rec_y[ref].da >> 4);	/* as the trace: frame 0 writes set 1 first */
++	vw(v, VENC_REC_Y + 0x04, ctx->rec_c[ref].da >> 4);
++	vw(v, VENC_REC_Y + 0x08, ctx->rec_y[cur].da >> 4);
++	vw(v, VENC_REC_Y + 0x0c, ctx->rec_c[cur].da >> 4);
++	vw(v, VENC_REC_Y + 0x10, ctx->mv[cur].da >> 4);
++	vw(v, VENC_REC_Y + 0x14, ctx->mv[ref].da >> 4);
++
++	/* go */
++	reinit_completion(&v->done);
++	v->irq_status = 0;
++	vw(v, VENC_IRQ_EN, 0x3f);
++	vw(v, VENC_MODE, 0x0f20bff0 | (ctx->frame ? BIT(23) : BIT(22)));
++	vw(v, VENC_CLKON, 1);
++	vw(v, VENC_START, 4);
++	left = wait_for_completion_timeout(&v->done, msecs_to_jiffies(200));
++	st = v->irq_status;
++	n = vr(v, VENC_BS_BYTES);
++	vw(v, VENC_CLKON, 0);
++
++	snprintf(v->last, sizeof(v->last), "frame %u %c bytes %u status %#x us %lld%s\n",
++		 ctx->frame, idr ? 'I' : 'P', n, st, ktime_us_delta(ktime_get(), t0),
++		 left ? "" : " TIMEOUT");
++	if (!left || !(st & IRQ_FRM) || n > ctx->bs.size)
++		return -EIO;
++	*idr_out = idr;
++	ctx->frame++;
++	ctx->gop_pos = (ctx->gop_pos + 1) % ctx->gop;
++	return n;
++}
++
++/* ---- the m2m job ---- */
++
++static const struct v4l2_event eos_event = { .type = V4L2_EVENT_EOS };
++
++/*
++ * The end of a drain: an empty CAPTURE buffer flagged LAST, then the EOS
++ * event. The last frame goes out in a buffer of its own before it, since a
++ * client may drop the data of a LAST buffer (GStreamer 1.22 does).
++ */
++static void last_done(struct tvenc_ctx *ctx, struct vb2_v4l2_buffer *vbuf)
++{
++	vb2_set_plane_payload(&vbuf->vb2_buf, 0, 0);
++	vbuf->field = V4L2_FIELD_NONE;
++	v4l2_m2m_last_buffer_done(ctx->fh.m2m_ctx, vbuf);
++	v4l2_event_queue_fh(&ctx->fh, &eos_event);
++}
++
++static void run_work(struct work_struct *work)
++{
++	struct tvenc_dev *v = container_of(work, struct tvenc_dev, run_work);
++	struct tvenc_ctx *ctx = v4l2_m2m_get_curr_priv(v->m2m);
++	struct vb2_v4l2_buffer *src, *dst, *next;
++	enum vb2_buffer_state state = VB2_BUF_STATE_ERROR;
++	dma_addr_t y, uv;
++	size_t hdr = 0, room;
++	bool idr = false, last;
++	u8 *out;
++	int n;
++
++	if (!ctx)
++		return;
++	/*
++	 * Both stay on their ready queues until the frame is done: a STOP that
++	 * comes meanwhile then sees this source buffer as the last one to drain,
++	 * not an empty queue (which would end the stream before this frame).
++	 */
++	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
++	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	if (!src || !dst)
++		goto finish;
++	v4l2_m2m_buf_copy_metadata(src, dst, false);
++
++	if (!ctx->session && session_start(ctx)) {
++		dev_err(v->dev, "cannot start the encoder (titan/venc_rc.bin?)\n");
++		goto done;
++	}
++	y = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
++	uv = ctx->src_fmt.num_planes == 2 ? vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 1) :
++					    y + ctx->pw * ctx->ph;
++	n = encode_frame(ctx, y, uv, &idr);
++	if (n < 0) {
++		v->errors++;
++		goto done;
++	}
++	out = vb2_plane_vaddr(&dst->vb2_buf, 0);
++	room = vb2_plane_size(&dst->vb2_buf, 0);
++	if (idr)
++		hdr = write_sps_pps(ctx, out);
++	if (!out || hdr + n > room) {
++		v->errors++;
++		goto done;
++	}
++	memcpy(out + hdr, ctx->bs.va, n);
++	vb2_set_plane_payload(&dst->vb2_buf, 0, hdr + n);
++	dst->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME | V4L2_BUF_FLAG_BFRAME);
++	dst->flags |= idr ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
++	dst->field = V4L2_FIELD_NONE;
++	v->frames++;
++	state = VB2_BUF_STATE_DONE;
++done:
++	last = v4l2_m2m_is_last_draining_src_buf(ctx->fh.m2m_ctx, src);
++	v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++	v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++	v4l2_m2m_buf_done(src, state);
++	v4l2_m2m_buf_done(dst, state);
++	/* a STOP command and this was the last frame: the empty LAST buffer
++	 * now, or the next CAPTURE buffer queued (tvenc_buf_queue) */
++	if (last) {
++		ctx->fh.m2m_ctx->last_src_buf = NULL;
++		next = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++		if (next)
++			last_done(ctx, next);
++		else
++			ctx->fh.m2m_ctx->next_buf_last = true;
++	}
++finish:
++	v4l2_m2m_job_finish(v->m2m, ctx->fh.m2m_ctx);
++}
++
++static void tvenc_device_run(void *priv)
++{
++	struct tvenc_ctx *ctx = priv;
++
++	queue_work(ctx->venc->wq, &ctx->venc->run_work);
++}
++
++static const struct v4l2_m2m_ops tvenc_m2m_ops = {
++	.device_run = tvenc_device_run,
++};
++
++/* ---- formats ---- */
++
++static void fill_src_fmt(struct v4l2_pix_format_mplane *f)
++{
++	u32 pw, ph;
++
++	f->width = clamp(ALIGN(f->width, 2), (u32)MIN_W, (u32)MAX_W);
++	f->height = clamp(ALIGN(f->height, 2), (u32)MIN_H, (u32)MAX_H);
++	/* too many macroblocks: the height gives way */
++	if (DIV_ROUND_UP(f->width, 16) * DIV_ROUND_UP(f->height, 16) > MAX_MBS)
++		f->height = ALIGN_DOWN(MAX_MBS / DIV_ROUND_UP(f->width, 16) * 16, 2);
++	if (f->pixelformat != V4L2_PIX_FMT_NV12M)
++		f->pixelformat = V4L2_PIX_FMT_NV12;
++	pw = ALIGN(f->width, 16);
++	ph = ALIGN(f->height, 16);
++	f->field = V4L2_FIELD_NONE;
++	f->colorspace = V4L2_COLORSPACE_REC709;
++	f->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	f->quantization = V4L2_QUANTIZATION_LIM_RANGE;
++	f->xfer_func = V4L2_XFER_FUNC_DEFAULT;
++	/* the encoder reads a pitch of whole macroblocks, chroma after a 16-line-aligned luma */
++	if (f->pixelformat == V4L2_PIX_FMT_NV12M) {
++		f->num_planes = 2;
++		f->plane_fmt[0].bytesperline = pw;
++		f->plane_fmt[0].sizeimage = pw * ph;
++		f->plane_fmt[1].bytesperline = pw;
++		f->plane_fmt[1].sizeimage = pw * ph / 2;
++	} else {
++		f->num_planes = 1;
++		f->plane_fmt[0].bytesperline = pw;
++		f->plane_fmt[0].sizeimage = pw * ph * 3 / 2;
++	}
++}
++
++static void fill_dst_fmt(struct tvenc_ctx *ctx, struct v4l2_pix_format_mplane *f)
++{
++	f->width = ctx->src_fmt.width;
++	f->height = ctx->src_fmt.height;
++	f->pixelformat = V4L2_PIX_FMT_H264;
++	f->field = V4L2_FIELD_NONE;
++	f->num_planes = 1;
++	f->colorspace = ctx->src_fmt.colorspace;
++	f->plane_fmt[0].bytesperline = 0;
++	f->plane_fmt[0].sizeimage = ALIGN(f->width, 16) * ALIGN(f->height, 16) + HDR_ROOM;
++}
++
++static int vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, DRV_NAME, sizeof(cap->driver));
++	strscpy(cap->card, "MT6771 H.264 encoder", sizeof(cap->card));
++	strscpy(cap->bus_info, "platform:" DRV_NAME, sizeof(cap->bus_info));
++	return 0;
++}
++
++static int vidioc_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
++{
++	static const u32 fmts[] = { V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_NV12M };
++
++	if (f->index >= ARRAY_SIZE(fmts))
++		return -EINVAL;
++	f->pixelformat = fmts[f->index];
++	return 0;
++}
++
++static int vidioc_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
++{
++	if (f->index)
++		return -EINVAL;
++	f->pixelformat = V4L2_PIX_FMT_H264;
++	f->flags = V4L2_FMT_FLAG_COMPRESSED;
++	return 0;
++}
++
++static int vidioc_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fs)
++{
++	if (fs->index)
++		return -EINVAL;
++	if (fs->pixel_format != V4L2_PIX_FMT_H264 && fs->pixel_format != V4L2_PIX_FMT_NV12 &&
++	    fs->pixel_format != V4L2_PIX_FMT_NV12M)
++		return -EINVAL;
++	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	fs->stepwise.min_width = MIN_W;
++	fs->stepwise.max_width = MAX_W;
++	fs->stepwise.step_width = 2;
++	fs->stepwise.min_height = MIN_H;
++	fs->stepwise.max_height = MAX_H;
++	fs->stepwise.step_height = 2;
++	return 0;
++}
++
++static int vidioc_g_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
++{
++	f->fmt.pix_mp = fh_to_ctx(priv)->src_fmt;
++	return 0;
++}
++
++static int vidioc_g_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
++{
++	f->fmt.pix_mp = fh_to_ctx(priv)->dst_fmt;
++	return 0;
++}
++
++static int vidioc_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
++{
++	fill_src_fmt(&f->fmt.pix_mp);
++	return 0;
++}
++
++/* the coded buffer: at least the driver's size, larger if the client asks (up to 8 MiB) */
++static void coded_size(struct v4l2_pix_format_mplane *f, u32 want)
++{
++	if (want > f->plane_fmt[0].sizeimage)
++		f->plane_fmt[0].sizeimage = min_t(u32, want, SZ_8M);
++}
++
++static int vidioc_try_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
++{
++	u32 want = f->fmt.pix_mp.plane_fmt[0].sizeimage;
++
++	fill_dst_fmt(fh_to_ctx(priv), &f->fmt.pix_mp);
++	coded_size(&f->fmt.pix_mp, want);
++	return 0;
++}
++
++static int vidioc_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct tvenc_ctx *ctx = fh_to_ctx(priv);
++
++	if (vb2_is_busy(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)))
++		return -EBUSY;
++	fill_src_fmt(&f->fmt.pix_mp);
++	ctx->src_fmt = f->fmt.pix_mp;
++	/* the coded size follows the raw one, keeping a larger buffer the client asked for */
++	if (!vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx))) {
++		u32 want = ctx->dst_fmt.plane_fmt[0].sizeimage;
++
++		fill_dst_fmt(ctx, &ctx->dst_fmt);
++		coded_size(&ctx->dst_fmt, want);
++	}
++	return 0;
++}
++
++static int vidioc_s_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct tvenc_ctx *ctx = fh_to_ctx(priv);
++	u32 want = f->fmt.pix_mp.plane_fmt[0].sizeimage;
++
++	if (vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
++		return -EBUSY;
++	fill_dst_fmt(ctx, &f->fmt.pix_mp);
++	coded_size(&f->fmt.pix_mp, want);
++	ctx->dst_fmt = f->fmt.pix_mp;
++	return 0;
++}
++
++static int vidioc_g_parm(struct file *file, void *priv, struct v4l2_streamparm *a)
++{
++	struct tvenc_ctx *ctx = fh_to_ctx(priv);
++
++	if (!V4L2_TYPE_IS_OUTPUT(a->type))
++		return -EINVAL;
++	a->parm.output.capability = V4L2_CAP_TIMEPERFRAME;
++	a->parm.output.timeperframe.numerator = ctx->fps_num;
++	a->parm.output.timeperframe.denominator = ctx->fps_den;
++	return 0;
++}
++
++static int vidioc_s_parm(struct file *file, void *priv, struct v4l2_streamparm *a)
++{
++	struct tvenc_ctx *ctx = fh_to_ctx(priv);
++	struct v4l2_fract *t = &a->parm.output.timeperframe;
++
++	if (!V4L2_TYPE_IS_OUTPUT(a->type))
++		return -EINVAL;
++	if (!t->numerator || !t->denominator) {
++		t->numerator = 1;
++		t->denominator = 30;
++	}
++	ctx->fps_num = t->numerator;
++	ctx->fps_den = t->denominator;
++	if (ctx_fps(ctx) != DIV_ROUND_CLOSEST(t->denominator, t->numerator)) {
++		ctx->fps_num = 1;
++		ctx->fps_den = ctx_fps(ctx);
++	}
++	t->numerator = ctx->fps_num;
++	t->denominator = ctx->fps_den;
++	a->parm.output.capability = V4L2_CAP_TIMEPERFRAME;
++	return 0;
++}
++
++/* STOP with nothing left to encode: the helper returns the LAST buffer at once; send EOS too */
++static int vidioc_encoder_cmd(struct file *file, void *priv, struct v4l2_encoder_cmd *ec)
++{
++	struct tvenc_ctx *ctx = fh_to_ctx(priv);
++	bool stopped = v4l2_m2m_has_stopped(ctx->fh.m2m_ctx);
++	int ret = v4l2_m2m_ioctl_encoder_cmd(file, priv, ec);
++
++	if (!ret && ec->cmd == V4L2_ENC_CMD_STOP && !stopped &&
++	    v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
++		v4l2_event_queue_fh(&ctx->fh, &eos_event);
++	return ret;
++}
++
++static int vidioc_subscribe_event(struct v4l2_fh *fh, const struct v4l2_event_subscription *sub)
++{
++	switch (sub->type) {
++	case V4L2_EVENT_EOS:
++		return v4l2_event_subscribe(fh, sub, 0, NULL);
++	case V4L2_EVENT_CTRL:
++		return v4l2_ctrl_subscribe_event(fh, sub);
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct v4l2_ioctl_ops tvenc_ioctl_ops = {
++	.vidioc_querycap = vidioc_querycap,
++	.vidioc_enum_fmt_vid_out = vidioc_enum_fmt_out,
++	.vidioc_enum_fmt_vid_cap = vidioc_enum_fmt_cap,
++	.vidioc_enum_framesizes = vidioc_enum_framesizes,
++	.vidioc_g_fmt_vid_out_mplane = vidioc_g_fmt_out,
++	.vidioc_g_fmt_vid_cap_mplane = vidioc_g_fmt_cap,
++	.vidioc_try_fmt_vid_out_mplane = vidioc_try_fmt_out,
++	.vidioc_try_fmt_vid_cap_mplane = vidioc_try_fmt_cap,
++	.vidioc_s_fmt_vid_out_mplane = vidioc_s_fmt_out,
++	.vidioc_s_fmt_vid_cap_mplane = vidioc_s_fmt_cap,
++	.vidioc_g_parm = vidioc_g_parm,
++	.vidioc_s_parm = vidioc_s_parm,
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
++	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++	.vidioc_encoder_cmd = vidioc_encoder_cmd,
++	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
++	.vidioc_subscribe_event = vidioc_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++/* ---- queues ---- */
++
++static int tvenc_queue_setup(struct vb2_queue *vq, unsigned int *nbufs, unsigned int *nplanes,
++			     unsigned int sizes[], struct device *alloc_devs[])
++{
++	struct tvenc_ctx *ctx = vb2_get_drv_priv(vq);
++	struct v4l2_pix_format_mplane *f = V4L2_TYPE_IS_OUTPUT(vq->type) ? &ctx->src_fmt : &ctx->dst_fmt;
++	unsigned int i;
++
++	if (*nplanes) {
++		if (*nplanes != f->num_planes)
++			return -EINVAL;
++		for (i = 0; i < f->num_planes; i++)
++			if (sizes[i] < f->plane_fmt[i].sizeimage)
++				return -EINVAL;
++		return 0;
++	}
++	*nplanes = f->num_planes;
++	for (i = 0; i < f->num_planes; i++)
++		sizes[i] = f->plane_fmt[i].sizeimage;
++	return 0;
++}
++
++static int tvenc_buf_prepare(struct vb2_buffer *vb)
++{
++	struct tvenc_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct v4l2_pix_format_mplane *f = V4L2_TYPE_IS_OUTPUT(vb->type) ? &ctx->src_fmt : &ctx->dst_fmt;
++	unsigned int i;
++
++	for (i = 0; i < f->num_planes; i++)
++		if (vb2_plane_size(vb, i) < f->plane_fmt[i].sizeimage)
++			return -EINVAL;
++	/* the encoder addresses buffers in 16-byte units */
++	for (i = 0; V4L2_TYPE_IS_OUTPUT(vb->type) && i < f->num_planes; i++)
++		if (vb2_dma_contig_plane_dma_addr(vb, i) & 15)
++			return -EINVAL;
++	return 0;
++}
++
++static void tvenc_buf_queue(struct vb2_buffer *vb)
++{
++	struct tvenc_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++
++	/* a drain ended with no CAPTURE buffer to mark: this one is the LAST */
++	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) && vb2_is_streaming(vb->vb2_queue) &&
++	    v4l2_m2m_dst_buf_is_last(ctx->fh.m2m_ctx)) {
++		last_done(ctx, vbuf);
++		return;
++	}
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
++}
++
++static int tvenc_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct tvenc_ctx *ctx = vb2_get_drv_priv(q);
++
++	v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, q);
++	/* a new stream starts with an IDR frame and its headers */
++	ctx->gop_pos = 0;
++	return 0;
++}
++
++static void tvenc_stop_streaming(struct vb2_queue *q)
++{
++	struct tvenc_ctx *ctx = vb2_get_drv_priv(q);
++	struct vb2_v4l2_buffer *vbuf;
++
++	flush_workqueue(ctx->venc->wq);
++	for (;;) {
++		vbuf = V4L2_TYPE_IS_OUTPUT(q->type) ? v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx) :
++						      v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++		if (!vbuf)
++			break;
++		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
++	}
++	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, q);
++	if (V4L2_TYPE_IS_OUTPUT(q->type) && v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
++		v4l2_event_queue_fh(&ctx->fh, &eos_event);
++	session_stop(ctx);
++}
++
++static const struct vb2_ops tvenc_qops = {
++	.queue_setup = tvenc_queue_setup,
++	.buf_prepare = tvenc_buf_prepare,
++	.buf_queue = tvenc_buf_queue,
++	.start_streaming = tvenc_start_streaming,
++	.stop_streaming = tvenc_stop_streaming,
++	.wait_prepare = vb2_ops_wait_prepare,
++	.wait_finish = vb2_ops_wait_finish,
++};
++
++static int queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
++{
++	struct tvenc_ctx *ctx = priv;
++	int ret;
++
++	src->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	src->io_modes = VB2_MMAP | VB2_DMABUF;
++	src->drv_priv = ctx;
++	src->ops = &tvenc_qops;
++	src->mem_ops = &vb2_dma_contig_memops;
++	src->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	src->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	src->lock = &ctx->venc->vfd_lock;
++	src->dev = ctx->venc->dev;
++	ret = vb2_queue_init(src);
++	if (ret)
++		return ret;
++
++	dst->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	dst->io_modes = VB2_MMAP | VB2_DMABUF;
++	dst->drv_priv = ctx;
++	dst->ops = &tvenc_qops;
++	dst->mem_ops = &vb2_dma_contig_memops;
++	dst->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	dst->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	dst->lock = &ctx->venc->vfd_lock;
++	dst->dev = ctx->venc->dev;
++	return vb2_queue_init(dst);
++}
++
++/* ---- controls ---- */
++
++static int tvenc_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct tvenc_ctx *ctx = container_of(ctrl->handler, struct tvenc_ctx, hdl);
++
++	switch (ctrl->id) {
++	case V4L2_CID_MPEG_VIDEO_BITRATE:
++		ctx->kbps = max(ctrl->val / 1000, 64);	/* taken at the next frame */
++		break;
++	case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
++		ctx->gop = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME:
++		ctx->force_idr = true;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_LEVEL:
++		/* level_idc of the menu's entries (1b counts as 1.1) */
++		ctx->req_level = (const u32[]){ 10, 11, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40 }[ctrl->val];
++		break;
++	default:
++		break;
++	}
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops tvenc_ctrl_ops = {
++	.s_ctrl = tvenc_s_ctrl,
++};
++
++static int init_ctrls(struct tvenc_ctx *ctx)
++{
++	struct v4l2_ctrl_handler *h = &ctx->hdl;
++	const struct v4l2_ctrl_ops *o = &tvenc_ctrl_ops;
++
++	v4l2_ctrl_handler_init(h, 10);
++	v4l2_ctrl_new_std(h, o, V4L2_CID_MPEG_VIDEO_BITRATE, 64000, 20000000, 1000, 4000000);
++	v4l2_ctrl_new_std(h, o, V4L2_CID_MPEG_VIDEO_GOP_SIZE, 1, 300, 1, 30);
++	v4l2_ctrl_new_std(h, o, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
++	/* the hardware's rate control is always on */
++	v4l2_ctrl_new_std(h, o, V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1, 1, 1, 1);
++	v4l2_ctrl_new_std_menu(h, o, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
++			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, ~BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CBR),
++			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR);
++	v4l2_ctrl_new_std_menu(h, o, V4L2_CID_MPEG_VIDEO_H264_PROFILE,
++			       V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE,
++			       ~(BIT(V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE) |
++				 BIT(V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE)),
++			       V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE);
++	v4l2_ctrl_new_std_menu(h, o, V4L2_CID_MPEG_VIDEO_H264_LEVEL,
++			       V4L2_MPEG_VIDEO_H264_LEVEL_4_0, 0, V4L2_MPEG_VIDEO_H264_LEVEL_3_1);
++	/* the SPS and PPS ride in the IDR frame's buffer */
++	v4l2_ctrl_new_std_menu(h, o, V4L2_CID_MPEG_VIDEO_HEADER_MODE,
++			       V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
++			       BIT(V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE),
++			       V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
++	v4l2_ctrl_new_std(h, o, V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, 0, 1, 0);
++	/* one raw frame is enough to start: frames are encoded one at a time, in order */
++	v4l2_ctrl_new_std(h, o, V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 32, 1, 1);
++	if (h->error) {
++		int ret = h->error;
++
++		v4l2_ctrl_handler_free(h);
++		return ret;
++	}
++	ctx->fh.ctrl_handler = h;
++	return v4l2_ctrl_handler_setup(h);
++}
++
++/* ---- file ops ---- */
++
++static int tvenc_open(struct file *file)
++{
++	struct tvenc_dev *v = video_drvdata(file);
++	struct tvenc_ctx *ctx;
++	int ret;
++
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	ctx->venc = v;
++	ctx->fps_num = 1;
++	ctx->fps_den = 30;
++	ctx->kbps = 4000;
++	ctx->gop = 30;
++	v4l2_fh_init(&ctx->fh, video_devdata(file));
++	file->private_data = &ctx->fh;
++	ret = init_ctrls(ctx);
++	if (ret)
++		goto err_fh;
++	ctx->src_fmt.width = 1280;
++	ctx->src_fmt.height = 720;
++	ctx->src_fmt.pixelformat = V4L2_PIX_FMT_NV12;
++	fill_src_fmt(&ctx->src_fmt);
++	fill_dst_fmt(ctx, &ctx->dst_fmt);
++	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(v->m2m, ctx, queue_init);
++	if (IS_ERR(ctx->fh.m2m_ctx)) {
++		ret = PTR_ERR(ctx->fh.m2m_ctx);
++		goto err_ctrl;
++	}
++	v4l2_fh_add(&ctx->fh);
++	return 0;
++
++err_ctrl:
++	v4l2_ctrl_handler_free(&ctx->hdl);
++err_fh:
++	v4l2_fh_exit(&ctx->fh);
++	kfree(ctx);
++	return ret;
++}
++
++static int tvenc_release(struct file *file)
++{
++	struct tvenc_ctx *ctx = fh_to_ctx(file->private_data);
++	struct tvenc_dev *v = ctx->venc;
++
++	mutex_lock(&v->vfd_lock);
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	mutex_unlock(&v->vfd_lock);
++	session_stop(ctx);
++	v4l2_fh_del(&ctx->fh);
++	v4l2_fh_exit(&ctx->fh);
++	v4l2_ctrl_handler_free(&ctx->hdl);
++	kfree(ctx);
++	return 0;
++}
++
++static const struct v4l2_file_operations tvenc_fops = {
++	.owner = THIS_MODULE,
++	.open = tvenc_open,
++	.release = tvenc_release,
++	.poll = v4l2_m2m_fop_poll,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = v4l2_m2m_fop_mmap,
++};
++
++/* ---- debugfs: the last frame, counters ---- */
++
++static int stats_show(struct seq_file *m, void *p)
++{
++	struct tvenc_dev *v = m->private;
++
++	seq_printf(m, "frames %lu errors %lu\n%s", v->frames, v->errors, v->last);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(stats);
++
++/* ---- platform ---- */
++
++static int tvenc_runtime_resume(struct device *dev)
++{
++	struct tvenc_dev *v = dev_get_drvdata(dev);
++
++	return clk_prepare_enable(v->clk);
++}
++
++static int tvenc_runtime_suspend(struct device *dev)
++{
++	struct tvenc_dev *v = dev_get_drvdata(dev);
++
++	clk_disable_unprepare(v->clk);
++	return 0;
++}
++
++static const struct dev_pm_ops tvenc_pm_ops = {
++	SET_RUNTIME_PM_OPS(tvenc_runtime_suspend, tvenc_runtime_resume, NULL)
++	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
++};
++
++static int tvenc_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np;
++	struct tvenc_dev *v;
++	int irq, ret;
++
++	v = devm_kzalloc(dev, sizeof(*v), GFP_KERNEL);
++	if (!v)
++		return -ENOMEM;
++	v->dev = dev;
++	mutex_init(&v->vfd_lock);
++	init_completion(&v->done);
++	INIT_WORK(&v->run_work, run_work);
++	platform_set_drvdata(pdev, v);
++	v->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(v->regs))
++		return PTR_ERR(v->regs);
++	v->clk = devm_clk_get(dev, "venc");
++	if (IS_ERR(v->clk))
++		return PTR_ERR(v->clk);
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++	ret = devm_request_irq(dev, irq, tvenc_irq, 0, DRV_NAME, v);
++	if (ret)
++		return ret;
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	/* larb 4 powers and clocks with us */
++	np = of_parse_phandle(dev->of_node, "mediatek,larb", 0);
++	if (np) {
++		struct platform_device *larb = of_find_device_by_node(np);
++
++		of_node_put(np);
++		if (!larb || !platform_get_drvdata(larb))
++			return -EPROBE_DEFER;
++		if (!device_link_add(dev, &larb->dev, DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS))
++			return -EINVAL;
++	}
++
++	v->wq = alloc_ordered_workqueue("titan-venc", WQ_MEM_RECLAIM);
++	if (!v->wq)
++		return -ENOMEM;
++	pm_runtime_set_autosuspend_delay(dev, 200);
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_enable(dev);
++
++	ret = v4l2_device_register(dev, &v->v4l2_dev);
++	if (ret)
++		goto err_pm;
++	v->m2m = v4l2_m2m_init(&tvenc_m2m_ops);
++	if (IS_ERR(v->m2m)) {
++		ret = PTR_ERR(v->m2m);
++		goto err_v4l2;
++	}
++
++	/* a media device, so the node reports itself as an encoder (MEDIA_ENT_F_PROC_VIDEO_ENCODER) */
++	v->mdev.dev = dev;
++	strscpy(v->mdev.model, DRV_NAME, sizeof(v->mdev.model));
++	strscpy(v->mdev.bus_info, "platform:" DRV_NAME, sizeof(v->mdev.bus_info));
++	media_device_init(&v->mdev);
++	v->v4l2_dev.mdev = &v->mdev;
++
++	v->vfd = (struct video_device) {
++		.fops = &tvenc_fops,
++		.ioctl_ops = &tvenc_ioctl_ops,
++		.minor = -1,
++		.release = video_device_release_empty,
++		.lock = &v->vfd_lock,
++		.v4l2_dev = &v->v4l2_dev,
++		.vfl_dir = VFL_DIR_M2M,
++		.device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING,
++	};
++	strscpy(v->vfd.name, DRV_NAME, sizeof(v->vfd.name));
++	video_set_drvdata(&v->vfd, v);
++	ret = video_register_device(&v->vfd, VFL_TYPE_VIDEO, -1);
++	if (ret)
++		goto err_m2m;
++	ret = v4l2_m2m_register_media_controller(v->m2m, &v->vfd,
++						 MEDIA_ENT_F_PROC_VIDEO_ENCODER);
++	if (ret)
++		goto err_vfd;
++	ret = media_device_register(&v->mdev);
++	if (ret)
++		goto err_mc;
++
++	v->dbg = debugfs_create_dir("titan_venc", NULL);
++	debugfs_create_file("stats", 0444, v->dbg, v, &stats_fops);
++	dev_info(dev, "H.264 encoder on /dev/video%d\n", v->vfd.num);
++	return 0;
++
++err_mc:
++	v4l2_m2m_unregister_media_controller(v->m2m);
++err_vfd:
++	video_unregister_device(&v->vfd);
++err_m2m:
++	media_device_cleanup(&v->mdev);
++	v4l2_m2m_release(v->m2m);
++err_v4l2:
++	v4l2_device_unregister(&v->v4l2_dev);
++err_pm:
++	pm_runtime_disable(dev);
++	destroy_workqueue(v->wq);
++	return ret;
++}
++
++static void tvenc_remove(struct platform_device *pdev)
++{
++	struct tvenc_dev *v = platform_get_drvdata(pdev);
++
++	debugfs_remove_recursive(v->dbg);
++	media_device_unregister(&v->mdev);
++	v4l2_m2m_unregister_media_controller(v->m2m);
++	video_unregister_device(&v->vfd);
++	media_device_cleanup(&v->mdev);
++	v4l2_m2m_release(v->m2m);
++	v4l2_device_unregister(&v->v4l2_dev);
++	/*
++	 * The driver core resumed the device for remove(); with runtime PM off
++	 * its put does not suspend it again, so do that here: a clock left
++	 * enabled stays counted, and the gate, which resets with the power
++	 * domain, would never be opened again.
++	 */
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++	if (!pm_runtime_status_suspended(&pdev->dev))
++		tvenc_runtime_suspend(&pdev->dev);
++	pm_runtime_set_suspended(&pdev->dev);
++	destroy_workqueue(v->wq);
++}
++
++static const struct of_device_id tvenc_of_match[] = {
++	{ .compatible = "mediatek,mt6771-venc" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, tvenc_of_match);
++
++static struct platform_driver tvenc_driver = {
++	.probe = tvenc_probe,
++	.remove_new = tvenc_remove,
++	.driver = {
++		.name = DRV_NAME,
++		.of_match_table = tvenc_of_match,
++		.pm = &tvenc_pm_ops,
++	},
++};
++module_platform_driver(tvenc_driver);
++
++MODULE_DESCRIPTION("MT6771 H.264 hardware encoder (V4L2 stateful)");
++MODULE_LICENSE("GPL");
++MODULE_FIRMWARE("titan/venc_rc.bin");

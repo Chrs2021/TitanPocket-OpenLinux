@@ -9,9 +9,245 @@ page is the current summary and takes precedence where they differ (a few
 of gnss.md's early sections, like "Verdict: replacing libmnl with open
 code", are history now).
 
-Last updated 2026-11-10 (the section "Broken since the modem runs": cause, fix, first fixes with the modem on).
+Last updated 2026-11-18 (the sections "Offline: the almanac" and "Time from the sky").
 
 ---
+
+## The daemon in Rust (2026-11-17)
+
+`titan-gnss-open` is now a Rust program, `userspace/titan-gnss-open/`
+(crate of the same name, std only, static aarch64 musl, `build.sh` →
+`out/titan-gnss-open`, runs the tests first). It is a port of the Python
+daemon (`userspace/titan-gnss-open/titan-gnss-open` and `tools/gnss/`
+`gpseph.py`, `snapfix.py`, `own02.py`, `navsub.py`, `session.py`,
+`meas-match.py`'s `record()`), formula for formula, with the same files
+in `/var/lib/titan-gnss-open`, the same status file, wakelock, watchdog,
+backoff, clock switching, orbit tiers and server failover, NMEA to gpsd,
+and the same `TITAN_GNSS_*` environment settings (the experiments that are
+off by default included: `TRACK`, `STEER`, `AIM_LEARN`, `CLOCK_GAIN`,
+`B_STEP`, `RECORD`). `chip-gnss.json` stays readable by both.
+
+| Module | Python it follows |
+|---|---|
+| `eph.rs` | `gpseph.py`: RINEX 3, GPS/BeiDou/GLONASS orbits, Doppler |
+| `navsub.rs` | `navsub.py`: 2B/3B/4B navigation data, Klobuchar, RINEX out |
+| `meas.rs` | `meas-match.py` `record()`: the `29` fields |
+| `snapfix.rs` | `snapfix.py`: the solves, `fix_from`, `identify` |
+| `session.rs` | `session.py`: the generated script, `CLOCKS` |
+| `own02.rs` | `own02.py` `regenerate()`, `visible()` |
+| `state.rs` | the daemon's files, the download, `status()` |
+| `main.rs` | the daemon: sessions, the feed, NMEA, the main loop |
+
+How it differs, on purpose:
+
+- One thread runs the session: the script is written to the probe from
+  the same loop that reads the chip's lines (the Python daemon had feed,
+  refresh and watchdog threads). The orbit download during a session runs
+  on a thread of its own, so the feed never waits for a server. SIGTERM is
+  taken on a thread with `sigwait`: the probe is killed, the receiver
+  marked closed, the wakelock released and the status file removed, as the
+  Python daemon's `finally` did.
+- The download is `curl` (with `-L --fail`, 20 s per server) and the file
+  is checked through `gzip -dc`, as `titan-cellloc` uses curl: no TLS crate.
+- GPS ephemerides always carry their carrier and system. In the Python
+  daemon those decoded from the chip or read back from `chip.rnx` had
+  neither, so a chip issue newer than the downloaded one reached
+  `look_any`'s `e["freq"]` and raised `KeyError` (a script failure, or a
+  failed session).
+- A GLONASS candidate whose orbit is too far from the time (`GLO_MAX_SPAN`)
+  is skipped in `identify` instead of raising: the Python daemon logged
+  "steering: ValueError" for those records (eight times in the replay
+  below) and could have failed the session in its second `identify` call.
+- A script piece that can't be made is logged ("the session's script
+  failed"); the Python feed ended silently on a `ValueError`.
+
+**Tests** (`cargo test`, 15): `tests/gen_vectors.py` runs the Python
+modules on an excerpt of a public IGS broadcast file
+(`tests/data/brdc-excerpt.rnx`) for a made-up receiver in the open
+Atlantic and writes `tests/vectors.json`; the Rust code must give the same
+satellite positions (GPS and BeiDou to 1 µm, GLONASS to 1 cm, integrated
+from another state), Doppler (0.1 mHz), elevations, the session script
+line for line, the regenerated `02`/`03` (GLONASS Doppler within 70 units of
+2^-16 Hz), `29` record fields, GPS subframes encoded from an ephemeris and
+decoded back, the Klobuchar page, the RINEX record, the NMEA sentences and
+DOPs byte for byte, and the snapshot fixes of seven synthetic scenarios
+(GPS only, with ionosphere, moving at 13 m/s, a four-satellite quick fix,
+GPS+BeiDou and GPS+GLONASS batches of two, a rejected time error) within
+1 mm of the Python fix. No capture or phone position is in the repository.
+
+On recorded data, `tests/replay_py.py DIR` runs the Python daemon's own
+`session()` over a probe log (`TITAN_GNSS_RECORD`; the probe and the clock
+replaced by the log), and `TITAN_GNSS_REPLAY_DIR=DIR cargo test --release
+replay_against_python` runs the Rust session's record handling
+(`titan-gnss-open replay LOG BRDC POSITION OUT`) over the same log. On the
+2026-11-15 00:55 UTC live session (150 s, 13 satellites locked at most):
+39 fixes each, at the same log times and of the same kind, the largest
+distance between the two 0.000 m. On the phone the same replay takes 0.53 s
+(0.46 s CPU) in Rust against 11.1 s (11.0 s CPU) for the Python daemon's
+code, start-up and the 8 MB orbit file included: ~6 ms against ~150 ms a
+2 s fix cycle. A solve is a few milliseconds, the feed writes 1.5 s ahead and
+the orbit download has its own thread, so the session stays on one thread:
+splitting the solves would gain nothing, wake more cores, and change the
+order of sums the tests compare to the millimetre. DIR stays under `out/`.
+
+**On the phone** (2026-11-17): installed by `install.sh` as
+`/usr/local/bin/titan-gnss-open`, and `titan-gnss-open.service` runs it.
+The Python daemon stays in `/usr/local/lib/titan-gnss-open/` (a drop-in
+with `ExecStart=/usr/bin/python3 /usr/local/lib/titan-gnss-open/titan-gnss-open`
+runs it; `install.sh` installs it again with `PYTHON=1`), and the old unit is
+`/root/titan-gnss-open.service.python`. The Rust daemon uses ~3 MB
+resident. The first sessions, indoors with no
+sky in view, tracked nothing in 75 s and ended, exactly as the Python
+daemon's sessions did there minutes later (same log lines; this morning
+the Python daemon had had five satellites at another spot). Later that
+morning, once satellites were in view, the Rust daemon's first fix came
+50 s into a session (full, five GPS satellites locked); the Python daemon,
+started right after in the same place, fixed 15 s into its session (44
+fixes in 5 minutes, spread about their median p50 122 m, p90 279 m; 17.1 s
+of CPU). The Rust daemon used 6.1 s of CPU in an 18-minute run, mostly
+searching. The side-by-side comparison was cut short (the phone reset,
+an AP watchdog after a resume like the one at 09:01 with Location off)
+and then dropped: the replay above is the like-for-like check.
+`tools/gnss/fix-ab.py` (on the phone as `/root/fix-ab.py`) records gpsd's
+fixes per run and compares runs by distance only.
+
+
+## Offline: the almanac (2026-11-18)
+
+Without the network the daemon had orbits for a while only: the downloaded
+file up to 4 h old (with the chip's own ephemeris) for fixes, then the file
+up to 48 h old only to aim the search, then nothing ("no-orbits", waiting
+for good). A phone offline for two days, or one that never downloaded,
+could not get a fix.
+
+Every GPS satellite broadcasts the almanac of all of them (subframe 5 pages
+1-24, subframe 4 pages 2-5 and 7-10), coarse Keplerian orbits good for
+weeks, the whole of it every 12.5 minutes. Now:
+
+- **Kept from the chip.** `navsub::almanac` decodes those pages
+  (IS-GPS-200 20.3.3.5.1.2) into an `Eph` with no corrections, `iode` −1
+  marking it, its reference time resolved to the week nearest the session's
+  start. The daemon keeps the newest entry of each healthy satellite in
+  `STATE/almanac.rnx` (RINEX, as `chip.rnx`); a satellite whose page says
+  unhealthy is dropped.
+- **A third tier.** `State::ephemeris`: the file up to 4 h old with the
+  chip's ephemeris (fixes), then the file up to 48 h old with the almanac
+  added (aim only), then the almanac alone, entries up to 28 days from their
+  reference time (`Tier::Almanac`, `"orbit": "almanac"` in the status, "aimed
+  with the almanac" in the log). As in the search tier, fixes use only what
+  the chip decodes in the session (`solve_own`): the first fix needs four or
+  five satellites' subframes 1-3, at least 18-30 s each after lock.
+- **Aiming with old orbits never worked.** `own02::visible` (and the GSV sky
+  view) skipped a satellite whose nearest orbit was over 4 h from its
+  reference time, so the 4-48 h search tier made no assignments at all; the
+  first offline run with the almanac showed the same ("0 satellites to
+  search"). They now take the nearest orbit within its own limit
+  (`own02::aim_age`: GLONASS 3 h, almanac 28 days, other ephemeris 4 h). With
+  a fresh file nothing changes (the tests compare the same assignments).
+
+Measured:
+
+- **Accuracy** (`tests::gps_almanac`): almanac pages encoded from the public
+  broadcast excerpt's 32 GPS ephemerides, quantized as sent, decode within
+  1.3 km of the ephemeris over its 4 h fit. Real pages from the 2026-10-30
+  window recordings: 0.7-1.6 km from that day's broadcast orbits, 42 h
+  before their reference time. A kilometre moves a satellite's Doppler by
+  well under 1 Hz; the search windows are 100 Hz and more. Three days after
+  the ephemeris, the made-up receiver of the tests sees no satellite to aim
+  at from the ephemeris and six or more from the almanac.
+- **Collecting it** (phone, 2026-11-18 06:11 UTC, sky in view): 28 GPS
+  satellites' almanac in 15 minutes of a normal session (G04, G06, G27 and
+  G31 not among them: no healthy page of theirs came in that time).
+- **A fix offline:** not measured yet. `tools/gnss/offline-test.sh` (on the
+  phone as `/root/offline-test.sh`) runs the daemon on a state directory
+  holding only `position`, `clock`, `iono` and `almanac.rnx`, with a `curl`
+  that fails and no IP but localhost, and compares its fix with the last
+  online one by distance only. Its first run made no assignments (the bug
+  above); then it ran alongside the normal service (Location switched on),
+  and with two daemons opening `/dev/stpgps` neither got an answer. The
+  script now yields to the service and leaves Location as it found it.
+
+**The satellite list (2026-11-18).** The status file now carries `"sats"`:
+every satellite above the horizon (from the orbits that aim the search, so
+the almanac's too) and every one heard in the last 10 s, each with its
+elevation and azimuth (whole degrees), C/N0, whether it is in full lock,
+in the current fix, and whether the solver has an ephemeris for it. Since
+2026-11-18 also its health, the broadcast orbit's accuracy and any special
+message:
+
+- **Health:** the newest usable orbit's own flag. A satellite with none
+  is taken from the orbit file's newest record (`eph::unhealthy`; `parse`
+  drops unhealthy records) or an almanac page. Satellites that aren't heard
+  and have no orbit stay unknown.
+- **Accuracy:** in metres. Orbits decoded from the chip this session carry
+  the URA index, converted with IS-GPS-200's table (`navsub::ura_m`, the same
+  for BeiDou). The orbit file's records give metres. `chip.rnx` keeps no
+  accuracy (the RINEX writer writes 0, as the Python one does), so a GPS
+  orbit reloaded from it shows none. GLONASS broadcasts no accuracy.
+- **Messages:** GPS subframe 4 page 17 (`navsub::special_message`, 22
+  characters), by the satellite that sent it, and logged.
+
+Live (2026-11-18, 32 satellites): 30 healthy, one GLONASS satellite heard
+but unhealthy by the file, one GPS satellite unknown. Accuracies were
+2-2.8 m (GPS, BeiDou), and no message, as usual. A
+satellite counts as heard from any record at 10 dB-Hz or more, of any layout
+(GPS by its PRN, without needing an orbit), so the list can show more heard
+than the `heard` count, which is fully tracked records only. The Location
+app shows it. The sky view behind GSV is now made from the same orbits and
+refreshed before anything is tracked; with a fresh file it is the same as
+before.
+
+Not covered offline: BeiDou and GLONASS (no almanac of theirs is decoded,
+so they are aimed only while a file or the chip's ephemeris is under 4 h
+old); a phone with no `position` (it waits); a phone moved far from the
+last fix (the seed must be within some tens of km, and fixes over 200 km
+from it are rejected).
+
+## Time from the sky (2026-11-18)
+
+Two clocks the daemon already had, made into a time source:
+
+- **Subframe times.** Every GPS subframe's HOW carries the time of week at
+  its end (`navsub::how_tow`). Against the line's time on the session's
+  clock (`t_start + ms`), 47 subframes of the 2026-11-15 recording agreed
+  within 3 ms. They reach the daemon a steady `L` after they end.
+- **The fix's time error.** A full fix solves one time error for the
+  session's clock. On an NTP-synced phone it reads +0.10 to +0.18 s (20
+  first fixes logged over 10 days): a bias `B`, the session's start against
+  the chip's time base, with ~0.03 s of noise. On the 2026-11-15 recording
+  the fix said +2.04 s and the subframes +1.80 s on the same clock, so
+  `L` ≈ 0.24 s.
+
+The phone clock's error (true time less the phone's) is then `dt − B` from
+a full fix, or `median(subframe) − B + L` from three subframes within 50 ms
+of each other: one satellite strong enough to decode for about 20 s, no fix
+needed. `B` and `L` are learnt while the clock is synced (each synced full
+fix steps them a tenth of the way, saved in `STATE/time-cal` every 5
+minutes; defaults 0.145 and 0.24 s). Measured live, synced (2026-11-18,
+three readings 20 s apart): the fix put the phone 0.022, 0.028 and 0.008 s
+behind network time, the subframes 0.058, 0.021 and 0.007 s ahead, closing
+in as the calibration learnt.
+
+While the kernel calls the clock unsynchronised (no network time):
+
+- **More than 0.5 s off:** the daemon sets the system clock
+  (`clock_settime`) once a session, unless the step would be over 3 days
+  (the week comes from the phone's clock) or `TITAN_GNSS_SET_CLOCK=0`.
+  Then it ends the session and starts again on the new time. It does not
+  write the RTC.
+- **Within 0.5 s:** it trusts the clock for four-satellite (quick) fixes,
+  holding the time error at the estimate. Before, these needed network
+  time.
+
+The kernel's flag stays unsynced either way; timesyncd takes over when the
+network returns. Subframe 4 page 18's GPS−UTC (`navsub::leap`) is decoded
+and logged if it isn't the 18 s the build assumes. The status file's
+`"time"` has the estimate (`ahead`: the phone's clock less true time; its
+`source`; `subframes_ahead`; `synced`; `set`; `leap`), and the Location app
+shows it as "Phone clock".
+
+Not yet run: an unsynced clock on the air (the step and the quick fixes it
+allows). A phone whose clock is before 2026 still waits ("no-clock").
 
 ## Broken since the modem runs (2026-11-09; fixed 2026-11-10)
 
@@ -671,7 +907,7 @@ titan-gnss → NMEA → UDP 127.0.0.1:10110 → gpsd -n → apps
 **The open stack (no libmnl)**, `titan-gnss-open`, opt-in:
 
 ```
-titan-gnss-open (Python)
+titan-gnss-open (Rust since 2026-11-17; Python before)
   ├─ GPS broadcast ephemeris, fetched hourly (IGS merged file from BKG)
   ├─ our 02 search assignments (Doppler from ephemeris), rewritten into a replay script
   ├─ titan-gps-probe (Rust): firmware patch + script → /dev/stpgps → CONNSYS GNSS DSP
@@ -1153,7 +1389,7 @@ Result: no change (set: G2 21, G8 19; clear: G2 19/15, G8 17/15).
 **Without `clk_ignore_unused`** (#128 with only that word removed from the
 boot header, `out/mainline/boot-6.12-128-noclkignore.img`): the kernel
 gates a clock the UFS needs, the root partition's superblock read fails
-with an I/O error, and the ramdisk stays in first light (telnet on
+with an I/O error, and the ramdisk stays in rescue mode (telnet on
 172.16.42.1). That is why our Debian images carry the option. #128 flashed
 back and checked. The infra clock gates differ widely between the kernels
 (infracfg `0x10001090`: 4.14 0x8baffb00, most gated; 6.12 0x00407800, most
@@ -1383,7 +1619,7 @@ Reported in use: the service turning off, "searching" with no satellites, and sa
 
 (Since 2026-11-10 a session runs on instead of restarting every 600 s.) Not changed, to be measured: and a fix over 200 km from the last position is rejected as an ambiguity with nothing to update that position, so a long trip with the GPS off would never get a fix.
 
-**Orbit data failover.** In order: the first of `BRDC_URLS` that serves a valid file (a login page also answers 200; only BKG's three were seen to serve it, as IGN timed out from here); the file up to 4 h old with the chip's own ephemeris; then the file up to 48 h old, GPS and BeiDou only, only to aim the search, with fixes from what the chip decodes from the sky. That last tier has not been tried on the air. For 3 h after midnight UTC it fetches the previous day's file, as the new one has little in it. With nothing at all the daemon waits and the app says so. Tested with fake probes and the real file: validation, each tier by file age, a corrupt file, a silent chip, garbage frames, 300 kB on stderr, a failed probe.
+**Orbit data failover.** In order: the first of `BRDC_URLS` that serves a valid file (a login page also answers 200; only BKG's three were seen to serve it, as IGN timed out from here); the file up to 4 h old with the chip's own ephemeris; then the file up to 48 h old, GPS and BeiDou only, with the almanac, only to aim the search, with fixes from what the chip decodes from the sky; then the almanac alone (2026-11-18, "Offline: the almanac" above). Until 2026-11-18 the 48 h tier made no assignments at all (the 4 h aiming limit). For 3 h after midnight UTC it fetches the previous day's file, as the new one has little in it. With nothing at all the daemon waits and the app says so. Tested with fake probes and the real file: validation, each tier by file age, a corrupt file, a silent chip, garbage frames, 300 kB on stderr, a failed probe.
 
 ## Methods that work
 
@@ -1413,7 +1649,8 @@ Reported in use: the service turning off, "searching" with no satellites, and sa
 
 | Path | What |
 |---|---|
-| `userspace/titan-gnss-open/` | the open daemon, its unit, `install.sh` |
+| `userspace/titan-gnss-open/` | the open daemon: the Rust crate (`src/`, `build.sh` → `out/titan-gnss-open`, tests in `src/tests.rs` with `tests/gen_vectors.py` and `tests/replay_py.py`), the Python daemon it was ported from, its unit, `install.sh` |
+| `tools/gnss/fix-ab.py` | two daemons' fixes in the same place, compared by distance only (`record LABEL SECONDS`, `compare`) |
 | `userspace/titan-gps/` | Rust crate: `frame` (codec), `patch` (finds/cuts the patch), `titan-gps-probe` (runs a script, from a file or as a stream on standard input with `-`, logs chip frames to stdout or `--log`; `--quiet` disables the log entirely). `build.sh` → `out/titan-gps-probe` (static aarch64 musl), tests included |
 | `userspace/titan-mnld/` | our libmnl host (C, 32-bit bionic); env switches `TITAN_MNLD_MEAS`, `_DBG`(`_TYPE`), `_MEMDUMP`, `_RAW`, `_DEBUG`, `_DROP`(`_AFTER`,`_B2`,`_ID`), `_FLIP`(`_SATS`,`_B2`,`_ID`,`_PERIOD`), `_WFLIP`(`_SV`,`_CON`,`_PERIOD`), `_PMTK` (`SEC:PMTK...;...`: send PMTK sentences, log libmnl's `$PMTK` output), `_CALIB` (a file whose bytes 0x40-0x4f become the init block's clock calibration, as stock mnld reads the modem's `CALIBRAT/ML4A_000`); all off unless set. `build.sh` → `out/titan-mnld` |
 | `tools/gnss/stpgps-decode.py` | decode an strace capture (`--dump`, `--fd N` when strace attached after the open) |
@@ -1439,7 +1676,8 @@ Ephemeris source: `https://igs.bkg.bund.de/root_ftp/IGS/BRDC/<yyyy>/<ddd>/BRDC00
   Location off (`titan-location off`), then `systemctl start
   titan-gps-driver`; stop it afterwards.
 - On the phone now: `/usr/local/bin/titan-gps-probe`,
-  `/usr/local/lib/titan-gnss-open/`, `/var/lib/titan-gnss-open/`
+  `/usr/local/bin/titan-gnss-open` (the daemon),
+  `/usr/local/lib/titan-gnss-open/` (the Python daemon, not run), `/var/lib/titan-gnss-open/`
   (`base.script`, `brdc.rnx`, `position`; root only),
   `/opt/android-gps/vendor/bin/titan-mnld` (the build with experiment
   switches; the previous one is `titan-mnld.orig` beside it), `/root/`
@@ -1526,11 +1764,12 @@ the Ghidra project and decompile of libmnl.
    BeiDou `4B`, GLONASS `3B`; the daemon caches them, `chip.rnx` and
    `chip-gnss.json`). Live (10-30, 6 minutes): GPS G06, G11, G12, G13,
    G17, G19 and BeiDou C14, C23, C27, C28 from the chip; no GLONASS yet
-   (an ephemeris must repeat in two 30 s frames; longer sessions). Still from the network: the first ephemeris on a
-   phone with no cache, and BeiDou's geostationary satellites (`4D`, not
-   visible here).
+   (an ephemeris must repeat in two 30 s frames; longer sessions). Still from the network: BeiDou and
+   GLONASS aiming after 4 h offline (GPS has the almanac since 2026-11-18),
+   and BeiDou's geostationary satellites (`4D`, not visible here).
 6. **Reliability**: restart sessions that never measure (the daemon does
    on the next cycle; it could check sooner).
-7. **Rust**: the project prefers Rust for tools that ship on the phone;
-   titan-gnss-open is Python (it grew out of the analysis scripts) and
-   could move into the `titan-gps` crate once the method settles.
+7. **Rust**: done (2026-11-17, "The daemon in Rust" above). The Python
+   modules in `tools/gnss/` stay the analysis tools and the reference the
+   tests are made from: a change to the method goes into both, and
+   `tests/gen_vectors.py` is run again.

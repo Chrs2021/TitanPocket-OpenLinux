@@ -77,7 +77,7 @@ esac
 mkdir -p "$OUT"
 for m in linux612/mtk_btif.ko common/wmt_drv.ko wlan_adaptor/wmt_chrdev_wifi.ko \
 	 wlan_gen3/wlan_drv_gen3.ko bt/legacy/bt_drv.ko fm/fmradio_drv.ko gps/gps_drv.ko; do
-	# without debug info: they ship in the first-light ramdisk (32 MB image)
+	# without debug info: they ship in the boot image's ramdisk (32 MB image)
 	[ -f "$SRC/$m" ] && aarch64-linux-gnu-strip --strip-debug -o "$OUT/$(basename "$m")" "$SRC/$m"
 done
 ls -la "$OUT"

@@ -386,12 +386,14 @@ desktop.md, "Calls and texts").
 | awake, unlocked | held 3 s | the power menu (desktop.md); the release does nothing |
 | awake, locked | held 3 s | nothing |
 | suspend refused (USB cable, ...) | — | stay "screen off", retry every 30 s |
-| screen off, a userspace wakelock held | — | no suspend, look again every 30 s |
+| screen off, a userspace wakelock held | — | no suspend, look again every 2 s (30 s until 2026-11-19) |
 | screen off | short press | panel on |
 | asleep | power key | wakes; the key press is swallowed, panel on |
-| asleep | any other wake (RTC, cable plugged in, ...) | straight back to sleep |
+| asleep | any other wake (RTC, cable plugged in, ...) | back to sleep after 3 s if the wake came through the PMIC or keypad (`/sys/power/pm_wakeup_irq`), else after 1 s (the modem's wakes; 3 s for all until 2026-11-19) |
 
-**Wakelocks** (2026-10-30): writing `mem` to `/sys/power/state` doesn't
+Restarting `titan-powerkey` while the screen is off lights it again: the
+service starts in the screen-on state. `echo off > /run/titan-powerkey.ctl`
+turns it off. **Wakelocks** (2026-10-30): writing `mem` to `/sys/power/state` doesn't
 look at wakelocks (that takes the `wakeup_count` handshake, which nothing
 here does), so titan-powerkey reads `/sys/power/wake_lock` itself and
 doesn't suspend while it names one; the screen still goes off. The GPS
@@ -536,6 +538,9 @@ tagged `power-switch`, and logind's default is **poweroff**), so
   back what it found at screen on. The settings are the modem's, shared by
   every AT channel (an untouched channel reads what the others set), so
   they go out on `cmd2`; `CGREG` and `CEREG` are one setting on this modem.
+  Since 2026-11-19 the emergency number lists (`+CEN1`/`+CEN2`, which come
+  with each new cell) go off too (`AT+CEN=0`); titan-ims reads the list
+  itself (modem.md, "Emergency calls").
   titan-ims, which needs mode 2 to read the cell for its SIP headers, now
   puts the mode back after reading it. Checked on the phone: modes 2, 2, 2
   and `CMER 3,0,0,1` before, 1, 1, 1 and `3,0,0,0` with the screen off,
