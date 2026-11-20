@@ -638,18 +638,25 @@ const struct file_operations WIFI_fops = {
 
 static int WIFI_init(void)
 {
-	dev_t dev = MKDEV(WIFI_major, 0);
+	dev_t dev;
 	int32_t alloc_ret = 0;
 	int32_t cdev_err = 0;
 
 	low_latency_mode = 0;
 
-	/* Allocate char device */
-	alloc_ret = register_chrdev_region(dev, WIFI_devs, WIFI_DRIVER_NAME);
+	/*
+	 * Allocate char device. Titan: a dynamic major, not the vendor's fixed
+	 * 153, which is spidev's (SPIDEV_MAJOR): with spidev loaded first (the
+	 * fingerprint sensor's SPI node) the fixed one failed with -EBUSY and
+	 * Wi-Fi never came up. The node is created below (CREATE_NODE_DYNAMIC),
+	 * so userspace opens /dev/wmtWifi whatever the number is.
+	 */
+	alloc_ret = alloc_chrdev_region(&dev, 0, WIFI_devs, WIFI_DRIVER_NAME);
 	if (alloc_ret) {
 		WIFI_ERR_FUNC("Fail to register device numbers\n");
 		return alloc_ret;
 	}
+	WIFI_major = MAJOR(dev);
 
 	cdev_init(&WIFI_cdev, &WIFI_fops);
 	WIFI_cdev.owner = THIS_MODULE;

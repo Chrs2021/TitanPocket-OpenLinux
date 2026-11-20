@@ -11,12 +11,13 @@
 # 4.14 build (build.sh) puts its objects next to the sources, and Kbuild
 # would take those for current.
 set -euo pipefail
+# KDIR/KSRC, O and OUT612 may be set to build against another 6.12 tree (another stable release)
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=/root/titan-conn-612
-KDIR=/workspace/kernel_vol_mnt/mainline/linux-6.12.115
-O=/root/titan-6.12-build
+KDIR=${KDIR:-/workspace/kernel_vol_mnt/mainline/linux-6.12.115}
+O=${O:-/root/titan-6.12-build}
 JOBS=${JOBS:-$(nproc)}
-OUT=$HERE/out612
+OUT=${OUT612:-$HERE/out612}
 export ARCH=arm64
 
 mkdir -p "$SRC"

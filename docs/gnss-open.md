@@ -987,7 +987,8 @@ titan-gnss-open (Rust since 2026-11-17; Python before)
   fills `02`/`03` from ephemeris), and the DSP firmware patch is loaded
   from `/lib/firmware/titan/mt6631-gnss-patch.bin`, extracted once from
   the phone's own libmnl.so (`titan-gps-probe --extract-patch`, run by
-  `install.sh`; never in the repository). Live test with `/opt/android-gps`
+  `install.sh`, or the standalone `tools/gnss/extract-patch.py LIBMNL
+  OUT`, which gives the same bytes; never in the repository). Live test with `/opt/android-gps`
   (libmnl and its chroot) made inaccessible to the daemon
   (`InaccessiblePaths`): continuous fixes on 10-14 satellites, ephemeris
   from the chip, gpsd in 3D mode. Left out of the generated session: the

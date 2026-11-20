@@ -15,7 +15,7 @@ cannot allow (its bus lock is a mutex).
  2 files changed, 136 insertions(+), 29 deletions(-)
 
 diff --git a/drivers/input/keyboard/matrix_keypad.c b/drivers/input/keyboard/matrix_keypad.c
-index 3c38bae576edd69a31f785066668414a02529f64..ed3f0177f71dcb7622ece7da2630d828b2d74dd3 100644
+index c502ee266d1a8c3d1ab3ea3a09e16aff6524b7b7..3dbff9b1c0afc557dc22be7799aa3281d3d4577c 100644
 --- a/drivers/input/keyboard/matrix_keypad.c
 +++ b/drivers/input/keyboard/matrix_keypad.c
 @@ -104,6 +104,32 @@ static void disable_row_irqs(struct matrix_keypad *keypad)
@@ -51,7 +51,7 @@ index 3c38bae576edd69a31f785066668414a02529f64..ed3f0177f71dcb7622ece7da2630d828
  static void matrix_keypad_scan(struct work_struct *work)
  {
  	struct matrix_keypad *keypad =
-@@ -157,11 +183,39 @@ static void matrix_keypad_scan(struct work_struct *work)
+@@ -154,11 +180,39 @@ static void matrix_keypad_scan(struct work_struct *work)
  
  	activate_all_cols(keypad, true);
  
@@ -93,7 +93,7 @@ index 3c38bae576edd69a31f785066668414a02529f64..ed3f0177f71dcb7622ece7da2630d828
  }
  
  static irqreturn_t matrix_keypad_interrupt(int irq, void *id)
-@@ -176,16 +230,17 @@ static irqreturn_t matrix_keypad_interrupt(int irq, void *id)
+@@ -173,16 +227,17 @@ static irqreturn_t matrix_keypad_interrupt(int irq, void *id)
  	 * scan already. In that case we should not try to
  	 * disable IRQs again.
  	 */

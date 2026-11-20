@@ -7,9 +7,10 @@
 # The driver needs the kernel's MD1 power domain (mt6771-power-controller) and the
 # DT that goes with it: flash a kernel built from the same tree.
 set -euo pipefail
+# KDIR/KSRC, O and OUT612 may be set to build against another 6.12 tree (another stable release)
 HERE=$(cd "$(dirname "$0")" && pwd)
-KDIR=/workspace/kernel_vol_mnt/mainline/linux-6.12.115
-O=/root/titan-6.12-build
+KDIR=${KDIR:-/workspace/kernel_vol_mnt/mainline/linux-6.12.115}
+O=${O:-/root/titan-6.12-build}
 export ARCH=arm64
 
 grep -q '^CONFIG_MTK_MT6771_MODEM=m' "$O/.config" || {
@@ -18,6 +19,6 @@ grep -q '^CONFIG_MTK_MT6771_MODEM=m' "$O/.config" || {
 }
 make -C "$KDIR" O="$O" -j"$(nproc)" W=1 drivers/net/wwan/wwan.ko \
 	drivers/net/wwan/mt6771/titan_modem.ko
-mkdir -p "$HERE/out612"
-cp "$O/drivers/net/wwan/mt6771/titan_modem.ko" "$O/drivers/net/wwan/wwan.ko" "$HERE/out612/"
-ls -l "$HERE/out612/titan_modem.ko"
+mkdir -p "${OUT612:-$HERE/out612}"
+cp "$O/drivers/net/wwan/mt6771/titan_modem.ko" "$O/drivers/net/wwan/wwan.ko" "${OUT612:-$HERE/out612}/"
+ls -l "${OUT612:-$HERE/out612}/titan_modem.ko"

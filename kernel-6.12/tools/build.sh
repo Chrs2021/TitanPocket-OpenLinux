@@ -11,7 +11,7 @@
 # set to the phone.
 set -euo pipefail
 
-KSRC=/workspace/kernel_vol_mnt/mainline/linux-6.12.115
+KSRC=${KSRC:-/workspace/kernel_vol_mnt/mainline/linux-6.12.115}
 O=${O:-/root/titan-6.12-build}
 # REPRO=1: a reproducible build. The kernel's build stamp (uname -v: build
 # counter, time, user@host) comes from the source's last commit instead of

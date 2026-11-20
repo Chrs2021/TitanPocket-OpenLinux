@@ -121,7 +121,10 @@ Register 0x8c points at a 0x4040-byte buffer the library fills from a blob
 it carries (`H264_GetRCCode`; three variants, the default used here): code
 for the encoder's rate-control processor (larb 4's `VENC_RCPU` port). The
 same bytes at every size and bit rate. It is vendor firmware: extract it
-from your own phone's `libvcodecdrv.so` and install it, never commit it:
+from your own phone's `libvcodecdrv.so` (the 32-bit one, in the vendor
+partition's `lib/`) and install it, never commit it. `tools/re/emu_venc.py`
+runs the library in `tools/re/emu32.py` (Python with the `unicorn`
+package) and writes the bytes the driver loads:
 
 ```sh
 venv/bin/python3 tools/re/emu_venc.py VENDOR/lib/libvcodecdrv.so --fmt 6 \

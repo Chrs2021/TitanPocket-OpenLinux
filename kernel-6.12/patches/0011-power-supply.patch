@@ -36,7 +36,7 @@ index bcfa63fb9f1e207b92ca1cf675165ca861d3dc93..fdaa82a768ff866a8f948c68a9ed6fa7
  	tristate "Maxim MAX17042/17047/17050/8997/8966 family Fuel Gauge"
  	depends on I2C
 diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
-index 8dcb4154531718875a2a1aaeba05b1f3268cb4d7..6fde145b9f1112470816498449643c792be19c2c 100644
+index 6673860ff26c193cc170fe1782af19b9459de499..c1c80f3ce76b2ba6d2c779efeb9ebcc39977936e 100644
 --- a/drivers/power/supply/Makefile
 +++ b/drivers/power/supply/Makefile
 @@ -52,6 +52,7 @@ obj-$(CONFIG_BATTERY_DA9052)	+= da9052-battery.o
@@ -48,7 +48,7 @@ index 8dcb4154531718875a2a1aaeba05b1f3268cb4d7..6fde145b9f1112470816498449643c79
  obj-$(CONFIG_BATTERY_MAX1720X)	+= max1720x_battery.o
  obj-$(CONFIG_BATTERY_MAX1721X)	+= max1721x_battery.o
 diff --git a/drivers/power/supply/mt6370-charger.c b/drivers/power/supply/mt6370-charger.c
-index ad8793bf997e15a7d6a6bca96e538e6056bb3153..23eca0dffe2d5594274c872b4a8f5f26aca74bc2 100644
+index 16ffa927147f68c5b2394da6a73e0cb9de8eff85..45bbabbc32c640405db60a4aefdf1c2eb1abd189 100644
 --- a/drivers/power/supply/mt6370-charger.c
 +++ b/drivers/power/supply/mt6370-charger.c
 @@ -20,6 +20,7 @@
@@ -325,7 +325,7 @@ index ad8793bf997e15a7d6a6bca96e538e6056bb3153..23eca0dffe2d5594274c872b4a8f5f26
  #define MT6370_CHG_DT_PROP_DECL(_name, _type, _field)	\
  {							\
  	.name = "mediatek,chg-" #_name,			\
-@@ -871,6 +1047,7 @@ static int mt6370_chg_probe(struct platform_device *pdev)
+@@ -864,6 +1040,7 @@ static int mt6370_chg_probe(struct platform_device *pdev)
  		return -ENOMEM;
  
  	priv->dev = &pdev->dev;
@@ -333,7 +333,7 @@ index ad8793bf997e15a7d6a6bca96e538e6056bb3153..23eca0dffe2d5594274c872b4a8f5f26
  
  	priv->regmap = dev_get_regmap(pdev->dev.parent, NULL);
  	if (!priv->regmap)
-@@ -920,11 +1097,20 @@ static int mt6370_chg_probe(struct platform_device *pdev)
+@@ -911,11 +1088,20 @@ static int mt6370_chg_probe(struct platform_device *pdev)
  	if (ret)
  		return dev_err_probe(dev, ret, "Failed to init mivr delayed work\n");
  

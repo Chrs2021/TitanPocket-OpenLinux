@@ -8,19 +8,21 @@ until a fix is available.
 
 ## Supported versions
 
-This project has no tagged releases yet. Only the `main` branch is
-supported.
+This project has no tagged releases yet. Only the `mainline-6.12` branch
+is supported.
 
 | Version | Supported |
 | --- | --- |
-| `main` | Yes |
-| Any other branch, fork, or local build | No — reproduce on `main` first |
+| `mainline-6.12` | Yes |
+| `main` (the 4.14 BSP kernel) | No — kept for reference, no longer developed; reproduce on `mainline-6.12` |
+| Any other branch, fork, or local build | No — reproduce on `mainline-6.12` first |
 
-Security fixes land on `main`. There is no backport branch.
+Security fixes land on `mainline-6.12`. There is no backport branch, and
+flaws in the 4.14 BSP base itself are MediaTek's.
 
-Base: MediaTek 4.14.186 BSP kernel (from `halium-11.0`), plus this
-project's changes, the out-of-tree CONNSYS connectivity modules, and the
-userspace programs in this repository.
+Base: Linux 6.12 (the kernel.org stable release named in `README.md`),
+plus this project's patch series (`kernel-6.12/patches/`) and its
+out-of-tree drivers (`modules/`).
 
 ## Reporting a vulnerability
 
@@ -56,7 +58,7 @@ This is a single-maintainer project, so timelines are best-effort:
 - An initial assessment of severity and affected components after that
 - Coordinated disclosure: fixes are developed privately and published
   with credit to the reporter (unless you prefer to remain anonymous)
-  once a fix is on `main`, normally within 90 days of the report. If a
+  once a fix is on `mainline-6.12`, normally within 90 days of the report. If a
   flaw is being actively exploited, or a fix needs longer, that timing
   will be discussed with the reporter.
 
@@ -67,22 +69,20 @@ it publicly.
 
 In scope — code in this repository:
 
-- `kernel/` — this project's kernel changes, including new and
-  reconstructed drivers:
-  - Battery fuel gauge (`oz8806_battery.c`)
-  - Speaker amplifier codec (`fs1860`)
-  - Touchpad glue, keyboard changes, `mtkfb_kms`, and the Panfrost
-    backport with MT6771 power glue
-- `modules/connectivity/` — WMT core, Wi-Fi (gen3), Bluetooth, and FM
-  drivers, including the reconstructed MT6771 platform files
-  (`mt6771.c`, `plat_priv.c`)
-- `userspace/` — the programs that replace Android's vendor daemons,
-  including `titan-wmt`, `titan-wifi-on`, `titan-btbridge`,
-  `titan-nvram-copy`, and `titan-nfc` (see Sensitive areas)
-- Build and configuration: `titanpocket_defconfig` and
-  `titanpocket_linux.config`, including security-relevant options such
-  as seccomp, cgroups/BPF, and device-node permissions in the systemd
-  units shipped here
+- `kernel-6.12/patches/` — this project's changes to Linux 6.12,
+  including its own drivers: the modem (`drivers/net/wwan/mt6771`: CCCI,
+  the AT mux, network data), the SPM/MCDI power management and the SCP
+  sensor hub (`drivers/soc/mediatek`), the fuel gauge (`oz8806_battery`),
+  the speaker amplifier (`fs1860`), the IR transmitter, the H.264 decoder
+  and encoder (`mt6771-vdec`, `mt6771-venc`), and the device tree
+- `modules/` — the out-of-tree drivers: CONNSYS (WMT core, Wi-Fi gen3,
+  Bluetooth, FM, GPS, including the reconstructed MT6771 platform files
+  `mt6771.c` and `plat_priv.c`), the camera and its ISP, and NFC
+  (`st21nfc`)
+- `kernel-6.12/tools/` — the build, the boot image and the ramdisk's
+  `/init` (its USB rescue shell and telnet)
+- Configuration: `titanpocket.config`, including security-relevant
+  options and debug interfaces
 
 ### Out of scope
 
@@ -94,9 +94,12 @@ In scope — code in this repository:
   MediaTek connectivity code with no change in this project — please
   report those upstream as well; a heads-up here is still welcome so
   the exposure of this kernel can be assessed.
-- Hardware that is not yet implemented (at the time of writing:
-  cameras, cellular modem, GPS) except where existing code for it is
-  reachable and exploitable.
+- Hardware that is not yet implemented (at the time of writing: the
+  fingerprint sensor) except where existing code for it is reachable
+  and exploitable.
+- The userspace programs the docs mention (the IMS client, the
+  connectivity launcher and relay, the NFC tools): they belong to a
+  separate project that is not in this repository.
 - Issues that require an already-root attacker on the device, a
   physically modified device, or an unlocked bootloader by themselves.
   This kernel is booted on an unlocked bootloader by design; reports
@@ -110,11 +113,20 @@ Some components handle untrusted external input, or sit next to
 credentials. Reports in these areas are especially valuable, and the
 handling rules below apply to both reporters and contributors.
 
+### Cellular modem
+
+The modem driver (patch 0019) carries data from the mobile network and
+the modem firmware into the kernel: CCCI messages over CCIF, the 27.010
+AT mux, network packets over CLDMA, and the modem's exception records.
+Length and header handling on all of these is in scope and high
+priority. Never include IMEIs, IMSIs, ICCIDs, phone numbers or SIM data
+in a report.
+
 ### NFC — ST21NFC, NCI, and `titan-nfc`
 
 The STMicro ST21NFC controller is driven through `/dev/st21nfc`, a thin
-pipe to the chip's NCI interface. The userspace program `titan-nfc`
-(Rust) implements NCI packet framing, segmentation and reassembly,
+pipe to the chip's NCI interface (the driver is in scope here). The
+userspace program `titan-nfc` (Rust, not in this repository) implements NCI packet framing, segmentation and reassembly,
 RF activation parsing (NFC-A/B/F/V), and tag handling: NDEF parsing
 and building, Type 2 read/write, Type 4 access over ISO 7816 APDUs,
 and Type 5 (ISO 15693) reads. Planned work includes MIFARE Classic
@@ -150,8 +162,9 @@ Handling rules for NFC work:
 The CONNSYS Wi-Fi and Bluetooth drivers process frames and management
 traffic from nearby devices, and the userspace launcher serves the
 chip's patch download. Treat malformed-frame handling, NVRAM
-hand-over, and the Bluetooth HCI relay (`titan-btbridge`, raw H4 over
-STP to `/dev/vhci`) as security-sensitive parsing surfaces.
+hand-over, and the Bluetooth path to BlueZ (raw H4 over STP, relayed to
+`/dev/vhci` by a userspace program not in this repository) as
+security-sensitive parsing surfaces.
 
 ### Device-unique data
 
@@ -164,7 +177,7 @@ Bluetooth addresses to a security report or a public issue.
 ### Boot and kernel configuration
 
 This kernel boots by replacing the stock boot image on an unlocked
-bootloader, using the stock device tree. Secure-boot bypasses of the
+bootloader, with its own device tree (`mt6771-unihertz-titan-pocket.dts`). Secure-boot bypasses of the
 Titan Pocket itself are out of scope (see above), but flaws in this
 project's configuration that weaken the running Linux system — overly
 permissive device nodes, debug interfaces left enabled beyond bring-up
@@ -174,7 +187,8 @@ kernel can reasonably enable — are in scope.
 ## Data to never include in a report
 
 - NVRAM dumps or records, or any firmware files copied from a phone
-- MAC addresses, Bluetooth addresses, serial numbers, or IMEIs
+- MAC addresses, Bluetooth addresses, serial numbers, IMEIs, IMSIs,
+  ICCIDs or phone numbers
 - NFC dumps, keys, or contents from cards/tags you do not own, and
   redacted versions even for cards you do own (see above)
 - Anyone else's personal data

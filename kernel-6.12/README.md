@@ -1,7 +1,7 @@
 # Linux 6.12 for the Unihertz Titan Pocket
 
 A port of the Titan Pocket (MediaTek MT6771 / Helio P70) to Linux
-**6.12.115**, as a patch series against the kernel.org release. It
+**6.12.118**, as a patch series against the kernel.org release. It
 replaces the 4.14 BSP kernel in `kernel/`: upstream drivers wherever
 the MT6771's blocks match the MT8183's (they mostly do), and our own
 drivers where the hardware is board-specific or MediaTek never
@@ -14,7 +14,7 @@ The work is in progress; see the table below for what works.
 
 | Path | What |
 |---|---|
-| `patches/` | the port, one patch per subsystem, for `git am` on v6.12.115 |
+| `patches/` | the port, one patch per subsystem, for `git am` on v6.12.118 |
 | `tools/build.sh` | configures and builds `Image.gz` and the board's device tree |
 | `tools/mkboot.sh` | packs an Android v2 boot image that the phone's LK bootloader accepts |
 | `tools/ramdisk-init` | `/init` of the boot image's small ramdisk: USB gadget, then Debian |
@@ -49,7 +49,7 @@ modules (`videodev`, `mc`, `videobuf2-*`): install those with it.
 | 0017 leds-flash | MT6370 flash: strobe timeout written at probe |
 | 0018 pmdomain-md1 | the MT6771 power controller with the modem's domain (MD1) |
 | 0019 modem | the MT6771 modem: CCCI over CCIF, the AT mux as WWAN ports, network data over CLDMA (`ccmniN`), exception handshake and devcoredump |
-| 0020 vdec | the MT6771 H.264 decoder (in progress) |
+| 0020 vdec | the MT6771 H.264 decoder (V4L2 stateless) and encoder (V4L2 stateful) |
 | 0021 panfrost | the GPU clock unprepared for system suspend, so its PLL stops |
 | 0022 pmic-keys | the MT6358's reset register with the MT6331's layout |
 | 0023 spidev | spidev for the fingerprint sensor on SPI0 |
@@ -57,7 +57,7 @@ modules (`videodev`, `mc`, `videobuf2-*`): install those with it.
 ## Building
 
 ```sh
-git clone --branch v6.12.115 --depth 1 \
+git clone --branch v6.12.118 --depth 1 \
     https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux-6.12
 cd linux-6.12
 git am /path/to/kernel-6.12/patches/*.patch
@@ -124,15 +124,18 @@ on 172.16.42.1 and a shell on the serial port, and back to fastboot after
 | Side keys, power key | `mt6779-keypad`, `mt6358-keys` | ✅ |
 | Audio (speaker, microphones, headphones) | MT8183 AFE + MT6358 + `fs1860` | ✅ |
 | Wi-Fi, Bluetooth, FM | `modules/connectivity/linux612/` | ✅ Bluetooth SCO through `mtk-btcvsd` (no call tried) |
-| GPS | `modules/connectivity/linux612/` | ⚠️ powers on; positioning not tried on 6.12 |
+| GPS | `modules/connectivity/linux612/` | ✅ the chip's raw data on `/dev/stpgps`; positions from a receiver program in userspace, no MediaTek library ([docs/gnss-open.md](../docs/gnss-open.md)) |
 | Sensors (accelerometer, gyroscope, magnetometer, light, proximity) | `mt6771-scp` (SCP sensor hub), IIO | ✅ |
 | IR transmitter | `mtk-pwm-ir-tx` | ✅ `/dev/lirc0` |
 | Vibration motor | `regulator-haptic` | ✅ |
 | Suspend to idle | | ✅ ~120 mA with the screen off |
-| Deep sleep (SPM) | `mt6771-spm` | ⚠️ with `mt6771_spm.deep=1`: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; 23 mA with the modem stopped, 39 mA with it registered and VoLTE up (4.14 reached 12 mA), with the SCP asleep and the A73 buck cut (2026-11-05), 37.5 mA in everyday standby on #136 (2026-11-15); the occasional reset was a hung wake (CPU 0 not restarting after a sleep of a minute or more), fixed on test by putting the CPU PLLs under the hardware's sleep control across each sleep (`mt6771_spm.pll_sleep=2`, the default): 0 resets in 100 long sleeps against 1 in 45 without it; unused PLLs (TVDPLL, the audio PLLs, the GPU's in system suspend) are off; what the SPM firmware does: `docs/spm-firmware.md` |
+| Deep sleep (SPM) | `mt6771-spm` | ✅ with `mt6771_spm.deep=1`, the Debian default: suspends and resumes with display, GPU, USB, Wi-Fi, Bluetooth and keyboard working; 23 mA asleep with the modem stopped, 28.5 mA with it registered and VoLTE up (#151, one 20-minute run; 37.5 mA on #136), with the SCP asleep and the A73 buck cut. ⚠️ The occasional reset was a hung wake (CPU 0 not restarting after a sleep of a minute or more); with the CPU PLLs under the hardware's sleep control across each sleep (`mt6771_spm.pll_sleep=2`, the default) 0 resets in 100 long sleeps against 1 in 45 without it, being confirmed in daily use. Unused PLLs (TVDPLL, the audio PLLs, the GPU's in system suspend) are off; what the SPM firmware does: `docs/spm-firmware.md` |
+| Screen-on idle (SODI) | `mt6771-spm`, `mtk-mcdi` | ✅ the SPM firmware's SODI from the last core standing, with the screen on (`mt6771_spm.sodi=1`, the Debian default); with the screen off the display and GPU are powered down |
 | Cameras (OV16880, OV8865) | `modules/camera/linux612/` (CAMSV, CAM A statistics, the DIP) | ✅ both at 30 fps through the hardware ISP, auto exposure and white balance, libcamera; the flash is not enabled |
+| Video decoder (H.264) | `mt6771-vdec` (patch 0020) | ✅ V4L2 stateless decoder (GStreamer `v4l2slh264dec`), bit-exact up to 1080p High; no firmware |
+| Video encoder (H.264) | `mt6771-venc` (patch 0020) | ✅ V4L2 stateful encoder (GStreamer `v4l2h264enc`) up to 1080p, the hardware's rate control; its rate-control code comes from the phone's vendor library ([docs/video-encoder.md](../docs/video-encoder.md)) |
 | NFC (ST21NFC) | `modules/nfc/linux612/` (`/dev/st21nfc`) | ✅ tags read; the controller and its 26 MHz clock buffer are off while the device is closed |
-| Cellular modem | `drivers/net/wwan/mt6771` (`titan_modem`, patch 0019) | ✅ registers on LTE under ModemManager, IPv6 data over CLDMA, IPv4 through 464XLAT; VoLTE calls, SMS and USSD with an IMS client in userspace; a call wakes the phone from deep sleep. Emergency calls not supported |
+| Cellular modem | `drivers/net/wwan/mt6771` (`titan_modem`, patch 0019) | ✅ registers on LTE under ModemManager, IPv6 data over CLDMA, IPv4 through 464XLAT; VoLTE calls, SMS and USSD with an IMS client in userspace; a call wakes the phone from deep sleep. Emergency calls are not supported |
 
 ## Firmware
 
@@ -140,4 +143,7 @@ No firmware is included. LK loads the SCP's firmware from the phone's
 `scp` partition before the kernel starts, and the SPM firmware comes
 with the phone's ATF (the kernel starts it through SiP calls); the CONNSYS
 firmware (Wi-Fi, Bluetooth patch) comes from the phone's vendor
-partition, as for the 4.14 kernel.
+partition, as for the 4.14 kernel. The video encoder's rate-control code
+(`titan/venc_rc.bin`) is extracted from the phone's vendor encoder
+library, and the GNSS chip's DSP patch from its `libmnl.so`; neither
+is distributed.
