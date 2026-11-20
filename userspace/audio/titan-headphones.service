@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+# Linux 6.12 only (card titanpocket); on 4.14 titan-speakerd switches the headphones
+ConditionPathExists=/proc/asound/titanpocket
+Description=Wired headphones: sound to the jack while plugged in (titan-headphones)
+After=sound.target
+
+[Service]
+ExecStart=/usr/local/sbin/titan-headphones
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

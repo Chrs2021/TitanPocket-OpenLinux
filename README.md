@@ -27,8 +27,8 @@ images and no installer.
 - **Mainline-based distributions** (postmarketOS and similar): this
   branch. The patches, device tree and config fragment give a kernel whose
   drivers speak standard Linux interfaces (DRM, ALSA, V4L2, IIO, input,
-  WWAN, cfg80211); a few pieces of hardware also need small userspace
-  helpers, described under "Userspace" below.
+  WWAN, cfg80211); the connectivity chip and the sound card also need
+  small userspace helpers, in `userspace/` ("Userspace" below).
 - **Android and Halium-based ROMs** (LineageOS, Ubuntu Touch and the
   like): MediaTek's vendor HALs expect the 4.14 BSP's interfaces, which
   this kernel doesn't have. The `main` branch is the useful one there: the
@@ -51,6 +51,7 @@ images and no installer.
 | `modules/nfc/` | the ST21NFC character driver (`linux612/`) |
 | `modules/modem/` | build script and a debugging module for the modem driver (the driver itself is in patch 0019) |
 | `modules/vdec/`, `modules/venc/` | out-of-tree builds of the H.264 decoder and encoder drivers (their source is in patch 0020) |
+| `userspace/` | the userspace the hardware needs: the connectivity chip's launcher, Wi-Fi and Bluetooth bring-up and FM tuner; the sound card's routes, PipeWire sink and headphone switching ([README](userspace/README.md)) |
 | `tools/` | test and analysis tools: `spm/` (the SPM firmware), `vdec/`, `venc/`; the firmware extractors `gnss/extract-patch.py` and `re/emu_venc.py` (below) |
 | `docs/` | hardware reference, per-subsystem notes and how the vendor drivers were reverse-engineered |
 | `kernel/` | the earlier kernel: MediaTek's 4.14.186 BSP with our drivers (see "The 4.14 kernel" below) |
@@ -155,12 +156,15 @@ that contain them.
 
 The drivers expose standard Linux interfaces (DRM, ALSA, V4L2, IIO,
 input, WWAN, cfg80211), but some hardware needs programs that replace
-Android's vendor services: a launcher that powers the connectivity chip
-and serves its patch download, a relay that puts Bluetooth on BlueZ, the
-GNSS receiver program, the power path for the loudspeaker, and an IMS
-client for calls and SMS. The userspace this was brought up with (those
-services, the desktop and the apps) is a separate project, not released;
-the docs describe what the hardware needs from it, and where they name a
+Android's vendor services. Those for the connectivity chip and the sound
+card are in [`userspace/`](userspace/README.md): a launcher that powers
+the chip and serves its patch download, Wi-Fi bring-up with the factory
+NVRAM record, a relay that puts Bluetooth on BlueZ, an FM tuner, the
+sound card's routes, a PipeWire speaker sink and headphone switching.
+Still outside this repository: the modem's file service and bring-up,
+the GNSS receiver program and the IMS client for calls and SMS, which
+belong to a separate project with the desktop and the apps; the docs
+describe what the hardware needs from them, and where they name such a
 program, it belongs to that project. Mesa 22.3 or later drives the GPU.
 
 ## Known limitations

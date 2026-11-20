@@ -79,6 +79,9 @@ In scope — code in this repository:
   Bluetooth, FM, GPS, including the reconstructed MT6771 platform files
   `mt6771.c` and `plat_priv.c`), the camera and its ISP, and NFC
   (`st21nfc`)
+- `userspace/` — the connectivity launcher (`titan-wmt`), the Wi-Fi
+  NVRAM hand-over, the Bluetooth relay (`titan-btbridge`), the FM tuner
+  and the audio helpers
 - `kernel-6.12/tools/` — the build, the boot image and the ramdisk's
   `/init` (its USB rescue shell and telnet)
 - Configuration: `titanpocket.config`, including security-relevant
@@ -97,9 +100,10 @@ In scope — code in this repository:
 - Hardware that is not yet implemented (at the time of writing: the
   fingerprint sensor) except where existing code for it is reachable
   and exploitable.
-- The userspace programs the docs mention (the IMS client, the
-  connectivity launcher and relay, the NFC tools): they belong to a
-  separate project that is not in this repository.
+- The userspace programs the docs mention that are not in `userspace/`
+  (the IMS client, the modem's file service, the GNSS receiver, the NFC
+  tools): they belong to a separate project that is not in this
+  repository.
 - Issues that require an already-root attacker on the device, a
   physically modified device, or an unlocked bootloader by themselves.
   This kernel is booted on an unlocked bootloader by design; reports
@@ -163,7 +167,7 @@ The CONNSYS Wi-Fi and Bluetooth drivers process frames and management
 traffic from nearby devices, and the userspace launcher serves the
 chip's patch download. Treat malformed-frame handling, NVRAM
 hand-over, and the Bluetooth path to BlueZ (raw H4 over STP, relayed to
-`/dev/vhci` by a userspace program not in this repository) as
+`/dev/vhci` by `userspace/connectivity/titan-btbridge.c`) as
 security-sensitive parsing surfaces.
 
 ### Device-unique data

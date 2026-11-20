@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Linux 6.12's sound card (titanpocket, our machine driver): route DL1, the
+# PipeWire sink's device (hw:0,0), to I2S3, the loudspeaker amp; ASoC's DAPM
+# then powers the amp while it plays (docs/mainline.md, "Audio"). And the
+# CONNSYS I2S (FM) to UL2 (hw:0,3), which the Radio app captures. On Linux 4.14
+# titan-speakerd switches the speaker path instead.
+# On the control device and after 90-alsa-restore.rules, whose restore of
+# the saved mixer state would otherwise switch the routes off again.
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="controlC*", ATTRS{id}=="titanpocket", RUN+="/usr/bin/amixer -q -c %n cset 'name=I2S3_CH1 DL1_CH1' on", RUN+="/usr/bin/amixer -q -c %n cset 'name=I2S3_CH2 DL1_CH2' on", RUN+="/usr/bin/amixer -q -c %n cset 'name=UL2_CH1 CONNSYS_I2S_CH1' on", RUN+="/usr/bin/amixer -q -c %n cset 'name=UL2_CH2 CONNSYS_I2S_CH2' on"

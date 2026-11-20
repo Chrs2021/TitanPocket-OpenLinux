@@ -1,0 +1,15 @@
+[package]
+name = "titan-headphones"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Titan Pocket wired headphones: sound to the jack while plugged in"
+license = "GPL-2.0-or-later"
+
+[[bin]]
+name = "titan-headphones"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+strip = true
