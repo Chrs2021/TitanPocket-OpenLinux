@@ -971,7 +971,7 @@ call log now counts filled and dropped frames.
 
 **Call volume.** In a call on the earpiece the volume keys step the handset gain by 2 dB, -10 to +8 dB, starting at -6 dB: `titan-powerkey` sees `call=active` in `/run/titan-lockinfo` and sends `{"cmd": "volume", "up": ...}` to `titan-ims`, which keeps the level in `/var/lib/titan-ims/earpiece-db` for later calls. On the loudspeaker or headphones `titan-ims` declines and the keys change PipeWire's volume as usual, which the call's stream follows. Since 2026-11-15 the mixer sets the same level: its "Earpiece" slider (-10 to +8 dB, 1 dB steps) sends `{"cmd": "volume", "db": n}`, which `titan-ims` (Rust and Python) clamps, keeps in `earpiece-db` and, in a call on the earpiece, writes to `Handset Volume` at once; the answer has `"live": true` then. Outside a call it is only kept, and the next call starts at it. The slider follows the file, so key presses in a call move it.
 
-Outgoing calls took three tries. An offer with `a=des:qos mandatory remote sendrecv` got `580 Precondition Failure`; `optional` for the remote side passed it. Then the carrier's server answered `200 OK` within about 2 s, with no ringing stage and `Reason: SIP;text="Invalid Identity Header";code=438`, and the other phone did not ring, with either form of the number as the identity. Adding `P-Early-Media: supported`, `Session-Expires: 1800`, `Min-SE: 90`, `Privacy: none`, `timer` in `Supported` and `application/3gpp-ims+xml` in `Accept` together made the other phone ring (one call, 2026-11-04); which of them mattered was not tested. A call should present `sip:+1...`: the `reg` event lists it, while P-Associated-URI gave the number without the `+`. Signalling: Outgoing and incoming INVITE with preconditions (183, PRACK, UPDATE), CANCEL, BYE, session timers. The sound is on the CPU, not
+Outgoing calls took three tries. An offer with `a=des:qos mandatory remote sendrecv` got `580 Precondition Failure`; `optional` for the remote side passed it. Then the carrier's server answered `200 OK` within about 2 s, with no ringing stage and `Reason: SIP;text="Invalid Identity Header";code=438`, and the other phone did not ring, with either form of the number as the identity. Adding `P-Early-Media: supported`, `Session-Expires: 1800`, `Min-SE: 90`, `Privacy: none`, `timer` in `Supported` and `application/3gpp-ims+xml` in `Accept` together made the other phone ring (one call, 2026-11-04); which of them mattered was not tested. A call should present `sip:+1...`: the `reg` event lists it, while P-Associated-URI gave the number without the `+`. Signalling: Outgoing and incoming INVITE with preconditions (183, PRACK, UPDATE), CANCEL, BYE, session timers. A call hung up here stays in the call table, ended, until its `BYE` is answered or 32 s pass, so the answer is logged (`call N: BYE <status>`, or "no answer to the BYE"); before 2026-11-21 the record was dropped on the next loop pass and the answer was never seen. In an answered call the dialog's local URI is the `To` URI of their INVITE (RFC 3261 12.1.1), not our own identity. The sound is on the CPU, not
 the modem: RTP on the IMS interface, AMR-WB (12.65 kbit/s) or AMR (12.2 kbit/s) through `libvo-amrwbenc` and `libopencore-amr*`, in either RFC 4867 packing,
 `telephone-event` for DTMF, and `pw-cat` (the Phone media role) for playback with `arecord` for the mic (`plughw:...,DEV=2`), on the HiFi routes from the UCM profile (earpiece, speaker, headphones; main mic with the preamplifier at 24 dB). Offline, encoding and decoding a tone in both codecs and packings kept its level (AMR-WB RMS 4151 of 4242, AMR 4053), and the devices open. Echo cancellation and the jitter buffer came later (below, "Voicemail, hold, call waiting, echo cancellation and MMS" and "Jitter buffer").
 
@@ -1026,8 +1026,110 @@ connects. The phone went back to that binary; a phone build of `titan-ims` shoul
 understood. The phone now runs such a build (the mixer's volume command, `out/ims-noimc/`): registered, `imc` off, no
 assert.
 
+**Call settings (supplementary services), first look (2026-11-20, T-Mobile, read-only).** Three ways
+to read or change forwarding, call waiting and caller-ID: the modem's own `AT+CCFC`/`AT+CCWA` answer
+`+CME ERROR: 30` (no network service: on LTE these go through IMS, not the modem), and `AT+CLIR?`
+`ERROR`; codes over USSD (USSI): `*#21#` came back "Request could not be completed. Please try
+again." and `*#43#` got a 200 and no answer in 30 s, so T-Mobile's USSD server doesn't do them. That
+leaves XCAP over Ut with GBA (TS 24.623, TS 33.220/33.222), as Android does. Not found yet: T-Mobile's
+XCAP and BSF hosts. The standard names (`xcap.ims.mnc260.mcc310.pub.3gppnetwork.org`,
+`bsf.mnc260.mcc310.pub.3gppnetwork.org`, the same with mnc240) don't resolve in the internet
+connection's DNS; the IMS connection's own DNS servers (four ULA addresses from `AT+CGCONTRDP`) can't
+be asked from outside titan-ims, since `ccmni2` has no address of its own. 
+From the stock firmware (`Firmware/super_ext/`, read only): MediaTek's design splits it. An
+AP-side XCAP client (`libutinterface_md.so`, with its own libcurl) does the HTTP and the XML; the
+modem does the GBA bootstrap with the SIM (`AT+EGBA=<4 args>`, answering `+EGBA:` with the NAF key,
+B-TID and lifetime); a CCCI port `/dev/ccci_ss_xcap` lets the modem's own SS commands run as XCAP
+through the AP. The default root is `xcap.ims.mnc…mcc….pub.3gppnetwork.org`; per-operator values
+come from `libutinterface_custom_md.so`, whose table gives T-Mobile (310260, 310240) the hosts
+`xcap.msg.lab.t-mobile.com` and `bsf.msg.lab.t-mobile.com`. The stock APN list carries XCAP on the
+internet APN (`fast.t-mobile.com`, types `default,mms,supl,rcs,xcap`), not on `ims`. Those hosts, and
+`xcap.msg.pc.t-mobile.com` / `bsf.msg.pc.t-mobile.com`, resolve in public DNS to IPv4 only and not
+in T-Mobile's LTE DNS, so they'd be reached through `clat`. `AT+EXCAPCFGGET` (the modem's XCAP
+settings) answers `+CME ERROR: 100` on our AT channel, even for `"version"`. The RIL's `AT+EGBA=<NAF>,<Ua id>,<0|1>,<netid>`
+is only for GBA_U (the UICC derives the keys; our tries: one `OK` after 23 s with no `+EGBA:`, then
+error 100); in GBA_ME the AP does the bootstrap, the SIM only answering AKA. So `titan-ims` does GBA_ME
+itself (`src/xcap.rs`: SHA-256, HMAC, the TS 33.220 KDF, HTTP Digest incl. AKAv1-MD5, 55 tests with
+published vectors) behind a read-only control command `{"cmd": "xcap-get", "naf": host, "bsf":
+host[/path]}` that writes the simservs document to `/run/titan-xcap.xml` (mode 600). On the network:
+the `msg.lab` hosts don't answer at all; `xcap.msg.pc.t-mobile.com` and `bsf.msg.pc.t-mobile.com`
+answer HTTPS on the public internet (plain HTTP: 308 to HTTPS; XCAP: TLS 1.2
+`TLS_RSA_WITH_AES_256_CBC_SHA256`, so the Ua id is `01 00 01 00 3D` and curl is held to that suite;
+XCAP alone: 401; BSF alone: 412). The bootstrap's first request (the IMPI in an empty digest) gets
+**403** from the BSF over Wi-Fi, at `/` and at `/bsf-auth/` (a path in the operator table): most
+likely it serves T-Mobile's own network only. Over LTE (data brought up by hand: `titan-ltedata --default`,
+which came up on `ccmni4` with IPv4 as well) the same 403, so not the network: the request. The
+operator table also gives T-Mobile an `X-TMUS-IMEI` header and a user-agent feature token
+(`T-Mobile VoLTE-RCS-ePDG-IR94-RTT-ussd`). With both (the IMEI rebuilt from the GSMA instance id with
+its Luhn digit; the user agent `Titan-Pocket-Linux/1.0 T-Mobile VoLTE-RCS-ePDG-IR94-RTT-ussd
+3gpp-gba`) **it works, over LTE and over Wi-Fi alike (2026-11-20, 22:06)**: BSF 401 with the AKA
+challenge, the SIM's RES accepted (200, B-TID and lifetime, 205 bytes), XCAP 401, then 200 with the
+user's simservs document (1947 bytes) in about 3 s. It holds: originating identity presentation on
+and its restriction's default "presentation-not-restricted"; communication diversion active with the
+four rules (`cfu`, `cfb`, `cfnry`, `cfnrc`) each `rule-deactivated` and no target; communication
+waiting on; incoming and outgoing barring off; the diversion capabilities (busy, no answer, not
+reachable, deactivated; telephony targets). Since then `titan-ims` keeps the sign-in for 30 minutes (a
+second read: 1.2 s, no bootstrap; a 401 on a kept one signs in again once) and has two control
+commands: `{"cmd": "xcap-get"}` and `{"cmd": "xcap-set", "what": "waiting"|"id"|"forward", "on": …,
+"rule": "cfu"|"cfb"|"cfnry"|"cfnrc", "number": …}`, both answering `{"ev": "xcap", "ok": …,
+"settings": {"id_shown", "waiting", "forward": {rule: {"on", "number"}}, "barring_in",
+"barring_out"}}` (the hosts come from the SIM's MCC/MNC). A change is one XCAP PUT, then a read:
+call waiting is the attribute `communication-waiting/@active` (`application/xcap-att+xml`); caller
+ID is the element `originating-identity-presentation-restriction/default-behaviour`
+(`presentation-restricted` or `-not-restricted`); a forwarding rule is the whole `cp:rule[@id=…]`
+element, written with `rule-deactivated` or not, its condition (`busy`, `no-answer`,
+`not-reachable`) and a `tel:` target (`application/xcap-el+xml`). Tests: the document's parsing and
+the change bodies on a document of T-Mobile's shape. The phone settings app shows them on a "Call
+settings" page. Reads verified on the phone; no change has been sent to the network yet. On the way, a crash:
+titan-ims panicked when a control command dropped the client that sent it (an event written to a
+socket that had hung up) and the read loop then unwrapped the missing client (fixed: the loop stops).
+
+**Conference calls (2026-11-20, built; not run on the network).** `{"cmd": "merge"}` with two
+calls up (one held) merges them as 3GPP TS 24.147 and RFC 4579 have it, which is also what the
+vendor's `volte_ua` does: a call to the conference factory, `sip:mmtel@conf-factory.<home domain>`
+(the IR.92 default; the stock firmware builds the same, with nothing T-Mobile-specific), then, once
+it's answered (the 200's Contact carries `isfocus`), a REFER to the focus for each call, one after
+the other as each is accepted: `Refer-To: <sip:+1…@<domain>;user=phone?Replaces=<call-id>%3Bto-tag%3D
+<their tag>%3Bfrom-tag%3D<ours>>` (a tel: party as a SIP URI, which can carry headers), with
+`Referred-By` and `Accept: message/sipfrag`. The network then invites each party into the
+conference with Replaces and ends our call with them; the REFER's NOTIFYs (event `refer`, a sipfrag)
+are answered and logged. A merge with a conference already up refers the other calls into it.
+Test: two answered calls, merge, the INVITE to the factory, the 200 with isfocus, the ACK to the
+focus, two REFERs in turn with the right Replaces tags. The dialer has "Add" (a second call from the
+keypad) and "Merge" (private/phone-apps.md).
+
+**Caller verification (2026-11-20, built and installed; not yet seen on a call).** An incoming
+INVITE's STIR/SHAKEN result as the US networks pass it on (ATIS-1000074): the `verstat` parameter of
+the P-Asserted-Identity's or From's URI (`TN-Validation-Passed`, `-Failed`, `No-TN-Validation`; in a
+tel: URI's parameters or a SIP URI's user part), an `Attestation-Info` header (A, B, C), and whether
+a signed `Identity` header came. `sip::verification()`; the call keeps it and its `call` events carry
+`verstat` ("passed", "failed", "none") and `attest`; the log line "caller verification: verstat …,
+attestation …, Identity header …" records what the network sent (no number). Tests: the four forms.
+The dialer shows it under the number of an incoming call (private/phone-apps.md). A call from another T-Mobile
+line (2026-11-20, 23:46) carried none of it: no `verstat`, no `Attestation-Info`, no `Identity`, and
+no display name in P-Asserted-Identity or From (`<sip:+1…@msg.pc.t-mobile.com;user=phone>`); its
+headers were the usual ones plus T-Mobile's Ericsson SBG's `eric-sbg-mediasite` and `eric-sbg-thid`,
+`p-ai-subscription`, `p-user-database`, `feature-caps`, `request-disposition`. So on-net calls come
+unverified (as expected: the STIR/SHAKEN verdict is for calls from other carriers), and the badge
+stays off; a call from another network is still to be seen. Each incoming INVITE now logs its header
+names and its identity headers with digits masked and display names by length only.
+
+**A registration outage (2026-11-20, 23:56 to about 00:01).** After about fifteen restarts of
+`titan-ims` that evening (installs), every REGISTER got `480 Temporarily Unavailable` with
+`reason: SIP;cause=480;text="CC_IMS_DNS_FAILURE_KEEP_CODE"` (T-Mobile's core failing a DNS lookup on
+our registration's way), the IMS PDN itself up (`ccmni0`, 3 P-CSCF); the service exited and retried
+every 2 minutes. A reboot (a new attach) cleared it: 401, then 200. Restarts in quick succession
+are best avoided.
+
+**Call statistics (2026-11-20, installed; not yet seen in a call).** Once a second, for each call
+whose sound runs, a `media` event: the codec as `Codec::describe()` puts it, packets sent and
+received, those expected from the RTP sequence numbers (RFC 3550 A.1: loss = expected −
+received), the interarrival jitter (A.8) in ms, frames in the jitter buffer, frames concealed and
+silent (no data), dropped and bad, and whether the echo canceller runs. The dialer's call card pulls
+down to show them (private/phone-apps.md).
+
 **Not done:** USSD menus on the network (see "USSD" below), emergency calls tested on a network (built since 2026-11-19, see "Emergency calls"), RCS,
-3-way calls, video, handover to Wi-Fi calling, and on the modem's side, calls, SMS and USSD sent as AT commands (the IMC's messages for them go unanswered).
+conference calls on the network, video, handover to Wi-Fi calling, and on the modem's side, calls, SMS and USSD sent as AT commands (the IMC's messages for them go unanswered).
 
 **Voicemail, hold, call waiting, echo cancellation and MMS (2026-11-19, tested offline; installed on the
 phone the same day, where registration works as before; no call, voicemail or MMS has run against the
@@ -1038,9 +1140,47 @@ network yet).**
   NOTIFY's counts go to `/run/titan-voicemail.json` (`waiting`, `new`, `old`) and as a `voicemail` event;
   the account address (`Message-Account`) stays in memory and is never logged. `{"cmd": "voicemail"}`
   calls it (else our own number, which most networks' voicemail answers). On the test phone's network
-  the SUBSCRIBE is refused (503), so a count can come only from a NOTIFY the network sends unasked;
+  the SUBSCRIBE is refused (500 or 503), so a count can come only from a NOTIFY the network sends unasked;
   the dialer shows the count and
   holding 1 calls it.
+- *Voicemail waiting by SMS* (2026-11-20): that network says "voicemail waiting" with an SMS from a
+  short code instead, which had been filed as a blank text (four of them in the inbox, all empty). An
+  SMS-DELIVER's message-waiting indication is now read in all three forms of TS 23.040/23.038: the DCS
+  message waiting groups (`0xC0`-`0xEF`: discard or store, active bit, type), the Special SMS Message
+  Indication header element (`01`: store bit, type, count) and the Enhanced Voice Mail Information
+  element (`23`: the count after the mailbox address). A voicemail one sets the same state as a NOTIFY
+  (the count if it gives one, else at least one while active; cleared sets none new). It is filed as a
+  text only when it asks to be stored and has text. A type 0 SMS (PID `0x40`) is acknowledged and
+  dropped, and so is any other SMS with no text. Those log their form (`PID .. DCS .. UDH ..`, no
+  content). Offline tests cover each form. Installed on the phone the same day; a test voicemail's alert
+  came about 2 min after the call in the DCS form with no count ("waiting", so 1 new), set
+  `/run/titan-voicemail.json` and the dialer's count, and was not filed as a text.
+- *Codecs offered* (2026-11-20): each call logs the codecs the other side's SDP lists (names and rates
+  only). A test call offered EVS/16000 first, then AMR-WB, AMR and
+  PCMU; `titan-ims` had no EVS then, so it took AMR-WB.
+- *EVS* (2026-11-20): the 3GPP floating-point reference codec (TS 26.443, from 3GPP's
+  `26443-j00.zip`, unpacked in `out/evs/src/`) behind a frame-at-a-time C interface of our own
+  (`userspace/titan-ims-rs/evs/titan_evs.c`, built by `evs/build.sh` into `libtitan-evs.so`,
+  installed in `/usr/local/lib`). EVS is patent-encumbered: the codec source and the library stay
+  local and are never committed or published. Checked against 3GPP's own `EVS_cod` and `EVS_dec`
+  on a 6 s test signal: identical encoded bits and identical decoded samples at 7.2, 9.6, 13.2,
+  16.4, 24.4 and 32 kbit/s WB, and with DTX at 13.2. On the phone, encoding plus decoding a
+  20 ms frame takes 1.9 ms on a little core (2.2 ms at 24.4 kbit/s) and 1.0-1.2 ms on a big one.
+  `titan-ims` (`src/evs.rs`) offers EVS first when the library is there
+  (`br=5.9-24.4;bw=nb-swb;max-red=0`) and picks it from an offer whose parameters leave a
+  primary mode: the widest bandwidth up to SWB (FB would need 48 kHz audio) at the highest rate
+  within their range up to 24.4 kbit/s (it fits `b=AS:49`). The answer repeats their parameters
+  with the bandwidth held to SWB. SWB runs the audio (capture, playback, echo canceller) at
+  32 kHz while the RTP clock stays at 16 kHz. Packets are compact unless they ask for
+  header-full (`hf-only=1`, or `cmr=1`, which adds a CMR byte asking nothing); either format is
+  read, and AMR-WB IO frames, 5.9 kbit/s SC-VBR sending and channel-aware mode aren't supported.
+  An offer that starts in AMR-WB IO mode (`evs-mode-switch=1`) gets AMR-WB instead.
+  First call on the network (2026-11-20, 23:50, from another T-Mobile phone; its offer: EVS
+  `br=5.9-13.2;bw=nb-swb;ch-aw-recv=2;max-red=0` first, then AMR-WB, AMR, PCMU): EVS at 13.2 kbit/s
+  SWB, 32 kHz audio and echo canceller, compact packets; about 20 s answered, 981 packets sent, 106
+  received (the far end was silent: EVS's DTX sends a SID about every 8th frame), 984 played (879
+  filled by the decoder's concealment/comfort noise, 83 empty), 0 bad, 0 dropped, no error. Speech
+  both ways not yet checked.
 - *Hold* (RFC 3264 section 8.4): a re-INVITE whose SDP says `sendonly`; the sound stops at once (the
   media keeps its RTP socket, sequence and SSRC) and comes back when the resume's `sendrecv` is
   accepted. A refused re-INVITE leaves the call as it was. Their hold (`sendonly` or `inactive` in their
@@ -1068,8 +1208,24 @@ network yet).**
   ..., "files": [...]}` posts an `m-send-req` (multipart/mixed, UTF-8 text, the MMSC fills in From) and
   reads the `m-send-conf`'s status. The MMSC comes from `/etc/titan-ims/mms.conf` (`mmsc=`, `proxy=`) or
   from mobile-broadband-provider-info for the SIM's MCC/MNC. The messages app shows the pictures, picks
-  one of the newest in `/root/Pictures` to attach, and takes several numbers for a group. Failed
-  downloads still store the `[MMS - not downloaded]` placeholder; there is no retry yet.
+  one of the newest in `/root/Pictures` to attach, and takes several numbers for a group.
+- *First MMS from the network* (2026-11-20, T-Mobile, Wi-Fi up): the notification came and was read,
+  but the download timed out (curl 28). Two faults. With Wi-Fi up, the system resolver asks Wi-Fi's
+  DNS, which gives the MMSC only an A record; curl, bound to the IPv6-only LTE interface, could not
+  use it. And there is no source routing on this kernel (`ip -6 rule`: not supported), so packets
+  for the carrier left by Wi-Fi's IPv6 default route: T-Mobile's DNS servers (unique-local `fd…`
+  addresses) and the NAT64 prefix that 464XLAT's IPv4 goes to. Through `clat` with the prefix pinned
+  by hand the MMSC answered 403; asked over LTE, T-Mobile's DNS gave the MMSC an AAAA, and the GET
+  over LTE's IPv6 to it returned the message (200, 558 kB, `m-retrieve-conf`) in 2.4 s.
+  Now `titan-net` routes the carrier's DNS servers (each a /128) and the NAT64 prefix (/96) over LTE
+  while the translator runs, and `titan-ims` looks the MMSC up in the LTE link's DNS
+  (`resolvectl -i`) and hands curl the IPv6 address (`--resolve`), falling back to `clat` for a host
+  with only IPv4. A failed download is kept (`/var/lib/titan-ims/mms/pending.tsv`, mode 600: the
+  message's address) and retried every 5 minutes, up to 12 tries, and on `{"cmd": "mms-retry"}`; a
+  success replaces the `[MMS - not downloaded]` placeholder. The first message came in that way, on
+  the first retry: one picture (557 kB JPEG). Sending, the same evening: a 40 kB PNG and a line of
+  text to one number, accepted by the MMSC in 3 s (`m-send-conf`, status 0x80, OK) and received
+  on the other phone (confirmed by the user).
 
 **SMS.** First run 2026-11-04, on the first try: one text received and stored, its report accepted (202), and two sent from the messages app, each accepted and acknowledged by the network within a second (RP-ACK), and both received by the other phone. On Android `volte_ua` has SMS handling and the `+g.3gpp.smsip` tag, and the RIL sends `AT+CMGS`; our capture holds only the set-up, with no message sent. `titan-ims` does it in SIP (TS 24.341): the registration's Contact carries `+g.3gpp.smsip`, and a `MESSAGE` of type `application/vnd.3gpp.sms` carries an RP-DATA (TS 24.011) with an SMS-SUBMIT or SMS-DELIVER (TS 23.040), to `tel:` the service centre from `AT+CSCA?`. A message is stored before it is acknowledged, in `/var/lib/titan-ims/messages.sqlite3` (mode 600); text and numbers never reach a log. Long messages go in parts and come back whole, in any order. `{"cmd": "sms", "to": ..., "text": ..., "class": 0-3 (optional)}` on the control socket sends one (the class sets the TP-DCS message class: 0 flash, 1 ME, 2 SIM, 3 TE; omitted means no class); the state follows as `sms-state`, and `sms` announces a new one. An incoming WAP push (8-bit data or a port-addressing header, which is how an MMS notification arrives) started an MMS download since 2026-11-19 (below); before, it was stored as an `[MMS - not downloaded]` placeholder, as a failed download still is. (The Rust client earlier mis-stored such a message because `CString` cannot hold the NUL bytes a WAP-push PDU carries; it now binds the body's raw bytes, and the messages app reads bodies lossily, so a bad row cannot blank the list.) Long messages, and non-GSM text, have only been tested offline: the published GSM 7-bit and SMS-DELIVER examples, and our encoders against our decoder (GSM, escapes, UCS2, emoji, up to 7 parts). The app is `userspace/titan-messages` (docs/desktop.md).
 
@@ -1208,6 +1364,12 @@ cell is sent once. A request tells BeaconDB roughly where the phone is.
 **The service.** `titan-cellloc watch 300` estimates every 5 minutes. Its unit, `titan-cellloc.service`, is
 installed but not enabled, because each query wakes the modem.
 
+**Its users** (2026-11-20). titan-gnss-open runs `titan-cellloc` itself when a session starts with no fix, or with
+one over an hour old and an estimate over 30 minutes old, and seeds its search from the estimate when the phone has
+moved far (gnss-open.md, "On demand, and the cells' seed"). The Location app and Maps show the estimate, marked as
+approximate with its accuracy in km, while GPS has no fix. An emergency call without a GPS fix in time sends it as
+its position (below).
+
 Tests (7) cover these cases, all with made-up cells placed over open ocean:
 
 - the `+ECELL` layouts and malformed input;
@@ -1331,6 +1493,11 @@ whose modem runs IMS. MediaTek's own stack (read as reference) brings up an APN 
    registered) the dialer starts the emergency instance itself and falls back to the modem the
    same way. An emergency number is never blocked by the dialer's SIM-locked or flight-mode
    checks.
+   Without a GPS fix within 3 s, the position is titan-cellloc's estimate when it is under 30
+   minutes old: the same PIDF-LO with the estimate's accuracy as the radius and `gp:method`
+   `Cell` (2026-11-20). For the whole emergency session the GPS receiver is held on
+   (`/run/titan-gnss-open.hold`), since titan-gnss-open otherwise runs only while an app
+   asks; it is released when the session ends. Tested offline only.
 
 **Not done:** the radio isn't switched on from flight mode for the call (the PDN then fails and
 so does the modem's call); the position isn't updated during the call (only the INVITE carries

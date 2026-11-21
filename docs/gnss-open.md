@@ -9,9 +9,233 @@ page is the current summary and takes precedence where they differ (a few
 of gnss.md's early sections, like "Verdict: replacing libmnl with open
 code", are history now).
 
-Last updated 2026-11-18 (the sections "Offline: the almanac" and "Time from the sky").
+Last updated 2026-11-20 (the section "On demand, and the cells' seed").
 
 ---
+
+## On demand, and the cells' seed (2026-11-20)
+
+**On demand.** Until now "Location on" meant a session all the time, and the
+daemon's wakelock with it: the phone never slept (about 120 mA with the screen
+off, against about 34 mA asleep). Now a session runs only while some app is
+connected to gpsd: an established TCP connection to port 2947 in
+`/proc/net/tcp` or `tcp6` (the Location app, Maps, Compass, titan-ims's
+emergency position), or while `/run/titan-gnss-open.hold` exists (titan-ims
+holds it through an emergency session; tools can too). It ends 120 s after the
+last one went (`IDLE_GRACE`), not counted as a failed session; then the probe
+is stopped, the receiver marked closed and the wakelock released, and the
+status reads `idle`. The wakelock is taken only while a session runs. The next
+session is a warm start: orbits, the last position and the clock that worked
+are kept. `TITAN_GNSS_ALWAYS=1` keeps the old behaviour. Module `demand.rs`.
+
+**The seed.** A session's search is aimed from a position within some tens of
+km. The last fix stays the seed unless the phone may have moved far: when the
+fix is missing or over an hour old the daemon reads titan-cellloc's estimate
+(`/run/titan-cellloc.json`; renewed first with a run of `titan-cellloc` when
+over 30 minutes old, offline from the tower database on the phone; modem.md,
+"Cell location"), and starts from it when there is no fix, or when it is
+further from the fix than 30 km or three times its accuracy. The log says
+which and to about how many km; never where.
+
+Tests: `demand.rs`'s four (the client count on `/proc/net/tcp` tables, the
+grace, the seed choice, the cells' file).
+
+**On the phone (2026-11-20, 20:51, at the window, modem on).** Installed as
+`/usr/local/bin/titan-gnss-open` (the 11-18 build kept as `.before-demand`;
+the service left off, as Location was). Run in a transient unit from a copy of
+the state without `position`, with the hold file for 60 s: "no fix yet:
+starting from the cell towers (to about 4 km)"; first GPS lock at 2 s, four at
+3 s, first fix at 8 s (5 satellites, residual rms 56 m), 17 locked by 60 s
+(median 27 dB-Hz). The same window had given nothing in twelve sessions from
+20:00 to 20:31 (seeded from the last fix); not explained yet. The session went
+on after the hold was released because the Location app was connected to gpsd
+(counted as wanting a position, as intended). Run again at 20:57 with the app
+closed (no gpsd client): cell seed again, first fix at 8 s; the hold released at
+20:58:05, "no app has wanted a position for 120 s: the receiver rests" and the
+session ended at 21:00:05 (79 fixes), with no wakelock left.
+
+
+## Frequency aiding from the modem (2026-11-20, studied: not on offer here)
+
+The idea: the receiver runs from the modem's crystal (co-clock), and the modem
+measures that crystal against its LTE cell all the time, so its estimate would
+pin the search term and let the windows shrink. What MediaTek's own stack does
+on this chip, from the vendor kernel and the local decompiles of mnld and
+libmnl (`out/gnss-re/`):
+
+- The CCCI IPC table has an AP-side GPS task (`AP_IPC_GPS`) and an AGPS one,
+  but the kernel defines no GPS messages; the modem's LTE layer 1 (`EL1`)
+  messages it does define are LTE/Wi-Fi/Bluetooth coexistence notices
+  (operating frequencies, TX timing) for the connectivity chip.
+- mnld's modem path is time, not frequency: a time-sync request through the
+  AGPS daemon and GPS time fed back to the modem; libmnl has "frame sync"
+  calls (fine time from the modem's frame timing) and hardware-sync hooks,
+  and the GPS driver logs that this chip needs no GPS-modem sync.
+- Frequency under co-clock is libmnl's crystal temperature model: the
+  thermistor, the modem's factory calibration (`ML4A_000`) and its own
+  learned files. Under Linux that model started about 1 ppm off (about
+  1.5 kHz at L1) before refining.
+- No vendor documentation we have covers any of it.
+
+So the modem's frequency estimate isn't passed to the GPS on this chip, and
+no interface for it is known. It also doesn't look like the limit: the fixed
+−350 Hz term locked in 2 s through a 2,000-count thermistor swing outdoors,
+and at the window it locked 17 satellites at 20:51 (cell seed, "On demand, and
+the cells' seed") after twelve sessions from 20:00 to 20:31 found nothing, the
+tuner's ±480 Hz sweep included. The last fix those twelve started from was
+1.8 km from the cell estimate (accuracy 3.7 km), so not that either; the RF
+gain register read 0x02ad (healthy, not the 0x0210 of the camera-clock noise)
+and the strongest signals about 26 dB-Hz. The modem helps where it already
+does: the crystal trim it sets, and the cells' position.
+
+## Following the clock as the crystal warms (2026-11-20, built; outdoors no need shown)
+
+The 2026-11-20 runs stopped locking anything about 20 minutes into an hour
+with the screen and receiver on (below). The GPS search term is the
+crystal's frequency error seen through our fixed clock frame, so it moves
+as the crystal warms; libmnl moves its clock frame by ~740 Hz in 6 minutes
+under Android for the same reason. `TITAN_GNSS_TUNE=1` (`src/tune.rs`, off
+by default) follows it:
+
+- **The crystal's temperature.** The MT6358's AUXADC reads the crystal's
+  own thermistor (`tsx_temp`) and the DCXO's (`dcxo_temp`); upstream's
+  `mt6359-auxadc` driver serves it from our device tree as it is, with
+  `CONFIG_MEDIATEK_MT6359_AUXADC=m` (added to `titanpocket.config`; the
+  module loaded on the running #1 kernel, iio device "MT6358"). Raw
+  counts, steady to ±2: TSX 14037-14050, DCXO 12804-12813 on a phone
+  idle at room temperature. The count falls as the crystal warms. The
+  `batt_temp` channel times out (no battery thermistor on that pin); the
+  daemon reads only `tsx_temp`, every 5 s.
+- **A model** of the term against the TSX count, from points that locks
+  teach (`aim-<clock>.tsx` in the state directory, up to 80 points):
+  a straight line once the points span 100 counts (4 or more points),
+  extrapolated at most half its span; before that, the term of the point
+  nearest in temperature; with none, −350 Hz.
+- **A sweep** when no GPS satellite has been locked for 12 s: the
+  unlocked satellites' term steps 0, +80, −80, +160 ... ±480 Hz, 5 s a
+  step. A lock credits the step in use 3 s before. On step 0 the model
+  gets the point (TSX, term). On another step the sweep holds that step
+  10 s, and only when a second GPS satellite locks on it too does the term
+  move there, the model get the point and the sweep stop (single credits
+  proved unreliable, below). Locked satellites keep the unswept term,
+  GLONASS and BeiDou follow it.
+- Logged: "tune: Gn locked, swept +80 Hz; term −270 Hz at TSX 13900 (12
+  points)", and the 30 s "locks" lines end with the term and TSX.
+
+Unit tests: `tune.rs`'s three (the model, the sweep and its credit,
+learning a warmer crystal). `steer-ab.sh` keeps each arm's `aim-*.tsx`
+from run to run (`keep-NAME/`) and logs the TSX count of every run; an arm
+`tune:TITAN_GNSS_TUNE=1` against `off` over 30+ minutes of screen and
+receiver is the test. The module isn't installed for boot yet.
+
+**A walk (2026-11-20, 16:06-16:41, `steer-ab.sh 150 6 "off tune:..."`,
+the phone carried outdoors on a cold afternoon, then indoors from ~16:28,
+over cellular):**
+
+| Run | TSX | first lock / 4 GPS / first fix | most locked |
+|---|---|---|---|
+| off 1 | 14309 | 2 / 4 / 6 s | 6 |
+| tune 1 | 14666 | 4 / 8 / 12 s | 20 |
+| tune 2 | 15002 | 48 / 52 / 53 s | 18 |
+| off 2 | 15138 | 2 / 5 / 6 s | 17 |
+| off 3 | 15290 | 2 / 4 / 6 s | 19 |
+| tune 3 | 15524 | 2 / 3 / 5 s | 19 |
+| tune 4 | 15725 | 2 / 6 / 5 s | 21 |
+| off 4 | 15914 | 2 / 2 / 6 s | 19 |
+| off 5 (going in) | 16090 | 2 / 4 / 6 s, then 0 held | 14 |
+| tune 5, 6, off 6 (indoors) | 16080-15619 | nothing locked | 0 |
+
+- **Outdoors the sky does it:** first fixes in 5-6 s, up to 21 satellites
+  locked, in both arms, against 20-30 s and 8-10 at the window.
+- **The crystal cooled by ~1800 counts** (13934 at the door to 16090) and
+  the fixed −350 Hz term locked within 2 s throughout. For strong signals
+  in a 101 Hz window the term didn't need to move over that range; a
+  weak sky is where it would show, and indoors (the last three runs)
+  neither arm locked anything, so that is still untested.
+- **The first tuner credited lone locks:** in tune 2 nothing locked for
+  48 s, the sweep ran, and single satellites locking at +240 and −240 Hz
+  moved the term to +132 and back to −348 Hz; points from held locks then
+  carried that onto a line (−192 Hz at 15532 to −90 Hz at 16063). Fixed
+  the same day: a sweep step needs two satellites, held locks teach
+  nothing (`tune.rs`, 30 tests). Not yet run again.
+- The 15:13 loss at the window (above) is still unexplained: no TSX was
+  read then.
+
+## Adaptive search windows (2026-11-20: measured, worse; off)
+
+libmnl narrows a GPS satellite's `02` search window step by step once the
+chip has it (512, then about 100, 12, 7 and 4 Hz within ~5 s;
+gnss-chip.md §8), and that narrowing is what lets it hold
+satellites at 15-20 dB-Hz. Ours kept every satellite not yet locked at one
+101 Hz window around geometric + the term (−350 Hz). `TITAN_GNSS_STEER=adaptive`
+(`src/adapt.rs`, off by default) does the narrowing per satellite, and adapts
+it to how well each centre is known:
+
+- A GPS satellite the chip reports (any record from `TRACK_CN0`, in
+  detection or lock) is narrowed while the reports keep coming:
+  46 Hz from 1 s after the first report, 24 Hz from 2 s, 12 Hz from 3 s
+  (`TITAN_GNSS_STEER_STAGES`, default `1:46,2:24,3:12`). The centre stays
+  geometric + the term, as libmnl's does (it doesn't follow the record
+  Doppler, whose per-satellite offset is unknown).
+- A satellite not reported for 3 s goes back to the 101 Hz search, and from
+  then on narrows one stage less than where it was lost; lost at 46 Hz, it
+  is not narrowed again that session. So a satellite whose centre is off by
+  more than a narrow window stops being narrowed, and one whose centre is
+  good goes on to 12 Hz.
+- `TITAN_GNSS_STEER_ALL=N` narrows the satellites not yet reported to N Hz
+  once two GPS satellites hold a lock (the term then confirmed), as libmnl
+  narrows every window at its first correction; 0 (default) leaves them at
+  101 Hz. The earlier fixed-window runs (§ "Android's libmnl, traced")
+  tried narrow windows only at the wrong term (−234 Hz, −200, −270), and
+  before the camera-clock fix (10 dB of noise), so they don't settle this.
+
+The log gains "first GPS lock N s", "four GPS satellites locked N s",
+"steer: Gn lost at N Hz; ..." and, on the 30 s "locks" lines, how many
+satellites were narrowed and how many were lost while narrowed. Unit tests:
+`adapt.rs`'s four (the stages, narrowing while reported, a loss narrowing
+less, a short run teaching nothing).
+
+**Measuring it:** `tools/gnss/steer-ab.sh [SECS] [ROUNDS] [ARMS]` on the
+phone runs the daemon in a transient unit (conflicting with the service, so
+switching Location on ends it) from a fresh copy of the live state each run,
+arms interleaved A B B A, and prints per arm the medians of first lock, four
+locked, first fix, most locked at once, locked at the end and fixes. Its log
+stays on the phone. An arm `f01:TITAN_GNSS_01=libmnl` tests the `01` frame
+filled as libmnl fills it (gnss-chip.md, "The `01` frame
+decoded").
+
+**Measured (2026-11-20, 14:52-15:26, phone by the window, screen on):**
+three arms, `off` (the defaults), `f01` (`TITAN_GNSS_01=libmnl`) and
+`adaptive`, 150 s a session, four rounds in A B C C B A order:
+
+| Round | off: 4 GPS locked / first fix / most / at end | f01 | adaptive |
+|---|---|---|---|
+| 1 | 26 s / 29 s / 8 / 5 | 20 s / 21 s / 9 / 5 | never / 15 s / 5 / 5 |
+| 2 | 8 s / 124 s / 6 / 6 | 27 s / 25 s / 10 / 8 | never / 30 s / 7 / 7 |
+| 3 | 34 s / 19 s / 9 / 9 | never / 20 s / 8 / 0 | nothing locked |
+| 4 | nothing locked | nothing locked | nothing locked |
+
+(most and at end count every constellation's locked satellites.)
+
+- **Adaptive narrowing loses the satellites it narrows.** In rounds 1-2,
+  of 39 narrowings (21 and 18), 32 were lost again, most
+  at 12 Hz, then at 24 and 46 Hz on the next tries; none of them went on
+  to lock, and the arm never had four GPS satellites together. Satellites
+  already locked kept their lock when narrowed. So our centres (geometric +
+  one fixed term) are not good to ±25 Hz for a detected satellite, which
+  libmnl's are; narrowing needs a centre we don't have yet. Off by default,
+  as it was.
+- **`f01`** fixed a little sooner in rounds 1-2 (21 and 25 s against 29
+  and 124 s) and held more (8-10 against 6-8), but three sessions an arm
+  can't separate that from the sky; it stays off until a longer run.
+- **From about 15:13 nothing locked in any arm** ("nothing tracked for
+  75 s with the modem clock" in rounds 3-4), with the phone's screen on
+  the whole test and the receiver running about 20 of every 23 minutes.
+  The likely cause is the crystal warming away from the fixed −350 Hz
+  term (B must be right to well within 200 Hz, §"The receiver clock" in
+  gnss-chip.md); the phone may also have been moved. Following the term
+  as the crystal warms (the drift tuner) is the next step before
+  narrowing or `f01` can be judged.
 
 ## The daemon in Rust (2026-11-17)
 
@@ -492,8 +716,10 @@ capture in `out/gnss-cap/android-1113/` (local). What it shows:
   they are tracked nothing; our frames plus Android's change since its
   start tracked 2-6 and nothing after 60 s. So the receiver's clock under
   our session does not move as libmnl's frames do (no script change
-  happens near 80 s either: our `01` millisecond field wraps at 65.5 s,
-  but Android's does too).
+  happens near 80 s either: our `01` millisecond field wraps at 65.5 s;
+  Android's was read as wrapping too, but it carries the high half in
+  bytes 6-7, so its count doesn't wrap: gnss-chip.md, "The `01` frame
+  decoded", 2026-11-20).
 - **Correction: layout `A0` is not full lock.** In a 150 s run of the same
   kind, only G17 and G19 (20-27 dB-Hz) reached the lock states (status
   bytes 6-7 `0251`, then `0261`) and held them. G3, G4, G6, G12 and G25
@@ -1115,7 +1341,7 @@ Code phase bit weights in chips (from bit flips against libmnl, exact to
 | `05` | setup, periodic | register-style settings `[u16 id][value]` |
 | `02` | 3/s per satellite | **search assignments** (below) |
 | `00` | 2/s | `00 00 [u16 ms]`, +500 each frame |
-| `01` | 2/s | `[u32 ~0x60][u32 ~0x0f93, slowly rising][u16 ms = 00's previous][u16 0x0420][00][u16 seconds, as in 02][00 00 00]` |
+| `01` | 1/s | `[i16 GPS search term, Hz][0000][u16 ~0x0f75][u16 ms high][u16 ms low = 00's previous][u16 0x0420][00][u16 seconds, as in 02][00 00][flag]` (gnss-chip.md, "The `01` frame decoded") |
 | `10` | 2/s | `01` + three groups `[u16 a][0000][ffff][u16 b]`; a and b follow the clock drift at a run-dependent scale (TCXO/temperature setting?). Changing them changes nothing in tracking |
 | `03` | 1/s | satellite list `00 [count]` + `[sv][constellation]` pairs |
 | `1C` | 1/s | empty control |
