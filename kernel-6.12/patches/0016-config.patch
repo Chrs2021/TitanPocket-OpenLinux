@@ -6,15 +6,15 @@ A fragment on top of defconfig: make defconfig titanpocket.config.
 The media core stays modular for the out-of-tree camera driver; udmabuf
 is built in for libcamera.
 ---
- arch/arm64/configs/titanpocket.config | 179 ++++++++++++++++++++++++++
- 1 file changed, 179 insertions(+)
+ arch/arm64/configs/titanpocket.config | 182 ++++++++++++++++++++++++++
+ 1 file changed, 182 insertions(+)
 
 diff --git a/arch/arm64/configs/titanpocket.config b/arch/arm64/configs/titanpocket.config
 new file mode 100644
-index 0000000000000000000000000000000000000000..018df1e7b65ec6515d49616236bc5cb5d8df2e35
+index 0000000000000000000000000000000000000000..42e8fbc177ff7bacc9d08b7c3c1e33e40e74edfe
 --- /dev/null
 +++ b/arch/arm64/configs/titanpocket.config
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,182 @@
 +# Titan Pocket on top of arm64 defconfig:
 +#   make defconfig titanpocket.config
 +CONFIG_LOCALVERSION="-titanpocket"
@@ -168,6 +168,9 @@ index 0000000000000000000000000000000000000000..018df1e7b65ec6515d49616236bc5cb5
 +# BC1.2, charge limits from the battery node) and its ADC
 +CONFIG_MEDIATEK_MT6370_ADC=y
 +CONFIG_CHARGER_MT6370=y
++# MT6358 PMIC AUXADC: chip, DCXO and crystal (TSX) temperatures; the GNSS
++# daemon follows its search term with the crystal temperature
++CONFIG_MEDIATEK_MT6359_AUXADC=m
 +CONFIG_LEDS_CLASS_MULTICOLOR=y
 +CONFIG_LEDS_MT6370_RGB=y
 +# The rear flash (LED flash class; the Camera app drives it through sysfs)

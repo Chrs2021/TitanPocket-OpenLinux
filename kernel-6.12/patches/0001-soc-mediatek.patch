@@ -33,14 +33,15 @@ SCP asks for the PLL, so UNIVPLL can stop.
 mtk-lk-fb: hands the bootloader's live framebuffer to simplefb, for a
 console before the display driver binds.
 ---
- drivers/soc/mediatek/Kconfig          |   44 +
- drivers/soc/mediatek/Makefile         |    4 +
- drivers/soc/mediatek/mt6771-scp.c     | 1380 ++++++++++++++++++
- drivers/soc/mediatek/mt6771-spm.c     | 1924 +++++++++++++++++++++++++
- drivers/soc/mediatek/mtk-lk-fb.c      |  249 ++++
- drivers/soc/mediatek/mtk-mcdi.c       |  264 ++++
- include/linux/soc/mediatek/mtk-mcdi.h |   17 +
- 7 files changed, 3882 insertions(+)
+ drivers/soc/mediatek/Kconfig            |   44 +
+ drivers/soc/mediatek/Makefile           |    4 +
+ drivers/soc/mediatek/mt6771-scp.c       | 1380 ++++++++++++++
+ drivers/soc/mediatek/mt6771-spm.c       | 2326 +++++++++++++++++++++++
+ drivers/soc/mediatek/mtk-lk-fb.c        |  249 +++
+ drivers/soc/mediatek/mtk-mcdi.c         |  264 +++
+ include/linux/soc/mediatek/mt6771-spm.h |   14 +
+ include/linux/soc/mediatek/mtk-mcdi.h   |   17 +
+ 8 files changed, 4298 insertions(+)
 
 diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
 index 1b7afb19ccd637471ad82ad833f589cb0f9405b1..cc73ddf801462547795930636f466c91eb5a83e9 100644
@@ -1510,10 +1511,10 @@ index 0000000000000000000000000000000000000000..b5c7ca4d1bbcc185f4d6f3a5f97f6df5
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/soc/mediatek/mt6771-spm.c b/drivers/soc/mediatek/mt6771-spm.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..4cc2f8dc6c054ae9d772b3916790220aafd575ea
+index 0000000000000000000000000000000000000000..b470414b8e97bc44a711110c8cf2c2fa57e91e47
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6771-spm.c
-@@ -0,0 +1,1924 @@
+@@ -0,0 +1,2326 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 SPM: resource requests and system suspend.
@@ -1594,9 +1595,11 @@ index 0000000000000000000000000000000000000000..4cc2f8dc6c054ae9d772b3916790220a
 +#include <linux/psci.h>
 +#include <linux/regmap.h>
 +#include <linux/sizes.h>
++#include <linux/soc/mediatek/mt6771-spm.h>
 +#include <linux/soc/mediatek/mtk-mcdi.h>
 +#include <linux/soc/mediatek/mtk_sip_svc.h>
 +#include <linux/string.h>
++#include <linux/stop_machine.h>
 +#include <linux/suspend.h>
 +#include <linux/tick.h>
 +
@@ -1979,11 +1982,21 @@ index 0000000000000000000000000000000000000000..4cc2f8dc6c054ae9d772b3916790220a
 +	"infra_pwm1", "infra_pwm2", "infra_pwm3", "infra_pwm4", "infra_pwm",
 +	"infra_uart1", "infra_uart2", "infra_uart3", "infra_spi0", "infra_cpum",
 +	"infra_irtx", "infra_spi1", "infra_i2c4",
++	/*
++	 * And the rest of those 4.14 keeps off while awake and nothing here uses
++	 * (docs/power-rails.md, "Clocks with no user"): found running after boot
++	 * and gated at run time without harm on 2026-11-20 (tools/power/clkdcm.py).
++	 * The SD card's controller takes msdc1 and msdc1_sck, not msdc1_self.
++	 */
++	"infra_gce_26m", "infra_i2c1_imm", "infra_i2c2_imm", "infra_i2c5",
++	"infra_i2c7", "infra_i2c8", "infra_spi2", "infra_spi3", "infra_spi4",
++	"infra_spi5", "infra_ap_msdc0", "infra_md_msdc0", "infra_msdc0_self",
++	"infra_msdc1_self", "infra_msdc2_self",
 +};
 +
 +static void spm_infra_gate_unused(struct device *dev)
 +{
-+	char names[160] = "";
++	char names[384] = "";
 +	int i, n = 0;
 +
 +	for (i = 0; i < ARRAY_SIZE(spm_infra_unused); i++) {
@@ -1997,6 +2010,47 @@ index 0000000000000000000000000000000000000000..4cc2f8dc6c054ae9d772b3916790220a
 +			       spm_infra_unused[i] + strlen("infra_"));
 +	}
 +	dev_info(dev, "unused infra clocks gated:%s\n", n ? names : " none");
++}
++
++/*
++ * Dynamic clock gating (DCM) that MediaTek's golden table for suspend wants
++ * on and nothing in this kernel switches on (docs/power-rails.md, "The
++ * vendor's golden settings"): the MCUSYS bus fabric's (bits 4, 5 and 17),
++ * the CCI's ADB400 bridges' (bits 3-6), the GIC's sync and the PMIC
++ * wrapper's (DCM_EN, which mainline's pwrap driver sets only on SoCs with
++ * PWRAP_CAP_DCM). MEM_DCM_CTRL bit 27, also in the table, stays as on 4.14
++ * (clear). Set at run time on 2026-11-20 with no harm seen; the current it
++ * saves was below what the fuel gauge resolves with the screen on.
++ */
++#define MCUSYS_BUS_FABRIC_DCM_CTRL	0x668
++#define MP_CCI_ADB400_DCM_CONFIG	0x740
++#define MCUCFG_GIC_SYNC_DCM		0x758
++#define PWRAP_DCM_EN_6771		0x1d0
++static bool dcm = true;
++module_param(dcm, bool, 0444);
++MODULE_PARM_DESC(dcm, "Switch on the bus, CCI, GIC and PMIC-wrapper DCM at boot");
++
++static void spm_dcm_init(struct device *dev)
++{
++	struct regmap *mcucfg = syscon_regmap_lookup_by_compatible("mediatek,mt6771-mcucfg");
++	struct device_node *np;
++	void __iomem *pwrap;
++
++	if (IS_ERR(mcucfg)) {
++		dev_warn(dev, "no MCUCFG syscon: DCM left as it is\n");
++		return;
++	}
++	regmap_set_bits(mcucfg, MCUSYS_BUS_FABRIC_DCM_CTRL, BIT(4) | BIT(5) | BIT(17));
++	regmap_set_bits(mcucfg, MP_CCI_ADB400_DCM_CONFIG, GENMASK(6, 3));
++	regmap_set_bits(mcucfg, MCUCFG_GIC_SYNC_DCM, BIT(0));
++	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6771-pwrap");
++	pwrap = np ? of_iomap(np, 0) : NULL;
++	of_node_put(np);
++	if (pwrap) {
++		writel(readl(pwrap + PWRAP_DCM_EN_6771) | GENMASK(17, 0), pwrap + PWRAP_DCM_EN_6771);
++		iounmap(pwrap);
++	}
++	dev_info(dev, "DCM on: bus fabric, CCI ADB400, GIC sync%s\n", pwrap ? ", PMIC wrapper" : "");
 +}
 +
 +static void spm_clk_init(struct device *dev)
@@ -2026,6 +2080,8 @@ index 0000000000000000000000000000000000000000..4cc2f8dc6c054ae9d772b3916790220a
 +		 tvdpll_off ? "off" : "left", aplls ? "off" : "left");
 +	if (infra_gate_unused)
 +		spm_infra_gate_unused(dev);
++	if (dcm)
++		spm_dcm_init(dev);
 +}
 +
 +/*
@@ -3319,16 +3375,23 @@ index 0000000000000000000000000000000000000000..4cc2f8dc6c054ae9d772b3916790220a
 +}
 +
 +/* The vendor sends these from its PM notifier; here only for "mem" */
++static void vcorefs_sleep_hold(bool hold);
++
 +static int mt6771_spm_suspend_begin(suspend_state_t state)
 +{
-+	int ret = sspm_spm_command(SSPM_SPM_SUSPEND_PREPARE);
++	int ret;
 +
++	vcorefs_sleep_hold(true);
++	ret = sspm_spm_command(SSPM_SPM_SUSPEND_PREPARE);
++	if (ret < 0)
++		vcorefs_sleep_hold(false);
 +	return ret < 0 ? ret : 0;
 +}
 +
 +static void mt6771_spm_suspend_end(void)
 +{
 +	sspm_spm_command(SSPM_SPM_POST_SUSPEND);
++	vcorefs_sleep_hold(false);
 +}
 +
 +static const struct platform_suspend_ops mt6771_spm_suspend_ops = {
@@ -3350,6 +3413,339 @@ index 0000000000000000000000000000000000000000..4cc2f8dc6c054ae9d772b3916790220a
 +	spm_sip(MTK_SIP_SPM_VCOREFS_ARGS, VCOREFS_GO, VCOREFS_FLAGS, 0);
 +	dev_info(dev, "SPM firmware started (status %lu)\n", status);
 +}
++
++/*
++ * Dynamic Vcore (docs/power-rails.md, "Dynamic Vcore"): what MediaTek's
++ * spm_vcorefs_init() (spm_v4/mtk_spm_vcorefs_mt6771.c) adds to the start
++ * above. The firmware's common scenario again with Vcore DVS and DRAM DFS on;
++ * the DVFSRC's tables for LPDDR4X, 2 channels at 3733 (firmware index 0);
++ * the watchdog told the DVFSRC is in use; then a software request. Each
++ * request is an OPP (vendor spm_trigger_dvfs()): DVFSRC_SW_REQ bits 3:2 the
++ * Vcore (1: 0.8 V, 0: the 0.725 V command), bits 1:0 the EMI (2, 1, 0: the
++ * DRAM's shuffles), OPP 0 {1, 2}, 1 {1, 1}, 2 {0, 1}, 3 {0, 0}; the
++ * firmware reports the OPP it reached one-hot in SPM_SW_RSV_5's low half.
++ * On from probe (mt6771_spm.vcorefs=0 on the command line keeps it off),
++ * before titan_modem loads: a modem booted against the firmware without DVS
++ * and DFS asks for the top level for good (MD_REQUEST 0x11), one booted
++ * against a scaling DVFSRC asks for nothing until it needs it. Running, the
++ * software asks OPP 3 and the hardware's requests (bandwidth, the modem, the
++ * SCP) raise it, as stock's kickers asking sw_opp 3. vcore_opp=0-3 asks an
++ * OPP for tests (the hardware may still raise it; never masked, unlike the
++ * vendor's "fixed" kicks), -1 lets go; vcorefs=0 parks it at OPP 0. Across
++ * a system suspend OPP 0 is asked (not tried at the low OPPs yet).
++ * Once started the firmware keeps scaling: as on stock, it is never
++ * restarted without DVS and DFS, which left the modem unable to boot (its
++ * DVFS driver asserts, 2026-11-21). And as MediaTek's ccci does around a
++ * modem start (md_cd_vcore_config()), titan_modem holds OPP 0 from before
++ * the modem's power-on to its second handshake: mt6771_spm_vcore_md_hold().
++ * Before the first start both are no-ops: the bootloader's state, which the
++ * modem accepts, stays.
++ */
++#define DVFSRC_PHYS		0x10012000
++#define DVFSRC_BASIC_CONTROL	0x000
++#define DVFSRC_SW_REQ		0x004
++#define DVFSRC_SW_REQ2		0x008
++#define DVFSRC_EMI_REQUEST	0x00c
++#define DVFSRC_EMI_REQUEST2	0x010
++#define DVFSRC_EMI_REQUEST3	0x014
++#define DVFSRC_EMI_QOS0		0x024
++#define DVFSRC_EMI_QOS1		0x028
++#define DVFSRC_EMI_MD2SPM0	0x030
++#define DVFSRC_EMI_MD2SPM1	0x034
++#define DVFSRC_VCORE_REQUEST	0x048
++#define DVFSRC_VCORE_REQUEST2	0x04c
++#define DVFSRC_VCORE_MD2SPM0	0x068
++#define DVFSRC_MD_SW_CONTROL	0x084
++#define DVFSRC_INT_EN		0x09c
++#define DVFSRC_TIMEOUT_NEXTREQ	0x0d8
++#define DVFSRC_LEVEL		0x0dc
++#define DVFSRC_LEVEL_LABEL(n)	(0x0e0 + 4 * (n))
++#define DVFSRC_QOS_EN		0x180
++#define DVFSRC_FORCE		0x300
++#define DVFSRC_RSRV_1		0x604
++#define SPM_SW_RSV_5		0x61c
++#define SPM_DVS_LEVEL		0x6b4
++/* the DRAM's current shuffle: DRAMC AO channel A 0x0e4 bits 2:1 (vendor get_shuffle_status()) */
++#define DRAMC_AO_CHA_PHYS	0x1022a000
++#define DRAMC_SHU_STATUS	0x0e4
++#define VCOREFS_DVS_DFS_OFF	(BIT(3) | BIT(4))
++/* the watchdog: DEBUG_CTL2 dvfsrc_en, LATCH_CTL dvfsrc (vendor mtk_rgu_cfg_dvfsrc()) */
++#define RGU_LATCH_CTL		0x044
++#define RGU_DEBUG_CTL2		0x0a0
++
++static const u32 dvfsrc_labels_3733[8] = {
++	0x00100000, 0x00210011, 0x01100100, 0x01210111,
++	0x02100200, 0x02210211, 0x03210321, 0x03210321,
++};
++static const u8 opp_vcore_req[4] = { 1, 1, 0, 0 };
++static const u8 opp_emi_req[4] = { 2, 1, 1, 0 };
++
++static void __iomem *dvfsrc, *dramc;
++static DEFINE_MUTEX(vcorefs_lock);
++static bool vcorefs_fw;		/* the firmware scales: started once, never stopped */
++static bool vcorefs;		/* scaling allowed (off: parked at OPP 0) */
++static bool md_hold;		/* a modem boot under way: OPP 0 held */
++static bool sleep_hold;		/* a system suspend under way: OPP 0 held */
++static bool vcorefs_want = true;	/* the boot's choice, until probe */
++static int vcore_opp = -1;	/* held, or -1 */
++
++/* the OPP the firmware last reached (SPM_SW_RSV_5, one-hot per OPP), or -1 */
++static int vcorefs_opp_now(void)
++{
++	u32 v;
++
++	regmap_read(spm_regmap, SPM_SW_RSV_5, &v);
++	switch (v & 0xffff) {
++	case 0x8: case 0x80: case 0x800: return 0;
++	case 0x4: case 0x40: case 0x400: return 1;
++	case 0x2: case 0x20: case 0x200: return 2;
++	case 0x1: case 0x10: case 0x100: case 0x1000: return 3;
++	default: return -1;
++	}
++}
++
++/*
++ * The OPP the hardware is at, from the DRAM's shuffle and the SPM's Vcore slot (SPM_DVS_LEVEL bit 1:
++ * the 0.8 V command): what the firmware's init must be told. Starting it with 0 while the DRAM
++ * was on shuffle 1 (left there by a failed step back) left it unable to switch back until a reboot
++ * (2026-11-20).
++ */
++static int vcorefs_opp_hw(void)
++{
++	u32 shu = (readl(dramc + DRAMC_SHU_STATUS) >> 1) & 3, dvs;
++
++	regmap_read(spm_regmap, SPM_DVS_LEVEL, &dvs);
++	if (shu == 0)
++		return 0;
++	if (shu == 1)
++		return dvs & BIT(1) ? 1 : 2;
++	return 3;
++}
++
++static int vcorefs_wait_idle(void)
++{
++	u32 v;
++
++	return readl_poll_timeout(dvfsrc + DVFSRC_LEVEL, v, !(v & 0xffff), 20, 20000);
++}
++
++/*
++ * The hardware's own requests, always live (vendor dvfsrc_hw_policy_mask(false)). The vendor masks
++ * them for its "fixed" kicks; here never: a modem booted against a scaling DVFSRC keeps asking it
++ * for its level and asserts (DVFS_drv.c:1914) within seconds of its input being masked, booting or
++ * running (2026-11-21).
++ */
++static void dvfsrc_hw_policy(void)
++{
++	writel(0x00290209, dvfsrc + DVFSRC_EMI_REQUEST);
++	writel(0, dvfsrc + DVFSRC_EMI_REQUEST3);
++	writel(0x00150000, dvfsrc + DVFSRC_VCORE_REQUEST);
++	writel(readl(dvfsrc + DVFSRC_MD_SW_CONTROL) & ~(BIT(0) | BIT(3) | BIT(5)), dvfsrc + DVFSRC_MD_SW_CONTROL);
++}
++
++/*
++ * Ask an OPP; the hardware's requests may still raise it. hold: wait until it is reached exactly
++ * (reported, not enforced), else until it is at or above it.
++ */
++static int vcorefs_request(int opp, bool hold)
++{
++	u32 v;
++	int ret, got;
++
++	if (vcorefs_wait_idle()) {
++		pr_warn("mt6771-spm: DVFS still busy (level 0x%x)\n", readl(dvfsrc + DVFSRC_LEVEL));
++		return -EBUSY;
++	}
++	dvfsrc_hw_policy();
++	v = readl(dvfsrc + DVFSRC_SW_REQ) & ~0xf;
++	writel(v | opp_vcore_req[opp] << 2 | opp_emi_req[opp], dvfsrc + DVFSRC_SW_REQ);
++	ret = read_poll_timeout(vcorefs_opp_now, got, hold ? got == opp : got >= 0 && got <= opp,
++				50, 50000, false);
++	pr_info("mt6771-spm: Vcore OPP %d %s: reached %d%s, SW_REQ 0x%x, level 0x%x, RSV_5 0x%x\n",
++		opp, hold ? "held" : "asked", got, ret ? " (timed out)" : "",
++		readl(dvfsrc + DVFSRC_SW_REQ), readl(dvfsrc + DVFSRC_LEVEL),
++		({ u32 r; regmap_read(spm_regmap, SPM_SW_RSV_5, &r); r; }));
++	return ret;
++}
++
++/* with every other CPU parked (none in SODI or deep idle, which kick the SPM too) */
++static int vcorefs_start_stopped(void *data)
++{
++	int i;
++
++	spm_sip(MTK_SIP_SPM_VCOREFS_ARGS, VCOREFS_DVFSFW_INIT, vcorefs_opp_hw(), 0);
++	spm_sip(MTK_SIP_SPM_VCOREFS_ARGS, VCOREFS_GO, VCOREFS_FLAGS & ~VCOREFS_DVS_DFS_OFF, 0);
++	/* vendor dvfsrc_init(), LP4X 2CH 3733, without the vendor's QoS */
++	for (i = 0; i < ARRAY_SIZE(dvfsrc_labels_3733); i++)
++		writel(dvfsrc_labels_3733[i], dvfsrc + DVFSRC_LEVEL_LABEL(i));
++	writel(0x32, dvfsrc + DVFSRC_EMI_QOS0);
++	writel(0x66, dvfsrc + DVFSRC_EMI_QOS1);
++	writel(0x80f8, dvfsrc + DVFSRC_EMI_MD2SPM0);
++	writel(0x0, dvfsrc + DVFSRC_EMI_MD2SPM1);
++	writel(0x80c0, dvfsrc + DVFSRC_VCORE_MD2SPM0);
++	writel(0x1c, dvfsrc + DVFSRC_RSRV_1);
++	writel(0x13, dvfsrc + DVFSRC_TIMEOUT_NEXTREQ);
++	writel(0x2, dvfsrc + DVFSRC_INT_EN);
++	writel(0x00290209, dvfsrc + DVFSRC_EMI_REQUEST);
++	writel(0, dvfsrc + DVFSRC_EMI_REQUEST2);
++	writel(0x00150000, dvfsrc + DVFSRC_VCORE_REQUEST);
++	writel(0, dvfsrc + DVFSRC_QOS_EN);
++	writel(0x00400000, dvfsrc + DVFSRC_FORCE);
++	writel(0x0000c07b, dvfsrc + DVFSRC_BASIC_CONTROL);
++	writel(0x0000017b, dvfsrc + DVFSRC_BASIC_CONTROL);
++	return 0;
++}
++
++static void vcorefs_rgu(void)
++{
++	struct device_node *np = of_find_compatible_node(NULL, NULL, "mediatek,mt6771-wdt");
++	void __iomem *rgu = np ? of_iomap(np, 0) : NULL;
++
++	of_node_put(np);
++	if (!rgu)
++		return;
++	writel((readl(rgu + RGU_DEBUG_CTL2) & 0xffffff) | BIT(9) | 0x55000000, rgu + RGU_DEBUG_CTL2);
++	writel((readl(rgu + RGU_LATCH_CTL) & 0xffffff) | BIT(13) | 0x95000000, rgu + RGU_LATCH_CTL);
++	iounmap(rgu);
++}
++
++/*
++ * The request that stands, the firmware started. Parked or while a modem boots: OPP 0 asked with
++ * the hardware's requests live (OPP 0 is the top, so nothing can lower it). Never masked then: the
++ * modem's DVFS driver asks for its level as it starts and asserts (DVFS_drv.c:1914) if the DVFSRC
++ * doesn't serve it, as it doesn't with the modem's input masked (2026-11-21).
++ */
++static int vcorefs_apply(void)
++{
++	if (!vcorefs || md_hold || sleep_hold)
++		return vcorefs_request(0, false);
++	if (vcore_opp >= 0)
++		return vcorefs_request(vcore_opp, true);
++	return vcorefs_request(3, false);
++}
++
++/* under vcorefs_lock */
++static int vcorefs_switch(bool on)
++{
++	int ret = 0;
++
++	if (on == vcorefs)
++		goto out;
++	if (!dvfsrc)
++		dvfsrc = ioremap(DVFSRC_PHYS, SZ_4K);
++	if (!dramc)
++		dramc = ioremap(DRAMC_AO_CHA_PHYS, SZ_4K);
++	if (!dvfsrc || !dramc) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	if (on && !vcorefs_fw) {
++		/* never under a modem that is booting: it checks the firmware's state then */
++		if (md_hold) {
++			ret = -EBUSY;
++			goto out;
++		}
++		stop_machine(vcorefs_start_stopped, NULL, NULL);
++		vcorefs_rgu();
++		vcorefs_fw = true;
++	}
++	vcorefs = on;
++	vcore_opp = -1;
++	ret = vcorefs_apply();
++	pr_info("mt6771-spm: dynamic Vcore %s\n", on ? "on" : "parked at OPP 0");
++out:
++	return ret;
++}
++
++static int vcorefs_set(const char *val, const struct kernel_param *kp)
++{
++	bool on;
++	int ret = kstrtobool(val, &on);
++
++	if (ret)
++		return ret;
++	mutex_lock(&vcorefs_lock);
++	if (!spm_regmap)
++		vcorefs_want = on;	/* the command line: probe starts it */
++	else
++		ret = vcorefs_switch(on);
++	mutex_unlock(&vcorefs_lock);
++	return ret;
++}
++
++static void vcorefs_sleep_hold(bool hold)
++{
++	mutex_lock(&vcorefs_lock);
++	sleep_hold = hold;
++	if (vcorefs_fw)
++		vcorefs_apply();
++	mutex_unlock(&vcorefs_lock);
++}
++
++/**
++ * mt6771_spm_vcore_md_hold() - hold Vcore and the DRAM at OPP 0 while the modem boots
++ * @hold: true before the modem is powered on, false once it has answered the second handshake
++ *
++ * As MediaTek's ccci (md_cd_vcore_config()): the modem's DVFS driver starts against the top OPP.
++ * A no-op until dynamic Vcore has been started. May sleep.
++ */
++void mt6771_spm_vcore_md_hold(bool hold)
++{
++	mutex_lock(&vcorefs_lock);
++	if (md_hold != hold) {
++		md_hold = hold;
++		if (vcorefs_fw) {
++			vcorefs_apply();
++			pr_info("mt6771-spm: modem boot: OPP 0 %s\n", hold ? "held" : "released");
++		}
++	}
++	mutex_unlock(&vcorefs_lock);
++}
++EXPORT_SYMBOL_GPL(mt6771_spm_vcore_md_hold);
++
++static int vcorefs_get(char *buf, const struct kernel_param *kp)
++{
++	return sysfs_emit(buf, "%d\n", spm_regmap ? vcorefs : vcorefs_want);
++}
++
++static const struct kernel_param_ops vcorefs_ops = { .set = vcorefs_set, .get = vcorefs_get };
++module_param_cb(vcorefs, &vcorefs_ops, NULL, 0644);
++MODULE_PARM_DESC(vcorefs, "Dynamic Vcore and DRAM frequency (DVFSRC): 1 on (default, from probe), 0 off (once started, parked at OPP 0)");
++
++static int vcore_opp_set(const char *val, const struct kernel_param *kp)
++{
++	int opp, ret = kstrtoint(val, 0, &opp);
++
++	if (ret)
++		return ret;
++	if (opp < -1 || opp > 3)
++		return -EINVAL;
++	mutex_lock(&vcorefs_lock);
++	if (!vcorefs) {
++		ret = -EPERM;
++	} else if (md_hold) {
++		vcore_opp = opp;	/* once the modem has booted */
++	} else {
++		ret = vcorefs_request(opp < 0 ? 3 : opp, opp >= 0);
++		if (!ret)
++			vcore_opp = opp;
++	}
++	mutex_unlock(&vcorefs_lock);
++	return ret;
++}
++
++static int vcore_opp_get(char *buf, const struct kernel_param *kp)
++{
++	if (!vcorefs_fw || !dvfsrc)
++		return sysfs_emit(buf, "off\n");
++	return sysfs_emit(buf, "%sheld %d, now %d, level 0x%x, SW_REQ 0x%x\n",
++			  !vcorefs ? "parked, " : md_hold ? "modem booting, " : "", vcore_opp,
++			  vcorefs_opp_now(), readl(dvfsrc + DVFSRC_LEVEL), readl(dvfsrc + DVFSRC_SW_REQ));
++}
++
++static const struct kernel_param_ops vcore_opp_ops = { .set = vcore_opp_set, .get = vcore_opp_get };
++module_param_cb(vcore_opp, &vcore_opp_ops, NULL, 0644);
++MODULE_PARM_DESC(vcore_opp, "Ask Vcore/DRAM OPP 0-3 (0 top; the hardware may raise it), -1 let go (OPP 3 asked); reads the state");
 +
 +static int mt6771_spm_probe(struct platform_device *pdev)
 +{
@@ -3393,6 +3789,13 @@ index 0000000000000000000000000000000000000000..4cc2f8dc6c054ae9d772b3916790220a
 +
 +	if (deep)
 +		suspend_set_ops(&mt6771_spm_suspend_ops);
++	/* dynamic Vcore before any modem boots (titan_modem is a module, loaded later) */
++	if (deep && vcorefs_want) {
++		mutex_lock(&vcorefs_lock);
++		if (vcorefs_switch(true))
++			dev_warn(dev, "dynamic Vcore didn't start\n");
++		mutex_unlock(&vcorefs_lock);
++	}
 +	return 0;
 +}
 +
@@ -3963,6 +4366,26 @@ index 0000000000000000000000000000000000000000..640e8f597505e39f5cb8985a980d415c
 +	return 0;
 +}
 +arch_initcall(mcdi_init);
+diff --git a/include/linux/soc/mediatek/mt6771-spm.h b/include/linux/soc/mediatek/mt6771-spm.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6a2b22332c5807a1ada8713e3a43bac5a9191af3
+--- /dev/null
++++ b/include/linux/soc/mediatek/mt6771-spm.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* MT6771 SPM: what other drivers ask of it (drivers/soc/mediatek/mt6771-spm.c) */
++#ifndef __SOC_MEDIATEK_MT6771_SPM_H
++#define __SOC_MEDIATEK_MT6771_SPM_H
++
++#include <linux/types.h>
++
++#if IS_ENABLED(CONFIG_MTK_MT6771_SPM)
++void mt6771_spm_vcore_md_hold(bool hold);
++#else
++static inline void mt6771_spm_vcore_md_hold(bool hold) { }
++#endif
++
++#endif
 diff --git a/include/linux/soc/mediatek/mtk-mcdi.h b/include/linux/soc/mediatek/mtk-mcdi.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..621fa684d05833a14060d7edc9bb490f6678e58e

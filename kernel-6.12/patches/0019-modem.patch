@@ -14,8 +14,8 @@ stalled, flushed.
  drivers/net/wwan/Kconfig              |   17 +
  drivers/net/wwan/Makefile             |    1 +
  drivers/net/wwan/mt6771/Makefile      |    2 +
- drivers/net/wwan/mt6771/titan_modem.c | 3306 +++++++++++++++++++++++++
- 4 files changed, 3326 insertions(+)
+ drivers/net/wwan/mt6771/titan_modem.c | 3322 +++++++++++++++++++++++++
+ 4 files changed, 3342 insertions(+)
 
 diff --git a/drivers/net/wwan/Kconfig b/drivers/net/wwan/Kconfig
 index 410b0245114e892808f1a445e34f954376e5d2ae..e718ce454cde5d17f54ef242e216dad27b54fcf1 100644
@@ -64,10 +64,10 @@ index 0000000000000000000000000000000000000000..b87597741f71a6f66c8690096673e8a3
 +obj-$(CONFIG_MTK_MT6771_MODEM) += titan_modem.o
 diff --git a/drivers/net/wwan/mt6771/titan_modem.c b/drivers/net/wwan/mt6771/titan_modem.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..4933100cb8d1d8ea8d08cae0cab3c8cf2e20b974
+index 0000000000000000000000000000000000000000..bfb3380290c026134aa8a0f7023dc6a79fc10687
 --- /dev/null
 +++ b/drivers/net/wwan/mt6771/titan_modem.c
-@@ -0,0 +1,3306 @@
+@@ -0,0 +1,3322 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * MT6771 modem (MD1): power it on, start the image LK left in memory, do
@@ -135,6 +135,7 @@ index 0000000000000000000000000000000000000000..4933100cb8d1d8ea8d08cae0cab3c8cf
 +#include <linux/regmap.h>
 +#include <linux/seq_file.h>
 +#include <linux/skbuff.h>
++#include <linux/soc/mediatek/mt6771-spm.h>
 +#include <linux/timekeeping.h>
 +#include <linux/unaligned.h>
 +#include <linux/vmalloc.h>
@@ -617,6 +618,7 @@ index 0000000000000000000000000000000000000000..4933100cb8d1d8ea8d08cae0cab3c8cf
 +	u32 ccism_size, ccism_exp_size;
 +
 +	bool powered, hs1_done, ready;
++	bool vcore_held;		/* Vcore at OPP 0 for the boot (the SPM's hold) */
 +	unsigned long rchnum;
 +	struct delayed_work watch;
 +	int watch_ticks;
@@ -1491,6 +1493,10 @@ index 0000000000000000000000000000000000000000..4933100cb8d1d8ea8d08cae0cab3c8cf
 +			md->ready = true;
 +			WRITE_ONCE(md->state, MD_READY);
 +			dev_info(md->dev, "HS2: modem ready\n");
++			if (md->vcore_held) {
++				md->vcore_held = false;
++				mt6771_spm_vcore_md_hold(false);
++			}
 +		}
 +		break;
 +	case MD_EX:
@@ -3069,6 +3075,9 @@ index 0000000000000000000000000000000000000000..4933100cb8d1d8ea8d08cae0cab3c8cf
 +
 +	init_rings(md);
 +	ccif_reset(md);
++	/* the top OPP until the second handshake, as MediaTek's ccci (md_cd_vcore_config()) */
++	md->vcore_held = true;
++	mt6771_spm_vcore_md_hold(true);
 +	enable_irq(md->irq);
 +	enable_irq(md->irq_ex);
 +	if (cldma) {
@@ -3081,6 +3090,8 @@ index 0000000000000000000000000000000000000000..4933100cb8d1d8ea8d08cae0cab3c8cf
 +			md_power_off(md);
 +		disable_irq(md->irq);
 +		disable_irq(md->irq_ex);
++		md->vcore_held = false;
++		mt6771_spm_vcore_md_hold(false);
 +		return ret;
 +	}
 +	WRITE_ONCE(md->state, MD_BOOTING);
@@ -3111,6 +3122,11 @@ index 0000000000000000000000000000000000000000..4933100cb8d1d8ea8d08cae0cab3c8cf
 +	cancel_delayed_work_sync(&md->watch);
 +	cancel_work_sync(&md->rx_work);
 +	cancel_work_sync(&md->at_work);
++	/* a boot that never reached the second handshake */
++	if (md->vcore_held) {
++		md->vcore_held = false;
++		mt6771_spm_vcore_md_hold(false);
++	}
 +	for (i = 0; i < AT_CHANS; i++) {
 +		if (md->at[i].port) {
 +			wwan_remove_port(md->at[i].port);
